@@ -16,7 +16,9 @@ pub fn fit_ab(min_dist: f32, spread: f32) -> (f32, f32) {
     // Generate target data
     let n = 300;
     let x_max = 3.0 * spread;
-    let xs: Vec<f32> = (0..n).map(|i| (i as f32 + 0.5) / n as f32 * x_max).collect();
+    let xs: Vec<f32> = (0..n)
+        .map(|i| (i as f32 + 0.5) / n as f32 * x_max)
+        .collect();
     let ys: Vec<f32> = xs
         .iter()
         .map(|&x| {
@@ -227,6 +229,12 @@ impl Default for GraphParams {
 /// These parameters control the embedding optimization process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationParams {
+    /// Random seed used for model initialization and training sampling.
+    ///
+    /// Default: 9999
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+
     /// Number of optimization epochs.
     ///
     /// Default: 100
@@ -327,6 +335,7 @@ pub struct OptimizationParams {
 impl Default for OptimizationParams {
     fn default() -> Self {
         Self {
+            seed: default_seed(),
             n_epochs: 100,
             batch_size: 1000,
             learning_rate: 0.001,
@@ -344,6 +353,10 @@ impl Default for OptimizationParams {
             figures_dir: None,
         }
     }
+}
+
+fn default_seed() -> u64 {
+    9999
 }
 
 // ─── UmapConfig ──────────────────────────────────────────────────────────────
@@ -423,6 +436,8 @@ impl Default for UmapConfig {
 /// backward compatibility and converts to/from `UmapConfig`.
 #[derive(Debug, Clone)]
 pub struct TrainingConfig {
+    /// Seed used for stochastic training sampling.
+    pub seed: u64,
     /// The distance metric to use for training the model.
     pub metric: Metric,
     /// The total number of epochs to run during training.
@@ -490,6 +505,7 @@ impl From<&UmapConfig> for TrainingConfig {
     fn from(config: &UmapConfig) -> Self {
         let (kernel_a, kernel_b) = fit_ab(config.manifold.min_dist, config.manifold.spread);
         TrainingConfig {
+            seed: config.optimization.seed,
             metric: config.graph.metric.clone(),
             epochs: config.optimization.n_epochs,
             batch_size: config.optimization.batch_size,
@@ -534,6 +550,7 @@ impl From<&TrainingConfig> for UmapConfig {
                 minkowski_p: config.minkowski_p,
             },
             optimization: OptimizationParams {
+                seed: config.seed,
                 n_epochs: config.epochs,
                 batch_size: config.batch_size,
                 learning_rate: config.learning_rate,
@@ -563,6 +580,7 @@ impl From<TrainingConfig> for UmapConfig {
 /// Builder pattern for constructing a `TrainingConfig` with optional parameters.
 #[derive(Default)]
 pub struct TrainingConfigBuilder {
+    seed: Option<u64>,
     metric: Option<Metric>,
     epochs: Option<usize>,
     batch_size: Option<usize>,
@@ -585,6 +603,11 @@ pub struct TrainingConfigBuilder {
 }
 
 impl TrainingConfigBuilder {
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
     pub fn with_metric(mut self, metric: Metric) -> Self {
         self.metric = Some(metric);
         self
@@ -694,6 +717,7 @@ impl TrainingConfigBuilder {
         let defaults = ManifoldParams::default();
         let (kernel_a, kernel_b) = fit_ab(defaults.min_dist, defaults.spread);
         Some(TrainingConfig {
+            seed: self.seed.unwrap_or_else(default_seed),
             metric: self.metric.unwrap_or(Metric::Euclidean),
             epochs: self.epochs.unwrap_or(1000),
             batch_size: self.batch_size.unwrap_or(1000),

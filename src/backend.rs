@@ -2,7 +2,7 @@ use burn::{
     backend::Autodiff,
     tensor::ops::{FloatTensor, IntTensor},
 };
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
 
 /// Extension of the Burn [`Backend`](burn::tensor::backend::Backend) trait that
@@ -82,8 +82,8 @@ pub trait AutodiffBackend: Backend + burn::tensor::backend::AutodiffBackend {}
 /// wrapped in [`Autodiff`].
 ///
 /// This covers the primary GPU training path:
-/// `Autodiff<CubeBackend<WgpuRuntime, f32, i32, u32>>`.
-#[cfg(feature = "gpu")]
+/// `Autodiff<CubeBackend<R, f32, i32, u8>>` for CubeCL runtimes such as WGPU and CUDA.
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> AutodiffBackend
     for Autodiff<CubeBackend<R, F, I, BT>>
 {
@@ -96,6 +96,9 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> AutodiffBa
 /// `Autodiff<burn_mlx::Mlx>`.
 #[cfg(feature = "mlx")]
 impl AutodiffBackend for Autodiff<burn_mlx::Mlx> {}
+
+/// This covers the CPU training path using Burn's ndarray backend.
+impl AutodiffBackend for Autodiff<burn::backend::NdArray<f32>> {}
 
 // TODO: Candle backend — blocked on burn-candle/candle-core DType compat
 // #[cfg(feature = "candle")]

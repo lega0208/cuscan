@@ -22,11 +22,7 @@ pub fn euclidean_pairwise_distance<B: burn::tensor::backend::Backend>(
     let [n, _d] = tensor.dims();
 
     // ||x_i||^2 for each row → [n, 1]
-    let sq_norms = tensor
-        .clone()
-        .powf_scalar(2.0)
-        .sum_dim(1)
-        .reshape([n, 1]);
+    let sq_norms = tensor.clone().powf_scalar(2.0).sum_dim(1).reshape([n, 1]);
 
     // -2 * X @ X^T → [n, n]
     let cross = tensor.clone().matmul(tensor.transpose());
@@ -74,8 +70,7 @@ pub fn euclidean_pairwise_distance_backward<B: burn::tensor::backend::Backend>(
 
     // grad_x = scale @ x - diag(scale.sum(1)) @ x
     // = scale @ x - (scale.sum(1).unsqueeze(1)) * x
-    let grad_x = scale.clone().matmul(x_t.clone())
-        - scale.sum_dim(1).reshape([n, 1]).mul(x_t);
+    let grad_x = scale.clone().matmul(x_t.clone()) - scale.sum_dim(1).reshape([n, 1]).mul(x_t);
 
     grad_x.into_primitive().tensor()
 }
@@ -97,17 +92,18 @@ pub fn knn<B: burn::tensor::backend::Backend>(
     let flat: Vec<f32> = pw.to_data().to_vec::<f32>().unwrap();
 
     // Reuse existing CPU k-NN implementation
-    let (idx_flat, dist_flat) = crate::train::get_distance_by_metric::knn_from_pairwise_cpu(
-        &flat, n, k,
-    );
+    let (idx_flat, dist_flat) =
+        crate::train::get_distance_by_metric::knn_from_pairwise_cpu(&flat, n, k);
 
     // Push back as tensors
     let indices: Tensor<B, 2, burn::tensor::Int> =
         Tensor::from_data(TensorData::new(idx_flat, [n, k]), &device);
-    let distances: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(dist_flat, [n, k]), &device);
+    let distances: Tensor<B, 2> = Tensor::from_data(TensorData::new(dist_flat, [n, k]), &device);
 
-    (indices.into_primitive(), distances.into_primitive().tensor())
+    (
+        indices.into_primitive(),
+        distances.into_primitive().tensor(),
+    )
 }
 
 /// Backward pass for k-NN. Not called in the sparse training path.

@@ -249,7 +249,12 @@ pub fn chart_vector(
         });
         for (i, label) in unique_labels.iter().enumerate() {
             let hue = i as f64 * 360.0 / unique_labels.len() as f64;
-            let color = HSL { h: hue, s: 0.7, l: 0.5 }.to_rgb();
+            let color = HSL {
+                h: hue,
+                s: 0.7,
+                l: 0.5,
+            }
+            .to_rgb();
             label_colors.push((label.clone(), RGBColor(color.0, color.1, color.2)));
         }
     }

@@ -44,7 +44,11 @@ pub fn pca<B: Backend>(
         TensorData::new(centered.clone(), [n_samples, n_features]),
         device,
     );
-    let cov = x.clone().transpose().matmul(x).div_scalar((n_samples - 1) as f32);
+    let cov = x
+        .clone()
+        .transpose()
+        .matmul(x)
+        .div_scalar((n_samples - 1) as f32);
 
     // 4. Extract eigenvectors via power iteration with deflation
     let mut cov_data: Vec<f32> = cov.to_data().to_vec::<f32>().unwrap();

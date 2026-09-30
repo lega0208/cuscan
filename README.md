@@ -17,7 +17,7 @@ See [docs.rs](https://docs.rs/crate/fast-umap/latest) for the full API reference
 - **Scales to 50K+ samples** — NN-Descent approximate KNN avoids the O(n^2) distance matrix
 - **Parametric** — trains a neural network, so you can
   [`transform()`](#transform-new-data) new unseen data instantly
-- **Three backends** — MLX (Apple Silicon native), WGPU (Metal/Vulkan/DX12), CPU (NdArray)
+- **Four backends** — CUDA (NVIDIA), MLX (Apple Silicon native), WGPU (Metal/Vulkan/DX12), CPU (NdArray)
 - **PCA warm-start** — optional PCA pre-training for faster convergence
 - **API mirrors umap-rs** — drop-in replacement with `Umap::new(config).fit(data)`
 
@@ -138,7 +138,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 - **Dimensionality Reduction** — projects high-dimensional data to 2-D or 3-D for visualization
 - **Parametric model** — learned neural network can project new, unseen data via `transform()`
-- **Three GPU backends** — MLX (Apple Silicon native), WGPU (Metal/Vulkan/DX12 via CubeCL), and CPU (NdArray)
+- **GPU backends** — CUDA (NVIDIA via CubeCL), MLX (Apple Silicon native), and WGPU (Metal/Vulkan/DX12 via CubeCL); CPU (NdArray) is also available
 - **PCA warm-start** — optional pre-training phase initializes embeddings from PCA for faster convergence (`pca` feature)
 - **NN-Descent** — approximate KNN in O(n*k) memory for datasets > 10K samples, avoiding the O(n^2) distance matrix (`nn-descent` feature)
 - **Automatic differentiation** — full autograd through custom kernels via burn's autodiff backend
@@ -192,6 +192,80 @@ println!("Shape: {} × {}", embedding.len(), embedding[0].len());
 
 ---
 
+## Python
+
+The Python package wraps the parametric model and supports CPU (`NdArray`) and
+GPU execution. A Rust toolchain is required to build it from source.
+
+From the repository root, install in editable mode with `uv`:
+
+```shell
+uv sync
+```
+
+Alternatively, in an activated Python virtual environment, use maturin or pip:
+
+```shell
+maturin develop
+# or
+pip install .
+```
+
+```python
+import numpy as np
+from fast_umap import UMAP
+
+X = np.random.default_rng(42).normal(size=(100, 10)).astype(np.float32)
+model = UMAP(device="cpu")  # choose "gpu" for GPU execution
+embedding = model.fit_transform(X)
+new_embedding = model.transform(X[:5])
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_neighbors` | `15` | Number of neighbors used to construct the neighborhood graph. |
+| `n_components` | `2` | Number of embedding dimensions. |
+| `metric` | `"euclidean"` | Input-space distance metric; only Euclidean is supported. |
+| `n_epochs` | `None` (100 epochs) | Number of training epochs. |
+| `learning_rate` | `0.001` | Adam optimizer learning rate. |
+| `min_dist` | `0.1` | Minimum distance used by the low-dimensional curve. |
+| `spread` | `1.0` | Effective scale of embedded points. |
+| `repulsion_strength` | `1.0` | Weight of negative-sample repulsion. |
+| `negative_sample_rate` | `5` | Number of negative samples per positive edge. |
+| `random_state` | `None` | Integer seed, NumPy `RandomState` or `Generator`; CPU runs are bit-identical for a fixed seed. |
+| `verbose` | `False` | Enable training progress output. |
+| `device` | `"gpu"` | Execution device: `"gpu"` or `"cpu"`. |
+| `hidden_sizes` | `(100,)` | Widths of the neural-network hidden layers. |
+| `patience` | `None` | Early-stopping patience. |
+| `timeout` | `None` | Training timeout in seconds. |
+
+### Differences from umap-learn
+
+- This is parametric UMAP: `transform` is a neural-network forward pass, not a
+  nearest-neighbor interpolation. The returned `embedding_` uses `float32`.
+- Only the Euclidean metric is supported. Supervised UMAP, densMAP, and
+  `inverse_transform` are not supported. umap-learn parameters without a
+  fast-umap equivalent (`init`, `target_*`, `low_memory`, ...) are not accepted
+  and raise `TypeError`.
+- `learning_rate` defaults to `0.001` (Adam), and `n_epochs` defaults to `100`.
+- `n_neighbors >= n_samples` raises `ValueError` rather than warning and
+  adjusting the neighbor count.
+- A fitted model is bound to the thread that created it. Ctrl-C is checked every
+  few epochs and only on the main thread.
+- With a fixed `random_state`, CPU execution is bit-identical.
+
+### Python development
+
+```shell
+uv sync
+uv run pytest
+uv run ruff check
+uv run ruff format --check
+uv run ty check
+```
+
+---
+
 ## Backend Choice: CPU vs GPU with Feature-Based Compilation
 
 fast-umap supports both CPU and GPU backends with feature-based compilation for optimal flexibility:
@@ -218,6 +292,20 @@ let fitted = umap.fit(data, None);
 - ✅ Transform new data through trained model
 - ✅ Custom GPU kernels for efficient computation
 - ✅ Automatic differentiation for training
+
+### CUDA Backend (NVIDIA)
+
+Enable the `cuda` feature to use an NVIDIA GPU. CUDA is not included in the `all` feature.
+
+```rust
+use fast_umap::cuda_backend::{device, CudaAutodiff};
+use fast_umap::prelude::*;
+
+let cuda_device = device(0).expect("CUDA device 0 is required");
+let config = UmapConfig::default();
+let umap = fast_umap::Umap::<CudaAutodiff>::with_device(config, cuda_device);
+let fitted = umap.fit(data, None);
+```
 
 ### MLX Backend (Apple Silicon) - Fastest on Mac
 
@@ -604,13 +692,14 @@ The feature-based compilation system provides:
 | Feature | Description | When to Use |
 |---------|-------------|--------------|
 | `gpu` | GPU backend (WGPU) | Cross-platform GPU, large datasets |
+| `cuda` | GPU backend (CUDA) | NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`) at runtime; `nvcc`/CUDA toolkit optional at build time; excluded from `all` and default features |
 | `mlx` | MLX backend (Apple native) | Apple Silicon (fastest on Mac) |
 | `cpu` | CPU backend (umap-rs) | CPU-only environments |
 | `pca` | PCA warm-start for embeddings | Better convergence quality |
 | `nn-descent` | Approximate KNN for large data | Datasets > 10K samples (avoids O(n^2) memory) |
 | `verbose` | Progress output | Development, debugging |
 | `plotters` | Visualization | Exploration, analysis |
-| `all` | Everything | Development, testing |
+| `all` | All optional features except `cuda` | Development, testing |
 
 **✅ Better Error Messages**
 - Clear feature requirements at compile time

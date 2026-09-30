@@ -55,8 +55,7 @@ pub fn euclidean_pairwise_distance_backward<B: Backend, C: CheckpointStrategy>(
             let (node_x, pairwise) = ops.state;
             let grad_pairwise = grads.consume::<B>(&ops.node);
             let x: FloatTensor<B> = checkpointer.retrieve_node_output(node_x);
-            let grad_x =
-                B::euclidean_pairwise_distance_backward(grad_pairwise, x, pairwise);
+            let grad_x = B::euclidean_pairwise_distance_backward(grad_pairwise, x, pairwise);
             grads.register::<B>(node_x, grad_x);
         }
     }

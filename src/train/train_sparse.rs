@@ -11,29 +11,26 @@
 //! 7. **Async loss readback** — GPU→CPU sync only every N epochs for progress display.
 //! 8. **Lazy loss plotting** — charts rendered only every N epochs, not every epoch.
 
-use crate::{
-    backend::AutodiffBackend,
-    format_duration,
-    model::UMAPModel,
-    normalize_data,
-    utils::convert_vector_to_tensor,
-};
 #[cfg(feature = "plotters")]
 use crate::chart::{self, plot_loss, ChartConfigBuilder};
+use crate::{
+    backend::AutodiffBackend, format_duration, model::UMAPModel, normalize_data,
+    utils::convert_vector_to_tensor,
+};
 use burn::{
     module::{AutodiffModule, Module},
     optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams, Optimizer},
     tensor::{cast::ToElement, Device, Int, Tensor, TensorData},
 };
 
-use super::get_distance_by_metric::*;
 use super::config::*;
+use super::get_distance_by_metric::*;
 
 use crossbeam_channel::Receiver;
 use indicatif::{ProgressBar, ProgressStyle};
 use num::{Float, FromPrimitive, ToPrimitive};
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{thread, time::Instant};
@@ -125,9 +122,13 @@ where
     if verbose {
         println!("[fast-umap] Configuration:");
         println!("[fast-umap]   samples={num_samples}  features={num_features}  k_neighbors={k}");
-        println!("[fast-umap]   epochs={}  lr={:.0e}  repulsion_strength={repulsion_strength}",
-            config.epochs, config.learning_rate);
-        println!("[fast-umap]   kernel: a={kernel_a:.4}  b={kernel_b:.4}  (q = 1 / (1 + a·d^(2b)))");
+        println!(
+            "[fast-umap]   epochs={}  lr={:.0e}  repulsion_strength={repulsion_strength}",
+            config.epochs, config.learning_rate
+        );
+        println!(
+            "[fast-umap]   kernel: a={kernel_a:.4}  b={kernel_b:.4}  (q = 1 / (1 + a·d^(2b)))"
+        );
     }
 
     // ── Z-score normalise input features ─────────────────────────────────────
@@ -156,7 +157,10 @@ where
     let knn_indices: Vec<i32>;
     #[cfg(feature = "nn-descent")]
     if use_nn_descent {
-        let data_f32: Vec<f32> = data.iter().map(|x| num::ToPrimitive::to_f32(x).unwrap()).collect();
+        let data_f32: Vec<f32> = data
+            .iter()
+            .map(|x| num::ToPrimitive::to_f32(x).unwrap())
+            .collect();
         let (idx, _dist) = crate::nn_descent::nn_descent(&data_f32, num_samples, num_features, k);
         knn_indices = idx;
     } else {
@@ -190,55 +194,53 @@ where
     let n_total = n_pos + n_neg;
 
     // ── Pre-generate fused edge-sample batches on GPU ────────────────────────
-    let mut rng = rand::rng();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
-    let fused_batches: Vec<(Tensor<B, 1, Int>, Tensor<B, 1, Int>, usize, usize)> =
-        (0..EDGE_BATCH_COUNT)
-            .map(|_| {
-                // Sample positive edges (with replacement if subsampling)
-                let pos_sample: Vec<&(i64, i64)> = if subsampling {
-                    let mut indices: Vec<usize> = (0..n_all_edges).collect();
-                    indices.shuffle(&mut rng);
-                    indices.iter().take(n_pos).map(|&i| &all_pos_edges[i]).collect()
-                } else {
-                    all_pos_edges.iter().collect()
-                };
+    let fused_batches: Vec<(Tensor<B, 1, Int>, Tensor<B, 1, Int>, usize, usize)> = (0
+        ..EDGE_BATCH_COUNT)
+        .map(|_| {
+            // Sample positive edges (with replacement if subsampling)
+            let pos_sample: Vec<&(i64, i64)> = if subsampling {
+                let mut indices: Vec<usize> = (0..n_all_edges).collect();
+                indices.shuffle(&mut rng);
+                indices
+                    .iter()
+                    .take(n_pos)
+                    .map(|&i| &all_pos_edges[i])
+                    .collect()
+            } else {
+                all_pos_edges.iter().collect()
+            };
 
-                let actual_n_pos = pos_sample.len();
+            let actual_n_pos = pos_sample.len();
 
-                let mut all_head: Vec<i64> = Vec::with_capacity(n_total);
-                let mut all_tail: Vec<i64> = Vec::with_capacity(n_total);
+            let mut all_head: Vec<i64> = Vec::with_capacity(n_total);
+            let mut all_tail: Vec<i64> = Vec::with_capacity(n_total);
 
-                // Positive edges
-                for &(h, t) in &pos_sample {
-                    all_head.push(*h);
-                    all_tail.push(*t);
+            // Positive edges
+            for &(h, t) in &pos_sample {
+                all_head.push(*h);
+                all_tail.push(*t);
+            }
+
+            // Negative samples
+            let actual_n_neg = n_neg;
+            for _ in 0..actual_n_neg {
+                let i = rng.random_range(0..num_samples);
+                let mut j = rng.random_range(0..num_samples - 1);
+                if j >= i {
+                    j += 1;
                 }
+                all_head.push(i as i64);
+                all_tail.push(j as i64);
+            }
 
-                // Negative samples
-                let actual_n_neg = n_neg;
-                for _ in 0..actual_n_neg {
-                    let i = rng.random_range(0..num_samples);
-                    let mut j = rng.random_range(0..num_samples - 1);
-                    if j >= i {
-                        j += 1;
-                    }
-                    all_head.push(i as i64);
-                    all_tail.push(j as i64);
-                }
-
-                let total = actual_n_pos + actual_n_neg;
-                let h = Tensor::from_data(
-                    TensorData::new(all_head, [total]),
-                    &device,
-                );
-                let t = Tensor::from_data(
-                    TensorData::new(all_tail, [total]),
-                    &device,
-                );
-                (h, t, actual_n_pos, total)
-            })
-            .collect();
+            let total = actual_n_pos + actual_n_neg;
+            let h = Tensor::from_data(TensorData::new(all_head, [total]), &device);
+            let t = Tensor::from_data(TensorData::new(all_tail, [total]), &device);
+            (h, t, actual_n_pos, total)
+        })
+        .collect();
 
     let knn_elapsed = knn_start.elapsed();
     if verbose {
@@ -266,10 +268,16 @@ where
         let pca_epochs = 10;
         let pca_lr = 1e-2;
 
-        let data_f32: Vec<f32> = data.iter().map(|x| num::ToPrimitive::to_f32(x).unwrap()).collect();
+        let data_f32: Vec<f32> = data
+            .iter()
+            .map(|x| num::ToPrimitive::to_f32(x).unwrap())
+            .collect();
         let n_components = model.forward(all_data_tensor.clone()).dims()[1];
         let (projected, _components, _mean) = crate::pca::pca::<B::InnerBackend>(
-            &data_f32, num_samples, num_features, n_components,
+            &data_f32,
+            num_samples,
+            num_features,
+            n_components,
             &device.clone().into(),
         );
 
@@ -290,7 +298,9 @@ where
         for _e in 0..pca_epochs {
             let output = model.forward(all_data_tensor.clone());
             let diff = output - pca_target.clone();
-            let mse_vals = (diff.clone() * diff).reshape([num_samples * n_components]).mean_dim(0);
+            let mse_vals = (diff.clone() * diff)
+                .reshape([num_samples * n_components])
+                .mean_dim(0);
             let grads = mse_vals.backward();
             let grads = GradientsParams::from_grads(grads, &model);
             model = pca_optim.step(pca_lr, model, grads);
@@ -353,8 +363,14 @@ where
         // have buggy select_add backward — fall back to gather for those.
         let (all_head_emb, all_tail_emb) = if B::USE_GATHER_FOR_SELECT {
             let output_dim = embeddings.dims()[1];
-            let gh = fused_h.clone().reshape([batch_n_total, 1]).repeat_dim(1, output_dim);
-            let gt = fused_t.clone().reshape([batch_n_total, 1]).repeat_dim(1, output_dim);
+            let gh = fused_h
+                .clone()
+                .reshape([batch_n_total, 1])
+                .repeat_dim(1, output_dim);
+            let gt = fused_t
+                .clone()
+                .reshape([batch_n_total, 1])
+                .repeat_dim(1, output_dim);
             (embeddings.clone().gather(0, gh), embeddings.gather(0, gt))
         } else {
             (
@@ -376,22 +392,27 @@ where
         let dist_pow_pos = dist_sq_pos.clamp_min(1e-8f32).powf_scalar(kernel_b);
         let q_pos = (dist_pow_pos.clone() * kernel_a + 1.0f32).recip();
         let attract_vals = q_pos.clamp_min(1e-6f32).log().neg();
-        let attraction = attract_vals.clone().reshape([attract_vals.dims().iter().product::<usize>()]).mean_dim(0);
+        let attraction = attract_vals
+            .clone()
+            .reshape([attract_vals.dims().iter().product::<usize>()])
+            .mean_dim(0);
 
         // Repulsion: -log(1-q) where 1-q = a*d^(2b) / (1 + a*d^(2b))
         let dist_pow_neg = dist_sq_neg.clamp_min(1e-8f32).powf_scalar(kernel_b);
         let a_dpow_neg = dist_pow_neg.clone() * kernel_a;
         let one_minus_q_neg = a_dpow_neg.clone() / (a_dpow_neg + 1.0f32);
         let repulse_vals = one_minus_q_neg.clamp_min(1e-6f32).log().neg();
-        let repulsion = repulse_vals.clone().reshape([repulse_vals.dims().iter().product::<usize>()]).mean_dim(0);
+        let repulsion = repulse_vals
+            .clone()
+            .reshape([repulse_vals.dims().iter().product::<usize>()])
+            .mean_dim(0);
 
         // ── UMAP cross-entropy loss ──────────────────────────────────────────
         let loss = attraction + repulsion_strength * repulsion;
 
         // ── Read loss from GPU only every N epochs ───────────────────────────
-        let should_read = epoch % LOSS_READBACK_INTERVAL == 0
-            || epoch >= config.epochs
-            || epoch == 0;
+        let should_read =
+            epoch % LOSS_READBACK_INTERVAL == 0 || epoch >= config.epochs || epoch == 0;
 
         let current_loss = if should_read {
             let v = F::from(loss.clone().into_scalar().to_f64()).unwrap();
@@ -506,12 +527,8 @@ where
             if epoch > 0 && epoch % STEP == 0 {
                 let losses_snap = losses.clone();
                 let model_snap = model.valid();
-                let tensor_data = convert_vector_to_tensor(
-                    data.clone(),
-                    num_samples,
-                    num_features,
-                    &device,
-                );
+                let tensor_data =
+                    convert_vector_to_tensor(data.clone(), num_samples, num_features, &device);
                 let embeddings = model_snap.forward(tensor_data);
                 let lpath = loss_plot_path.clone();
                 let caption = format!("{name}_{epoch}");

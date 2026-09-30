@@ -54,11 +54,10 @@ pub fn knn_kernel<F: Float + CubePrimitive, I: Int>(
 
                     // Shift larger entries one slot to the right to make room.
                     while i > 0 {
-                        if dist < local_distances[row * k_usize + i] {
+                        if dist < local_distances[row * k_usize + i - 1] {
                             local_distances[row * k_usize + i] =
                                 local_distances[row * k_usize + i - 1];
-                            local_indices[row * k_usize + i] =
-                                local_indices[row * k_usize + i - 1];
+                            local_indices[row * k_usize + i] = local_indices[row * k_usize + i - 1];
                         } else {
                             break;
                         }
@@ -85,11 +84,11 @@ pub fn knn_kernel<F: Float + CubePrimitive, I: Int>(
 /// Re-runs the forward KNN pass to recover which neighbours were selected, then
 /// propagates gradients from `grad_output` back to `grad_pairwise_distances`.
 #[cube(launch)]
-pub fn knn_backward_kernel<F: Float + CubePrimitive>(
-    pairwise_distances: &Tensor<F>,          // [n, n]
+pub fn knn_backward_kernel<F: Float + CubePrimitive, I: Int>(
+    pairwise_distances: &Tensor<F>, // [n, n]
     k: u32,
     local_distances: &mut Tensor<F>,         // [n, k] scratch
-    local_indices: &mut Tensor<F>,           // [n, k] scratch  (stored as F for compat)
+    local_indices: &mut Tensor<I>,           // [n, k] scratch
     grad_output: &Tensor<F>,                 // [n, k] gradient w.r.t. KNN distances
     grad_pairwise_distances: &mut Tensor<F>, // [n, n] gradient output
 ) {
@@ -103,7 +102,7 @@ pub fn knn_backward_kernel<F: Float + CubePrimitive>(
         // ── initialise scratch ──────────────────────────────────────────────
         for i in 0..k_usize {
             local_distances[row * k_usize + i] = F::new(INFINITY);
-            local_indices[row * k_usize + i] = F::new(0.0);
+            local_indices[row * k_usize + i] = I::cast_from(n);
         }
 
         // ── re-run insertion sort to find the k nearest neighbours ───────────
@@ -115,11 +114,10 @@ pub fn knn_backward_kernel<F: Float + CubePrimitive>(
                     let mut i = k_usize - 1;
 
                     while i > 0 {
-                        if dist < local_distances[row * k_usize + i] {
+                        if dist < local_distances[row * k_usize + i - 1] {
                             local_distances[row * k_usize + i] =
                                 local_distances[row * k_usize + i - 1];
-                            local_indices[row * k_usize + i] =
-                                local_indices[row * k_usize + i - 1];
+                            local_indices[row * k_usize + i] = local_indices[row * k_usize + i - 1];
                         } else {
                             break;
                         }
@@ -127,7 +125,7 @@ pub fn knn_backward_kernel<F: Float + CubePrimitive>(
                     }
 
                     local_distances[row * k_usize + i] = dist;
-                    local_indices[row * k_usize + i] = F::cast_from(col);
+                    local_indices[row * k_usize + i] = I::cast_from(col);
                 }
             }
         }
@@ -138,18 +136,14 @@ pub fn knn_backward_kernel<F: Float + CubePrimitive>(
         // [neighbor_col * n + row] is owned by thread `neighbor_col` and will be
         // handled there if `row` happens to be one of that thread's k-neighbours.
         // Writing to both here would cause a GPU data race (non-atomic +=).
-        let epsilon = F::new(1e-8);
         for i in 0..k_usize {
             let grad_value = grad_output[row * k_usize + i];
 
-            if grad_value != F::new(0.0) {
-                let dist = F::max(local_distances[row * k_usize + i], epsilon);
-                let grad_pairwise = grad_value / dist;
-
+            if grad_value != F::new(0.0_f32) {
                 let neighbor_col = u32::cast_from(local_indices[row * k_usize + i]) as usize;
                 if neighbor_col < n {
                     // Safe: only this thread (row) writes to row's entries.
-                    grad_pairwise_distances[row * n + neighbor_col] += grad_pairwise;
+                    grad_pairwise_distances[row * n + neighbor_col] += grad_value;
                 }
             }
         }

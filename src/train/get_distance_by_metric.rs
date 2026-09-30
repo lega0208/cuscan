@@ -37,9 +37,7 @@ pub fn knn_from_pairwise_cpu(flat: &[f32], n: usize, k: usize) -> (Vec<i32>, Vec
             });
         }
         // Sort the k winners in ascending order.
-        row[..k].sort_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        row[..k].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for (slot, (dist, idx)) in row[..k].iter().enumerate() {
             out_idx[i * k + slot] = *idx as i32;
@@ -66,7 +64,6 @@ pub fn knn_tensors_from_cpu<B: Backend>(
 ) -> (Tensor<B, 2, Int>, Tensor<B, 2>) {
     let knn_indices: Tensor<B, 2, Int> =
         Tensor::from_data(TensorData::new(idx_flat, [n, k]), device);
-    let knn_dist: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(dist_flat, [n, k]), device);
+    let knn_dist: Tensor<B, 2> = Tensor::from_data(TensorData::new(dist_flat, [n, k]), device);
     (knn_indices, knn_dist)
 }

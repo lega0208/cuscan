@@ -12,8 +12,8 @@ use num::Float;
 
 // Re-export the new umap-rs style API
 pub use crate::{
-    FittedUmap, GraphParams, ManifoldParams, Metric, OptimizationParams, Umap, UmapConfig,
-    EpochProgress, LossReduction,
+    EpochProgress, FittedUmap, GraphParams, LossReduction, ManifoldParams, Metric,
+    OptimizationParams, Umap, UmapConfig,
 };
 
 // Re-export legacy types for backward compatibility

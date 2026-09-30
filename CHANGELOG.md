@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Added an optional CUDA backend that reuses the CubeCL kernels; enable it with the `cuda` feature. Runtime requires an NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`); `nvcc`/CUDA toolkit are optional at build time.
+- **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `UMAP` estimator, selectable GPU (WGPU) or CPU (NdArray) backend via `device=`.
+- Added `OptimizationParams.seed`; the sampling RNG is seeded as well as the model RNG.
+- Added `validate_fit_input` and `validate_fit_data` to reject invalid fit inputs before training.
+
+### Changed
+
+- `transform` now applies the standardization learned during training; previously it transformed raw input without that standardization.
+- Dropped the Burn `train` feature to provide deterministic CPU execution.
+- Python `transform` handles empty inputs and reports feature-count mismatches as `ValueError`.
+
+---
+
 ## [1.5.0] — 2026-04-11
 
 ### Changed

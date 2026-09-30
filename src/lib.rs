@@ -105,14 +105,17 @@ pub mod backend;
 pub mod chart;
 #[cfg(feature = "cpu")]
 pub mod cpu_backend;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
 pub mod distances;
 pub mod generic_backend;
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub mod kernels;
 pub mod macros;
 #[cfg(feature = "mlx")]
 pub mod mlx_backend;
 pub mod model;
+pub mod ndarray_backend;
 #[cfg(feature = "nn-descent")]
 pub mod nn_descent;
 pub mod normalizer;
@@ -128,6 +131,53 @@ pub use train::{
     EpochProgress, GraphParams, LossReduction, ManifoldParams, Metric, OptimizationParams,
     TrainingConfig, TrainingConfigBuilder, UmapConfig,
 };
+
+/// Validate data dimensions and model settings before fitting.
+pub fn validate_fit_input(
+    config: &UmapConfig,
+    n_samples: usize,
+    n_features: usize,
+) -> Result<(), String> {
+    if n_samples == 0 {
+        return Err("n_samples must be greater than zero".to_string());
+    }
+    if n_features == 0 {
+        return Err("n_features must be greater than zero".to_string());
+    }
+    if config.n_components == 0 {
+        return Err("n_components must be greater than zero".to_string());
+    }
+    if config.graph.n_neighbors == 0 {
+        return Err("n_neighbors must be greater than zero".to_string());
+    }
+    if n_samples <= config.graph.n_neighbors {
+        return Err("n_samples must be greater than n_neighbors".to_string());
+    }
+    if config.hidden_sizes.is_empty() {
+        return Err("hidden_sizes must not be empty".to_string());
+    }
+    Ok(())
+}
+
+/// Validate that fitting data is non-empty, rectangular, and compatible with
+/// the requested model configuration.
+pub fn validate_fit_data<F>(config: &UmapConfig, data: &[Vec<F>]) -> Result<(), String> {
+    let n_features = data
+        .first()
+        .ok_or_else(|| "n_samples must be greater than zero".to_string())?
+        .len();
+    if let Some((row, values)) = data
+        .iter()
+        .enumerate()
+        .find(|(_, values)| values.len() != n_features)
+    {
+        return Err(format!(
+            "row {row} has {} features; expected {n_features}",
+            values.len()
+        ));
+    }
+    validate_fit_input(config, data.len(), n_features)
+}
 
 /// UMAP dimensionality reduction algorithm (GPU-accelerated, parametric).
 ///
@@ -258,12 +308,14 @@ impl<B: AutodiffBackend> Umap<B> {
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
+        validate_fit_data(&self.config, &data)
+            .unwrap_or_else(|error| panic!("invalid fit input: {error}"));
         let default_name = "model";
         let num_samples = data.len();
         let num_features = data[0].len();
         let batch_size = num_samples;
 
-        let seed = 9999;
+        let seed = self.config.optimization.seed;
         B::seed(&self.device, seed);
 
         // Flatten input data
@@ -280,11 +332,10 @@ impl<B: AutodiffBackend> Umap<B> {
         let model: UMAPModel<B> = UMAPModel::new(&model_config, &self.device);
 
         // Build training config from UmapConfig
-        let (kernel_a, kernel_b) = train::fit_ab(
-            self.config.manifold.min_dist,
-            self.config.manifold.spread,
-        );
+        let (kernel_a, kernel_b) =
+            train::fit_ab(self.config.manifold.min_dist, self.config.manifold.spread);
         let training_config = TrainingConfig {
+            seed,
             metric: self.config.graph.metric.clone(),
             epochs: self.config.optimization.n_epochs,
             batch_size,
@@ -323,7 +374,14 @@ impl<B: AutodiffBackend> Umap<B> {
             None,
         );
 
-        Self::finalize(model, train_data, num_samples, num_features, self.device, self.config)
+        Self::finalize(
+            model,
+            train_data,
+            num_samples,
+            num_features,
+            self.device,
+            self.config,
+        )
     }
 
     /// Like [`fit_with_signal`], but also accepts a progress callback that is
@@ -338,12 +396,14 @@ impl<B: AutodiffBackend> Umap<B> {
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
+        validate_fit_data(&self.config, &data)
+            .unwrap_or_else(|error| panic!("invalid fit input: {error}"));
         let default_name = "model";
         let num_samples = data.len();
         let num_features = data[0].len();
         let batch_size = num_samples;
 
-        let seed = 9999;
+        let seed = self.config.optimization.seed;
         B::seed(&self.device, seed);
 
         let train_data: Vec<F> = data.into_iter().flatten().collect();
@@ -357,11 +417,10 @@ impl<B: AutodiffBackend> Umap<B> {
 
         let model: UMAPModel<B> = UMAPModel::new(&model_config, &self.device);
 
-        let (kernel_a, kernel_b) = train::fit_ab(
-            self.config.manifold.min_dist,
-            self.config.manifold.spread,
-        );
+        let (kernel_a, kernel_b) =
+            train::fit_ab(self.config.manifold.min_dist, self.config.manifold.spread);
         let training_config = TrainingConfig {
+            seed,
             metric: self.config.graph.metric.clone(),
             epochs: self.config.optimization.n_epochs,
             batch_size,
@@ -398,7 +457,14 @@ impl<B: AutodiffBackend> Umap<B> {
             Some(on_progress),
         );
 
-        Self::finalize(model, train_data, num_samples, num_features, self.device, self.config)
+        Self::finalize(
+            model,
+            train_data,
+            num_samples,
+            num_features,
+            self.device,
+            self.config,
+        )
     }
 
     /// Shared finalization: extract embedding from trained model.
@@ -416,13 +482,9 @@ impl<B: AutodiffBackend> Umap<B> {
         let model: UMAPModel<B::InnerBackend> = model.valid();
 
         let mut normalized_data = train_data;
-        normalize_data(&mut normalized_data, num_samples, num_features);
-        let global = convert_vector_to_tensor(
-            normalized_data,
-            num_samples,
-            num_features,
-            &device,
-        );
+        let (feature_mean, feature_std) =
+            normalize_data(&mut normalized_data, num_samples, num_features);
+        let global = convert_vector_to_tensor(normalized_data, num_samples, num_features, &device);
         let embedding_tensor = model.forward(global);
         let embedding: Vec<Vec<f64>> = convert_tensor_to_vector(embedding_tensor);
 
@@ -432,6 +494,8 @@ impl<B: AutodiffBackend> Umap<B> {
             config,
             embedding,
             num_features,
+            feature_mean,
+            feature_std,
         }
     }
 }
@@ -453,8 +517,9 @@ pub struct FittedUmap<B: AutodiffBackend> {
     device: Device<B>,
     config: UmapConfig,
     embedding: Vec<Vec<f64>>,
-    #[allow(dead_code)]
     num_features: usize,
+    feature_mean: Vec<f64>,
+    feature_std: Vec<f64>,
 }
 
 impl<B: AutodiffBackend> FittedUmap<B> {
@@ -482,6 +547,11 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     /// Get a reference to the configuration used for this fit.
     pub fn config(&self) -> &UmapConfig {
         &self.config
+    }
+
+    /// Get the number of input features expected by this fitted model.
+    pub fn n_features(&self) -> usize {
+        self.num_features
     }
 
     /// Transform new data points into the embedding space.
@@ -512,10 +582,33 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     ///
     /// A 2D tensor of shape `[n_new_samples, n_components]`.
     pub fn transform_to_tensor(&self, data: Vec<Vec<f64>>) -> Tensor<B::InnerBackend, 2> {
+        if data.is_empty() {
+            return Tensor::from_data(
+                burn::tensor::TensorData::new(Vec::<f64>::new(), [0, self.config.n_components]),
+                &self.device,
+            );
+        }
         let num_samples = data.len();
         let num_features = data[0].len();
+        assert_eq!(
+            num_features, self.num_features,
+            "expected {} features, got {}",
+            self.num_features, num_features
+        );
+        assert!(
+            data.iter().all(|row| row.len() == num_features),
+            "transform data rows must all have {num_features} features"
+        );
 
-        let train_data: Vec<f64> = data.into_iter().flatten().collect();
+        let train_data: Vec<f64> = data
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, value)| {
+                let feature = index % num_features;
+                (value - self.feature_mean[feature]) / self.feature_std[feature]
+            })
+            .collect();
 
         let global = convert_vector_to_tensor(train_data, num_samples, num_features, &self.device);
 
@@ -546,15 +639,20 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     /// let fitted = umap.fit(data, None);
     /// fitted.save("model.umap").expect("Failed to save model");
     /// ```
-    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         serialize::save_model::<B>(&self.model, path)
     }
 
     /// Load a model's weights from a file into a new FittedUmap instance.
     ///
-    /// Creates a new FittedUmap with the loaded weights. Note that the configuration
-    /// must match the configuration used when the model was saved (same input size,
-    /// hidden layer sizes, and output size).
+    /// Creates a new FittedUmap with the loaded weights. Loaded models use
+    /// identity input normalization (zero means and unit standard deviations),
+    /// because normalization statistics are not stored with model weights. The
+    /// configuration must match the saved model (same input size, hidden layer
+    /// sizes, and output size).
     ///
     /// # Arguments
     ///
@@ -605,6 +703,8 @@ impl<B: AutodiffBackend> FittedUmap<B> {
             config,
             embedding: Vec::new(),
             num_features: input_size,
+            feature_mean: vec![0.0; input_size],
+            feature_std: vec![1.0; input_size],
         })
     }
 

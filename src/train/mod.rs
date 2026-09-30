@@ -2,20 +2,17 @@ mod config;
 pub mod get_distance_by_metric;
 mod train_sparse;
 
-use crate::{
-    backend::AutodiffBackend,
-    format_duration,
-    model::UMAPModel,
-    normalize_data,
-    utils::convert_vector_to_tensor,
-};
 #[cfg(feature = "plotters")]
 use crate::chart::{self, plot_loss, ChartConfigBuilder};
+use crate::{
+    backend::AutodiffBackend, format_duration, model::UMAPModel, normalize_data,
+    utils::convert_vector_to_tensor,
+};
 use burn::{
     module::{AutodiffModule, Module},
     optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams, Optimizer},
     record::{BinFileRecorder, FullPrecisionSettings},
-    tensor::{cast::ToElement, Device, Int, IndexingUpdateOp, Tensor, TensorData},
+    tensor::{cast::ToElement, Device, IndexingUpdateOp, Int, Tensor, TensorData},
 };
 pub use config::*;
 pub use train_sparse::{train_sparse, EpochProgress};
@@ -102,9 +99,13 @@ where
     if verbose {
         println!("[fast-umap] Configuration:");
         println!("[fast-umap]   samples={num_samples}  features={num_features}  k_neighbors={k}");
-        println!("[fast-umap]   epochs={}  lr={:.0e}  repulsion_strength={repulsion_strength}",
-            config.epochs, config.learning_rate);
-        println!("[fast-umap]   kernel: a={kernel_a:.4}  b={kernel_b:.4}  (q = 1 / (1 + a·d^(2b)))");
+        println!(
+            "[fast-umap]   epochs={}  lr={:.0e}  repulsion_strength={repulsion_strength}",
+            config.epochs, config.learning_rate
+        );
+        println!(
+            "[fast-umap]   kernel: a={kernel_a:.4}  b={kernel_b:.4}  (q = 1 / (1 + a·d^(2b)))"
+        );
     }
 
     if batch_size <= 1 {
@@ -134,9 +135,7 @@ where
     //   4. Store the input tensor slice for cheap reuse across epochs.
     // ─────────────────────────────────────────────────────────────────────────
     if verbose {
-        println!(
-            "[fast-umap] Computing batch-local k-NN graph (k={k}) …",
-        );
+        println!("[fast-umap] Computing batch-local k-NN graph (k={k}) …",);
     }
 
     let mut batches_start: Vec<usize> = Vec::new();
@@ -173,28 +172,23 @@ where
                 knn_ind_flat[local_i * bs + local_j] = 1.0;
             }
         }
-        let knn_indicator: Tensor<B, 2> = Tensor::from_data(
-            TensorData::new(knn_ind_flat, [bs, bs]),
-            &device,
-        );
+        let knn_indicator: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(knn_ind_flat, [bs, bs]), &device);
         let within_knn_count = bs * k; // all k-NN are in-batch by construction
 
         // (3b) Diagonal (self-pair) identity matrix — built on GPU via
         //      arange + scatter to avoid a large CPU allocation.
-        let diag_idx: Tensor<B, 1, Int> =
-            Tensor::arange(0i64..(bs as i64), &device);
-        let eye: Tensor<B, 2> =
-            Tensor::<B, 2>::zeros([bs, bs], &device).scatter(
-                1,
-                diag_idx.reshape([bs, 1]),
-                Tensor::ones([bs, 1], &device),
-                IndexingUpdateOp::Add,
-            );
+        let diag_idx: Tensor<B, 1, Int> = Tensor::arange(0i64..(bs as i64), &device);
+        let eye: Tensor<B, 2> = Tensor::<B, 2>::zeros([bs, bs], &device).scatter(
+            1,
+            diag_idx.reshape([bs, 1]),
+            Tensor::ones([bs, 1], &device),
+            IndexingUpdateOp::Add,
+        );
 
         // non_neighbor_mask[i,j] = 1  iff j is not a k-NN of i and i ≠ j
         let non_neighbor_mask =
-            (Tensor::ones([bs, bs], &device) - knn_indicator.clone() - eye)
-                .clamp_min(0.0f32);
+            (Tensor::ones([bs, bs], &device) - knn_indicator.clone() - eye).clamp_min(0.0f32);
 
         batches_start.push(batch_start);
         tensor_batches.push(tensor_batch);
@@ -203,9 +197,7 @@ where
 
     let num_batches = batches_start.len();
     if verbose {
-        println!(
-            "[fast-umap] Precomputation done ({num_batches} batch(es)). Training started …"
-        );
+        println!("[fast-umap] Precomputation done ({num_batches} batch(es)). Training started …");
     }
 
     // Concatenate all batch tensors for O(1) slicing in the epoch loop.
@@ -275,18 +267,16 @@ where
             // knn_indicator zeros out non-neighbour entries; we normalise by
             // the exact count of k-NN pairs.
             let log_q = q.clone().clamp_min(1e-6f32).log();
-            let attraction =
-                (log_q.neg() * knn_indicator).sum() / within_knn_count as f32;
+            let attraction = (log_q.neg() * knn_indicator).sum() / within_knn_count as f32;
 
             // ── Repulsion: mean over non-k-NN pairs of −log(1 − q_ij) ────────
             // 1 − q = a*d^(2b) / (1 + a*d^(2b)).
             let one_minus_q = a_dpow.clone() / (a_dpow + 1.0f32);
             let repulsion_per_pair = one_minus_q.clamp_min(1e-6f32).log().neg();
 
-            let num_non_neighbors =
-                (bs * (bs - 1)).saturating_sub(within_knn_count) as f32;
-            let repulsion = (repulsion_per_pair * non_neighbor_mask).sum()
-                / num_non_neighbors.max(1.0);
+            let num_non_neighbors = (bs * (bs - 1)).saturating_sub(within_knn_count) as f32;
+            let repulsion =
+                (repulsion_per_pair * non_neighbor_mask).sum() / num_non_neighbors.max(1.0);
 
             // ── UMAP cross-entropy loss ───────────────────────────────────────
             let loss = attraction + repulsion_strength * repulsion;
@@ -374,12 +364,8 @@ where
             if epoch > 0 && epoch % STEP == 0 {
                 let losses_snap = losses.clone();
                 let model_snap = model.valid();
-                let tensor_data = convert_vector_to_tensor(
-                    data.clone(),
-                    num_samples,
-                    num_features,
-                    &device,
-                );
+                let tensor_data =
+                    convert_vector_to_tensor(data.clone(), num_samples, num_features, &device);
                 let embeddings = model_snap.forward(tensor_data);
                 let lpath = loss_plot_path.clone();
                 let caption = format!("{name}_{epoch}");

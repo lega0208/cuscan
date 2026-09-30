@@ -4,10 +4,9 @@ use burn::{
     prelude::Backend,
     tensor::{ops::FloatTensor, Device, Tensor, TensorData, TensorPrimitive},
 };
-use num::{Float, FromPrimitive};
+use num::{Float, FromPrimitive, ToPrimitive};
 // use prettytable::{row, Table};
 use rand::{distr::uniform::SampleUniform, Rng};
-use rayon::prelude::*;
 
 /// Generates random test data with the given number of samples and features.
 ///
@@ -194,26 +193,26 @@ const SMALL_STD_DEV: f64 = 1e-6;
 /// # Note
 /// This function assumes that the dataset has at least one sample and one feature.
 /// The data is normalized in-place, meaning the original data is modified directly.
-pub fn normalize_data<F: Float>(data: &mut [F], num_samples: usize, num_features: usize)
+pub fn normalize_data<F: Float>(
+    data: &mut [F],
+    num_samples: usize,
+    num_features: usize,
+) -> (Vec<f64>, Vec<f64>)
 where
-    F: num::FromPrimitive + Send + Sync,
+    F: num::FromPrimitive + ToPrimitive + Send + Sync,
 {
-    // Parallelize the outer loop over features
+    let mut means = Vec::with_capacity(num_features);
+    let mut standard_deviations = Vec::with_capacity(num_features);
+    // Sum sequentially to keep normalization statistics deterministic.
     (0..num_features).into_iter().for_each(|feature_idx| {
         // Calculate mean and standard deviation for the current feature
-        let (sum, sum_sq) = (0..num_samples)
-            .into_par_iter()
-            .fold(
-                || (F::zero(), F::zero()), // Initial value for fold: (sum, sum_sq)
-                |(acc_sum, acc_sum_sq), sample_idx| {
-                    let value = data[sample_idx * num_features + feature_idx];
-                    (acc_sum + value, acc_sum_sq + value * value)
-                },
-            )
-            .reduce(
-                || (F::zero(), F::zero()),
-                |(sum1, sum_sq1), (sum2, sum_sq2)| (sum1 + sum2, sum_sq1 + sum_sq2),
-            );
+        let (sum, sum_sq) = (0..num_samples).fold(
+            (F::zero(), F::zero()),
+            |(acc_sum, acc_sum_sq), sample_idx| {
+                let value = data[sample_idx * num_features + feature_idx];
+                (acc_sum + value, acc_sum_sq + value * value)
+            },
+        );
 
         let mean = sum / F::from_usize(num_samples).unwrap();
         let variance = (sum_sq / F::from_usize(num_samples).unwrap()) - (mean * mean);
@@ -221,8 +220,10 @@ where
 
         // Avoid division by zero by adding SMALL_STD_DEV
         let safe_std_dev = std_dev + F::from_f64(SMALL_STD_DEV).unwrap();
+        means.push(mean.to_f64().unwrap());
+        standard_deviations.push(safe_std_dev.to_f64().unwrap());
 
-        // Normalize the feature in parallel
+        // Normalize the feature in place.
         (0..num_samples).into_iter().for_each(|sample_idx| {
             let idx = sample_idx * num_features + feature_idx;
             let value = data[idx];
@@ -231,6 +232,7 @@ where
             data[idx] = normalized_value;
         });
     });
+    (means, standard_deviations)
 }
 
 /// Normalizes a 1D tensor using min-max normalization.

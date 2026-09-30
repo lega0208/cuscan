@@ -95,7 +95,7 @@ pub fn nn_descent(data: &[f32], n: usize, d: usize, k: usize) -> (Vec<i32>, Vec<
                     let dist = euclidean_dist(data, i, u, d);
                     // SAFETY: we only read graph[i], parallel reads are safe
                     // Updates happen via atomic-like check below
-                    let worst = unsafe { &*(& graph[i] as *const Vec<(f32, u32)>) };
+                    let worst = unsafe { &*(&graph[i] as *const Vec<(f32, u32)>) };
                     if dist < worst[k - 1].0 {
                         local_updates += 1;
                     }

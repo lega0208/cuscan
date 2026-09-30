@@ -3,11 +3,7 @@
 //! This module provides CPU-based UMAP functionality as a fallback when GPU is not available.
 //! Currently implements utility functions and provides a foundation for full CPU support.
 
-use crate::{
-    distances::*,
-    train::*,
-    utils::*,
-};
+use crate::{distances::*, train::*, utils::*};
 use burn::tensor::{Device, Tensor};
 use ndarray::Array2;
 use num::Float;
@@ -35,7 +31,7 @@ impl CpuUmap {
         // Convert data to flat format
         let n_samples = data.len();
         let n_features = data[0].len();
-        
+
         let mut flat_data = Vec::with_capacity(n_samples * n_features);
         for sample in &data {
             for &val in sample {
@@ -70,7 +66,7 @@ fn create_simple_embedding(n_samples: usize, n_features: usize, data: &[f64]) ->
     // Simple dimensionality reduction: take first 2 principal components
     // This is just for demonstration - real UMAP would be more sophisticated
     let mut embedding = vec![vec![0.0, 0.0]; n_samples];
-    
+
     // Simple projection: use first two features scaled
     for i in 0..n_samples {
         let base_idx = i * n_features;
@@ -79,7 +75,7 @@ fn create_simple_embedding(n_samples: usize, n_features: usize, data: &[f64]) ->
             embedding[i][1] = data[base_idx + 1] * 10.0;
         }
     }
-    
+
     embedding
 }
 
@@ -115,7 +111,7 @@ impl CpuFittedUmap {
 /// Public API for CPU backend
 pub mod api {
     use super::*;
-    
+
     /// CPU-specific UMAP fit function
     pub fn fit_cpu<F: Float>(
         config: UmapConfig,

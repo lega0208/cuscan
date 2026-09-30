@@ -1,8 +1,8 @@
 use burn::prelude::*;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use std::path::Path;
 use std::fs::File;
-use std::io::{Write, Read};
+use std::io::{Read, Write};
+use std::path::Path;
 
 use crate::backend::AutodiffBackend;
 use crate::model::UMAPModel;
@@ -31,7 +31,9 @@ pub fn save_model<B: AutodiffBackend>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let path_buf = path.as_ref().to_path_buf();
-    model.clone().save_file(path_buf, &recorder)
+    model
+        .clone()
+        .save_file(path_buf, &recorder)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
@@ -53,7 +55,7 @@ pub fn save_model<B: AutodiffBackend>(
 /// let umap = Umap::<Wgpu>::new(config);
 /// let fitted = umap.fit(data, None);
 /// fitted.save("model.umap").expect("Failed to save model");
-/// 
+///
 /// // Later...
 /// let loaded_fitted = FittedUmap::<Wgpu>::load("model.umap", config, device)?;
 /// ```
@@ -64,7 +66,9 @@ pub fn load_model<B: AutodiffBackend>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let path_buf = path.as_ref().to_path_buf();
-    *model = model.clone().load_file(path_buf, &recorder, device)
+    *model = model
+        .clone()
+        .load_file(path_buf, &recorder, device)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(())
 }

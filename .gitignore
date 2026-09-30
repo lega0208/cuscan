@@ -2,3 +2,9 @@
 .DS_Store
 data/*
 *.bin
+.gjc
+.venv/
+*.so
+__pycache__/
+.pytest_cache/
+.ruff_cache/

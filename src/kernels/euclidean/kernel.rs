@@ -17,9 +17,9 @@ pub fn euclidean_pairwise_distance_kernel<F: Float>(
     if row >= n || col >= n || row > col {
         // no-op — lower triangle and out-of-range threads
     } else if row == col {
-        output[row * n + col] = F::new(0.0);
+        output[row * n + col] = F::new(0.0_f32);
     } else {
-        let mut sum = F::new(0.0);
+        let mut sum = F::new(0.0_f32);
         for i in 0..d {
             let diff = x[row * d + i] - x[col * d + i];
             sum += diff * diff;
@@ -42,23 +42,23 @@ pub fn euclidean_pairwise_distance_kernel<F: Float>(
 /// Total work: n·d threads × n iterations each = O(n²d) — same as forward.
 #[cube(launch)]
 pub fn euclidean_pairwise_distance_backward_kernel<F: Float>(
-    x: &Tensor<F>,           // [n, d]  original input
-    pairwise: &Tensor<F>,    // [n, n]  precomputed distances (from forward state)
+    x: &Tensor<F>,             // [n, d]  original input
+    pairwise: &Tensor<F>,      // [n, n]  precomputed distances (from forward state)
     grad_pairwise: &Tensor<F>, // [n, n]  ∂loss/∂pairwise_distances
-    grad_x: &mut Tensor<F>,  // [n, d]  ∂loss/∂x  — written by this kernel
+    grad_x: &mut Tensor<F>,    // [n, d]  ∂loss/∂x  — written by this kernel
 ) {
     let row = ABSOLUTE_POS_X as usize; // sample index
     let feat = ABSOLUTE_POS_Y as usize; // feature index
 
     let n = pairwise.shape(0);
     let d = x.shape(1);
-    let epsilon = F::new(1e-8);
+    let epsilon = F::new(1e-8_f32);
 
     if row >= n || feat >= d {
         // out-of-range thread
     } else {
         let x_row_feat = x[row * d + feat];
-        let mut grad_sum = F::new(0.0);
+        let mut grad_sum = F::new(0.0_f32);
 
         for col in 0..n {
             if col != row {

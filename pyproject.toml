@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fast-umap"
+dynamic = ["version"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[dependency-groups]
+dev = ["maturin", "pytest", "ruff", "ty"]
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "python"
+module-name = "fast_umap._fast_umap"
+features = ["pyo3/extension-module"]
+
+[tool.uv]
+cache-keys = [
+    "pyproject.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "bindings/python/Cargo.toml",
+    { file = "bindings/python/src/**/*.rs" },
+    { file = "src/**/*.rs" },
+]
+
+[tool.ruff]
+line-length = 100
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "NPY", "RUF"]
+
+[tool.ty.src]
+include = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
