@@ -1,12 +1,13 @@
 use core::f64;
 
+use burn::backend::tensor::FloatTensor;
 use burn::{
-    prelude::Backend,
-    tensor::{ops::FloatTensor, Device, Tensor, TensorData, TensorPrimitive},
+    backend::Dispatch,
+    tensor::{Device, Tensor, TensorData},
 };
 use num::{Float, FromPrimitive, ToPrimitive};
 // use prettytable::{row, Table};
-use rand::{distr::uniform::SampleUniform, Rng};
+use rand::{distr::uniform::SampleUniform, RngExt};
 
 /// Generates random test data with the given number of samples and features.
 ///
@@ -36,7 +37,7 @@ pub fn generate_test_data<F: Float + FromPrimitive + SampleUniform>(
     data
 }
 
-/// Converts a vector of `f64` values into a `Tensor<B, 2>` for the specified backend.
+/// Converts a vector of values into a 2D tensor on the specified device.
 ///
 /// # Arguments
 /// * `data` - A vector of `f64` values representing the data to convert.
@@ -45,31 +46,31 @@ pub fn generate_test_data<F: Float + FromPrimitive + SampleUniform>(
 /// * `device` - The device to place the tensor on (e.g., CPU, GPU).
 ///
 /// # Returns
-/// A `Tensor<B, 2>` containing the data arranged as samples x features.
+/// A `Tensor<2>` containing the data arranged as samples x features.
 ///
 /// This function uses the `TensorData` struct to create a tensor from the given data, then places it
 /// on the specified device (`CPU` or `GPU`).
-pub fn convert_vector_to_tensor<B: Backend, F: Float>(
+pub fn convert_vector_to_tensor<F: Float>(
     data: Vec<F>,
     num_samples: usize,  // Number of samples
     num_features: usize, // Number of features (columns) per sample
-    device: &Device<B>,  // Device to place the tensor (CPU, GPU)
-) -> Tensor<B, 2>
+    device: &Device,     // Device to place the tensor (CPU, GPU)
+) -> Tensor<2>
 where
     F: burn::tensor::Element,
 {
     let tensor_data = TensorData::new(data, [num_samples, num_features]);
-    Tensor::<B, 2>::from_data(tensor_data, device)
+    Tensor::<2>::from_data(tensor_data, device)
 }
 
 /// Prints the content of a tensor in a table format with index and tensor values.
 ///
 /// # Arguments
-/// * `data` - The tensor to print, with a generic backend and dimensionality `D`.
+/// * `data` - The tensor to print, with dimensionality `D`.
 ///
 /// This function prints the tensor's data in a table with each row corresponding to one sample.
 /// The tensor data is printed in a format that makes it easy to inspect.
-// pub fn print_tensor<B: Backend, const D: usize>(data: &Tensor<B, D>) {
+// pub fn print_tensor<const D: usize>(data: &Tensor<D>) {
 //     let dims = data.dims();
 //     let n_samples = match dims.len() > 0 {
 //         true => dims[0],
@@ -102,12 +103,12 @@ where
 /// * `data` - The tensor to print.
 ///
 /// This function is similar to `print_tensor`, but with an added title to help distinguish different tensor prints.
-// pub fn print_tensor_with_title<B: Backend, const D: usize>(title: &str, data: &Tensor<B, D>) {
+// pub fn print_tensor_with_title<const D: usize>(title: &str, data: &Tensor<D>) {
 //     println!("{title}");
 //     print_tensor(data);
 // }
 
-/// Converts a 2D tensor into a `Vec<Vec<f64>>` for easier inspection or manipulation.
+/// Converts a 2D tensor into a nested vector for easier inspection or manipulation.
 ///
 /// # Arguments
 /// * `data` - A 2D tensor (samples x features) to convert into a vector of vectors.
@@ -117,14 +118,14 @@ where
 ///
 /// This function extracts the data from a tensor and converts it into a `Vec<Vec<F>>` format. The conversion
 /// assumes that the tensor is in a 2D shape and the precision is `f32` within the tensor.
-pub fn convert_tensor_to_vector<B: Backend, F: Float>(data: Tensor<B, 2>) -> Vec<Vec<F>>
+pub fn convert_tensor_to_vector<F: Float>(data: Tensor<2>) -> Vec<Vec<F>>
 where
     F: burn::tensor::Element,
 {
     let n_components = data.dims()[1]; // usually 2 dimensional
 
     // Burn Tensor only has f32 precision inside the tensors, when you export to to_data
-    let data = data.to_data().to_vec::<f32>().unwrap();
+    let data = data.to_data().try_to_vec::<f32>().unwrap();
 
     let data: Vec<Vec<f32>> = data
         .chunks(n_components)
@@ -183,6 +184,8 @@ const SMALL_STD_DEV: f64 = 1e-6;
 ///
 /// # Example
 /// ```
+/// use fast_umap::utils::normalize_data;
+///
 /// let mut data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 /// let num_samples = 2;
 /// let num_features = 3;
@@ -243,12 +246,9 @@ where
 ///
 /// # Type Parameters
 ///
-/// - `B`: The autodiff backend type. This should implement the `AutodiffBackend` trait,
-///   which provides support for automatic differentiation.
-///
 /// # Arguments
 ///
-/// - `tensor`: A 1D tensor of type `Tensor<B, 1>`, which represents the input data to be normalized.
+/// - `tensor`: A 1D tensor of type `Tensor<1>`, which represents the input data to be normalized.
 ///
 /// # Returns
 ///
@@ -259,7 +259,7 @@ where
 ///
 /// The normalization is performed using the following formula:
 ///
-/// ```
+/// ```text
 /// normalized = (tensor - min) / (max - min + epsilon)
 /// ```
 ///
@@ -274,10 +274,14 @@ where
 /// # Example
 ///
 /// ```rust
-/// let tensor = Tensor::<B, 1>::from_data(vec![1.0, 2.0, 3.0], &device);
+/// use burn::tensor::{Device, Tensor};
+/// use fast_umap::utils::normalize_tensor;
+///
+/// let device = Device::flex();
+/// let tensor = Tensor::<1>::from_data([1.0f32, 2.0, 3.0], &device);
 /// let normalized_tensor = normalize_tensor(tensor);
 /// ```
-pub fn normalize_tensor<B: Backend>(tensor: Tensor<B, 1>) -> Tensor<B, 1> {
+pub fn normalize_tensor(tensor: Tensor<1>) -> Tensor<1> {
     let device = tensor.device();
 
     // Normalize the result using min-max normalization:
@@ -285,7 +289,7 @@ pub fn normalize_tensor<B: Backend>(tensor: Tensor<B, 1>) -> Tensor<B, 1> {
     let max_val = tensor.clone().max(); // Find the maximum value
 
     // this is to prevent deleting by zero
-    let offset_val = Tensor::<B, 1>::from_data(TensorData::new(vec![1e-6], [1]), &device);
+    let offset_val = Tensor::<1>::from_data(TensorData::new(vec![1e-6], [1]), &device);
 
     // Read the scalar diff as f32.
     // We intentionally avoid .equal() + .to_vec::<bool>() because the WGPU
@@ -294,7 +298,7 @@ pub fn normalize_tensor<B: Backend>(tensor: Tensor<B, 1>) -> Tensor<B, 1> {
     let diff: f32 = (max_val.clone() - min_val.clone())
         .abs()
         .to_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap()
         .first()
         .copied()
@@ -321,8 +325,8 @@ pub fn normalize_tensor<B: Backend>(tensor: Tensor<B, 1>) -> Tensor<B, 1> {
 /// * `tensor` — The raw float-tensor primitive to display.
 /// * `rows`   — Maximum number of rows to print (clamped to at least `MIN_SIZE`).
 /// * `cols`   — Maximum number of columns to print (clamped to at least `MIN_SIZE`).
-pub fn print_primitive_tensor<B: Backend>(tensor: &FloatTensor<B>, rows: usize, cols: usize) {
-    let tensor: Tensor<B, 2> = Tensor::from_primitive(TensorPrimitive::Float(tensor.clone()));
+pub fn print_primitive_tensor(tensor: &FloatTensor<Dispatch>, rows: usize, cols: usize) {
+    let tensor: Tensor<2> = Tensor::from_dispatch(tensor.clone().into());
     print_tensor(&tensor, rows, cols)
 }
 
@@ -340,12 +344,12 @@ const MIN_SIZE: usize = 10;
 /// * `tensor` — The 2-D tensor to display.
 /// * `rows`   — Maximum number of rows to print (floored to `MIN_SIZE`).
 /// * `cols`   — Maximum number of columns to print (floored to `MIN_SIZE`).
-pub fn print_tensor<B: Backend>(tensor: &Tensor<B, 2>, rows: usize, cols: usize) {
-    let shape = tensor.shape().dims;
+pub fn print_tensor(tensor: &Tensor<2>, rows: usize, cols: usize) {
+    let shape = tensor.dims();
     let n = shape[0]; // Number of rows
     let d = shape[1]; // Number of columns
 
-    let data = tensor.to_data().to_vec::<f32>().unwrap();
+    let data = tensor.to_data().try_to_vec::<f32>().unwrap();
 
     let nn = n.min(rows.max(MIN_SIZE)); // Ensure nn is at least MIN_SIZE if rows > 0
     let dd = d.min(cols.max(MIN_SIZE)); // Ensure dd is at least MIN_SIZE if cols > 0

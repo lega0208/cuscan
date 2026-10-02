@@ -1,10 +1,8 @@
-use cubecl::wgpu::WgpuRuntime;
 use fast_umap::prelude::*;
 use mnist::*;
 
 fn main() {
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
+    let device = burn::tensor::Device::wgpu(burn::tensor::DeviceKind::DefaultDevice).autodiff();
 
     let num_samples = 10_000_usize;
     let num_features = 28 * 28; // 784
@@ -46,7 +44,7 @@ fn main() {
         ..Default::default()
     };
 
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let umap = fast_umap::Umap::with_device(config, device);
     let fitted = umap.fit(data, Some(labels.clone()));
 
     println!(

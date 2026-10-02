@@ -1,6 +1,6 @@
-use burn::{backend::*, module::AutodiffModule as _, prelude::*};
+use burn::{module::Module as _, prelude::*};
 use crossbeam_channel::{unbounded, Receiver};
-use fast_umap::{backend::AutodiffBackend, chart};
+use fast_umap::chart;
 #[allow(unused)]
 use fast_umap::{
     chart::*,
@@ -10,7 +10,6 @@ use fast_umap::{
     utils::*,
 };
 use mnist::*;
-use wgpu::WgpuRuntime;
 
 fn generate_model_name(
     prefix: &str,
@@ -31,13 +30,13 @@ fn generate_model_name(
     )
 }
 
-fn execute<B: AutodiffBackend>(
+fn execute(
     name: String,
     num_features: usize,
     num_samples: usize,
     hidden_sizes: Vec<usize>,
     output_size: usize,
-    device: Device<B>,
+    device: Device,
     train_data: Vec<f64>,
     labels: Vec<String>,
     config: TrainingConfig,
@@ -52,7 +51,7 @@ fn execute<B: AutodiffBackend>(
         .unwrap();
 
     // Initialize the UMAP model with the defined configuration and the selected device
-    let model: UMAPModel<B> = UMAPModel::new(&model_config, &device);
+    let model = UMAPModel::new(&model_config, &device);
 
     // Start training the UMAP model with the specified training data and configuration
     let (model, _, best_loss) = train(
@@ -64,7 +63,7 @@ fn execute<B: AutodiffBackend>(
         &config,            // The training configuration
         device.clone(),
         exit_rx,
-        None,               // no labels for benchmark runs
+        None, // no labels for benchmark runs
     );
 
     // Validate the trained model after training
@@ -87,12 +86,12 @@ fn execute<B: AutodiffBackend>(
     best_loss
 }
 
-fn find_best_hyperparameters<B: AutodiffBackend>(
+fn find_best_hyperparameters(
     num_features: usize,
     num_samples: usize,
     train_data: Vec<f64>,
     labels: Vec<String>,
-    device: Device<B>,
+    device: Device,
     config: TrainingConfig,
     learning_rates: Vec<f64>,
     batch_sizes: Vec<usize>,
@@ -134,7 +133,7 @@ fn find_best_hyperparameters<B: AutodiffBackend>(
                         current_config.epochs = epochs;
 
                         // Execute training and get the loss for this configuration
-                        let loss = execute::<B>(
+                        let loss = execute(
                             model_name.clone(),
                             num_features,
                             num_samples,
@@ -169,14 +168,8 @@ fn main() {
     ctrlc::set_handler(move || exit_tx.send(()).expect("Could not send signal on channel."))
         .expect("Error setting Ctrl-C handler");
 
-    // Define a custom backend type using Wgpu with 32-bit floating point precision and 32-bit integer type
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-
-    // Define the AutodiffBackend based on the custom MyBackend type
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
-
     // Initialize the GPU device for computation
-    let device = burn::backend::wgpu::WgpuDevice::default();
+    let device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice).autodiff();
 
     // Set training parameters and configuration
     let num_samples = 10_000 as usize;
@@ -194,7 +187,7 @@ fn main() {
     let normalized = true;
 
     // Seed the random number generator to ensure reproducibility
-    MyBackend::seed(&device, seed);
+    device.seed(seed);
 
     let Mnist {
         trn_img, trn_lbl, ..
@@ -248,7 +241,7 @@ fn main() {
     let epochs_options = vec![500];
 
     // Find the best hyperparameters
-    let (best_config, best_loss) = find_best_hyperparameters::<MyAutodiffBackend>(
+    let (best_config, best_loss) = find_best_hyperparameters(
         num_features,
         num_samples,
         train_data,

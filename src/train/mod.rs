@@ -4,15 +4,11 @@ mod train_sparse;
 
 #[cfg(feature = "plotters")]
 use crate::chart::{self, plot_loss, ChartConfigBuilder};
-use crate::{
-    backend::AutodiffBackend, format_duration, model::UMAPModel, normalize_data,
-    utils::convert_vector_to_tensor,
-};
+use crate::{format_duration, model::UMAPModel, normalize_data, utils::convert_vector_to_tensor};
 use burn::{
-    module::{AutodiffModule, Module},
-    optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams, Optimizer},
-    record::{BinFileRecorder, FullPrecisionSettings},
-    tensor::{cast::ToElement, Device, IndexingUpdateOp, Int, Tensor, TensorData},
+    module::Module,
+    optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams},
+    tensor::{Device, IndexingUpdateOp, Int, Tensor, TensorData},
 };
 pub use config::*;
 pub use train_sparse::{train_sparse, EpochProgress};
@@ -45,19 +41,19 @@ use std::{thread, time::Instant};
 ///
 /// `−log(q)` → 0 as d → 0  (pull neighbours together).
 /// `−log(1−q)` → 0 as d → ∞ (push non-neighbours apart).
-pub fn train<B: AutodiffBackend, F: Float>(
+pub fn train<F: Float>(
     name: &str,
-    mut model: UMAPModel<B>,
+    mut model: UMAPModel,
     num_samples: usize,
     num_features: usize,
     mut data: Vec<F>,
     config: &TrainingConfig,
-    device: Device<B>,
+    device: Device,
     exit_rx: Receiver<()>,
     // Optional per-sample labels for coloured epoch snapshots.
     // Pass `None` for monochrome.
     labels: Option<Vec<String>>,
-) -> (UMAPModel<B>, Vec<F>, F)
+) -> (UMAPModel, Vec<F>, F)
 where
     F: FromPrimitive + Send + Sync + burn::tensor::Element,
 {
@@ -86,8 +82,7 @@ where
         }
     };
 
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let model_path = format!("/tmp/{name}.bin");
+    let model_path = format!("/tmp/{name}.burnpack");
 
     let batch_size = config.batch_size;
     let k = config.k_neighbors;
@@ -139,9 +134,9 @@ where
     }
 
     let mut batches_start: Vec<usize> = Vec::new();
-    let mut tensor_batches: Vec<Tensor<B, 2>> = Vec::new();
+    let mut tensor_batches: Vec<Tensor<2>> = Vec::new();
     // Per-batch: (knn_indicator [bs,bs], within_knn_count, non_neighbor_mask [bs,bs])
-    let mut batch_artefacts: Vec<(Tensor<B, 2>, usize, Tensor<B, 2>)> = Vec::new();
+    let mut batch_artefacts: Vec<(Tensor<2>, usize, Tensor<2>)> = Vec::new();
 
     for batch_start in (0..num_samples).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(num_samples);
@@ -153,12 +148,12 @@ where
             let s = i * num_features;
             batch_vec.extend_from_slice(&data[s..s + num_features]);
         }
-        let tensor_batch: Tensor<B, 2> =
+        let tensor_batch: Tensor<2> =
             convert_vector_to_tensor(batch_vec, bs, num_features, &device);
 
         // (1) High-dim pairwise distances, pulled to CPU for sorting
         let hd_pairwise = pairwise_distances(tensor_batch.clone());
-        let flat: Vec<f32> = hd_pairwise.to_data().to_vec::<f32>().unwrap();
+        let flat: Vec<f32> = hd_pairwise.to_data().try_to_vec::<f32>().unwrap();
 
         // (2) Batch-local k-NN sort (CPU)
         let (idx_flat, _) = knn_from_pairwise_cpu(&flat, bs, k);
@@ -172,14 +167,14 @@ where
                 knn_ind_flat[local_i * bs + local_j] = 1.0;
             }
         }
-        let knn_indicator: Tensor<B, 2> =
+        let knn_indicator: Tensor<2> =
             Tensor::from_data(TensorData::new(knn_ind_flat, [bs, bs]), &device);
         let within_knn_count = bs * k; // all k-NN are in-batch by construction
 
         // (3b) Diagonal (self-pair) identity matrix — built on GPU via
         //      arange + scatter to avoid a large CPU allocation.
-        let diag_idx: Tensor<B, 1, Int> = Tensor::arange(0i64..(bs as i64), &device);
-        let eye: Tensor<B, 2> = Tensor::<B, 2>::zeros([bs, bs], &device).scatter(
+        let diag_idx: Tensor<1, Int> = Tensor::arange(0i64..(bs as i64), &device);
+        let eye: Tensor<2> = Tensor::<2>::zeros([bs, bs], &device).scatter(
             1,
             diag_idx.reshape([bs, 1]),
             Tensor::ones([bs, 1], &device),
@@ -201,7 +196,7 @@ where
     }
 
     // Concatenate all batch tensors for O(1) slicing in the epoch loop.
-    let tensor_batches_all = Tensor::<B, 2>::cat(tensor_batches, 0);
+    let tensor_batches_all = Tensor::<2>::cat(tensor_batches, 0);
 
     // ── Optimizer ─────────────────────────────────────────────────────────────
     let config_optimizer = AdamConfig::new()
@@ -281,7 +276,7 @@ where
             // ── UMAP cross-entropy loss ───────────────────────────────────────
             let loss = attraction + repulsion_strength * repulsion;
 
-            let current_loss = F::from(loss.clone().into_scalar().to_f64()).unwrap();
+            let current_loss = F::from(loss.clone().into_scalar::<f32>() as f64).unwrap();
 
             if current_loss.is_nan() || current_loss.is_infinite() {
                 eprintln!(
@@ -329,7 +324,7 @@ where
             epochs_without_improvement = 0;
             model
                 .clone()
-                .save_file(model_path.clone(), &recorder)
+                .save_file(&model_path)
                 .expect("Could not save model checkpoint");
         } else {
             epochs_without_improvement += 1;
@@ -418,7 +413,7 @@ where
     }
 
     model = model
-        .load_file(model_path, &recorder, &device)
+        .try_load_file(&model_path)
         .expect("Could not load best model checkpoint");
 
     let total_elapsed = start_time.elapsed();

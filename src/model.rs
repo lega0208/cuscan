@@ -5,15 +5,13 @@ use serde::{Deserialize, Serialize};
 /// A neural network model with a configurable number of layers and dynamic sizes.
 /// The model can have multiple hidden layers, with each layer having its own configurable size.
 ///
-/// # Arguments
-/// * `B` - The backend type for tensor operations (e.g., `AutodiffBackend`)
 #[derive(Module, Debug)]
-pub struct UMAPModel<B: Backend> {
-    layers: Vec<Linear<B>>, // Vector to store dynamic layers
-    activation: Relu,       // ReLU activation function
+pub struct UMAPModel {
+    layers: Vec<Linear>, // Vector to store dynamic layers
+    activation: Relu,    // ReLU activation function
 }
 
-impl<B: Backend> UMAPModel<B> {
+impl UMAPModel {
     /// Creates a new instance of `UMAPModel` with the specified configuration and device.
     ///
     /// # Arguments
@@ -22,7 +20,7 @@ impl<B: Backend> UMAPModel<B> {
     ///
     /// # Returns
     /// A new `UMAPModel` instance initialized with the provided configuration.
-    pub fn new(config: &UMAPModelConfig, device: &Device<B>) -> Self {
+    pub fn new(config: &UMAPModelConfig, device: &Device) -> Self {
         // Build the layers dynamically based on the hidden layer sizes.
         let mut layers = Vec::new();
         let mut input_size = config.input_size;
@@ -58,7 +56,7 @@ impl<B: Backend> UMAPModel<B> {
     ///
     /// # Returns
     /// A 2D tensor representing the output after passing through all the layers and activations.
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, input: Tensor<2>) -> Tensor<2> {
         let mut x = input;
 
         // Forward pass through each layer with activation

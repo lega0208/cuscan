@@ -1,6 +1,6 @@
 /// Criterion benchmarks for fast-umap.
 ///
-/// All benchmarks run on the CPU (`burn::backend::NdArray`) so no GPU is
+/// All benchmarks run on Burn's Flex CPU device so no GPU is
 /// required and they integrate easily into CI.
 ///
 /// Benchmark groups:
@@ -10,9 +10,8 @@
 ///   • model_forward       – UMAPModel forward pass at various sizes
 ///   • normalize_tensor    – 1-D min-max normalisation
 ///   • layer_normalize     – 2-D layer normalisation
-use burn::backend::NdArray;
-use burn::tensor::{Tensor, TensorData};
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use burn::tensor::{Device, Tensor, TensorData};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use fast_umap::{
     model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize as layer_normalize,
@@ -22,16 +21,14 @@ use fast_umap::{
     },
 };
 
-type B = NdArray<f32>;
-
-fn cpu() -> burn::backend::ndarray::NdArrayDevice {
-    burn::backend::ndarray::NdArrayDevice::Cpu
+fn cpu() -> Device {
+    Device::flex()
 }
 
 // ---------------------------------------------------------------------------
 // Helper: build a model
 // ---------------------------------------------------------------------------
-fn build_model(input: usize, hidden: &[usize], output: usize) -> UMAPModel<B> {
+fn build_model(input: usize, hidden: &[usize], output: usize) -> UMAPModel {
     let cfg = UMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden.to_vec())
@@ -87,8 +84,7 @@ fn bench_tensor_convert(c: &mut Criterion) {
             let data: Vec<f32> = generate_test_data(s, f);
             let device = cpu();
             b.iter(|| {
-                let t: Tensor<B, 2> =
-                    convert_vector_to_tensor(data.clone(), s, f, &device);
+                let t: Tensor<2> = convert_vector_to_tensor(data.clone(), s, f, &device);
                 let _v: Vec<Vec<f64>> = convert_tensor_to_vector(t);
             });
         });
@@ -103,11 +99,11 @@ fn bench_model_forward(c: &mut Criterion) {
     let mut group = c.benchmark_group("model_forward");
 
     let configs: &[(&str, usize, &[usize], usize, usize)] = &[
-        ("16s-10f-32h-2o",  16,   &[32],       10, 2),
-        ("64s-50f-64h-2o",  64,   &[64],       50, 2),
-        ("128s-50f-128h-2o", 128, &[128],      50, 2),
-        ("64s-100f-128h-3o", 64,  &[128, 64],  100, 3),
-        ("256s-100f-256h-2o",256, &[256, 128], 100, 2),
+        ("16s-10f-32h-2o", 16, &[32], 10, 2),
+        ("64s-50f-64h-2o", 64, &[64], 50, 2),
+        ("128s-50f-128h-2o", 128, &[128], 50, 2),
+        ("64s-100f-128h-3o", 64, &[128, 64], 100, 3),
+        ("256s-100f-256h-2o", 256, &[256, 128], 100, 2),
     ];
 
     for &(label, num_samples, hidden, num_features, output_size) in configs {
@@ -116,8 +112,7 @@ fn bench_model_forward(c: &mut Criterion) {
             let model = build_model(f, hidden, output_size);
             let device = cpu();
             let data: Vec<f32> = generate_test_data(s, f);
-            let input: Tensor<B, 2> =
-                Tensor::from_data(TensorData::new(data, [s, f]), &device);
+            let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [s, f]), &device);
             b.iter(|| {
                 let _out = model.forward(input.clone());
             });
@@ -138,8 +133,7 @@ fn bench_normalize_tensor(c: &mut Criterion) {
             let device = cpu();
             let data: Vec<f32> = generate_test_data(n, 1);
             b.iter(|| {
-                let t: Tensor<B, 1> =
-                    Tensor::from_data(TensorData::new(data.clone(), [n]), &device);
+                let t: Tensor<1> = Tensor::from_data(TensorData::new(data.clone(), [n]), &device);
                 normalize_tensor(t)
             });
         });
@@ -158,8 +152,7 @@ fn bench_layer_normalize(c: &mut Criterion) {
         group.bench_with_input(id, &(samples, features), |b, &(s, f)| {
             let device = cpu();
             let data: Vec<f32> = generate_test_data(s, f);
-            let t: Tensor<B, 2> =
-                Tensor::from_data(TensorData::new(data, [s, f]), &device);
+            let t: Tensor<2> = Tensor::from_data(TensorData::new(data, [s, f]), &device);
             b.iter(|| layer_normalize(t.clone()));
         });
     }

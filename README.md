@@ -10,16 +10,16 @@ See [docs.rs](https://docs.rs/crate/fast-umap/latest) for the full API reference
 
 ## Highlights
 
-- **Up to 38× faster with MLX** on Apple Silicon vs WGPU
-  (see [MLX benchmarks](#performance--mlx-vs-wgpu-apple-silicon) below)
+- Historical Apple Silicon MLX benchmark results are retained below for reference;
+  MLX is no longer a supported runtime backend.
 - **Up to 4.7× faster** than [umap-rs](https://crates.io/crates/umap-rs) on
   datasets ≥ 10 000 samples (see [benchmarks](#performance--fast-umap-vs-umap-rs) below)
 - **Scales to 50K+ samples** — NN-Descent approximate KNN avoids the O(n^2) distance matrix
 - **Parametric** — trains a neural network, so you can
   [`transform()`](#transform-new-data) new unseen data instantly
-- **Four backends** — CUDA (NVIDIA), MLX (Apple Silicon native), WGPU (Metal/Vulkan/DX12), CPU (NdArray)
+- **Runtime-selected Burn devices** — WGPU (Metal/Vulkan/DX12), CUDA (NVIDIA), or CPU Flex
 - **PCA warm-start** — optional PCA pre-training for faster convergence
-- **API mirrors umap-rs** — drop-in replacement with `Umap::new(config).fit(data)`
+- **API mirrors umap-rs** — use `Umap::new(config).fit(data, labels)`
 
 ---
 
@@ -71,12 +71,11 @@ Or run all benchmarks at once (hardware + comparison + MNIST):
 
 ---
 
-## Performance — MLX vs WGPU (Apple Silicon)
+## Historical benchmark — MLX vs WGPU (Apple Silicon)
 
-On Apple Silicon, the MLX backend ([burn-mlx](https://github.com/eidolons-ai/burn-mlx))
-is **3–38× faster** than the WGPU backend across all configurations tested.
-MLX talks directly to Metal with unified memory (zero-copy CPU/GPU), while
-WGPU adds a WebGPU abstraction layer.
+These measurements were collected on an earlier version of fast-umap and are
+preserved as historical results only. MLX has since been removed; these numbers
+do not describe the current runtime or imply current performance.
 
 ![Backend benchmark chart](figures/backend_benchmark.svg)
 
@@ -93,30 +92,9 @@ WGPU adds a WebGPU abstraction layer.
 | 3-D output | 5K | 100 | [128] | 3D | 12.31s | 0.33s | **MLX 38x** |
 | Huge | 50K | 100 | [128] | 2D | -- | 14.04s | MLX only |
 
-> 50 epochs per scenario, Apple Silicon. The 50K scenario uses NN-Descent
+> Historical measurements: 50 epochs per scenario on Apple Silicon. The 50K scenario used NN-Descent
 > approximate KNN (`nn-descent` feature) — WGPU can't run it because the
 > exact pairwise distance matrix would need 10 GB.
-
-**Reproduce:**
-
-```shell
-cargo run --release --features gpu,mlx,pca,nn-descent --example backend_benchmark
-```
-
-### Using the MLX backend
-
-```toml
-[dependencies]
-fast-umap = { version = "1.6", features = ["mlx"] }
-```
-
-```rust
-type MlxBackend = burn_mlx::Mlx;
-type MyAutodiffBackend = burn::backend::Autodiff<MlxBackend>;
-
-let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
-let fitted = umap.fit(data, None);
-```
 
 ---
 
@@ -126,7 +104,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 | Area | Change |
 |------|--------|
-| **MLX backend** | Apple Silicon native backend via [burn-mlx](https://github.com/eidolons-ai/burn-mlx) — 4-24× faster than WGPU on Mac (feature: `mlx`) |
 | **PCA warm-start** | Pre-trains the network to approximate PCA output before UMAP loss, improving convergence (feature: `pca`) |
 | **NN-Descent** | Approximate KNN graph construction in O(n*k) memory — enables 50K+ sample datasets without the O(n^2) distance matrix (feature: `nn-descent`) |
 | **Generic backend ops** | Pairwise distance and KNN implemented with standard Burn tensor ops, enabling any backend without CubeCL |
@@ -138,7 +115,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 - **Dimensionality Reduction** — projects high-dimensional data to 2-D or 3-D for visualization
 - **Parametric model** — learned neural network can project new, unseen data via `transform()`
-- **GPU backends** — CUDA (NVIDIA via CubeCL), MLX (Apple Silicon native), and WGPU (Metal/Vulkan/DX12 via CubeCL); CPU (NdArray) is also available
+- **Execution devices** — WGPU (Metal/Vulkan/DX12), CUDA (NVIDIA), and CPU Flex
 - **PCA warm-start** — optional pre-training phase initializes embeddings from PCA for faster convergence (`pca` feature)
 - **NN-Descent** — approximate KNN in O(n*k) memory for datasets > 10K samples, avoiding the O(n^2) distance matrix (`nn-descent` feature)
 - **Automatic differentiation** — full autograd through custom kernels via burn's autodiff backend
@@ -159,8 +136,8 @@ cargo add fast-umap
 ```toml
 [dependencies]
 fast-umap  = "1.6.0"
-burn       = { version = "0.20.1", features = ["wgpu", "autodiff", "autotune"] }
-cubecl     = { version = "0.9.0",  features = ["wgpu"] }
+burn       = { version = "=0.22.0-pre.4", features = ["wgpu", "autodiff", "autotune"] }
+cubecl     = { version = "=0.11.0-pre.4", features = ["wgpu"] }
 ```
 
 ---
@@ -168,11 +145,8 @@ cubecl     = { version = "0.9.0",  features = ["wgpu"] }
 ## Quick Start
 
 ```rust
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
-
-type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
 
 // 100 samples × 10 features
 let data: Vec<Vec<f64>> = generate_test_data(100, 10)
@@ -182,7 +156,10 @@ let data: Vec<Vec<f64>> = generate_test_data(100, 10)
 
 // Fit UMAP (default: 2-D output, Euclidean distance)
 let config = UmapConfig::default();
-let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+let umap = fast_umap::Umap::with_device(
+    config,
+    Device::wgpu(DeviceKind::DefaultDevice),
+);
 let fitted = umap.fit(data.clone(), None);
 
 // Get embedding
@@ -194,8 +171,8 @@ println!("Shape: {} × {}", embedding.len(), embedding[0].len());
 
 ## Python
 
-The Python package wraps the parametric model and supports CPU (`NdArray`) and
-GPU execution. A Rust toolchain is required to build it from source.
+The Python package wraps the parametric model and supports CPU Flex and GPU
+execution. A Rust toolchain is required to build it from source.
 
 From the repository root, install in editable mode with `uv`:
 
@@ -275,14 +252,14 @@ fast-umap supports both CPU and GPU backends with feature-based compilation for 
 For GPU-accelerated execution (requires WGPU-compatible GPU):
 
 ```rust
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
-
 let config = UmapConfig::default();
-let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+let umap = fast_umap::Umap::with_device(
+    config,
+    Device::wgpu(DeviceKind::DefaultDevice),
+);
 let fitted = umap.fit(data, None);
 ```
 
@@ -293,39 +270,23 @@ let fitted = umap.fit(data, None);
 - ✅ Custom GPU kernels for efficient computation
 - ✅ Automatic differentiation for training
 
-### CUDA Backend (NVIDIA)
+### Runtime device selection
 
-Enable the `cuda` feature to use an NVIDIA GPU. CUDA is not included in the `all` feature.
+`Umap` and `FittedUmap` are backend-independent. Select a Burn device at
+runtime; use Flex for CPU computation or WGPU for GPU computation:
 
 ```rust
-use fast_umap::cuda_backend::{device, CudaAutodiff};
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-let cuda_device = device(0).expect("CUDA device 0 is required");
 let config = UmapConfig::default();
-let umap = fast_umap::Umap::<CudaAutodiff>::with_device(config, cuda_device);
-let fitted = umap.fit(data, None);
+let cpu = Umap::with_device(config.clone(), Device::flex());
+let gpu = Umap::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
+let fitted = cpu.fit(data, None);
 ```
 
-### MLX Backend (Apple Silicon) - Fastest on Mac
-
-For native Apple Silicon acceleration via [MLX](https://github.com/eidolons-ai/burn-mlx):
-
-```rust
-type MlxBackend = burn_mlx::Mlx;
-type MyAutodiffBackend = burn::backend::Autodiff<MlxBackend>;
-
-let config = UmapConfig::default();
-let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
-let fitted = umap.fit(data, None);
-```
-
-**Features:**
-- ✅ Full parametric UMAP with neural network training
-- ✅ Native Metal GPU acceleration (no WGPU layer)
-- ✅ Unified memory — zero-copy CPU/GPU data sharing
-- ✅ Transform new data through trained model
-- ✅ 4–24× faster than WGPU on Apple Silicon
+The WGPU device requires the `gpu` feature. CUDA can also be selected through
+Burn's runtime device API when compiled with the `cuda` feature.
 
 ### CPU Backend - Full Functionality with umap-rs Fallback
 
@@ -359,7 +320,7 @@ For CPU-only execution or when GPU is not available, fast-umap provides a comple
 
 See [`cpu_training_demo` example](examples/cpu_training_demo.rs) for complete CPU usage.
 
-### Feature-Based Compilation
+## Feature-Based Compilation
 
 fast-umap uses Cargo features to enable only the backends you need:
 
@@ -367,17 +328,11 @@ fast-umap uses Cargo features to enable only the backends you need:
 # GPU backend (default, includes gpu + verbose features)
 cargo build --release
 
-# MLX backend (Apple Silicon, fastest on Mac)
-cargo build --release --features mlx
-
-# With PCA warm-start and approximate KNN
-cargo build --release --features mlx,pca,nn-descent
-
-# CPU-only backend
-cargo build --release --features cpu
-
-# Minimal build (no backends, library mode only)
+# Flex CPU device without GPU dependencies
 cargo build --release --no-default-features
+
+# Optional classical umap-rs CPU fallback and PCA/NN-Descent
+cargo build --release --features cpu,pca,nn-descent
 
 # All features (development)
 cargo build --release --features all
@@ -391,10 +346,10 @@ The [`backend_choice` example](examples/backend_choice.rs) demonstrates runtime 
 
 ```shell
 # Run with GPU backend
-cargo run --release --example backend_choice gpu
+cargo run --release --features gpu --example backend_choice -- wgpu
 
-# Run with CPU backend  
-cargo run --release --features cpu --example backend_choice cpu
+# Run with CPU Flex backend
+cargo run --release --example backend_choice -- flex
 ```
 
 ### CPU Testing Examples
@@ -406,7 +361,8 @@ For working CPU examples, see the test suite:
 cargo test --lib
 ```
 
-The tests in `tests/tests.rs` demonstrate NdArray backend usage for CPU computation.
+The tests in `tests/tests.rs` exercise the Burn Flex CPU device. The `cpu`
+Cargo feature separately enables the classical `umap-rs` fallback API.
 
 ---
 
@@ -416,8 +372,8 @@ The public API mirrors [`umap-rs`](https://crates.io/crates/umap-rs):
 
 | Type | Description |
 |------|-------------|
-| [`Umap<B>`](https://docs.rs/fast-umap/latest/fast_umap/struct.Umap.html) | Main algorithm struct — `Umap::new(config)` |
-| [`FittedUmap<B>`](https://docs.rs/fast-umap/latest/fast_umap/struct.FittedUmap.html) | Fitted model — `.embedding()`, `.transform()`, `.into_embedding()`, `.config()` |
+| [`Umap`](https://docs.rs/fast-umap/latest/fast_umap/struct.Umap.html) | Backend-independent main algorithm — `Umap::new(config)` or `Umap::with_device(config, device)` |
+| [`FittedUmap`](https://docs.rs/fast-umap/latest/fast_umap/struct.FittedUmap.html) | Backend-independent fitted model — `.embedding()`, `.transform()`, `.into_embedding()`, `.config()` |
 | [`UmapConfig`](https://docs.rs/fast-umap/latest/fast_umap/struct.UmapConfig.html) | Configuration with nested `GraphParams` + `OptimizationParams` |
 | [`ManifoldParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.ManifoldParams.html) | `min_dist`, `spread` — control cluster tightness and separation |
 | [`GraphParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.GraphParams.html) | `n_neighbors`, `metric`, `normalized`, `minkowski_p` |
@@ -494,17 +450,17 @@ cargo run --release --example cpu_training_demo
 
 ### Backend Choice — CPU vs GPU selection
 
-Demonstrates how to choose between CPU (NdArray) and GPU (WGPU) backends at runtime:
+Demonstrates how to choose between the CPU Flex and WGPU devices at runtime:
 
 ```shell
-# Run with GPU backend (default)
-cargo run --release --example backend_choice gpu
+# Run with WGPU backend
+cargo run --release --features gpu --example backend_choice -- wgpu
 
-# Run with CPU backend  
-cargo run --release --example backend_choice cpu
+# Run with CPU Flex backend
+cargo run --release --example backend_choice -- flex
 ```
 
-**Note about CPU backend:** The CPU option shows backend selection structure. For utility functions, see `cpu_training_demo`. The GPU backend provides full parametric UMAP with neural network training and the ability to transform new data.
+Both devices use the parametric model and support transforming new data.
 
 ### Simple — random data, 2-D embedding
 
@@ -513,12 +469,10 @@ cargo run --release --example simple
 ```
 
 ```rust
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
 fn main() {
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
 
     let data: Vec<Vec<f64>> = (0..100 * 3)
         .map(|_| rand::rng().random::<f64>())
@@ -528,7 +482,10 @@ fn main() {
         .collect();
 
     let config = UmapConfig::default();
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let umap = fast_umap::Umap::with_device(
+        config,
+        Device::wgpu(DeviceKind::DefaultDevice),
+    );
     let fitted = umap.fit(data.clone(), None);
 
     let embedding = fitted.embedding();
@@ -546,12 +503,10 @@ cargo run --release --example advanced
 ```
 
 ```rust
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
 fn main() {
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
 
     let train_data: Vec<f32> = generate_test_data(1000, 100);
     let data: Vec<Vec<f32>> = train_data.chunks(100).map(|c| c.to_vec()).collect();
@@ -576,7 +531,10 @@ fn main() {
         ..Default::default()
     };
 
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let umap = fast_umap::Umap::with_device(
+        config,
+        Device::wgpu(DeviceKind::DefaultDevice),
+    );
     let fitted = umap.fit(data, None);
 
     println!("Embedding: {} samples × {} dims",
@@ -619,7 +577,10 @@ let config = UmapConfig {
     ..Default::default()
 };
 
-let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+let umap = fast_umap::Umap::with_device(
+        config,
+        Device::wgpu(DeviceKind::DefaultDevice),
+    );
 let fitted = umap.fit(data, Some(labels));
 ```
 
@@ -669,8 +630,8 @@ writing any files.
 Demonstrates CPU backend capabilities:
 
 ```shell
-# Run CPU demo (requires cpu feature)
-cargo run --release --features cpu --example cpu_training_demo
+# Run CPU Flex demo
+cargo run --release --example cpu_training_demo
 ```
 
 ### Developer Experience Improvements
@@ -678,13 +639,13 @@ cargo run --release --features cpu --example cpu_training_demo
 The feature-based compilation system provides:
 
 **✅ Faster Compilation**
-- Compile only what you need: `cargo build --release --features cpu`
+- Compile the umap-rs CPU fallback only when needed: `cargo build --release --features cpu`
 - Minimal builds: `cargo build --release --no-default-features`
 - Feature-specific examples and documentation
 
 **✅ Smaller Binaries**
 - GPU-only: exclude CPU dependencies (save ~5MB)
-- CPU-only: exclude GPU dependencies (save ~10MB)
+- CPU Flex builds can omit the `gpu` feature
 - Library mode: minimal footprint for integration
 
 **✅ Clear Feature Matrix**
@@ -693,8 +654,7 @@ The feature-based compilation system provides:
 |---------|-------------|--------------|
 | `gpu` | GPU backend (WGPU) | Cross-platform GPU, large datasets |
 | `cuda` | GPU backend (CUDA) | NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`) at runtime; `nvcc`/CUDA toolkit optional at build time; excluded from `all` and default features |
-| `mlx` | MLX backend (Apple native) | Apple Silicon (fastest on Mac) |
-| `cpu` | CPU backend (umap-rs) | CPU-only environments |
+| `cpu` | Classical UMAP fallback via umap-rs | Non-parametric CPU UMAP |
 | `pca` | PCA warm-start for embeddings | Better convergence quality |
 | `nn-descent` | Approximate KNN for large data | Datasets > 10K samples (avoids O(n^2) memory) |
 | `verbose` | Progress output | Development, debugging |
@@ -761,7 +721,6 @@ FittedUmap with .embedding() and .transform()
 | [`generic_backend`] | -- | Backend ops via standard Burn tensor math (works on any backend) |
 | [`autodiff_ops`] | -- | Autodiff backward registration for custom ops |
 | [`kernels`] | `gpu` | Custom CubeCL GPU kernels (Euclidean distance, k-NN) |
-| [`mlx_backend`] | `mlx` | MLX backend implementation for Apple Silicon |
 | [`pca`] | `pca` | PCA warm-start for initial embedding |
 | [`nn_descent`] | `nn-descent` | NN-Descent approximate KNN graph construction |
 | [`chart`] | `plotters` | 2-D scatter plots and loss curves |
@@ -772,33 +731,25 @@ FittedUmap with .embedding() and .transform()
 
 ---
 
-## Legacy API
+## Convenience API
 
-The original `UMAP` struct and `train()` function are still available for
-backward compatibility:
+The convenience `UMAP` API is nongeneric and uses the default Burn device:
 
 ```rust
 use fast_umap::prelude::*;
 
-// Legacy one-liner
-let umap: fast_umap::UMAP<MyAutodiffBackend> = umap(data.clone());
-let embedding = umap.transform(data);
-
-// Legacy manual training
-let (model, losses, best_loss) = fast_umap::train::train(
-    "my_run", model, num_samples, num_features,
-    train_data, &config, device, exit_rx, None,
-);
+let fitted = fast_umap::umap(data.clone());
+let embedding = fitted.embedding();
+let transformed = fitted.transform(data);
 ```
 
-> **Note:** The legacy API uses the dense O(n²) training path. Use the new
-> `Umap::new(config).fit(data)` API for the optimized sparse training path.
+For explicit device selection or configuration, use `Umap::with_device(config, device)`.
 
 ---
 
 ## Testing
 
-All tests run on CPU (`burn::backend::NdArray`) — no GPU required.
+Tests use Burn’s Flex CPU device by default; no GPU is required.
 
 ```shell
 cargo test
@@ -829,7 +780,7 @@ Full detail files:
 [comparison\_apple\_m3\_max.md](benches/results/comparison_apple_m3_max.md) ·
 [cpu\_apple\_silicon\_aarch64.md](benches/results/cpu_apple_silicon_aarch64.md)
 
-### CPU — Apple M3 Max (NdArray backend)
+### Historical CPU benchmark — Apple M3 Max (NdArray backend)
 
 ![CPU benchmark chart](benches/results/cpu_apple_m3_max.svg)
 
@@ -931,7 +882,7 @@ Full detail files:
 - [x] New API mirroring umap-rs (`Umap`, `FittedUmap`, `UmapConfig`)
 - [x] Sparse training with edge subsampling + negative sampling
 - [x] Crate comparison benchmark (fast-umap vs umap-rs)
-- [x] MLX backend for Apple Silicon (4–24× faster than WGPU)
+- [x] Historical MLX backend benchmark (runtime backend removed)
 - [x] PCA warm-start for initial embedding
 - [x] Approximate KNN (NN-descent) for datasets > 10K
 

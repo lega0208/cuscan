@@ -8,11 +8,11 @@ echo "1. Testing default features (gpu + verbose):"
 cargo check --example feature_demo
 echo
 
-echo "2. Testing CPU-only features:"
+echo "2. Testing the umap-rs CPU fallback feature:"
 cargo check --example feature_demo --features cpu --no-default-features
 echo
 
-echo "3. Testing minimal features (no backends):"
+echo "3. Testing minimal features (Flex CPU backend):"
 cargo check --lib --no-default-features
 echo
 
@@ -32,20 +32,16 @@ else
 fi
 echo
 
-echo "7. Testing all features:"
-if [ "$(uname)" = "Darwin" ]; then
-    cargo check --example feature_demo --features all
-else
-    echo "SKIPPED: all features include MLX, which is Apple-only (macOS required)"
-fi
+echo "7. Testing all non-CUDA features:"
+cargo check --example feature_demo --features all
 echo
 
 echo "8. Testing GPU backend explicitly:"
 cargo check --example backend_choice --features gpu
 echo
 
-echo "9. Testing CPU backend explicitly:"
-cargo check --example backend_choice --features cpu
+echo "9. Testing the Flex CPU device explicitly:"
+cargo check --example backend_choice --no-default-features
 echo
 
 echo "=== Feature Compilation Tests Complete ==="

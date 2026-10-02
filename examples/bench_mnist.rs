@@ -6,14 +6,12 @@
 ///
 /// Usage:
 ///     cargo run --release --example bench_mnist
-use cubecl::wgpu::WgpuRuntime;
 use fast_umap::{chart, prelude::*};
 use mnist::*;
 use std::time::Instant;
 
 fn main() {
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
+    let device = burn::tensor::Device::wgpu(burn::tensor::DeviceKind::DefaultDevice).autodiff();
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -65,17 +63,23 @@ fn main() {
         ..Default::default()
     };
 
-    println!("  Training UMAP ({} epochs, k={})…",
-        config.optimization.n_epochs, config.graph.n_neighbors);
+    println!(
+        "  Training UMAP ({} epochs, k={})…",
+        config.optimization.n_epochs, config.graph.n_neighbors
+    );
     let fit_start = Instant::now();
 
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let umap = fast_umap::Umap::with_device(config, device);
     let fitted = umap.fit(data, Some(labels.clone()));
 
     let fit_secs = fit_start.elapsed().as_secs_f64();
     println!();
     println!("  Fit time: {fit_secs:.2}s");
-    println!("  Embedding: {} × {}", fitted.embedding().len(), fitted.embedding()[0].len());
+    println!(
+        "  Embedding: {} × {}",
+        fitted.embedding().len(),
+        fitted.embedding()[0].len()
+    );
 
     // ── Generate figures ─────────────────────────────────────────────────────
     std::fs::create_dir_all("figures").unwrap();

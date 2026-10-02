@@ -24,12 +24,12 @@
 //!
 //! // Configure and fit UMAP
 //! let config = UmapConfig::default();
-//! // let umap = Umap::<MyAutodiffBackend>::new(config);
+//! // let umap = Umap::new(config);
 //! // let fitted = umap.fit(data.clone(), None);
 //! // let embedding = fitted.embedding();
 //! // let new_embedding = fitted.transform(new_data);
 //! // fitted.save("model.umap")?; // Save trained model
-//! // let loaded = FittedUmap::<MyAutodiffBackend>::load("model.umap", config, input_size, device)?;
+//! // let loaded = FittedUmap::load("model.umap", config, input_size, device)?;
 //! ```
 //!
 //! ## Interface
@@ -86,8 +86,7 @@
 //! | [`serialize`] | Model weight serialization/deserialization |
 //! | [`prelude`] | Re-exports of the most commonly used items |
 
-use backend::AutodiffBackend;
-use burn::module::AutodiffModule;
+use burn::module::Module;
 
 use crossbeam_channel::Receiver;
 use model::{UMAPModel, UMAPModelConfigBuilder};
@@ -99,8 +98,6 @@ use burn::tensor::{Device, Tensor};
 
 pub mod autodiff_ops;
 pub mod backend;
-// #[cfg(feature = "candle")]
-// pub mod candle_backend;  // TODO: re-enable when burn-candle fixes candle-core DType compat
 #[cfg(feature = "plotters")]
 pub mod chart;
 #[cfg(feature = "cpu")]
@@ -108,14 +105,12 @@ pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod distances;
+pub mod flex_backend;
 pub mod generic_backend;
 #[cfg(any(feature = "gpu", feature = "cuda"))]
 pub mod kernels;
 pub mod macros;
-#[cfg(feature = "mlx")]
-pub mod mlx_backend;
 pub mod model;
-pub mod ndarray_backend;
 #[cfg(feature = "nn-descent")]
 pub mod nn_descent;
 pub mod normalizer;
@@ -210,16 +205,16 @@ pub fn validate_fit_data<F>(config: &UmapConfig, data: &[Vec<F>]) -> Result<(), 
 ///     ..Default::default()
 /// };
 ///
-/// let umap = Umap::<MyAutodiffBackend>::new(config);
+/// let umap = Umap::new(config);
 /// let fitted = umap.fit(data, None);
 /// let embedding = fitted.embedding();
 /// ```
-pub struct Umap<B: AutodiffBackend> {
+pub struct Umap {
     config: UmapConfig,
-    device: Device<B>,
+    device: Device,
 }
 
-impl<B: AutodiffBackend> Umap<B> {
+impl Umap {
     /// Create a new UMAP instance with the given configuration.
     ///
     /// Uses the default device for the backend.
@@ -230,7 +225,7 @@ impl<B: AutodiffBackend> Umap<B> {
     pub fn new(config: UmapConfig) -> Self {
         Self {
             config,
-            device: Default::default(),
+            device: Device::default().autodiff(),
         }
     }
 
@@ -240,8 +235,11 @@ impl<B: AutodiffBackend> Umap<B> {
     ///
     /// * `config` - UMAP configuration parameters
     /// * `device` - The device (CPU or GPU) on which to perform computation
-    pub fn with_device(config: UmapConfig, device: Device<B>) -> Self {
-        Self { config, device }
+    pub fn with_device(config: UmapConfig, device: Device) -> Self {
+        Self {
+            config,
+            device: device.autodiff(),
+        }
     }
 
     /// Get a reference to the configuration.
@@ -267,11 +265,11 @@ impl<B: AutodiffBackend> Umap<B> {
     ///
     /// ```ignore
     /// let config = UmapConfig::default();
-    /// let umap = Umap::<MyAutodiffBackend>::new(config);
+    /// let umap = Umap::new(config);
     /// let fitted = umap.fit(data, None);
     /// let embedding = fitted.embedding();
     /// ```
-    pub fn fit<F: Float>(self, data: Vec<Vec<F>>, labels: Option<Vec<String>>) -> FittedUmap<B>
+    pub fn fit<F: Float>(self, data: Vec<Vec<F>>, labels: Option<Vec<String>>) -> FittedUmap
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
@@ -304,7 +302,7 @@ impl<B: AutodiffBackend> Umap<B> {
         data: Vec<Vec<F>>,
         labels: Option<Vec<String>>,
         exit_rx: Receiver<()>,
-    ) -> FittedUmap<B>
+    ) -> FittedUmap
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
@@ -316,7 +314,7 @@ impl<B: AutodiffBackend> Umap<B> {
         let batch_size = num_samples;
 
         let seed = self.config.optimization.seed;
-        B::seed(&self.device, seed);
+        self.device.seed(seed);
 
         // Flatten input data
         let train_data: Vec<F> = data.into_iter().flatten().collect();
@@ -329,7 +327,7 @@ impl<B: AutodiffBackend> Umap<B> {
             .build()
             .unwrap();
 
-        let model: UMAPModel<B> = UMAPModel::new(&model_config, &self.device);
+        let model = UMAPModel::new(&model_config, &self.device);
 
         // Build training config from UmapConfig
         let (kernel_a, kernel_b) =
@@ -361,7 +359,7 @@ impl<B: AutodiffBackend> Umap<B> {
 
         // Use the sparse training path (O(n·k) per epoch) by default.
         // Falls back to dense path only if explicitly requested in the future.
-        let (model, _losses, _best_loss): (UMAPModel<B>, Vec<F>, F) = train::train_sparse(
+        let (model, _losses, _best_loss): (UMAPModel, Vec<F>, F) = train::train_sparse(
             default_name,
             model,
             num_samples,
@@ -392,7 +390,7 @@ impl<B: AutodiffBackend> Umap<B> {
         labels: Option<Vec<String>>,
         exit_rx: Receiver<()>,
         on_progress: Box<dyn Fn(EpochProgress) + Send>,
-    ) -> FittedUmap<B>
+    ) -> FittedUmap
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
@@ -404,7 +402,7 @@ impl<B: AutodiffBackend> Umap<B> {
         let batch_size = num_samples;
 
         let seed = self.config.optimization.seed;
-        B::seed(&self.device, seed);
+        self.device.seed(seed);
 
         let train_data: Vec<F> = data.into_iter().flatten().collect();
 
@@ -415,7 +413,7 @@ impl<B: AutodiffBackend> Umap<B> {
             .build()
             .unwrap();
 
-        let model: UMAPModel<B> = UMAPModel::new(&model_config, &self.device);
+        let model = UMAPModel::new(&model_config, &self.device);
 
         let (kernel_a, kernel_b) =
             train::fit_ab(self.config.manifold.min_dist, self.config.manifold.spread);
@@ -444,7 +442,7 @@ impl<B: AutodiffBackend> Umap<B> {
             figures_dir: self.config.optimization.figures_dir.clone(),
         };
 
-        let (model, _losses, _best_loss): (UMAPModel<B>, Vec<F>, F) = train::train_sparse(
+        let (model, _losses, _best_loss): (UMAPModel, Vec<F>, F) = train::train_sparse(
             default_name,
             model,
             num_samples,
@@ -469,17 +467,18 @@ impl<B: AutodiffBackend> Umap<B> {
 
     /// Shared finalization: extract embedding from trained model.
     fn finalize<F: Float>(
-        model: UMAPModel<B>,
+        model: UMAPModel,
         train_data: Vec<F>,
         num_samples: usize,
         num_features: usize,
-        device: Device<B>,
+        device: Device,
         config: UmapConfig,
-    ) -> FittedUmap<B>
+    ) -> FittedUmap
     where
         F: num::FromPrimitive + burn::tensor::Element,
     {
-        let model: UMAPModel<B::InnerBackend> = model.valid();
+        let model = model.valid();
+        let device = device.without_autodiff();
 
         let mut normalized_data = train_data;
         let (feature_mean, feature_std) =
@@ -512,9 +511,9 @@ impl<B: AutodiffBackend> Umap<B> {
 /// Because this is a parametric UMAP (neural network), it can project unseen
 /// data through [`transform`](FittedUmap::transform) — unlike classical UMAP
 /// implementations.
-pub struct FittedUmap<B: AutodiffBackend> {
-    model: UMAPModel<B::InnerBackend>,
-    device: Device<B>,
+pub struct FittedUmap {
+    model: UMAPModel,
+    device: Device,
     config: UmapConfig,
     embedding: Vec<Vec<f64>>,
     num_features: usize,
@@ -522,7 +521,7 @@ pub struct FittedUmap<B: AutodiffBackend> {
     feature_std: Vec<f64>,
 }
 
-impl<B: AutodiffBackend> FittedUmap<B> {
+impl FittedUmap {
     /// Get the computed embedding for the training data.
     ///
     /// Returns a reference to the embedding coordinates. Each inner vector
@@ -581,7 +580,7 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     /// # Returns
     ///
     /// A 2D tensor of shape `[n_new_samples, n_components]`.
-    pub fn transform_to_tensor(&self, data: Vec<Vec<f64>>) -> Tensor<B::InnerBackend, 2> {
+    pub fn transform_to_tensor(&self, data: Vec<Vec<f64>>) -> Tensor<2> {
         if data.is_empty() {
             return Tensor::from_data(
                 burn::tensor::TensorData::new(Vec::<f64>::new(), [0, self.config.n_components]),
@@ -632,10 +631,9 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     ///
     /// ```ignore
     /// use fast_umap::prelude::*;
-    /// use burn::backend::Wgpu;
     ///
     /// let config = UmapConfig::default();
-    /// let umap = Umap::<Wgpu>::new(config);
+    /// let umap = Umap::new(config);
     /// let fitted = umap.fit(data, None);
     /// fitted.save("model.umap").expect("Failed to save model");
     /// ```
@@ -643,7 +641,7 @@ impl<B: AutodiffBackend> FittedUmap<B> {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        serialize::save_model::<B>(&self.model, path)
+        serialize::save_model(&self.model, path)
     }
 
     /// Load a model's weights from a file into a new FittedUmap instance.
@@ -669,21 +667,22 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     ///
     /// ```ignore
     /// use fast_umap::prelude::*;
-    /// use burn::backend::Wgpu;
     ///
     /// // Load a previously saved model
     /// let config = UmapConfig::default();
     /// let device = Default::default();
     /// let input_size = 100; // Must match the data used during training
-    /// let fitted = FittedUmap::<Wgpu>::load("model.umap", config, input_size, device)?;
+    /// let fitted = FittedUmap::load("model.umap", config, input_size, device)?;
     /// let embedding = fitted.transform(new_data);
     /// ```
     pub fn load(
         path: impl AsRef<std::path::Path>,
         config: UmapConfig,
         input_size: usize,
-        device: Device<B>,
+        device: Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = device.without_autodiff();
+
         // Create a new model with the same architecture
         let model_config = UMAPModelConfigBuilder::default()
             .input_size(input_size)
@@ -691,10 +690,10 @@ impl<B: AutodiffBackend> FittedUmap<B> {
             .output_size(config.n_components)
             .build()?;
 
-        let mut model: UMAPModel<B::InnerBackend> = UMAPModel::new(&model_config, &device);
+        let mut model = UMAPModel::new(&model_config, &device);
 
         // Load the weights
-        serialize::load_model::<B>(&mut model, path, &device)?;
+        serialize::load_model(&mut model, path, &device)?;
 
         // Create a FittedUmap instance (embedding will be empty since we don't have training data)
         Ok(Self {
@@ -728,19 +727,18 @@ impl<B: AutodiffBackend> FittedUmap<B> {
     ///
     /// ```ignore
     /// use fast_umap::prelude::*;
-    /// use burn::backend::Wgpu;
     ///
     /// // Load a previously saved model
     /// let config = UmapConfig::default();
     /// let device = Default::default();
     /// let sample = vec![1.0, 2.0, 3.0]; // Same dimensionality as training data
-    /// let fitted = FittedUmap::<Wgpu>::load_with_sample("model.umap", config, sample, device)?;
+    /// let fitted = FittedUmap::load_with_sample("model.umap", config, sample, device)?;
     /// ```
     pub fn load_with_sample(
         path: impl AsRef<std::path::Path>,
         config: UmapConfig,
         sample_data: Vec<f64>,
-        device: Device<B>,
+        device: Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let input_size = sample_data.len();
         Self::load(path, config, input_size, device)
@@ -753,18 +751,18 @@ impl<B: AutodiffBackend> FittedUmap<B> {
 ///
 /// This struct is provided for backward compatibility. New code should use
 /// the [`Umap`] / [`FittedUmap`] API which mirrors `umap-rs`.
-pub struct UMAP<B: AutodiffBackend> {
-    model: UMAPModel<B::InnerBackend>,
-    device: Device<B>,
+pub struct UMAP {
+    model: UMAPModel,
+    device: Device,
 }
 
-impl<B: AutodiffBackend> UMAP<B> {
+impl UMAP {
     /// Trains the UMAP model on the given data and returns a fitted UMAP model.
     ///
     /// **Deprecated**: Use `Umap::new(config).fit(data, None)` instead.
     pub fn fit<F: Float>(
         data: Vec<Vec<F>>,
-        device: Device<B>,
+        device: Device,
         output_size: usize,
         exit_rx: Receiver<()>,
     ) -> Self
@@ -782,7 +780,8 @@ impl<B: AutodiffBackend> UMAP<B> {
         let epochs = 100;
         let seed = 9999;
 
-        B::seed(&device, seed);
+        let device = device.autodiff();
+        device.seed(seed);
 
         let train_data: Vec<F> = data.into_iter().flatten().collect();
 
@@ -793,7 +792,7 @@ impl<B: AutodiffBackend> UMAP<B> {
             .build()
             .unwrap();
 
-        let model: UMAPModel<B> = UMAPModel::new(&model_config, &device);
+        let model = UMAPModel::new(&model_config, &device);
 
         let config = TrainingConfig::builder()
             .with_epochs(epochs)
@@ -804,25 +803,26 @@ impl<B: AutodiffBackend> UMAP<B> {
             .build()
             .expect("Failed to build TrainingConfig");
 
-        let (model, _losses, _best_loss): (UMAPModel<B>, Vec<F>, F) = train(
+        let (model, _losses, _best_loss): (UMAPModel, Vec<F>, F) = train(
             default_name,
             model,
             num_samples,
             num_features,
-            train_data.clone(),
+            train_data,
             &config,
             device.clone(),
             exit_rx,
             None,
         );
 
-        let model: UMAPModel<B::InnerBackend> = model.valid();
+        let model = model.valid();
+        let device = device.without_autodiff();
 
         UMAP { model, device }
     }
 
     /// Transforms the input data to a tensor using the trained UMAP model.
-    pub fn transform_to_tensor(&self, data: Vec<Vec<f64>>) -> Tensor<B::InnerBackend, 2> {
+    pub fn transform_to_tensor(&self, data: Vec<Vec<f64>>) -> Tensor<2> {
         let num_samples = data.len();
         let num_features = data[0].len();
 

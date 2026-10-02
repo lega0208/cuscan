@@ -4,18 +4,7 @@
 //! runtime, and exposes basic CUDA device discovery helpers.
 
 #[cfg(test)]
-use burn::tensor::{Tensor, TensorData, TensorPrimitive};
-
-use crate::backend::{AutodiffBackend, Backend};
-
-/// CubeCL backend using Burn's CUDA runtime and its default element types.
-pub type Cuda = burn::backend::Cuda<f32, i32>;
-
-/// CUDA backend wrapped with Burn's automatic differentiation support.
-pub type CudaAutodiff = burn::backend::Autodiff<Cuda>;
-
-/// Burn's CUDA device type.
-pub use burn::backend::cuda::CudaDevice;
+use burn::tensor::{Int, Tensor, TensorData};
 
 /// Return the number of CUDA devices visible to the CUDA driver.
 ///
@@ -35,21 +24,52 @@ pub fn is_available() -> bool {
 }
 
 /// Return a CUDA device by index, or `None` when the driver is unavailable or the index is out of range.
-pub fn device(index: usize) -> Option<CudaDevice> {
-    (index < device_count()).then(|| CudaDevice::new(index))
+pub fn device(index: usize) -> Option<burn::tensor::Device> {
+    (index < device_count()).then(|| burn::tensor::Device::cuda(index))
 }
-
-const _: fn() = || {
-    fn assert_autodiff_backend<B: AutodiffBackend>() {}
-    assert_autodiff_backend::<CudaAutodiff>();
-};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use crate::backend::UmapOps;
+    use burn::backend::Dispatch;
+    use rand::RngExt;
 
-    fn available_device_or_skip() -> Option<CudaDevice> {
+    fn pairwise_distance(x: Tensor<2>) -> Tensor<2> {
+        Tensor::from_dispatch(<Dispatch as UmapOps>::euclidean_pairwise_distance(
+            x.into_dispatch(),
+        ))
+    }
+
+    fn knn(x: Tensor<2>, k: u32) -> (Tensor<2, Int>, Tensor<2>) {
+        let (indices, distances) = <Dispatch as UmapOps>::knn(x.into_dispatch(), k);
+        (
+            Tensor::from_dispatch(indices),
+            Tensor::from_dispatch(distances),
+        )
+    }
+
+    fn knn_backward(pairwise: Tensor<2>, k: u32, grad: Tensor<2>) -> Tensor<2> {
+        Tensor::from_dispatch(<Dispatch as UmapOps>::knn_backward(
+            pairwise.into_dispatch(),
+            k,
+            grad.into_dispatch(),
+        ))
+    }
+
+    fn euclidean_pairwise_distance_backward(
+        grad_pairwise: Tensor<2>,
+        points: Tensor<2>,
+        pairwise: Tensor<2>,
+    ) -> Tensor<2> {
+        Tensor::from_dispatch(<Dispatch as UmapOps>::euclidean_pairwise_distance_backward(
+            grad_pairwise.into_dispatch(),
+            points.into_dispatch(),
+            pairwise.into_dispatch(),
+        ))
+    }
+
+    fn available_device_or_skip() -> Option<burn::tensor::Device> {
         if !is_available() {
             if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
                 panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
@@ -76,30 +96,23 @@ mod tests {
             return;
         };
 
-        let points = Tensor::<CudaAutodiff, 2>::from_data(
+        let device = device.autodiff();
+        let points = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 0.0, 3.0, 0.0, 0.0, 4.0], [3, 2]),
             &device,
         );
-        let distances = <CudaAutodiff as Backend>::euclidean_pairwise_distance(
-            points.into_primitive().tensor(),
-        );
-        let distance_tensor: Tensor<CudaAutodiff, 2> =
-            Tensor::from_primitive(TensorPrimitive::Float(distances));
-        let actual_distances = distance_tensor.to_data().to_vec::<f32>().unwrap();
+        let distance_tensor = pairwise_distance(points);
+        let actual_distances = distance_tensor.to_data().try_to_vec::<f32>().unwrap();
         let expected_distances = [0.0, 3.0, 4.0, 3.0, 0.0, 5.0, 4.0, 5.0, 0.0];
         for (actual, expected) in actual_distances.iter().zip(expected_distances) {
             assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
         }
 
-        let (indices, nearest_distances) =
-            <CudaAutodiff as Backend>::knn(distance_tensor.into_primitive().tensor(), 1);
-        let indices: Tensor<CudaAutodiff, 2, burn::tensor::Int> = Tensor::from_primitive(indices);
-        let actual_indices = indices.to_data().to_vec::<i32>().unwrap();
+        let (indices, nearest_distances) = knn(distance_tensor, 1);
+        let actual_indices = indices.to_data().try_to_vec::<i32>().unwrap();
         assert_eq!(actual_indices, [1, 0, 0]);
 
-        let nearest_distances: Tensor<CudaAutodiff, 2> =
-            Tensor::from_primitive(TensorPrimitive::Float(nearest_distances));
-        let actual_nearest_distances = nearest_distances.to_data().to_vec::<f32>().unwrap();
+        let actual_nearest_distances = nearest_distances.to_data().try_to_vec::<f32>().unwrap();
         assert_eq!(actual_nearest_distances, [3.0, 3.0, 4.0]);
     }
 
@@ -110,7 +123,7 @@ mod tests {
         };
 
         // Distances for points at 0, 1, 4, 10, 18, and 29 on a line.
-        let pairwise = Tensor::<Cuda, 2>::from_data(
+        let pairwise = Tensor::<2>::from_data(
             TensorData::new(
                 vec![
                     0.0f32, 1.0, 4.0, 10.0, 18.0, 29.0, 1.0, 0.0, 3.0, 9.0, 17.0, 28.0, 4.0, 3.0,
@@ -121,15 +134,13 @@ mod tests {
             ),
             &device,
         );
-        let (indices, distances) = <Cuda as Backend>::knn(pairwise.into_primitive().tensor(), 3);
-        let indices: Tensor<Cuda, 2, burn::tensor::Int> = Tensor::from_primitive(indices);
+        let (indices, distances) = knn(pairwise, 3);
         assert_eq!(
-            indices.to_data().to_vec::<i32>().unwrap(),
+            indices.to_data().try_to_vec::<i32>().unwrap(),
             [1, 2, 3, 0, 2, 3, 1, 0, 3, 2, 4, 1, 3, 5, 2, 4, 3, 2]
         );
 
-        let distances: Tensor<Cuda, 2> = Tensor::from_primitive(TensorPrimitive::Float(distances));
-        let actual_distances = distances.to_data().to_vec::<f32>().unwrap();
+        let actual_distances = distances.to_data().try_to_vec::<f32>().unwrap();
         assert_eq!(
             actual_distances,
             [
@@ -151,20 +162,15 @@ mod tests {
             return;
         };
 
-        let pairwise = Tensor::<Cuda, 2>::from_data(
+        let pairwise = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 3.0, 4.0, 3.0, 0.0, 5.0, 4.0, 5.0, 0.0], [3, 3]),
             &device,
         );
         let grad_output =
-            Tensor::<Cuda, 2>::from_data(TensorData::new(vec![1.0f32, 1.0, 1.0], [3, 1]), &device);
-        let grad = <Cuda as Backend>::knn_backward(
-            pairwise.into_primitive().tensor(),
-            1,
-            grad_output.into_primitive().tensor(),
-        );
-        let grad: Tensor<Cuda, 2> = Tensor::from_primitive(TensorPrimitive::Float(grad));
+            Tensor::<2>::from_data(TensorData::new(vec![1.0f32, 1.0, 1.0], [3, 1]), &device);
+        let grad = knn_backward(pairwise, 1, grad_output);
         assert_eq!(
-            grad.to_data().to_vec::<f32>().unwrap(),
+            grad.to_data().try_to_vec::<f32>().unwrap(),
             [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
         );
     }
@@ -176,7 +182,7 @@ mod tests {
         };
 
         // Four points on a line at 0, 2, 5, and 11 have unambiguous top-2 neighbors.
-        let pairwise = Tensor::<Cuda, 2>::from_data(
+        let pairwise = Tensor::<2>::from_data(
             TensorData::new(
                 vec![
                     0.0f32, 2.0, 5.0, 11.0, 2.0, 0.0, 3.0, 9.0, 5.0, 3.0, 0.0, 6.0, 11.0, 9.0, 6.0,
@@ -186,18 +192,13 @@ mod tests {
             ),
             &device,
         );
-        let grad_output = Tensor::<Cuda, 2>::from_data(
+        let grad_output = Tensor::<2>::from_data(
             TensorData::new(vec![1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0], [4, 2]),
             &device,
         );
-        let grad = <Cuda as Backend>::knn_backward(
-            pairwise.into_primitive().tensor(),
-            2,
-            grad_output.into_primitive().tensor(),
-        );
-        let grad: Tensor<Cuda, 2> = Tensor::from_primitive(TensorPrimitive::Float(grad));
+        let grad = knn_backward(pairwise, 2, grad_output);
         assert_eq!(
-            grad.to_data().to_vec::<f32>().unwrap(),
+            grad.to_data().try_to_vec::<f32>().unwrap(),
             [0.0, 1.0, 10.0, 0.0, 2.0, 0.0, 20.0, 0.0, 30.0, 3.0, 0.0, 0.0, 0.0, 40.0, 4.0, 0.0]
         );
     }
@@ -208,25 +209,20 @@ mod tests {
             return;
         };
 
-        let points = Tensor::<Cuda, 2>::from_data(
+        let points = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 0.0, 3.0, 0.0], [2, 2]),
             &device,
         );
-        let pairwise = Tensor::<Cuda, 2>::from_data(
+        let pairwise = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 3.0, 3.0, 0.0], [2, 2]),
             &device,
         );
-        let grad_pairwise = Tensor::<Cuda, 2>::from_data(
+        let grad_pairwise = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 1.0, 0.0, 0.0], [2, 2]),
             &device,
         );
-        let grad = <Cuda as Backend>::euclidean_pairwise_distance_backward(
-            grad_pairwise.into_primitive().tensor(),
-            points.into_primitive().tensor(),
-            pairwise.into_primitive().tensor(),
-        );
-        let grad: Tensor<Cuda, 2> = Tensor::from_primitive(TensorPrimitive::Float(grad));
-        let actual = grad.to_data().to_vec::<f32>().unwrap();
+        let grad = euclidean_pairwise_distance_backward(grad_pairwise, points, pairwise);
+        let actual = grad.to_data().try_to_vec::<f32>().unwrap();
         for (actual, expected) in actual.iter().zip([-1.0, 0.0, 1.0, 0.0]) {
             assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
         }
@@ -257,7 +253,7 @@ mod tests {
             ..Default::default()
         };
 
-        let fitted = crate::Umap::<CudaAutodiff>::with_device(config, device).fit(data, None);
+        let fitted = crate::Umap::with_device(config, device.autodiff()).fit(data, None);
         let embedding = fitted.embedding();
         assert_eq!(embedding.len(), 50);
         assert!(embedding.iter().all(|row| row.len() == 2));
@@ -293,14 +289,14 @@ mod tests {
             ..Default::default()
         };
 
-        let fitted = crate::Umap::<CudaAutodiff>::with_device(config.clone(), device.clone())
+        let fitted = crate::Umap::with_device(config.clone(), device.clone().autodiff())
             .fit(data.clone(), None);
         let temp_dir = tempfile::Builder::new()
             .prefix("fast-umap-cuda-")
             .tempdir_in(std::env::temp_dir())?;
         let model_path = temp_dir.path().join("model.bin");
         fitted.save(&model_path)?;
-        let loaded = crate::FittedUmap::<CudaAutodiff>::load(&model_path, config, 2, device)?;
+        let loaded = crate::FittedUmap::load(&model_path, config, 2, device.autodiff())?;
 
         let original_embedding = fitted.transform(data.clone());
         let loaded_embedding = loaded.transform(data);

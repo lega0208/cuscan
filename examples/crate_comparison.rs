@@ -11,28 +11,15 @@
 ///
 /// Each crate is timed end-to-end: data prep → fit → extract embedding.
 /// The comparison is run across several dataset sizes.
-use std::{
-    fs,
-    io::Write as _,
-    path::Path,
-    time::Instant,
-};
+use std::{fs, io::Write as _, path::Path, time::Instant};
 
-use ndarray_017 as ndarray;
+use ndarray;
 
 // ── fast-umap imports ────────────────────────────────────────────────────────
-use fast_umap::{
-    utils::generate_test_data,
-    Umap, UmapConfig, GraphParams, OptimizationParams,
-};
+use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
 
 // ── umap-rs imports ──────────────────────────────────────────────────────────
 use umap_rs::{Umap as UmapRs, UmapConfig as UmapRsConfig};
-
-// ── burn backend ─────────────────────────────────────────────────────────────
-type GpuBackend =
-    burn::backend::wgpu::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
-type MyAutodiffBackend = burn::backend::Autodiff<GpuBackend>;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -152,7 +139,7 @@ fn compute_knn(
 
 /// Random initialization for umap-rs
 fn random_init(n_samples: usize, n_components: usize) -> ndarray::Array2<f32> {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     ndarray::Array2::from_shape_fn((n_samples, n_components), |_| {
         rng.random_range(-10.0f32..10.0)
@@ -202,7 +189,7 @@ fn run_fast_umap(sc: &Scenario) -> TimingResult {
 
     let (exit_tx, exit_rx) = crossbeam_channel::unbounded();
     // Don't set ctrlc handler here — may already be set
-    let umap = Umap::<MyAutodiffBackend>::new(config);
+    let umap = Umap::new(config);
     let fitted = umap.fit_with_signal(data, None, exit_rx);
     let fit_secs = fit_start.elapsed().as_secs_f64();
 
@@ -301,8 +288,12 @@ fn write_md(path: &str, results: &[TimingResult]) {
 
     let scenarios = scenarios();
     for sc in &scenarios {
-        let fu = results.iter().find(|r| r.scenario == sc.label && r.crate_name == "fast-umap");
-        let ur = results.iter().find(|r| r.scenario == sc.label && r.crate_name == "umap-rs");
+        let fu = results
+            .iter()
+            .find(|r| r.scenario == sc.label && r.crate_name == "fast-umap");
+        let ur = results
+            .iter()
+            .find(|r| r.scenario == sc.label && r.crate_name == "umap-rs");
         if let (Some(fu), Some(ur)) = (fu, ur) {
             let speedup = ur.total_secs / fu.total_secs;
             let icon = if speedup > 1.0 { "🚀" } else { "" };
@@ -320,8 +311,12 @@ fn write_md(path: &str, results: &[TimingResult]) {
     );
 
     for sc in &scenarios {
-        let fu = results.iter().find(|r| r.scenario == sc.label && r.crate_name == "fast-umap");
-        let ur = results.iter().find(|r| r.scenario == sc.label && r.crate_name == "umap-rs");
+        let fu = results
+            .iter()
+            .find(|r| r.scenario == sc.label && r.crate_name == "fast-umap");
+        let ur = results
+            .iter()
+            .find(|r| r.scenario == sc.label && r.crate_name == "umap-rs");
         if let (Some(fu), Some(ur)) = (fu, ur) {
             let speedup = ur.fit_secs / fu.fit_secs;
             let icon = if speedup > 1.0 { "🚀" } else { "" };
@@ -334,8 +329,12 @@ fn write_md(path: &str, results: &[TimingResult]) {
 
     md.push_str("\n---\n\n");
     md.push_str("**Notes:**\n");
-    md.push_str("- fast-umap is a *parametric* UMAP (neural network, GPU-accelerated via burn/CubeCL)\n");
-    md.push_str("- umap-rs is a *classical* UMAP (SGD on embedding, CPU, multithreaded via rayon)\n");
+    md.push_str(
+        "- fast-umap is a *parametric* UMAP (neural network, GPU-accelerated via burn/CubeCL)\n",
+    );
+    md.push_str(
+        "- umap-rs is a *classical* UMAP (SGD on embedding, CPU, multithreaded via rayon)\n",
+    );
     md.push_str("- fast-umap includes batch-local KNN computation; umap-rs requires precomputed KNN (included in total time)\n");
     md.push_str("- fast-umap can `transform()` new unseen data; umap-rs cannot (yet)\n");
 
@@ -380,7 +379,11 @@ fn write_svg(path: &str, results: &[TimingResult]) {
     let w = &mut out;
 
     writeln!(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SVG_W}\" height=\"{svg_h:.0}\" font-family=\"system-ui, -apple-system, sans-serif\">").unwrap();
-    writeln!(w, "<rect width=\"{SVG_W}\" height=\"{svg_h:.0}\" fill=\"#FAFAFA\"/>").unwrap();
+    writeln!(
+        w,
+        "<rect width=\"{SVG_W}\" height=\"{svg_h:.0}\" fill=\"#FAFAFA\"/>"
+    )
+    .unwrap();
 
     // Title
     writeln!(
@@ -450,7 +453,8 @@ fn write_svg(path: &str, results: &[TimingResult]) {
                 cx + bw + 5.0,
                 by_base + BAR_H / 2.0 + 3.5,
                 fu.total_secs,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // umap-rs bar
@@ -467,7 +471,8 @@ fn write_svg(path: &str, results: &[TimingResult]) {
                 cx + bw + 5.0,
                 ur_by + BAR_H / 2.0 + 3.5,
                 ur.total_secs,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Speedup label
@@ -604,18 +609,9 @@ fn main() {
     let results_dir = "figures";
     println!("━━━  Writing results  ━━━");
 
-    write_json(
-        &format!("{results_dir}/crate_comparison.json"),
-        &results,
-    );
-    write_md(
-        &format!("{results_dir}/crate_comparison.md"),
-        &results,
-    );
-    write_svg(
-        &format!("{results_dir}/crate_comparison.svg"),
-        &results,
-    );
+    write_json(&format!("{results_dir}/crate_comparison.json"), &results);
+    write_md(&format!("{results_dir}/crate_comparison.md"), &results);
+    write_svg(&format!("{results_dir}/crate_comparison.svg"), &results);
 
     println!();
     println!("✓  Done. Results in {results_dir}/crate_comparison.*");

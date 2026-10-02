@@ -1,10 +1,6 @@
-use cubecl::wgpu::WgpuRuntime;
 use fast_umap::prelude::*;
-use fast_umap::{Umap, FittedUmap};
+use fast_umap::{FittedUmap, Umap};
 use std::path::PathBuf;
-
-type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate some test data
@@ -17,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     println!("Training UMAP model...");
-    
+
     // Configure and fit UMAP
     let config = UmapConfig {
         n_components: 2,
@@ -28,10 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..Default::default()
     };
-    
-    let umap = Umap::<MyAutodiffBackend>::new(config.clone());
+
+    let umap = Umap::new(config.clone());
     let fitted = umap.fit(data.clone(), None);
-    
+
     println!("Original embedding:");
     let embedding = fitted.embedding();
     for (i, point) in embedding.iter().enumerate() {
@@ -46,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the model
     println!("\nLoading model from {:?}...", model_path);
-    let loaded_fitted = FittedUmap::<MyAutodiffBackend>::load(
+    let loaded_fitted = FittedUmap::load(
         &model_path,
         config,
         4, // Input size (number of features)
@@ -55,10 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model loaded successfully!");
 
     // Test the loaded model with some new data
-    let new_data: Vec<Vec<f64>> = vec![
-        vec![1.5, 2.5, 3.5, 4.5],
-        vec![2.5, 3.5, 4.5, 5.5],
-    ];
+    let new_data: Vec<Vec<f64>> = vec![vec![1.5, 2.5, 3.5, 4.5], vec![2.5, 3.5, 4.5, 5.5]];
 
     println!("\nTransforming new data with loaded model:");
     let new_embedding = loaded_fitted.transform(new_data);

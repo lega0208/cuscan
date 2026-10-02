@@ -1,24 +1,26 @@
 /// Compare UMAP training with PCA warm-start enabled.
 ///
 /// Usage:
-///     cargo run --release --features mlx --example pca_comparison
+///     cargo run --release --features gpu,pca --example pca_comparison
 use std::time::Instant;
 
-use fast_umap::{
-    utils::generate_test_data,
-    Umap, UmapConfig, GraphParams, OptimizationParams,
-};
+use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
 
-#[cfg(feature = "mlx")]
-type Backend = burn::backend::Autodiff<burn_mlx::Mlx>;
-#[cfg(all(feature = "gpu", not(feature = "mlx")))]
-type Backend = burn::backend::Autodiff<
-    burn::backend::wgpu::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>,
->;
+fn device() -> burn::tensor::Device {
+    #[cfg(feature = "gpu")]
+    {
+        burn::tensor::Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        burn::tensor::Device::flex()
+    }
+}
 
 fn run(n_samples: usize, n_features: usize, epochs: usize) {
     let flat: Vec<f32> = generate_test_data(n_samples, n_features);
-    let data: Vec<Vec<f64>> = flat.chunks(n_features)
+    let data: Vec<Vec<f64>> = flat
+        .chunks(n_features)
         .map(|c| c.iter().map(|&x| x as f64).collect())
         .collect();
 
@@ -41,13 +43,17 @@ fn run(n_samples: usize, n_features: usize, epochs: usize) {
 
     let start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
-    let umap = Umap::<Backend>::new(config);
+    let umap = Umap::with_device(config, device());
     let fitted = umap.fit_with_signal(data, None, exit_rx);
     let elapsed = start.elapsed().as_secs_f64();
 
     let emb = fitted.embedding();
-    println!("\n  Result: {:.3}s, {} samples x {} dims\n",
-        elapsed, emb.len(), emb[0].len());
+    println!(
+        "\n  Result: {:.3}s, {} samples x {} dims\n",
+        elapsed,
+        emb.len(),
+        emb[0].len()
+    );
 }
 
 fn main() {

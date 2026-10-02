@@ -1,30 +1,27 @@
 //! Autodiff registration for custom fast-umap operations.
 //!
-//! This module wires the custom [`Backend`] trait operations into Burn's
+//! This module wires the custom [`UmapOps`] operations into Burn's
 //! autodiff graph so that `loss.backward()` correctly computes gradients
 //! through pairwise distance and k-NN computations.
 //!
-//! The code is generic over any `B: Backend` and is NOT tied to CubeCL or
-//! any specific GPU runtime — it works with MLX, WGPU, NdArray, etc.
+//! The code is generic over any `B: UmapOps` and is NOT tied to CubeCL or
+//! any specific GPU runtime — it works with Flex, WGPU, CUDA, and other
+//! supported CubeCL runtimes.
 
 use std::fmt::Debug;
 
-use burn::{
-    backend::{
-        autodiff::{
-            checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
-            grads::Gradients,
-            ops::{Backward, Ops, OpsKind},
-            NodeId,
-        },
-        Autodiff,
+use burn::backend::{
+    autodiff::{
+        checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
+        grads::Gradients,
+        ops::{Backward, Ops, OpsKind},
+        NodeId,
     },
-    tensor::ops::{FloatTensor, IntTensor},
+    tensor::{FloatTensor, IntTensor},
+    Autodiff,
 };
 
-use crate::backend::Backend;
-#[allow(unused_imports)]
-use crate::{print_if, print_primitive_tensor};
+use crate::backend::UmapOps;
 
 // ── Euclidean pairwise distance autodiff ─────────────────────────────────────
 
@@ -37,13 +34,13 @@ use crate::{print_if, print_primitive_tensor};
 /// 4. Registers the backward hook.
 ///
 /// On the **untracked** path it simply runs the forward computation.
-pub fn euclidean_pairwise_distance_backward<B: Backend, C: CheckpointStrategy>(
+pub fn euclidean_pairwise_distance_backward<B: UmapOps, C: CheckpointStrategy>(
     x: FloatTensor<Autodiff<B, C>>,
 ) -> FloatTensor<Autodiff<B, C>> {
     #[derive(Debug)]
     struct EuclideanPairwiseDistanceBackward;
 
-    impl<B: Backend> Backward<B, 1> for EuclideanPairwiseDistanceBackward {
+    impl<B: UmapOps> Backward<B, 1> for EuclideanPairwiseDistanceBackward {
         type State = (NodeId, FloatTensor<B>);
 
         fn backward(
@@ -61,18 +58,18 @@ pub fn euclidean_pairwise_distance_backward<B: Backend, C: CheckpointStrategy>(
     }
 
     match EuclideanPairwiseDistanceBackward
-        .prepare::<C>([x.node.clone()])
+        .prepare::<C>([x.node()])
         .compute_bound()
         .stateful()
     {
         OpsKind::Tracked(mut prep) => {
             let x_state = prep.checkpoint(&x);
-            let pairwise = B::euclidean_pairwise_distance(x.clone().primitive);
+            let pairwise = B::euclidean_pairwise_distance(x.primitive().clone());
             let state = (x_state, pairwise.clone());
             prep.finish(state, pairwise)
         }
         OpsKind::UnTracked(prep) => {
-            let output = B::euclidean_pairwise_distance(x.primitive);
+            let output = B::euclidean_pairwise_distance(x.into_primitive());
             prep.finish(output)
         }
     }
@@ -86,16 +83,14 @@ pub fn euclidean_pairwise_distance_backward<B: Backend, C: CheckpointStrategy>(
 /// k-NN, and registers the backward hook.
 ///
 /// On the **untracked** path: runs the forward pass only.
-pub fn knn_backward<B: Backend, C: CheckpointStrategy>(
+pub fn knn_backward<B: UmapOps, C: CheckpointStrategy>(
     pairwise_distances: FloatTensor<Autodiff<B, C>>,
     k: u32,
 ) -> (IntTensor<Autodiff<B, C>>, FloatTensor<Autodiff<B, C>>) {
-    const VERBOSE: bool = false;
-
     #[derive(Debug)]
     struct KnnBackward;
 
-    impl<B: Backend> Backward<B, 1> for KnnBackward {
+    impl<B: UmapOps> Backward<B, 1> for KnnBackward {
         type State = (NodeId, u32);
 
         fn backward(
@@ -109,80 +104,36 @@ pub fn knn_backward<B: Backend, C: CheckpointStrategy>(
             let pairwise_distances: FloatTensor<B> =
                 checkpointer.retrieve_node_output(node_pairwise_distances);
 
-            if VERBOSE {
-                println!("grad_output {grad_output:?}");
-                print_primitive_tensor::<B>(&grad_output, 10, 10);
-                println!("pairwise_distances {pairwise_distances:?}");
-                print_primitive_tensor::<B>(&pairwise_distances, 10, 10);
-            }
-
             let grad_pairwise_distances = B::knn_backward(pairwise_distances, k, grad_output);
-
-            if VERBOSE {
-                println!("===grad_pairwise_distances=== {grad_pairwise_distances:?}");
-                print_primitive_tensor::<B>(&grad_pairwise_distances, 0, 0);
-            }
-
             grads.register::<B>(node_pairwise_distances, grad_pairwise_distances);
         }
     }
 
-    // Indices branch
-    let indicies = match KnnBackward
-        .prepare::<C>([pairwise_distances.node.clone()])
+    match KnnBackward
+        .prepare::<C>([pairwise_distances.node()])
         .compute_bound()
         .stateful()
     {
         OpsKind::Tracked(mut prep) => {
             let pairwise_distances_state = prep.checkpoint(&pairwise_distances);
-            let (indicies, _distances) = B::knn(pairwise_distances.clone().primitive, k);
+            let (indices, distances) = B::knn(pairwise_distances.into_primitive(), k);
             let state = (pairwise_distances_state, k);
-            let indicies = B::int_into_float(indicies);
-            prep.finish(state, indicies)
+            let distances = prep.finish(state, distances);
+            (indices, distances)
         }
         OpsKind::UnTracked(prep) => {
-            let (indicies, _distances) = B::knn(pairwise_distances.clone().primitive, k);
-            let indicies = B::int_into_float(indicies);
-            prep.finish(indicies)
+            let (indices, distances) = B::knn(pairwise_distances.into_primitive(), k);
+            (indices, prep.finish(distances))
         }
-    };
-
-    // Distances branch
-    let distances = match KnnBackward
-        .prepare::<C>([pairwise_distances.node.clone()])
-        .compute_bound()
-        .stateful()
-    {
-        OpsKind::Tracked(mut prep) => {
-            let pairwise_distances_state = prep.checkpoint(&pairwise_distances);
-            let (_indicies, distances) = B::knn(pairwise_distances.clone().primitive, k);
-            let state = (pairwise_distances_state, k);
-            prep.finish(state, distances)
-        }
-        OpsKind::UnTracked(prep) => {
-            let (_indicies, distances) = B::knn(pairwise_distances.clone().primitive, k);
-            prep.finish(distances)
-        }
-    };
-
-    // Convert indices from float back to int
-    let inner_tensor = indicies.into_primitive();
-    let int_tensor = B::float_into_int(inner_tensor);
-    let indicies: IntTensor<Autodiff<B, C>> = IntTensor::<Autodiff<B, C>>::from(int_tensor);
-
-    (indicies, distances)
+    }
 }
 
 // ── Autodiff Backend impl ────────────────────────────────────────────────────
 
-/// Implementation of the fast-umap [`Backend`] trait for [`Autodiff`]-wrapped
-/// backends.
+/// Handwritten autodiff implementation for Burn's dynamic custom-op dispatch.
 ///
-/// This is generic over any `B: Backend` — it works with CubeBackend (WGPU),
-/// MLX, or any other backend that implements the custom trait.
-impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
-    const USE_GATHER_FOR_SELECT: bool = B::USE_GATHER_FOR_SELECT;
-
+/// This preserves custom backward rules for each backend implementing `UmapOps`.
+impl<B: UmapOps, C: CheckpointStrategy> UmapOps for Autodiff<B, C> {
     fn euclidean_pairwise_distance(x: FloatTensor<Self>) -> FloatTensor<Self> {
         euclidean_pairwise_distance_backward::<B, C>(x)
     }

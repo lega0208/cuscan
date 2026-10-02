@@ -1,7 +1,7 @@
-use burn::backend::{Autodiff, NdArray};
-use fast_umap::{validate_fit_data, validate_fit_input, OptimizationParams, TrainingConfig, Umap, UmapConfig};
-
-type CpuBackend = Autodiff<NdArray<f32>>;
+use burn::tensor::Device;
+use fast_umap::{
+    validate_fit_data, validate_fit_input, OptimizationParams, TrainingConfig, Umap, UmapConfig,
+};
 
 fn sample_data() -> Vec<Vec<f32>> {
     (0..60)
@@ -16,7 +16,7 @@ fn sample_data() -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn fit(seed: u64, data: Vec<Vec<f32>>) -> fast_umap::FittedUmap<CpuBackend> {
+fn fit(seed: u64, data: Vec<Vec<f32>>) -> fast_umap::FittedUmap {
     let config = UmapConfig {
         graph: fast_umap::GraphParams {
             n_neighbors: 5,
@@ -31,11 +31,11 @@ fn fit(seed: u64, data: Vec<Vec<f32>>) -> fast_umap::FittedUmap<CpuBackend> {
         ..Default::default()
     };
     let (_exit_tx, exit_rx) = crossbeam_channel::unbounded();
-    Umap::<CpuBackend>::new(config).fit_with_signal(data, None, exit_rx)
+    Umap::with_device(config, Device::flex().autodiff()).fit_with_signal(data, None, exit_rx)
 }
 
 #[test]
-fn ndarray_fit_transform_is_finite_reproducible_and_normalized_consistently() {
+fn flex_cpu_fit_transform_is_finite_reproducible_and_normalized_consistently() {
     let data = sample_data();
     let first = fit(9999, data.clone());
     let same_seed = fit(9999, data.clone());
@@ -62,10 +62,11 @@ fn ndarray_fit_transform_is_finite_reproducible_and_normalized_consistently() {
             assert!((train_value - transformed_value).abs() <= 1e-5);
         }
     }
-    assert_eq!(
-        first.transform_to_tensor(Vec::new()).dims(),
-        [0, 2]
-    );
+    let transformed_tensor = first.transform_to_tensor(vec![vec![0.0; 5]]);
+    assert!(!transformed_tensor.device().is_autodiff());
+    let empty_tensor = first.transform_to_tensor(Vec::new());
+    assert_eq!(empty_tensor.dims(), [0, 2]);
+    assert!(!empty_tensor.device().is_autodiff());
     let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         first.transform_to_tensor(vec![vec![0.0; 4]])
     }));

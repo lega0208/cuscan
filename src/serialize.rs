@@ -1,10 +1,6 @@
-use burn::prelude::*;
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use std::fs::File;
-use std::io::{Read, Write};
+use burn::{module::Module, tensor::Device};
 use std::path::Path;
 
-use crate::backend::AutodiffBackend;
 use crate::model::UMAPModel;
 
 /// Save a UMAP model's weights to a file.
@@ -18,22 +14,20 @@ use crate::model::UMAPModel;
 ///
 /// ```ignore
 /// use fast_umap::prelude::*;
-/// use burn::backend::Wgpu;
-///
+/// use burn::tensor::Device;
+/// let device = Device::flex();
 /// let config = UmapConfig::default();
-/// let umap = Umap::<Wgpu>::new(config);
+/// let umap = Umap::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);
 /// fitted.save("model.umap").expect("Failed to save model");
 /// ```
-pub fn save_model<B: AutodiffBackend>(
-    model: &UMAPModel<B::InnerBackend>,
+pub fn save_model(
+    model: &UMAPModel,
     path: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let path_buf = path.as_ref().to_path_buf();
     model
         .clone()
-        .save_file(path_buf, &recorder)
+        .save_file(path)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
@@ -49,26 +43,25 @@ pub fn save_model<B: AutodiffBackend>(
 ///
 /// ```ignore
 /// use fast_umap::prelude::*;
-/// use burn::backend::Wgpu;
-///
+/// use burn::tensor::Device;
+/// let device = Device::flex();
 /// let config = UmapConfig::default();
-/// let umap = Umap::<Wgpu>::new(config);
+/// let umap = Umap::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);
 /// fitted.save("model.umap").expect("Failed to save model");
 ///
 /// // Later...
-/// let loaded_fitted = FittedUmap::<Wgpu>::load("model.umap", config, device)?;
+/// let loaded_fitted = FittedUmap::load("model.umap", config, device)?;
 /// ```
-pub fn load_model<B: AutodiffBackend>(
-    model: &mut UMAPModel<B::InnerBackend>,
+pub fn load_model(
+    model: &mut UMAPModel,
     path: impl AsRef<Path>,
-    device: &Device<B>,
+    device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let path_buf = path.as_ref().to_path_buf();
     *model = model
         .clone()
-        .load_file(path_buf, &recorder, device)
+        .to_device(device)
+        .try_load_file(path)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(())
 }

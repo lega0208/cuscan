@@ -1,11 +1,8 @@
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
 fn main() {
     type F = f32;
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, F, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
-
     // Set training hyperparameters
     let num_samples = 1000;
     let num_features = 100;
@@ -38,7 +35,8 @@ fn main() {
         ..Default::default()
     };
 
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
+    let umap = Umap::with_device(config, device);
     let fitted = umap.fit(data, None);
 
     // Access the embedding

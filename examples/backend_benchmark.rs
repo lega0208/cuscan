@@ -1,32 +1,18 @@
-/// Benchmark comparison across all available backends.
+/// Benchmark the Flex CPU backend across a range of workloads.
 ///
 /// Usage:
-///     cargo run --release --features gpu,mlx,candle --example backend_benchmark
+///     cargo run --release --example backend_benchmark
 ///
 /// Output:
 ///     figures/backend_benchmark.md — Markdown summary table
 ///
-/// All backends run the same fast-umap configuration on identical datasets.
+/// Each run uses the same fast-umap configuration on its generated dataset.
 /// Timing covers end-to-end fit (including KNN precomputation and training).
-use std::{
-    io::Write as _,
-    time::Instant,
-};
-
-use fast_umap::{
-    utils::generate_test_data,
-    Umap, UmapConfig, GraphParams, OptimizationParams,
-};
-
-// ── Backend type aliases ────────────────────────────────────────────────────
+use std::{io::Write as _, time::Instant};
 
 #[cfg(feature = "gpu")]
-type WgpuAutodiff = burn::backend::Autodiff<
-    burn::backend::wgpu::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>,
->;
-
-#[cfg(feature = "mlx")]
-type MlxAutodiff = burn::backend::Autodiff<burn_mlx::Mlx>;
+use burn::tensor::{Device, DeviceKind};
+use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -44,20 +30,100 @@ struct Scenario {
 fn scenarios() -> Vec<Scenario> {
     vec![
         // ── Varying dataset size (fixed model) ─────────────────────────────
-        Scenario { label: "500x20".into(),     n_samples: 500,    n_features: 20,  n_neighbors: 10, n_components: 2, hidden_sizes: vec![64],      n_epochs: 50 },
-        Scenario { label: "1Kx50".into(),      n_samples: 1_000,  n_features: 50,  n_neighbors: 15, n_components: 2, hidden_sizes: vec![128],     n_epochs: 50 },
-        Scenario { label: "5Kx100".into(),     n_samples: 5_000,  n_features: 100, n_neighbors: 15, n_components: 2, hidden_sizes: vec![128],     n_epochs: 50 },
-        Scenario { label: "10Kx100".into(),    n_samples: 10_000, n_features: 100, n_neighbors: 15, n_components: 2, hidden_sizes: vec![128],     n_epochs: 50 },
-        Scenario { label: "20Kx100".into(),    n_samples: 20_000, n_features: 100, n_neighbors: 15, n_components: 2, hidden_sizes: vec![128],     n_epochs: 50 },
+        Scenario {
+            label: "500x20".into(),
+            n_samples: 500,
+            n_features: 20,
+            n_neighbors: 10,
+            n_components: 2,
+            hidden_sizes: vec![64],
+            n_epochs: 50,
+        },
+        Scenario {
+            label: "1Kx50".into(),
+            n_samples: 1_000,
+            n_features: 50,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
+        Scenario {
+            label: "5Kx100".into(),
+            n_samples: 5_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
+        Scenario {
+            label: "10Kx100".into(),
+            n_samples: 10_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
+        Scenario {
+            label: "20Kx100".into(),
+            n_samples: 20_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
         // ── High dimensionality ────────────────────────────────────────────
-        Scenario { label: "2Kx500".into(),     n_samples: 2_000,  n_features: 500, n_neighbors: 15, n_components: 2, hidden_sizes: vec![256],     n_epochs: 50 },
-        Scenario { label: "5Kx784".into(),     n_samples: 5_000,  n_features: 784, n_neighbors: 15, n_components: 2, hidden_sizes: vec![256],     n_epochs: 50 },
+        Scenario {
+            label: "2Kx500".into(),
+            n_samples: 2_000,
+            n_features: 500,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![256],
+            n_epochs: 50,
+        },
+        Scenario {
+            label: "5Kx784".into(),
+            n_samples: 5_000,
+            n_features: 784,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![256],
+            n_epochs: 50,
+        },
         // ── Deep network ───────────────────────────────────────────────────
-        Scenario { label: "5Kx100 deep".into(), n_samples: 5_000, n_features: 100, n_neighbors: 15, n_components: 2, hidden_sizes: vec![256, 128, 64], n_epochs: 50 },
+        Scenario {
+            label: "5Kx100 deep".into(),
+            n_samples: 5_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![256, 128, 64],
+            n_epochs: 50,
+        },
         // ── 3-D output ─────────────────────────────────────────────────────
-        Scenario { label: "5Kx100 3D".into(),  n_samples: 5_000,  n_features: 100, n_neighbors: 15, n_components: 3, hidden_sizes: vec![128],     n_epochs: 50 },
+        Scenario {
+            label: "5Kx100 3D".into(),
+            n_samples: 5_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 3,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
         // ── Large scale (NN-Descent) ───────────────────────────────────────
-        Scenario { label: "50Kx100".into(),    n_samples: 50_000, n_features: 100, n_neighbors: 15, n_components: 2, hidden_sizes: vec![128],     n_epochs: 50 },
+        Scenario {
+            label: "50Kx100".into(),
+            n_samples: 50_000,
+            n_features: 100,
+            n_neighbors: 15,
+            n_components: 2,
+            hidden_sizes: vec![128],
+            n_epochs: 50,
+        },
     ]
 }
 
@@ -99,28 +165,38 @@ struct TimingResult {
 
 // ── Runners ─────────────────────────────────────────────────────────────────
 
+fn run_flex(sc: &Scenario) -> TimingResult {
+    let total_start = Instant::now();
+    let data = gen_data(sc.n_samples, sc.n_features);
+    let fit_start = Instant::now();
+    let (_, exit_rx) = crossbeam_channel::unbounded();
+    let fitted = Umap::new(make_config(sc)).fit_with_signal(data, None, exit_rx);
+    let fit_secs = fit_start.elapsed().as_secs_f64();
+    let _ = fitted.into_embedding();
+    TimingResult {
+        scenario: sc.label.clone(),
+        backend: "Flex CPU".into(),
+        total_secs: total_start.elapsed().as_secs_f64(),
+        fit_secs,
+    }
+}
+
 #[cfg(feature = "gpu")]
 fn run_wgpu(sc: &Scenario) -> TimingResult {
     let total_start = Instant::now();
     let data = gen_data(sc.n_samples, sc.n_features);
     let fit_start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
-    let fitted = Umap::<WgpuAutodiff>::new(make_config(sc)).fit_with_signal(data, None, exit_rx);
+    let device = Device::wgpu(DeviceKind::DefaultDevice);
+    let fitted = Umap::with_device(make_config(sc), device).fit_with_signal(data, None, exit_rx);
     let fit_secs = fit_start.elapsed().as_secs_f64();
     let _ = fitted.into_embedding();
-    TimingResult { scenario: sc.label.clone(), backend: "WGPU".into(), total_secs: total_start.elapsed().as_secs_f64(), fit_secs }
-}
-
-#[cfg(feature = "mlx")]
-fn run_mlx(sc: &Scenario) -> TimingResult {
-    let total_start = Instant::now();
-    let data = gen_data(sc.n_samples, sc.n_features);
-    let fit_start = Instant::now();
-    let (_, exit_rx) = crossbeam_channel::unbounded();
-    let fitted = Umap::<MlxAutodiff>::new(make_config(sc)).fit_with_signal(data, None, exit_rx);
-    let fit_secs = fit_start.elapsed().as_secs_f64();
-    let _ = fitted.into_embedding();
-    TimingResult { scenario: sc.label.clone(), backend: "MLX".into(), total_secs: total_start.elapsed().as_secs_f64(), fit_secs }
+    TimingResult {
+        scenario: sc.label.clone(),
+        backend: "WGPU".into(),
+        total_secs: total_start.elapsed().as_secs_f64(),
+        fit_secs,
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -133,10 +209,10 @@ fn main() {
     println!();
     println!("  Epochs: 50");
 
-    let mut backends: Vec<&str> = vec![];
-    if cfg!(feature = "gpu") { backends.push("WGPU"); }
-    if cfg!(feature = "mlx") { backends.push("MLX"); }
-    println!("  Backends: {}", backends.join(", "));
+    println!(
+        "  Backends: Flex CPU{}",
+        if cfg!(feature = "gpu") { ", WGPU" } else { "" }
+    );
     println!();
 
     let scenarios = scenarios();
@@ -144,56 +220,59 @@ fn main() {
 
     // ── Warmup ──────────────────────────────────────────────────────────────
     let warmup_sc = Scenario {
-        label: "warmup".into(), n_samples: 100, n_features: 10,
-        n_neighbors: 5, n_components: 2, hidden_sizes: vec![16], n_epochs: 5,
+        label: "warmup".into(),
+        n_samples: 100,
+        n_features: 10,
+        n_neighbors: 5,
+        n_components: 2,
+        hidden_sizes: vec![16],
+        n_epochs: 5,
     };
 
+    {
+        print!("  Flex CPU warmup ... ");
+        std::io::stdout().flush().unwrap();
+        let t = Instant::now();
+        let _ = run_flex(&warmup_sc);
+        println!("done ({:.2}s)", t.elapsed().as_secs_f64());
+    }
     #[cfg(feature = "gpu")]
     {
-        print!("  WGPU warmup   ... ");
+        print!("  WGPU warmup ... ");
         std::io::stdout().flush().unwrap();
         let t = Instant::now();
         let _ = run_wgpu(&warmup_sc);
-        println!("done ({:.2}s)", t.elapsed().as_secs_f64());
-    }
-    #[cfg(feature = "mlx")]
-    {
-        print!("  MLX warmup    ... ");
-        std::io::stdout().flush().unwrap();
-        let t = Instant::now();
-        let _ = run_mlx(&warmup_sc);
         println!("done ({:.2}s)", t.elapsed().as_secs_f64());
     }
     println!();
 
     // ── Run scenarios ───────────────────────────────────────────────────────
     for sc in &scenarios {
-        let hidden_str = sc.hidden_sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+        let hidden_str = sc
+            .hidden_sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
             "---  {} ({}x{}, hidden=[{}], k={}, out={})  ---",
             sc.label, sc.n_samples, sc.n_features, hidden_str, sc.n_neighbors, sc.n_components
         );
 
+        print!("  Flex CPU ... ");
+        std::io::stdout().flush().unwrap();
+        let r = run_flex(sc);
+        println!("total={:.3}s  fit={:.3}s", r.total_secs, r.fit_secs);
+        results.push(r);
         #[cfg(feature = "gpu")]
-        {
-            // Skip 50K on WGPU — would need 10GB for pairwise matrix without nn-descent
-            if sc.n_samples <= 20_000 {
-                print!("  WGPU   ... ");
-                std::io::stdout().flush().unwrap();
-                let r = run_wgpu(sc);
-                println!("total={:.3}s  fit={:.3}s", r.total_secs, r.fit_secs);
-                results.push(r);
-            } else {
-                println!("  WGPU   ... skipped (dataset too large for O(n^2) pairwise)");
-            }
-        }
-        #[cfg(feature = "mlx")]
-        {
-            print!("  MLX    ... ");
+        if sc.n_samples <= 20_000 {
+            print!("  WGPU ... ");
             std::io::stdout().flush().unwrap();
-            let r = run_mlx(sc);
+            let r = run_wgpu(sc);
             println!("total={:.3}s  fit={:.3}s", r.total_secs, r.fit_secs);
             results.push(r);
+        } else if cfg!(feature = "gpu") {
+            println!("  WGPU ... skipped (dataset too large for O(n^2) pairwise)");
         }
         println!();
     }
@@ -203,29 +282,49 @@ fn main() {
 
     let mut md = String::new();
     md.push_str("# Backend Benchmark\n\n");
-    md.push_str("50 epochs per scenario, Apple Silicon\n\n");
-    md.push_str("| Scenario | Samples | Features | Hidden | Out | WGPU | MLX | Speedup |\n");
-    md.push_str("|----------|---------|----------|--------|-----|------|-----|--------|\n");
+    md.push_str("50 epochs per scenario\n\n");
+    md.push_str(
+        "| Scenario | Samples | Features | Hidden | Out | Flex CPU | WGPU | Flex speedup |\n",
+    );
+    md.push_str(
+        "|----------|---------|----------|--------|-----|----------|------|--------------|\n",
+    );
 
     for sc in &scenarios {
-        let wgpu = results.iter().find(|r| r.backend == "WGPU" && r.scenario == sc.label);
-        let mlx = results.iter().find(|r| r.backend == "MLX" && r.scenario == sc.label);
-
-        let wt = wgpu.map(|r| format!("{:.2}s", r.total_secs)).unwrap_or_else(|| "--".into());
-        let mt = mlx.map(|r| format!("{:.2}s", r.total_secs)).unwrap_or_else(|| "--".into());
-        let hidden_str = sc.hidden_sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
-
-        let speedup = match (wgpu, mlx) {
-            (Some(w), Some(m)) => {
-                let s = w.total_secs / m.total_secs;
-                format!("**MLX {:.1}x**", s)
-            }
-            (None, Some(_)) => "MLX only".into(),
+        let flex = results
+            .iter()
+            .find(|r| r.backend == "Flex CPU" && r.scenario == sc.label);
+        let wgpu = results
+            .iter()
+            .find(|r| r.backend == "WGPU" && r.scenario == sc.label);
+        let flex_time = flex
+            .map(|r| format!("{:.2}s", r.total_secs))
+            .unwrap_or_else(|| "--".into());
+        let wgpu_time = wgpu
+            .map(|r| format!("{:.2}s", r.total_secs))
+            .unwrap_or_else(|| "--".into());
+        let speedup = match (flex, wgpu) {
+            (Some(flex), Some(wgpu)) => format!("{:.1}x", wgpu.total_secs / flex.total_secs),
             _ => "--".into(),
         };
+        let hidden_str = sc
+            .hidden_sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
-        md.push_str(&format!("| {} | {} | {} | [{}] | {}D | {} | {} | {} |\n",
-            sc.label, sc.n_samples, sc.n_features, hidden_str, sc.n_components, wt, mt, speedup));
+        md.push_str(&format!(
+            "| {} | {} | {} | [{}] | {}D | {} | {} | {} |\n",
+            sc.label,
+            sc.n_samples,
+            sc.n_features,
+            hidden_str,
+            sc.n_components,
+            flex_time,
+            wgpu_time,
+            speedup
+        ));
     }
 
     print!("{}", md);

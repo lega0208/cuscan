@@ -1,7 +1,7 @@
 /// fast-umap benchmark reporter.
 ///
 /// Detects available hardware (CPU model, GPU model via WGPU/Metal/Vulkan),
-/// runs timing loops for every benchmark group on both CPU (NdArray) and GPU
+/// runs timing loops for every benchmark group on both CPU (Flex) and GPU
 /// (WGPU) backends, then writes hardware-tagged Markdown + SVG files to
 /// `benches/results/`.
 ///
@@ -15,10 +15,7 @@
 /// The files are also copied to the generic
 ///     benches/results/benchmark_results.md + .svg
 /// so the README always links to the latest run.
-use burn::{
-    prelude::Backend,
-    tensor::{Tensor, TensorData},
-};
+use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
 use fast_umap::{
     model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize as layer_normalize,
@@ -33,12 +30,6 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-
-// ─── Backend aliases ─────────────────────────────────────────────────────────
-
-type CpuBackend = burn::backend::NdArray<f32>;
-type GpuBackend =
-    burn::backend::wgpu::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>;
 
 // ─── Hardware detection ───────────────────────────────────────────────────────
 
@@ -74,7 +65,9 @@ fn detect_cpu() -> String {
                 if line.starts_with("Hardware") {
                     if let Some(v) = line.split(':').nth(1) {
                         let s = v.trim().to_string();
-                        if !s.is_empty() { hw = s; }
+                        if !s.is_empty() {
+                            hw = s;
+                        }
                     }
                 }
                 if implementer.is_empty() && line.starts_with("CPU implementer") {
@@ -88,7 +81,8 @@ fn detect_cpu() -> String {
             }
             if !implementer.is_empty() {
                 let arch = std::process::Command::new("uname")
-                    .arg("-m").output()
+                    .arg("-m")
+                    .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|_| "aarch64".into());
                 let vendor = match implementer.as_str() {
@@ -97,7 +91,7 @@ fn detect_cpu() -> String {
                     "0x61" => "Apple Silicon",
                     "0x53" => "Samsung",
                     "0xc0" => "Ampere",
-                    other  => return format!("ARM64 (implementer {other})"),
+                    other => return format!("ARM64 (implementer {other})"),
                 };
                 return format!("{vendor} ({arch})");
             }
@@ -199,11 +193,10 @@ fn detect_gpu_name() -> Option<String> {
 /// Uses `catch_unwind` so the binary never crashes if there is no usable GPU.
 fn gpu_available() -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        let t: Tensor<GpuBackend, 1> =
-            Tensor::from_data(TensorData::new(vec![1.0f32], [1]), &device);
+        let device = Device::wgpu(DeviceKind::DefaultDevice);
+        let t: Tensor<1> = Tensor::from_data(TensorData::new(vec![1.0f32], [1]), &device);
         // Force sync: read back the value
-        let _ = t.to_data().to_vec::<f32>().unwrap();
+        let _ = t.to_data().try_to_vec::<f32>().unwrap();
     }))
     .is_ok()
 }
@@ -276,7 +269,7 @@ struct Entry {
 struct Group {
     name: String,
     /// Short canonical identifier used to match CPU↔GPU pairs for comparison.
-    /// E.g. both "model_forward (CPU / NdArray)" and "model_forward (GPU / WGPU)"
+    /// E.g. both "model_forward (CPU / Flex)" and "model_forward (GPU / WGPU)"
     /// share the key "model_forward".
     key: String,
     entries: Vec<Entry>,
@@ -284,12 +277,7 @@ struct Group {
 
 // ─── Model helpers ────────────────────────────────────────────────────────────
 
-fn build_model<B: Backend>(
-    input: usize,
-    hidden: &[usize],
-    output: usize,
-    device: &B::Device,
-) -> UMAPModel<B> {
+fn build_model(input: usize, hidden: &[usize], output: usize, device: &Device) -> UMAPModel {
     let cfg = UMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden.to_vec())
@@ -302,7 +290,7 @@ fn build_model<B: Backend>(
 // ─── CPU benchmark suite ──────────────────────────────────────────────────────
 
 fn run_cpu_benchmarks() -> Vec<Group> {
-    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let device = Device::flex();
     let mut groups = Vec::new();
 
     // ── normalize_data ──
@@ -325,17 +313,36 @@ fn run_cpu_benchmarks() -> Vec<Group> {
                 hi_us: hi,
             });
         }
-        groups.push(Group { name: "normalize_data".into(), key: "normalize_data".into(), entries });
+        groups.push(Group {
+            name: "normalize_data".into(),
+            key: "normalize_data".into(),
+            entries,
+        });
     }
 
     // ── generate_test_data ──
     {
         let mut entries = Vec::new();
         for (s, f) in [(100, 10), (500, 30), (1_000, 50), (5_000, 100)] {
-            let (mean, lo, hi) = measure(|| { let _: Vec<f32> = generate_test_data(s, f); }, 5, 50);
-            entries.push(Entry { label: format!("{s}×{f}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            let (mean, lo, hi) = measure(
+                || {
+                    let _: Vec<f32> = generate_test_data(s, f);
+                },
+                5,
+                50,
+            );
+            entries.push(Entry {
+                label: format!("{s}×{f}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "generate_test_data".into(), key: "generate_test_data".into(), entries });
+        groups.push(Group {
+            name: "generate_test_data".into(),
+            key: "generate_test_data".into(),
+            entries,
+        });
     }
 
     // ── tensor_convert  (Vec ↔ Tensor round-trip) ──
@@ -345,38 +352,60 @@ fn run_cpu_benchmarks() -> Vec<Group> {
             let data: Vec<f32> = generate_test_data(s, f);
             let (mean, lo, hi) = measure(
                 || {
-                    let t: Tensor<CpuBackend, 2> =
-                        convert_vector_to_tensor(data.clone(), s, f, &device);
+                    let t: Tensor<2> = convert_vector_to_tensor(data.clone(), s, f, &device);
                     let _: Vec<Vec<f64>> = convert_tensor_to_vector(t);
                 },
                 3,
                 30,
             );
-            entries.push(Entry { label: format!("{s}×{f}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            entries.push(Entry {
+                label: format!("{s}×{f}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "tensor_convert (Vec↔Tensor)".into(), key: "tensor_convert".into(), entries });
+        groups.push(Group {
+            name: "tensor_convert (Vec↔Tensor)".into(),
+            key: "tensor_convert".into(),
+            entries,
+        });
     }
 
     // ── model_forward ──
     {
         let configs: &[(&str, usize, &[usize], usize, usize)] = &[
-            ("16s×10f [32]→2",         16,  &[32],       10, 2),
-            ("64s×50f [64]→2",         64,  &[64],       50, 2),
-            ("128s×50f [128]→2",      128,  &[128],      50, 2),
-            ("64s×100f [128,64]→3",    64,  &[128, 64], 100, 3),
-            ("256s×100f [256,128]→2", 256,  &[256, 128],100, 2),
+            ("16s×10f [32]→2", 16, &[32], 10, 2),
+            ("64s×50f [64]→2", 64, &[64], 50, 2),
+            ("128s×50f [128]→2", 128, &[128], 50, 2),
+            ("64s×100f [128,64]→3", 64, &[128, 64], 100, 3),
+            ("256s×100f [256,128]→2", 256, &[256, 128], 100, 2),
         ];
         let mut entries = Vec::new();
         for &(label, s, hidden, f, out) in configs {
-            let model: UMAPModel<CpuBackend> = build_model(f, hidden, out, &device);
+            let model = build_model(f, hidden, out, &device);
             let data: Vec<f32> = generate_test_data(s, f);
-            let input: Tensor<CpuBackend, 2> =
-                Tensor::from_data(TensorData::new(data, [s, f]), &device);
+            let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [s, f]), &device);
             let iters = if s > 100 { 20 } else { 50 };
-            let (mean, lo, hi) = measure(|| { let _ = model.forward(input.clone()); }, 3, iters);
-            entries.push(Entry { label: label.into(), mean_us: mean, lo_us: lo, hi_us: hi });
+            let (mean, lo, hi) = measure(
+                || {
+                    let _ = model.forward(input.clone());
+                },
+                3,
+                iters,
+            );
+            entries.push(Entry {
+                label: label.into(),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "model_forward (CPU / NdArray)".into(), key: "model_forward".into(), entries });
+        groups.push(Group {
+            name: "model_forward (CPU / Flex)".into(),
+            key: "model_forward".into(),
+            entries,
+        });
     }
 
     // ── normalize_tensor (1-D min-max) ──
@@ -386,16 +415,25 @@ fn run_cpu_benchmarks() -> Vec<Group> {
             let data: Vec<f32> = generate_test_data(n, 1);
             let (mean, lo, hi) = measure(
                 || {
-                    let t: Tensor<CpuBackend, 1> =
+                    let t: Tensor<1> =
                         Tensor::from_data(TensorData::new(data.clone(), [n]), &device);
                     let _ = normalize_tensor(t);
                 },
                 5,
                 50,
             );
-            entries.push(Entry { label: format!("n={n}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            entries.push(Entry {
+                label: format!("n={n}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "normalize_tensor (1-D min-max)".into(), key: "normalize_tensor".into(), entries });
+        groups.push(Group {
+            name: "normalize_tensor (1-D min-max)".into(),
+            key: "normalize_tensor".into(),
+            entries,
+        });
     }
 
     // ── layer_normalize (2-D) ──
@@ -403,13 +441,26 @@ fn run_cpu_benchmarks() -> Vec<Group> {
         let mut entries = Vec::new();
         for (s, f) in [(32, 16), (128, 64), (512, 128), (1_000, 256)] {
             let data: Vec<f32> = generate_test_data(s, f);
-            let t: Tensor<CpuBackend, 2> =
-                Tensor::from_data(TensorData::new(data, [s, f]), &device);
-            let (mean, lo, hi) =
-                measure(|| { let _ = layer_normalize(t.clone()); }, 3, 30);
-            entries.push(Entry { label: format!("{s}×{f}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            let t: Tensor<2> = Tensor::from_data(TensorData::new(data, [s, f]), &device);
+            let (mean, lo, hi) = measure(
+                || {
+                    let _ = layer_normalize(t.clone());
+                },
+                3,
+                30,
+            );
+            entries.push(Entry {
+                label: format!("{s}×{f}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "layer_normalize (2-D)".into(), key: "layer_normalize".into(), entries });
+        groups.push(Group {
+            name: "layer_normalize (2-D)".into(),
+            key: "layer_normalize".into(),
+            entries,
+        });
     }
 
     groups
@@ -418,39 +469,47 @@ fn run_cpu_benchmarks() -> Vec<Group> {
 // ─── GPU benchmark suite ──────────────────────────────────────────────────────
 
 fn run_gpu_benchmarks() -> Vec<Group> {
-    let device = burn::backend::wgpu::WgpuDevice::default();
+    let device = Device::wgpu(DeviceKind::DefaultDevice);
     let mut groups = Vec::new();
 
     // ── model_forward on GPU ──
     {
         let configs: &[(&str, usize, &[usize], usize, usize)] = &[
-            ("16s×10f [32]→2",         16,  &[32],       10, 2),
-            ("64s×50f [64]→2",         64,  &[64],       50, 2),
-            ("128s×50f [128]→2",      128,  &[128],      50, 2),
-            ("64s×100f [128,64]→3",    64,  &[128, 64], 100, 3),
-            ("256s×100f [256,128]→2", 256,  &[256, 128],100, 2),
-            ("512s×100f [256,128]→2", 512,  &[256, 128],100, 2),
+            ("16s×10f [32]→2", 16, &[32], 10, 2),
+            ("64s×50f [64]→2", 64, &[64], 50, 2),
+            ("128s×50f [128]→2", 128, &[128], 50, 2),
+            ("64s×100f [128,64]→3", 64, &[128, 64], 100, 3),
+            ("256s×100f [256,128]→2", 256, &[256, 128], 100, 2),
+            ("512s×100f [256,128]→2", 512, &[256, 128], 100, 2),
         ];
         let mut entries = Vec::new();
         for &(label, s, hidden, f, out) in configs {
-            let model: UMAPModel<GpuBackend> = build_model(f, hidden, out, &device);
+            let model = build_model(f, hidden, out, &device);
             let data: Vec<f32> = generate_test_data(s, f);
-            let input: Tensor<GpuBackend, 2> =
-                Tensor::from_data(TensorData::new(data, [s, f]), &device);
+            let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [s, f]), &device);
             // force GPU init / JIT warmup
             let iters = 30;
             let (mean, lo, hi) = measure(
                 || {
                     let out = model.forward(input.clone());
                     // read back to synchronise GPU before stopping the clock
-                    let _ = out.to_data().to_vec::<f32>().unwrap();
+                    let _ = out.to_data().try_to_vec::<f32>().unwrap();
                 },
                 5,
                 iters,
             );
-            entries.push(Entry { label: label.into(), mean_us: mean, lo_us: lo, hi_us: hi });
+            entries.push(Entry {
+                label: label.into(),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "model_forward (GPU / WGPU)".into(), key: "model_forward".into(), entries });
+        groups.push(Group {
+            name: "model_forward (GPU / WGPU)".into(),
+            key: "model_forward".into(),
+            entries,
+        });
     }
 
     // ── normalize_tensor on GPU ──
@@ -460,17 +519,26 @@ fn run_gpu_benchmarks() -> Vec<Group> {
             let data: Vec<f32> = generate_test_data(n, 1);
             let (mean, lo, hi) = measure(
                 || {
-                    let t: Tensor<GpuBackend, 1> =
+                    let t: Tensor<1> =
                         Tensor::from_data(TensorData::new(data.clone(), [n]), &device);
                     let out = normalize_tensor(t);
-                    let _ = out.to_data().to_vec::<f32>().unwrap();
+                    let _ = out.to_data().try_to_vec::<f32>().unwrap();
                 },
                 5,
                 30,
             );
-            entries.push(Entry { label: format!("n={n}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            entries.push(Entry {
+                label: format!("n={n}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "normalize_tensor (GPU / WGPU)".into(), key: "normalize_tensor".into(), entries });
+        groups.push(Group {
+            name: "normalize_tensor (GPU / WGPU)".into(),
+            key: "normalize_tensor".into(),
+            entries,
+        });
     }
 
     // ── layer_normalize on GPU ──
@@ -480,17 +548,26 @@ fn run_gpu_benchmarks() -> Vec<Group> {
             let data: Vec<f32> = generate_test_data(s, f);
             let (mean, lo, hi) = measure(
                 || {
-                    let t: Tensor<GpuBackend, 2> =
+                    let t: Tensor<2> =
                         Tensor::from_data(TensorData::new(data.clone(), [s, f]), &device);
                     let out = layer_normalize(t);
-                    let _ = out.to_data().to_vec::<f32>().unwrap();
+                    let _ = out.to_data().try_to_vec::<f32>().unwrap();
                 },
                 5,
                 20,
             );
-            entries.push(Entry { label: format!("{s}×{f}"), mean_us: mean, lo_us: lo, hi_us: hi });
+            entries.push(Entry {
+                label: format!("{s}×{f}"),
+                mean_us: mean,
+                lo_us: lo,
+                hi_us: hi,
+            });
         }
-        groups.push(Group { name: "layer_normalize (GPU / WGPU)".into(), key: "layer_normalize".into(), entries });
+        groups.push(Group {
+            name: "layer_normalize (GPU / WGPU)".into(),
+            key: "layer_normalize".into(),
+            entries,
+        });
     }
 
     groups
@@ -517,7 +594,7 @@ fn write_markdown(path: &str, hw_label: &str, hw_detail: &str, groups: &[Group])
     md.push_str(&format!("# fast-umap — Benchmark Results\n\n"));
     md.push_str(&format!("> **Hardware:** {hw_label}  \n"));
     md.push_str(&format!("> **Detail:** {hw_detail}  \n"));
-    md.push_str("> **Backend:** burn 0.20.1  \n");
+    md.push_str("> **Backend:** burn 0.22.0-pre.4 · Flex / WGPU  \n");
     md.push_str("> **Reproduce:** `cargo run --release --bin bench_report`\n\n");
     md.push_str("![chart](benchmark_results.svg)\n\n");
     md.push_str("All times are **[min, mean, max]** over multiple timed iterations.\n\n");
@@ -562,8 +639,7 @@ fn write_svg(path: &str, hw_label: &str, groups: &[Group]) {
 
     // Palette: avoid raw strings with hex — just plain &str literals.
     let colours = [
-        "4C78A8", "F58518", "E45756", "72B7B2", "54A24B", "B279A2",
-        "FF9DA7", "9D755D",
+        "4C78A8", "F58518", "E45756", "72B7B2", "54A24B", "B279A2", "FF9DA7", "9D755D",
     ];
 
     let log_ticks = |lo: f64, hi: f64| -> Vec<f64> {
@@ -589,7 +665,11 @@ fn write_svg(path: &str, hw_label: &str, groups: &[Group]) {
 
     // SVG root + background
     writeln!(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SVG_W}\" height=\"{svg_h}\" font-family=\"monospace,Arial,sans-serif\">").unwrap();
-    writeln!(w, "<rect width=\"{SVG_W}\" height=\"{svg_h}\" fill=\"#FAFAFA\"/>").unwrap();
+    writeln!(
+        w,
+        "<rect width=\"{SVG_W}\" height=\"{svg_h}\" fill=\"#FAFAFA\"/>"
+    )
+    .unwrap();
     writeln!(w, "<text x=\"{}\" y=\"30\" text-anchor=\"middle\" font-size=\"15\" font-weight=\"bold\" fill=\"#222\">{hw_label} \u{2014} fast-umap Benchmark Results</text>",
         SVG_W / 2.0).unwrap();
 
@@ -616,9 +696,7 @@ fn write_svg(path: &str, hw_label: &str, groups: &[Group]) {
 
         let lo_log = (lo_val * 0.55).log10();
         let hi_log = (hi_val * 1.45).log10();
-        let x_of = |v: f64| -> f64 {
-            (v.log10() - lo_log) / (hi_log - lo_log) * chart_w
-        };
+        let x_of = |v: f64| -> f64 { (v.log10() - lo_log) / (hi_log - lo_log) * chart_w };
 
         let cx = px + CHART_LEFT;
         let cy = py + CHART_TOP;
@@ -651,10 +729,10 @@ fn write_svg(path: &str, hw_label: &str, groups: &[Group]) {
 
         // bars + whiskers + labels
         for (i, e) in g.entries.iter().enumerate() {
-            let by    = cy + i as f64 * (bar_h + bar_gap);
-            let bw    = x_of(e.mean_us);
-            let lo_x  = cx + x_of(e.lo_us.max(lo_val * 0.56));
-            let hi_x  = cx + x_of(e.hi_us);
+            let by = cy + i as f64 * (bar_h + bar_gap);
+            let bw = x_of(e.mean_us);
+            let lo_x = cx + x_of(e.lo_us.max(lo_val * 0.56));
+            let hi_x = cx + x_of(e.hi_us);
             let mid_y = by + bar_h / 2.0;
             let lbl_y = mid_y + 3.5;
 
@@ -685,10 +763,13 @@ fn write_svg(path: &str, hw_label: &str, groups: &[Group]) {
             ).unwrap();
 
             // value label (right of bar)
-            writeln!(w,
+            writeln!(
+                w,
                 "<text x=\"{:.1}\" y=\"{lbl_y:.1}\" font-size=\"8\" fill=\"#555\">{}</text>",
-                cx + bw + 4.0, fmt_us(e.mean_us)
-            ).unwrap();
+                cx + bw + 4.0,
+                fmt_us(e.mean_us)
+            )
+            .unwrap();
         }
 
         // x-axis baseline
@@ -766,17 +847,12 @@ fn build_comparison(cpu: &[Group], gpu: &[Group]) -> Vec<CompGroup> {
 
 // ── Comparison Markdown ───────────────────────────────────────────────────────
 
-fn write_comparison_markdown(
-    path: &str,
-    cpu_hw: &str,
-    gpu_hw: &str,
-    comp: &[CompGroup],
-) {
+fn write_comparison_markdown(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGroup]) {
     let mut md = String::new();
     md.push_str("# fast-umap — CPU vs GPU Comparison\n\n");
     md.push_str(&format!("> **CPU:** {cpu_hw}  \n"));
     md.push_str(&format!("> **GPU:** {gpu_hw} (WGPU / Metal)  \n"));
-    md.push_str("> **Backend:** burn 0.20.1 · NdArray vs WGPU  \n");
+    md.push_str("> **Backend:** burn 0.22.0-pre.4 · Flex vs WGPU  \n");
     md.push_str("> **Reproduce:** `cargo run --release --bin bench_report`\n\n");
     md.push_str("![chart](comparison.svg)\n\n");
     md.push_str("Speedup = CPU mean ÷ GPU mean.  \n");
@@ -832,15 +908,15 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
     const LEGEND_H: f64 = 22.0;
     const CHART_LEFT: f64 = 185.0;
     const CHART_RIGHT: f64 = 72.0; // room for speedup label
-    const CHART_TOP: f64 = 36.0;   // panel title
+    const CHART_TOP: f64 = 36.0; // panel title
     const CHART_BOTTOM: f64 = 32.0; // x-axis ticks
-    const BAR_H: f64 = 11.0;       // height of a single bar
-    const PAIR_GAP: f64 = 2.0;     // gap between CPU and GPU bar in same pair
-    const ENTRY_GAP: f64 = 10.0;   // gap between different input entries
-    const PANEL_PAD: f64 = 8.0;    // padding inside panel border
+    const BAR_H: f64 = 11.0; // height of a single bar
+    const PAIR_GAP: f64 = 2.0; // gap between CPU and GPU bar in same pair
+    const ENTRY_GAP: f64 = 10.0; // gap between different input entries
+    const PANEL_PAD: f64 = 8.0; // padding inside panel border
 
-    let cpu_colour = "4C78A8";  // blue  — CPU
-    let gpu_colour = "F58518";  // orange — GPU
+    let cpu_colour = "4C78A8"; // blue  — CPU
+    let gpu_colour = "F58518"; // orange — GPU
 
     // Compute per-group panel heights
     let chart_w = SVG_W - CHART_LEFT - CHART_RIGHT;
@@ -855,7 +931,11 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
             let n = cg.pairs.len() as f64;
             let ch = n * (2.0 * BAR_H + PAIR_GAP) + (n - 1.0) * ENTRY_GAP;
             let ph = CHART_TOP + LEGEND_H + ch + CHART_BOTTOM + 2.0 * PANEL_PAD;
-            Panel { cg, chart_h: ch, panel_h: ph }
+            Panel {
+                cg,
+                chart_h: ch,
+                panel_h: ph,
+            }
         })
         .collect();
 
@@ -883,7 +963,11 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
 
     // SVG root + background
     writeln!(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SVG_W}\" height=\"{total_h:.1}\" font-family=\"monospace,Arial,sans-serif\">").unwrap();
-    writeln!(w, "<rect width=\"{SVG_W}\" height=\"{total_h:.1}\" fill=\"#FAFAFA\"/>").unwrap();
+    writeln!(
+        w,
+        "<rect width=\"{SVG_W}\" height=\"{total_h:.1}\" fill=\"#FAFAFA\"/>"
+    )
+    .unwrap();
 
     // Main title
     writeln!(w,
@@ -893,10 +977,29 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
 
     // Global legend
     let lx = SVG_W / 2.0 - 100.0;
-    writeln!(w, "<rect x=\"{lx:.1}\" y=\"30\" width=\"12\" height=\"10\" fill=\"#{cpu_colour}\" rx=\"2\"/>").unwrap();
-    writeln!(w, "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">CPU (NdArray)</text>", lx + 15.0).unwrap();
-    writeln!(w, "<rect x=\"{:.1}\" y=\"30\" width=\"12\" height=\"10\" fill=\"#{gpu_colour}\" rx=\"2\"/>", lx + 105.0).unwrap();
-    writeln!(w, "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">GPU (WGPU/Metal)</text>", lx + 120.0).unwrap();
+    writeln!(
+        w,
+        "<rect x=\"{lx:.1}\" y=\"30\" width=\"12\" height=\"10\" fill=\"#{cpu_colour}\" rx=\"2\"/>"
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">CPU (Flex)</text>",
+        lx + 15.0
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "<rect x=\"{:.1}\" y=\"30\" width=\"12\" height=\"10\" fill=\"#{gpu_colour}\" rx=\"2\"/>",
+        lx + 105.0
+    )
+    .unwrap();
+    writeln!(
+        w,
+        "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">GPU (WGPU/Metal)</text>",
+        lx + 120.0
+    )
+    .unwrap();
 
     let mut cur_y = TITLE_H;
 
@@ -906,19 +1009,13 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
         let ph = panel.panel_h;
 
         // All values for shared log scale
-        let all_vals: Vec<f64> = cg
-            .pairs
-            .iter()
-            .flat_map(|p| [p.cpu_us, p.gpu_us])
-            .collect();
+        let all_vals: Vec<f64> = cg.pairs.iter().flat_map(|p| [p.cpu_us, p.gpu_us]).collect();
         let lo_val = all_vals.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi_val = all_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
         let lo_log = (lo_val * 0.45).log10();
         let hi_log = (hi_val * 1.55).log10();
-        let x_of = |v: f64| -> f64 {
-            (v.log10() - lo_log) / (hi_log - lo_log) * chart_w
-        };
+        let x_of = |v: f64| -> f64 { (v.log10() - lo_log) / (hi_log - lo_log) * chart_w };
 
         let cx = CHART_LEFT;
         let cy = py + PANEL_PAD + CHART_TOP + LEGEND_H;
@@ -963,10 +1060,13 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
                 "<rect x=\"{cx:.1}\" y=\"{by:.1}\" width=\"{cpu_bw:.1}\" height=\"{BAR_H:.1}\" rx=\"2\" fill=\"#{cpu_colour}\" opacity=\"0.85\"/>",
             ).unwrap();
             // value at right end
-            writeln!(w,
+            writeln!(
+                w,
                 "<text x=\"{:.1}\" y=\"{cpu_lbl_y:.1}\" font-size=\"7.5\" fill=\"#555\">{}</text>",
-                cx + cpu_bw + 4.0, fmt_us(p.cpu_us)
-            ).unwrap();
+                cx + cpu_bw + 4.0,
+                fmt_us(p.cpu_us)
+            )
+            .unwrap();
 
             // ── GPU bar ──
             let gpu_by = by + BAR_H + PAIR_GAP;
@@ -975,10 +1075,13 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
             writeln!(w,
                 "<rect x=\"{cx:.1}\" y=\"{gpu_by:.1}\" width=\"{gpu_bw:.1}\" height=\"{BAR_H:.1}\" rx=\"2\" fill=\"#{gpu_colour}\" opacity=\"0.85\"/>",
             ).unwrap();
-            writeln!(w,
+            writeln!(
+                w,
                 "<text x=\"{:.1}\" y=\"{gpu_lbl_y:.1}\" font-size=\"7.5\" fill=\"#555\">{}</text>",
-                cx + gpu_bw + 4.0, fmt_us(p.gpu_us)
-            ).unwrap();
+                cx + gpu_bw + 4.0,
+                fmt_us(p.gpu_us)
+            )
+            .unwrap();
 
             // ── Speedup label (rightmost edge) ──
             let speedup = p.speedup();
@@ -1047,7 +1150,7 @@ fn main() {
     let results_dir = "benches/results";
 
     // ── CPU benchmarks ───────────────────────────────────────────────────────
-    println!("━━━  Running CPU benchmarks (NdArray backend)  ━━━");
+    println!("━━━  Running CPU benchmarks (Flex backend)  ━━━");
     let cpu_groups = run_cpu_benchmarks();
 
     // Print a quick summary to stdout
@@ -1103,11 +1206,20 @@ fn main() {
             // Print a quick speedup table to stdout
             for cg in &comp {
                 println!("\n  [{}]", cg.key);
-                println!("    {:38}  {:>10}  {:>10}  {:>8}", "input", "CPU", "GPU", "speedup");
+                println!(
+                    "    {:38}  {:>10}  {:>10}  {:>8}",
+                    "input", "CPU", "GPU", "speedup"
+                );
                 println!("    {}", "─".repeat(72));
                 for p in &cg.pairs {
                     let s = p.speedup();
-                    let icon = if s >= 2.0 { " 🚀" } else if s >= 1.0 { "  ✓" } else { " ↓" };
+                    let icon = if s >= 2.0 {
+                        " 🚀"
+                    } else if s >= 1.0 {
+                        "  ✓"
+                    } else {
+                        " ↓"
+                    };
                     println!(
                         "    {:38}  {:>10}  {:>10}  {:>6.2}×{}",
                         p.label,
@@ -1122,7 +1234,7 @@ fn main() {
             println!("\n━━━  Saving comparison results  ━━━");
             // Use the CPU chip name for the filename (both are the same chip on Apple Silicon)
             let comp_slug = cpu_safe.clone();
-            let comp_md  = format!("{results_dir}/comparison_{comp_slug}.md");
+            let comp_md = format!("{results_dir}/comparison_{comp_slug}.md");
             let comp_svg = format!("{results_dir}/comparison_{comp_slug}.svg");
             // The SVG is written next to the md, but the md references comparison.svg
             // (relative, same dir) — write the SVG using the same base name.

@@ -7,20 +7,17 @@
 //! 3. **Negative sampling** — `neg_rate` random non-neighbor pairs per sampled edge.
 //! 4. **In-memory checkpointing** — best model weights kept in RAM, no disk I/O.
 //! 5. **Pre-batched edge samples** — uploaded to GPU once, cycled per epoch.
-//! 6. **Fused gather** — positive + negative indices merged into 2 selects (not 4).
+//! 6. **Fused row selection** — positive + negative indices merged into 2 selects (not 4).
 //! 7. **Async loss readback** — GPU→CPU sync only every N epochs for progress display.
 //! 8. **Lazy loss plotting** — charts rendered only every N epochs, not every epoch.
 
 #[cfg(feature = "plotters")]
 use crate::chart::{self, plot_loss, ChartConfigBuilder};
-use crate::{
-    backend::AutodiffBackend, format_duration, model::UMAPModel, normalize_data,
-    utils::convert_vector_to_tensor,
-};
+use crate::{format_duration, model::UMAPModel, normalize_data, utils::convert_vector_to_tensor};
 use burn::{
-    module::{AutodiffModule, Module},
-    optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams, Optimizer},
-    tensor::{cast::ToElement, Device, Int, Tensor, TensorData},
+    module::Module,
+    optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams},
+    tensor::{Device, Int, Tensor, TensorData},
 };
 
 use super::config::*;
@@ -30,7 +27,7 @@ use crossbeam_channel::Receiver;
 use indicatif::{ProgressBar, ProgressStyle};
 use num::{Float, FromPrimitive, ToPrimitive};
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{thread, time::Instant};
@@ -67,18 +64,18 @@ pub struct EpochProgress {
     pub epoch_ms: f64,
 }
 
-pub fn train_sparse<B: AutodiffBackend, F: Float>(
+pub fn train_sparse<F: Float>(
     name: &str,
-    mut model: UMAPModel<B>,
+    mut model: UMAPModel,
     num_samples: usize,
     num_features: usize,
     mut data: Vec<F>,
     config: &TrainingConfig,
-    device: Device<B>,
+    device: Device,
     exit_rx: Receiver<()>,
     labels: Option<Vec<String>>,
     on_progress: Option<Box<dyn Fn(EpochProgress) + Send>>,
-) -> (UMAPModel<B>, Vec<F>, F)
+) -> (UMAPModel, Vec<F>, F)
 where
     F: FromPrimitive + Send + Sync + burn::tensor::Element,
 {
@@ -151,7 +148,7 @@ where
     }
     let knn_start = Instant::now();
 
-    let all_data_tensor: Tensor<B, 2> =
+    let all_data_tensor: Tensor<2> =
         convert_vector_to_tensor(data.clone(), num_samples, num_features, &device);
 
     let knn_indices: Vec<i32>;
@@ -165,14 +162,14 @@ where
         knn_indices = idx;
     } else {
         let hd_pairwise = pairwise_distances(all_data_tensor.clone());
-        let flat: Vec<f32> = hd_pairwise.to_data().to_vec::<f32>().unwrap();
+        let flat: Vec<f32> = hd_pairwise.to_data().try_to_vec::<f32>().unwrap();
         let (idx, _dist) = knn_from_pairwise_cpu(&flat, num_samples, k);
         knn_indices = idx;
     }
     #[cfg(not(feature = "nn-descent"))]
     {
         let hd_pairwise = pairwise_distances(all_data_tensor.clone());
-        let flat: Vec<f32> = hd_pairwise.to_data().to_vec::<f32>().unwrap();
+        let flat: Vec<f32> = hd_pairwise.to_data().try_to_vec::<f32>().unwrap();
         let (idx, _dist) = knn_from_pairwise_cpu(&flat, num_samples, k);
         knn_indices = idx;
     }
@@ -196,8 +193,7 @@ where
     // ── Pre-generate fused edge-sample batches on GPU ────────────────────────
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
-    let fused_batches: Vec<(Tensor<B, 1, Int>, Tensor<B, 1, Int>, usize, usize)> = (0
-        ..EDGE_BATCH_COUNT)
+    let fused_batches: Vec<(Tensor<1, Int>, Tensor<1, Int>, usize, usize)> = (0..EDGE_BATCH_COUNT)
         .map(|_| {
             // Sample positive edges (with replacement if subsampling)
             let pos_sample: Vec<&(i64, i64)> = if subsampling {
@@ -273,7 +269,7 @@ where
             .map(|x| num::ToPrimitive::to_f32(x).unwrap())
             .collect();
         let n_components = model.forward(all_data_tensor.clone()).dims()[1];
-        let (projected, _components, _mean) = crate::pca::pca::<B::InnerBackend>(
+        let (projected, _components, _mean) = crate::pca::pca(
             &data_f32,
             num_samples,
             num_features,
@@ -281,7 +277,7 @@ where
             &device.clone().into(),
         );
 
-        let pca_target: Tensor<B, 2> = Tensor::from_data(
+        let pca_target: Tensor<2> = Tensor::from_data(
             TensorData::new(projected, [num_samples, n_components]),
             &device,
         );
@@ -353,31 +349,16 @@ where
         // ── Forward: embed ALL points at once ────────────────────────────────
         let embeddings = model.forward(all_data_tensor.clone()); // [n, output_dim]
 
-        // ── Fused gather: 2 selects instead of 4 ────────────────────────────
+        // ── Fused row selection ─────────────────────────────────────────────
         let (fused_h, fused_t, batch_n_pos, batch_n_total) =
             &fused_batches[epoch % EDGE_BATCH_COUNT];
         let batch_n_pos = *batch_n_pos;
         let batch_n_total = *batch_n_total;
 
-        // select(0, indices) is fastest on most backends, but some (e.g. MLX)
-        // have buggy select_add backward — fall back to gather for those.
-        let (all_head_emb, all_tail_emb) = if B::USE_GATHER_FOR_SELECT {
-            let output_dim = embeddings.dims()[1];
-            let gh = fused_h
-                .clone()
-                .reshape([batch_n_total, 1])
-                .repeat_dim(1, output_dim);
-            let gt = fused_t
-                .clone()
-                .reshape([batch_n_total, 1])
-                .repeat_dim(1, output_dim);
-            (embeddings.clone().gather(0, gh), embeddings.gather(0, gt))
-        } else {
-            (
-                embeddings.clone().select(0, fused_h.clone()),
-                embeddings.select(0, fused_t.clone()),
-            )
-        };
+        let (all_head_emb, all_tail_emb) = (
+            embeddings.clone().select(0, fused_h.clone()),
+            embeddings.select(0, fused_t.clone()),
+        );
 
         let diff = all_head_emb - all_tail_emb;
         let dist_sq = (diff.clone() * diff).sum_dim(1); // [batch_n_total, 1]
@@ -415,7 +396,7 @@ where
             epoch % LOSS_READBACK_INTERVAL == 0 || epoch >= config.epochs || epoch == 0;
 
         let current_loss = if should_read {
-            let v = F::from(loss.clone().into_scalar().to_f64()).unwrap();
+            let v = F::from(loss.clone().into_scalar::<f32>() as f64).unwrap();
             last_read_loss = v;
             v
         } else {

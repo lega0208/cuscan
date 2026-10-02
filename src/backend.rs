@@ -1,12 +1,11 @@
-use burn::{
-    backend::Autodiff,
-    tensor::ops::{FloatTensor, IntTensor},
+use burn::backend::{
+    backend_extension,
+    tensor::{FloatTensor, IntTensor},
+    Backend,
 };
-#[cfg(any(feature = "gpu", feature = "cuda"))]
-use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
 
-/// Extension of the Burn [`Backend`](burn::tensor::backend::Backend) trait that
-/// adds the custom GPU kernels required by fast-umap.
+/// Backend operations used by fast-umap and routed through Burn's dynamic
+/// backend dispatch.
 ///
 /// Two kernels are exposed:
 ///
@@ -17,16 +16,20 @@ use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElemen
 ///   pairwise distance matrix; differentiable (backward propagates through
 ///   the selected entries).
 ///
-/// Concrete implementations are provided for [`CubeBackend`] (GPU) and
-/// [`Autodiff<B>`] (automatic differentiation wrapper).
-pub trait Backend: burn::tensor::backend::Backend {
-    /// Whether to use `gather` instead of `select` for row indexing.
-    ///
-    /// Some backends (e.g. MLX) have buggy `select_add` in their backward pass.
-    /// When `true`, the training loop uses `gather` (correct everywhere but
-    /// slightly slower) instead of `select` (faster but broken on some backends).
-    const USE_GATHER_FOR_SELECT: bool = false;
-
+/// Implementations are provided by CubeCL, Flex, and the handwritten
+/// autodiff adapter in `autodiff_ops`.
+#[backend_extension(
+    Cube: cfg(any(feature = "gpu", feature = "cuda")),
+    Flex,
+    Autodiff,
+    Fusion: cfg(any(feature = "gpu", feature = "cuda")),
+)]
+pub trait UmapOps: Backend {
+    #[fusion(dtype = x, shape = {
+        let mut shape = x.clone();
+        shape[1] = shape[0];
+        shape
+    })]
     /// Compute the full `[n, n]` symmetric Euclidean pairwise distance matrix
     /// for an input tensor of shape `[n, d]`.
     ///
@@ -43,12 +46,26 @@ pub trait Backend: burn::tensor::backend::Backend {
     /// * `pairwise`      — precomputed distance matrix saved from the forward pass, shape `[n, n]`
     ///
     /// Returns `∂loss/∂x`, shape `[n, d]`.
+    #[fusion(dtype = x, shape = x)]
     fn euclidean_pairwise_distance_backward(
         grad_pairwise: FloatTensor<Self>,
         x: FloatTensor<Self>,
         pairwise: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 
+    #[fusion(meta = |pairwise_distances, k| {
+        let shape = [pairwise_distances.shape[0], *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(
+                shape.into(),
+                burn::tensor::DType::I32,
+            ),
+            burn::backend::fusion::custom::TensorSpec::new(
+                shape.into(),
+                pairwise_distances.dtype,
+            ),
+        )
+    })]
     /// Select the `k` nearest neighbours for every row of `pairwise_distances`.
     ///
     /// Returns `(indices, distances)`:
@@ -62,47 +79,11 @@ pub trait Backend: burn::tensor::backend::Backend {
     /// then propagates `grad_output` (shape `[n, k]`) back to a gradient with
     /// respect to `pairwise_distances` (shape `[n, n]`).
     ///
-    /// Only called on the inner [`CubeBackend`]; the [`Autodiff`] wrapper
-    /// delegates via `euclidean::backward`.
+    /// The autodiff adapter registers this operation in Burn's gradient graph.
+    #[fusion(dtype = pairwise_distances, shape = pairwise_distances)]
     fn knn_backward(
         pairwise_distances: FloatTensor<Self>,
         k: u32,
         grad_output: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 }
-
-/// Marker trait combining the fast-umap [`Backend`] extension with Burn's own
-/// [`AutodiffBackend`](burn::tensor::backend::AutodiffBackend).
-///
-/// Implement this trait for any backend that should support end-to-end
-/// gradient flow through the custom kernels.
-pub trait AutodiffBackend: Backend + burn::tensor::backend::AutodiffBackend {}
-
-/// Blanket implementation of [`AutodiffBackend`] for any [`CubeBackend`]
-/// wrapped in [`Autodiff`].
-///
-/// This covers the primary GPU training path:
-/// `Autodiff<CubeBackend<R, f32, i32, u8>>` for CubeCL runtimes such as WGPU and CUDA.
-#[cfg(any(feature = "gpu", feature = "cuda"))]
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> AutodiffBackend
-    for Autodiff<CubeBackend<R, F, I, BT>>
-{
-}
-
-/// Blanket implementation of [`AutodiffBackend`] for [`burn_mlx::Mlx`]
-/// wrapped in [`Autodiff`].
-///
-/// This covers the MLX (Apple Silicon) training path:
-/// `Autodiff<burn_mlx::Mlx>`.
-#[cfg(feature = "mlx")]
-impl AutodiffBackend for Autodiff<burn_mlx::Mlx> {}
-
-/// This covers the CPU training path using Burn's ndarray backend.
-impl AutodiffBackend for Autodiff<burn::backend::NdArray<f32>> {}
-
-// TODO: Candle backend — blocked on burn-candle/candle-core DType compat
-// #[cfg(feature = "candle")]
-// impl<F: burn_candle::element::FloatCandleElement, I: burn_candle::element::IntCandleElement>
-//     AutodiffBackend for Autodiff<burn_candle::Candle<F, I>>
-// {
-// }

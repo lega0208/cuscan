@@ -9,7 +9,7 @@
 //! "Efficient k-nearest neighbor graph construction for generic similarity measures."
 
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 use rayon::prelude::*;
 
 /// Build an approximate k-NN graph using NN-Descent.

@@ -1,6 +1,7 @@
+use burn::backend::Dispatch;
 /// Integration tests for fast-umap.
 ///
-/// These tests use `burn::backend::NdArray` (CPU) so no GPU is required.
+/// These tests use Burn's Flex CPU device so no GPU is required.
 /// They cover:
 ///   - Pure utility functions (normalize_data, format_duration, generate_test_data)
 ///   - Tensor round-trips (convert_vector_to_tensor / convert_tensor_to_vector)
@@ -9,8 +10,8 @@
 ///   - Configuration builders (TrainingConfig, UMAPModelConfig)
 ///   - Distance functions (euclidean, manhattan, cosine, minkowski)
 ///     via the standard-backend overloads in distances.rs
-use burn::backend::NdArray;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{DType, Device, Tensor, TensorData};
+use fast_umap::backend::UmapOps;
 use fast_umap::{
     model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize,
@@ -23,12 +24,10 @@ use fast_umap::{
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// Backend alias
+// Flex CPU device
 // ---------------------------------------------------------------------------
-type B = NdArray<f32>;
-
-fn cpu() -> burn::backend::ndarray::NdArrayDevice {
-    burn::backend::ndarray::NdArrayDevice::Cpu
+fn cpu() -> Device {
+    Device::flex()
 }
 
 // ===========================================================================
@@ -82,9 +81,7 @@ fn normalize_data_zero_mean_unit_std() {
 fn normalize_data_multi_feature() {
     let num_samples = 4;
     let num_features = 3;
-    let mut data: Vec<f64> = (0..num_samples * num_features)
-        .map(|i| i as f64)
-        .collect();
+    let mut data: Vec<f64> = (0..num_samples * num_features).map(|i| i as f64).collect();
     normalize_data(&mut data, num_samples, num_features);
     assert!(data.iter().all(|v| !v.is_nan()));
     assert!(data.iter().all(|v| v.is_finite()));
@@ -159,16 +156,13 @@ fn tensor_round_trip_f32() {
     let num_samples = 4;
     let num_features = 3;
     let orig: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let tensor: Tensor<B, 2> =
+    let tensor: Tensor<2> =
         convert_vector_to_tensor(orig.clone(), num_samples, num_features, &device);
     assert_eq!(tensor.dims(), [num_samples, num_features]);
     let back: Vec<Vec<f64>> = convert_tensor_to_vector(tensor);
     let flat: Vec<f32> = back.into_iter().flatten().map(|v| v as f32).collect();
     for (a, b) in orig.iter().zip(flat.iter()) {
-        assert!(
-            (a - b).abs() < 1e-5,
-            "round-trip mismatch: {a} vs {b}"
-        );
+        assert!((a - b).abs() < 1e-5, "round-trip mismatch: {a} vs {b}");
     }
 }
 
@@ -178,7 +172,7 @@ fn tensor_shape_matches_input() {
     let num_samples = 7;
     let num_features = 5;
     let data: Vec<f32> = vec![0.0f32; num_samples * num_features];
-    let t: Tensor<B, 2> = convert_vector_to_tensor(data, num_samples, num_features, &device);
+    let t: Tensor<2> = convert_vector_to_tensor(data, num_samples, num_features, &device);
     assert_eq!(t.dims(), [num_samples, num_features]);
 }
 
@@ -186,7 +180,7 @@ fn tensor_shape_matches_input() {
 fn convert_tensor_to_vector_shape() {
     let device = cpu();
     let data: Vec<f32> = (0..30).map(|i| i as f32).collect();
-    let t: Tensor<B, 2> = convert_vector_to_tensor(data, 6, 5, &device);
+    let t: Tensor<2> = convert_vector_to_tensor(data, 6, 5, &device);
     let v: Vec<Vec<f64>> = convert_tensor_to_vector(t);
     assert_eq!(v.len(), 6);
     assert!(v.iter().all(|row| row.len() == 5));
@@ -197,8 +191,7 @@ fn convert_tensor_nan_replaced_by_zero() {
     // put NaN into a tensor manually via from_data
     let device = cpu();
     let data = vec![f32::NAN, 0.0, 0.0, 0.0];
-    let t: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(data, [2, 2]), &device);
+    let t: Tensor<2> = Tensor::from_data(TensorData::new(data, [2, 2]), &device);
     let v: Vec<Vec<f64>> = convert_tensor_to_vector(t);
     assert_eq!(v[0][0], 0.0, "NaN should be replaced by 0.0");
 }
@@ -211,10 +204,9 @@ fn convert_tensor_nan_replaced_by_zero() {
 fn normalize_tensor_bounds() {
     let device = cpu();
     let data: Vec<f32> = vec![1.0, 3.0, 5.0, 7.0, 9.0];
-    let t: Tensor<B, 1> =
-        Tensor::from_data(TensorData::new(data, [5]), &device);
+    let t: Tensor<1> = Tensor::from_data(TensorData::new(data, [5]), &device);
     let n = normalize_tensor(t);
-    let vals = n.to_data().to_vec::<f32>().unwrap();
+    let vals = n.to_data().try_to_vec::<f32>().unwrap();
     assert!(vals.iter().all(|&v| v >= 0.0 && v <= 1.0 + 1e-5));
 }
 
@@ -222,11 +214,10 @@ fn normalize_tensor_bounds() {
 fn normalize_tensor_constant_input() {
     let device = cpu();
     let data = vec![4.0f32; 6];
-    let t: Tensor<B, 1> =
-        Tensor::from_data(TensorData::new(data.clone(), [6]), &device);
+    let t: Tensor<1> = Tensor::from_data(TensorData::new(data.clone(), [6]), &device);
     let n = normalize_tensor(t);
     // All equal → normaliser returns the original tensor unchanged
-    let vals = n.to_data().to_vec::<f32>().unwrap();
+    let vals = n.to_data().try_to_vec::<f32>().unwrap();
     assert!(vals.iter().all(|&v| !v.is_nan()));
 }
 
@@ -238,10 +229,9 @@ fn normalize_tensor_constant_input() {
 fn normalizer_no_nan() {
     let device = cpu();
     let data: Vec<f32> = (0..20).map(|i| i as f32).collect();
-    let t: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(data, [4, 5]), &device);
+    let t: Tensor<2> = Tensor::from_data(TensorData::new(data, [4, 5]), &device);
     let n = normalize(t);
-    let vals = n.to_data().to_vec::<f32>().unwrap();
+    let vals = n.to_data().try_to_vec::<f32>().unwrap();
     assert!(vals.iter().all(|v| !v.is_nan()));
 }
 
@@ -249,8 +239,7 @@ fn normalizer_no_nan() {
 fn normalizer_shape_preserved() {
     let device = cpu();
     let data: Vec<f32> = vec![0.0f32; 15];
-    let t: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(data, [3, 5]), &device);
+    let t: Tensor<2> = Tensor::from_data(TensorData::new(data, [3, 5]), &device);
     let n = normalize(t);
     assert_eq!(n.dims(), [3, 5]);
 }
@@ -340,7 +329,7 @@ fn metric_from_invalid_str_panics() {
 // UMAPModel construction and forward pass
 // ===========================================================================
 
-fn make_model(input: usize, hidden: Vec<usize>, output: usize) -> UMAPModel<B> {
+fn make_model(input: usize, hidden: Vec<usize>, output: usize) -> UMAPModel {
     let cfg = UMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden)
@@ -355,8 +344,10 @@ fn model_forward_output_shape_2d() {
     let device = cpu();
     let model = make_model(10, vec![32], 2);
     let num_samples = 5;
-    let input: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(vec![0.5f32; num_samples * 10], [num_samples, 10]), &device);
+    let input: Tensor<2> = Tensor::from_data(
+        TensorData::new(vec![0.5f32; num_samples * 10], [num_samples, 10]),
+        &device,
+    );
     let out = model.forward(input);
     assert_eq!(out.dims(), [num_samples, 2]);
 }
@@ -366,8 +357,10 @@ fn model_forward_output_shape_3d() {
     let device = cpu();
     let model = make_model(8, vec![16, 8], 3);
     let num_samples = 3;
-    let input: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(vec![1.0f32; num_samples * 8], [num_samples, 8]), &device);
+    let input: Tensor<2> = Tensor::from_data(
+        TensorData::new(vec![1.0f32; num_samples * 8], [num_samples, 8]),
+        &device,
+    );
     let out = model.forward(input);
     assert_eq!(out.dims(), [num_samples, 3]);
 }
@@ -378,11 +371,13 @@ fn model_forward_no_nan() {
     let model = make_model(16, vec![32, 16], 2);
     let num_samples = 10;
     let data: Vec<f32> = generate_test_data(num_samples, 16);
-    let input: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(data, [num_samples, 16]), &device);
+    let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [num_samples, 16]), &device);
     let out = model.forward(input);
-    let vals = out.to_data().to_vec::<f32>().unwrap();
-    assert!(vals.iter().all(|v| !v.is_nan()), "model output contains NaN");
+    let vals = out.to_data().try_to_vec::<f32>().unwrap();
+    assert!(
+        vals.iter().all(|v| !v.is_nan()),
+        "model output contains NaN"
+    );
 }
 
 #[test]
@@ -391,11 +386,18 @@ fn model_forward_deterministic() {
     let device = cpu();
     let model = make_model(6, vec![12], 2);
     let data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
-    let make_input = || -> Tensor<B, 2> {
-        Tensor::from_data(TensorData::new(data.clone(), [1, 6]), &device)
-    };
-    let out1 = model.forward(make_input()).to_data().to_vec::<f32>().unwrap();
-    let out2 = model.forward(make_input()).to_data().to_vec::<f32>().unwrap();
+    let make_input =
+        || -> Tensor<2> { Tensor::from_data(TensorData::new(data.clone(), [1, 6]), &device) };
+    let out1 = model
+        .forward(make_input())
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    let out2 = model
+        .forward(make_input())
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
     for (a, b) in out1.iter().zip(out2.iter()) {
         assert!((a - b).abs() < 1e-6, "forward pass is not deterministic");
     }
@@ -405,8 +407,7 @@ fn model_forward_deterministic() {
 fn model_single_hidden_layer() {
     let model = make_model(4, vec![8], 2);
     let device = cpu();
-    let input: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(vec![1.0f32; 4], [1, 4]), &device);
+    let input: Tensor<2> = Tensor::from_data(TensorData::new(vec![1.0f32; 4], [1, 4]), &device);
     let out = model.forward(input);
     assert_eq!(out.dims(), [1, 2]);
 }
@@ -416,41 +417,52 @@ fn model_deep_network() {
     let model = make_model(20, vec![64, 32, 16, 8], 2);
     let device = cpu();
     let data: Vec<f32> = generate_test_data(4, 20);
-    let input: Tensor<B, 2> =
-        Tensor::from_data(TensorData::new(data, [4, 20]), &device);
+    let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [4, 20]), &device);
     let out = model.forward(input);
     assert_eq!(out.dims(), [4, 2]);
-    assert!(out.to_data().to_vec::<f32>().unwrap().iter().all(|v| v.is_finite()));
+    assert!(out
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap()
+        .iter()
+        .all(|v| v.is_finite()));
 }
 
 // ===========================================================================
 // Distance functions
 // These live in fast_umap::distances and use crate::backend::Backend.
-// We test them via standard tensor arithmetic directly, to avoid requiring
-// a CubeBackend (GPU) implementation in the test environment.
+// We test them via standard tensor arithmetic directly on the Flex CPU device.
 // ===========================================================================
 
 /// Compute Euclidean pairwise distances with standard tensor ops
-fn euclidean_distances_cpu(x: Tensor<B, 2>) -> Tensor<B, 2> {
+fn euclidean_distances_cpu(x: Tensor<2>) -> Tensor<2> {
     let _n = x.dims()[0];
     let x3 = x.clone().unsqueeze::<3>(); // [1, n, d]
-    let xt = x.unsqueeze_dim(1);         // [n, 1, d]
-    let diff = x3 - xt;                  // [n, n, d]
-    // sum_dim keeps the dim (gives [n,n,1]), then squeeze to [n,n]
-    let sq_sum: Tensor<B, 3> = diff.powi_scalar(2).sum_dim(2);
-    sq_sum.squeeze_dim::<2>(2).sqrt()    // [n, n]
+    let xt = x.unsqueeze_dim(1); // [n, 1, d]
+    let diff = x3 - xt; // [n, n, d]
+                        // sum_dim keeps the dim (gives [n,n,1]), then squeeze to [n,n]
+    let sq_sum: Tensor<3> = diff.powi_scalar(2).sum_dim(2);
+    sq_sum.squeeze_dim::<2>(2).sqrt() // [n, n]
 }
 
 #[test]
 fn euclidean_distance_self_is_zero() {
     let device = cpu();
     let data = vec![1.0f32, 0.0, 0.0, 1.0];
-    let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(data, [2, 2]), &device);
+    let x: Tensor<2> = Tensor::from_data(TensorData::new(data, [2, 2]), &device);
     let dist = euclidean_distances_cpu(x);
-    let vals = dist.to_data().to_vec::<f32>().unwrap();
+    let vals = dist.to_data().try_to_vec::<f32>().unwrap();
     // diagonal entries must be 0
-    assert!(vals[0].abs() < 1e-5, "dist(0,0) should be 0, got {}", vals[0]);
-    assert!(vals[3].abs() < 1e-5, "dist(1,1) should be 0, got {}", vals[3]);
+    assert!(
+        vals[0].abs() < 1e-5,
+        "dist(0,0) should be 0, got {}",
+        vals[0]
+    );
+    assert!(
+        vals[3].abs() < 1e-5,
+        "dist(1,1) should be 0, got {}",
+        vals[3]
+    );
 }
 
 #[test]
@@ -458,20 +470,28 @@ fn euclidean_distance_known_value() {
     let device = cpu();
     // [0,0] and [3,4] → distance = 5.0
     let data = vec![0.0f32, 0.0, 3.0, 4.0];
-    let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(data, [2, 2]), &device);
+    let x: Tensor<2> = Tensor::from_data(TensorData::new(data, [2, 2]), &device);
     let dist = euclidean_distances_cpu(x);
-    let vals = dist.to_data().to_vec::<f32>().unwrap();
-    assert!((vals[1] - 5.0).abs() < 1e-4, "expected 5.0, got {}", vals[1]);
-    assert!((vals[2] - 5.0).abs() < 1e-4, "expected 5.0, got {}", vals[2]);
+    let vals = dist.to_data().try_to_vec::<f32>().unwrap();
+    assert!(
+        (vals[1] - 5.0).abs() < 1e-4,
+        "expected 5.0, got {}",
+        vals[1]
+    );
+    assert!(
+        (vals[2] - 5.0).abs() < 1e-4,
+        "expected 5.0, got {}",
+        vals[2]
+    );
 }
 
 #[test]
 fn euclidean_distance_symmetric() {
     let device = cpu();
     let data: Vec<f32> = (0..9).map(|i| i as f32).collect();
-    let x: Tensor<B, 2> = Tensor::from_data(TensorData::new(data, [3, 3]), &device);
+    let x: Tensor<2> = Tensor::from_data(TensorData::new(data, [3, 3]), &device);
     let dist = euclidean_distances_cpu(x);
-    let vals = dist.to_data().to_vec::<f32>().unwrap();
+    let vals = dist.to_data().try_to_vec::<f32>().unwrap();
     // dist[i,j] == dist[j,i]
     let n = 3;
     for i in 0..n {
@@ -486,9 +506,161 @@ fn euclidean_distance_symmetric() {
 #[test]
 fn manhattan_distance_known_value() {
     let device = cpu();
-    let a: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![1.0f32, 2.0, 4.0, 6.0], [2, 2]), &device);
-    let b: Tensor<B, 2> = Tensor::from_data(TensorData::new(vec![1.0f32, 2.0, 4.0, 6.0], [2, 2]), &device);
+    let a: Tensor<2> = Tensor::from_data(
+        TensorData::new(vec![1.0f32, 2.0, 4.0, 6.0], [2, 2]),
+        &device,
+    );
+    let b: Tensor<2> = Tensor::from_data(
+        TensorData::new(vec![1.0f32, 2.0, 4.0, 6.0], [2, 2]),
+        &device,
+    );
     let diff = (a - b).abs().sum_dim(1); // [2,1]
-    let vals = diff.to_data().to_vec::<f32>().unwrap();
-    assert!(vals.iter().all(|&v| v.abs() < 1e-5), "identical rows → L1 distance 0");
+    let vals = diff.to_data().try_to_vec::<f32>().unwrap();
+    assert!(
+        vals.iter().all(|&v| v.abs() < 1e-5),
+        "identical rows → L1 distance 0"
+    );
+}
+
+fn assert_umap_ops_dispatch_and_gradients(device: Device) {
+    let points = Tensor::<2>::from_data(
+        TensorData::new(vec![0.0f32, 0.0, 3.0, 4.0], [2, 2]),
+        &device,
+    )
+    .require_grad();
+    let pairwise = Tensor::from_dispatch(<Dispatch as UmapOps>::euclidean_pairwise_distance(
+        points.clone().into_dispatch(),
+    ));
+    assert_eq!(pairwise.dims(), [2, 2]);
+    let pairwise_values = pairwise.to_data().try_to_vec::<f32>().unwrap();
+    assert!((pairwise_values[0]).abs() < 1e-5);
+    assert!((pairwise_values[1] - 5.0).abs() < 1e-4);
+    assert!((pairwise_values[2] - 5.0).abs() < 1e-4);
+    assert!((pairwise_values[3]).abs() < 1e-5);
+
+    // An asymmetric upstream gradient verifies contributions from both
+    // entries of the symmetric distance matrix are accumulated.
+    let upstream = Tensor::<2>::from_data(
+        TensorData::new(vec![0.0f32, 1.0, 3.0, 0.0], [2, 2]),
+        &device,
+    );
+    let grads = (pairwise * upstream).sum().backward();
+    let input_grad = points
+        .grad(&grads)
+        .unwrap()
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    for (actual, expected) in input_grad.iter().zip([-2.4f32, -3.2, 2.4, 3.2]) {
+        assert!(
+            (actual - expected).abs() < 1e-4,
+            "gradient {actual} != {expected}"
+        );
+    }
+
+    // Duplicate points exercise zero distances in both pairwise and k-NN ops.
+    let duplicates = Tensor::<2>::from_data(
+        TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 3.0, 4.0], [3, 2]),
+        &device,
+    );
+    let duplicate_distances = Tensor::<2>::from_dispatch(
+        <Dispatch as UmapOps>::euclidean_pairwise_distance(duplicates.into_dispatch()),
+    );
+    let duplicate_values = duplicate_distances.to_data().try_to_vec::<f32>().unwrap();
+    assert_eq!(duplicate_values[1], 0.0);
+    assert_eq!(duplicate_values[3], 0.0);
+    assert!((duplicate_values[2] - 5.0).abs() < 1e-4);
+    assert!(duplicate_values.iter().all(|value| value.is_finite()));
+
+    let pairwise_input = Tensor::<2>::from_data(
+        TensorData::new(vec![0.0f32, 0.0, 4.0, 0.0, 0.0, 5.0, 4.0, 5.0, 0.0], [3, 3]),
+        &device,
+    )
+    .require_grad();
+    let (indices, knn_distances) =
+        <Dispatch as UmapOps>::knn(pairwise_input.clone().into_dispatch(), 1);
+    let knn_distances = Tensor::<2>::from_dispatch(knn_distances);
+    let indices = Tensor::<2, burn::tensor::Int>::from_dispatch(indices)
+        .to_data()
+        .try_to_vec::<i32>()
+        .unwrap();
+    let knn_values = knn_distances.to_data().try_to_vec::<f32>().unwrap();
+    assert_eq!(indices, vec![1, 0, 0]);
+    assert_eq!(knn_values, vec![0.0, 0.0, 4.0]);
+
+    let grads = knn_distances.sum().backward();
+    let pairwise_grad = pairwise_input
+        .grad(&grads)
+        .unwrap()
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    assert_eq!(
+        pairwise_grad,
+        vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn flex_umap_ops_dispatch_and_gradients() {
+    assert_umap_ops_dispatch_and_gradients(Device::flex().autodiff());
+}
+
+#[test]
+fn flex_knn_f64_dispatch_preserves_order_dtype_and_backward() {
+    let device = Device::flex().autodiff();
+    let pairwise = Tensor::<2>::from_data(
+        TensorData::new(
+            vec![
+                0.0f64,
+                1.0,
+                1.0 + 1e-10,
+                1.0,
+                0.0,
+                2.0,
+                1.0 + 1e-10,
+                2.0,
+                0.0,
+            ],
+            [3, 3],
+        ),
+        (&device, DType::F64),
+    )
+    .require_grad();
+
+    let (indices, distances) = <Dispatch as UmapOps>::knn(pairwise.clone().into_dispatch(), 1);
+    let indices = Tensor::<2, burn::tensor::Int>::from_dispatch(indices);
+    let distances = Tensor::<2>::from_dispatch(distances);
+
+    assert_eq!(distances.dtype(), DType::F64);
+    assert_eq!(
+        distances.to_data().try_to_vec::<f64>().unwrap(),
+        vec![1.0, 1.0, 1.0 + 1e-10]
+    );
+    assert_eq!(
+        indices.to_data().try_to_vec::<i32>().unwrap(),
+        vec![1, 0, 0]
+    );
+
+    let grads = distances.sum().backward();
+    let pairwise_grad = pairwise.grad(&grads).unwrap();
+    assert_eq!(pairwise_grad.dtype(), DType::F64);
+    assert_eq!(
+        pairwise_grad.to_data().try_to_vec::<f64>().unwrap(),
+        vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn knn_cpu_selector_allows_empty_neighbor_count() {
+    let (indices, distances) =
+        fast_umap::train::get_distance_by_metric::knn_from_pairwise_cpu(&[0.0f32; 4], 2, 0);
+    assert!(indices.is_empty());
+    assert!(distances.is_empty());
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_umap_ops_dispatch_and_gradients() {
+    assert_umap_ops_dispatch_and_gradients(Device::wgpu(Default::default()).autodiff());
 }

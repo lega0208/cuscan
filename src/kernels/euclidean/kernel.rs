@@ -7,6 +7,7 @@ use cubecl::{cube, prelude::*};
 pub fn euclidean_pairwise_distance_kernel<F: Float>(
     x: &Tensor<F>,          // [n, d]
     output: &mut Tensor<F>, // [n, n]
+    #[define(F)] _dtype: ElemType,
 ) {
     let row = ABSOLUTE_POS_X as usize;
     let col = ABSOLUTE_POS_Y as usize;
@@ -46,6 +47,7 @@ pub fn euclidean_pairwise_distance_backward_kernel<F: Float>(
     pairwise: &Tensor<F>,      // [n, n]  precomputed distances (from forward state)
     grad_pairwise: &Tensor<F>, // [n, n]  ∂loss/∂pairwise_distances
     grad_x: &mut Tensor<F>,    // [n, d]  ∂loss/∂x  — written by this kernel
+    #[define(F)] _dtype: ElemType,
 ) {
     let row = ABSOLUTE_POS_X as usize; // sample index
     let feat = ABSOLUTE_POS_Y as usize; // feature index

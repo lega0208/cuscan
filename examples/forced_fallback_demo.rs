@@ -2,13 +2,13 @@
 //!
 //! This example simulates GPU failure to demonstrate the fallback mechanism.
 
-use rand::Rng;
+use rand::RngExt;
 
 fn main() {
     println!("=== Forced Fallback Demo ===");
     println!("This demo shows what happens when GPU fails and CPU fallback is used.");
     println!();
-    
+
     // Generate test data
     let num_samples = 50;
     let num_features = 3;
@@ -19,29 +19,40 @@ fn main() {
         .chunks_exact(num_features)
         .map(|chunk| chunk.to_vec())
         .collect();
-    
-    println!("Generated {} samples with {} features each", num_samples, num_features);
+
+    println!(
+        "Generated {} samples with {} features each",
+        num_samples, num_features
+    );
     println!();
-    
+
     // Simulate GPU failure by forcing a panic
     println!("Simulating GPU backend failure...");
     let gpu_result = try_gpu_backend_with_forced_failure(data.clone());
-    
+
     match gpu_result {
         Ok(embedding) => {
             println!("✓ GPU backend succeeded (unexpected!):");
-            println!("  Embedding shape: {} × {}", embedding.len(), embedding[0].len());
+            println!(
+                "  Embedding shape: {} × {}",
+                embedding.len(),
+                embedding[0].len()
+            );
         }
         Err(gpu_error) => {
             println!("⚠ GPU backend failed as expected: {}", gpu_error);
             println!("Falling back to CPU backend...");
             println!();
-            
+
             match try_cpu_backend(data.clone()) {
                 Ok(cpu_embedding) => {
                     println!("✓ CPU backend succeeded:");
-                    println!("  Embedding shape: {} × {}", cpu_embedding.len(), cpu_embedding[0].len());
-                    println!("  Transform support: ❌ No");
+                    println!(
+                        "  Embedding shape: {} × {}",
+                        cpu_embedding.len(),
+                        cpu_embedding[0].len()
+                    );
+                    println!("  Transform support: ✅ Yes");
                     println!();
                     println!("✅ Fallback mechanism worked perfectly!");
                     println!("   GPU failed → CPU took over → Success!");
@@ -54,7 +65,7 @@ fn main() {
             }
         }
     }
-    
+
     println!();
     println!("=== Forced Fallback Demo Complete ===");
 }
@@ -69,13 +80,13 @@ fn try_gpu_backend_with_forced_failure(_data: Vec<Vec<f64>>) -> Result<Vec<Vec<f
         // - Out of GPU memory
         // - GPU initialization failure
         // - Unsupported GPU hardware
-        
+
         println!("  GPU initialization... FAILED (simulated)");
-        
+
         // Simulate failure
         Err("Simulated GPU failure: Could not initialize WGPU device".to_string())
     }
-    
+
     #[cfg(not(feature = "gpu"))]
     {
         Err("GPU feature not compiled. Use --features gpu".to_string())
@@ -85,16 +96,16 @@ fn try_gpu_backend_with_forced_failure(_data: Vec<Vec<f64>>) -> Result<Vec<Vec<f
 /// Try CPU backend (same as fallback_demo)
 #[allow(unused_variables)]
 fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
-    #[cfg(feature = "cpu")]
     {
-        use fast_umap::{prelude::*, cpu_backend::api as cpu_api};
+        use fast_umap::prelude::*;
         use std::panic::catch_unwind;
 
         println!("  CPU initialization... SUCCESS");
         println!("  CPU processing... COMPLETE");
 
         let config = UmapConfig::default();
-        match catch_unwind(|| cpu_api::fit_cpu(config, data, None)) {
+        let umap = fast_umap::Umap::with_device(config, burn::tensor::Device::flex());
+        match catch_unwind(|| umap.fit(data, None)) {
             Ok(fitted) => Ok(fitted.embedding().clone()),
             Err(e) => {
                 if let Some(s) = e.downcast_ref::<&str>() {
@@ -106,10 +117,5 @@ fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
                 }
             }
         }
-    }
-    
-    #[cfg(not(feature = "cpu"))]
-    {
-        Err("CPU feature not compiled. Use --features cpu".to_string())
     }
 }

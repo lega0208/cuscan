@@ -108,12 +108,7 @@ type Float = f64;
 /// # Arguments
 /// * `data` - A 2D tensor of data points to plot
 /// * `config` - Optional custom chart configuration
-pub fn chart_tensor<B: Backend>(
-    data: Tensor<B, 2>,
-    labels: Option<Vec<String>>,
-    config: Option<ChartConfig>,
-) {
-    // pub fn chart_tensor<B: Backend>(data: Tensor<B, 2>, config: Option<ChartConfig>) {
+pub fn chart_tensor(data: Tensor<2>, labels: Option<Vec<String>>, config: Option<ChartConfig>) {
     let data: Vec<Vec<Float>> = convert_tensor_to_vector(data);
     chart_vector(data, labels, config);
 }

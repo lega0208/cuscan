@@ -1,7 +1,5 @@
 use burn::tensor::Tensor;
 
-use crate::backend::Backend;
-
 /// Calculate the pairwise Euclidean distance matrix for a given 2D tensor
 ///
 /// # Arguments
@@ -12,7 +10,7 @@ use crate::backend::Backend;
 ///
 /// This function computes the pairwise Euclidean distance between samples by using broadcasting
 /// to efficiently subtract the samples from each other, squaring the differences, and summing across the features.
-pub fn euclidean<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 1> {
+pub fn euclidean(x: Tensor<2>) -> Tensor<1> {
     let n_samples = x.dims()[0]; // Number of samples (rows)
     let _n_features = x.dims()[1]; // Number of features (columns)
 
@@ -55,12 +53,16 @@ pub fn euclidean<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 1> {
 ///
 /// # Example
 /// ```rust
-/// let x = Tensor::from([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+/// use burn::tensor::{Device, Tensor};
+/// use fast_umap::distances::euclidean_knn;
+///
+/// let device = Device::flex();
+/// let x = Tensor::<2>::from_data([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], &device);
 /// let k = 2;
 /// let result = euclidean_knn(x, k);
 /// println!("{:?}", result); // Output: sum of squared distances for each sample to its 2 nearest neighbors
 /// ```
-pub fn euclidean_knn<B: Backend>(x: Tensor<B, 2>, k: usize) -> Tensor<B, 1> {
+pub fn euclidean_knn(x: Tensor<2>, k: usize) -> Tensor<1> {
     let n_samples = x.dims()[0]; // Number of samples (rows)
 
     // Expand x to shapes that allow broadcasting for pairwise subtraction:
@@ -83,7 +85,7 @@ pub fn euclidean_knn<B: Backend>(x: Tensor<B, 2>, k: usize) -> Tensor<B, 1> {
     let (top_k_distances, _top_k_indices) = pairwise_distances.topk_with_indices(k, 1);
 
     // Sum the top K distances for each sample:
-    let sum_of_top_k_distances: Tensor<B, 1> = top_k_distances.sum_dim(1).reshape([n_samples]); // Shape: (n_samples)
+    let sum_of_top_k_distances: Tensor<1> = top_k_distances.sum_dim(1).reshape([n_samples]); // Shape: (n_samples)
 
     sum_of_top_k_distances
 }
@@ -106,7 +108,7 @@ pub fn euclidean_knn<B: Backend>(x: Tensor<B, 2>, k: usize) -> Tensor<B, 1> {
 /// This computes the L1 norm of each row, *not* pairwise Manhattan distances
 /// between rows.  It is used as a distance-from-origin proxy when the
 /// `Manhattan` metric is selected.
-pub fn manhattan<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
+pub fn manhattan(tensor: Tensor<2>) -> Tensor<1> {
     let n_samples = tensor.dims()[0];
     // Sum the absolute difference along the rows (axis 1)
     let x = tensor
@@ -135,7 +137,14 @@ pub fn manhattan<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
 ///
 /// # Example
 /// ```
-/// let tensor = Tensor::from([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+/// use burn::tensor::{Device, Tensor};
+/// use fast_umap::distances::cosine;
+///
+/// let device = Device::flex();
+/// let tensor = Tensor::<2>::from_data(
+///     [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+///     &device,
+/// );
 /// let similarities = cosine(tensor);
 /// // `similarities` is a 1D tensor of cosine similarities between the first row and all other rows
 /// ```
@@ -150,7 +159,7 @@ pub fn manhattan<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
 /// # Performance
 /// This function clones the tensor multiple times, which may impact performance for large tensors.
 /// Optimizations could be made to minimize memory allocations and cloning.
-pub fn cosine<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
+pub fn cosine(tensor: Tensor<2>) -> Tensor<1> {
     let n_samples = tensor.dims()[0];
     let n_features = tensor.dims()[1];
     // First, get the first row to compare to
@@ -160,9 +169,9 @@ pub fn cosine<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
     let first_row_norm = first_row.clone().powi_scalar(2).sum_dim(1).sqrt();
 
     // Compute dot product of each row with the first row
-    let dot_product: Tensor<B, 2> = tensor.clone().mul(first_row.clone()); // Calculate dot product for each row
-    let dot_product: Tensor<B, 3> = dot_product.unsqueeze_dim(2);
-    let dot_product: Tensor<B, 2> = dot_product.sum_dim(1).reshape([n_samples, 1]); // Reshape to a column vector (1D)
+    let dot_product: Tensor<2> = tensor.clone().mul(first_row.clone()); // Calculate dot product for each row
+    let dot_product: Tensor<3> = dot_product.unsqueeze_dim(2);
+    let dot_product: Tensor<2> = dot_product.sum_dim(1).reshape([n_samples, 1]); // Reshape to a column vector (1D)
 
     // Compute L2 norm (magnitude) of each row manually (sqrt(sum(x^2)))
     let row_norms = tensor.clone().powi_scalar(2).sum_dim(1).sqrt();
@@ -195,7 +204,14 @@ pub fn cosine<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
 ///
 /// # Example
 /// ```
-/// let tensor = Tensor::from([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+/// use burn::tensor::{Device, Tensor};
+/// use fast_umap::distances::minkowski;
+///
+/// let device = Device::flex();
+/// let tensor = Tensor::<2>::from_data(
+///     [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+///     &device,
+/// );
 /// let distances = minkowski(tensor, 2.0);
 /// // `distances` will contain the Euclidean distances between each row and the first row.
 /// ```
@@ -210,7 +226,7 @@ pub fn cosine<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 1> {
 /// The function clones the tensor to avoid modifying the original data. For large tensors, this may
 /// incur some overhead due to memory allocation. You may want to explore optimization techniques like
 /// in-place operations if memory usage is a concern.
-pub fn minkowski<B: Backend>(tensor: Tensor<B, 2>, p: f64) -> Tensor<B, 1> {
+pub fn minkowski(tensor: Tensor<2>, p: f64) -> Tensor<1> {
     let n_samples = tensor.dims()[0];
     let n_features = tensor.dims()[1];
 

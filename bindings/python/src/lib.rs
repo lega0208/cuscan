@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use burn::backend::{Autodiff, NdArray};
+use burn::tensor::{Device, DeviceKind};
 use crossbeam_channel::unbounded;
-use cubecl::wgpu::WgpuRuntime;
 use fast_umap::{
     validate_fit_data, FittedUmap, GraphParams, ManifoldParams, Metric, OptimizationParams, Umap,
     UmapConfig,
@@ -13,17 +12,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-type GpuBackend = Autodiff<burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>>;
-type CpuBackend = Autodiff<NdArray<f32>>;
-
-enum Inner {
-    Gpu(FittedUmap<GpuBackend>),
-    Cpu(FittedUmap<CpuBackend>),
-}
-
 #[pyclass(frozen, unsendable)]
 struct FittedModel {
-    inner: Mutex<Option<Inner>>,
+    inner: Mutex<Option<Box<FittedUmap>>>,
     device: String,
 }
 
@@ -40,15 +31,10 @@ impl FittedModel {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("fitted model lock poisoned"))?;
-        Ok(
-            match inner
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("fitted model unavailable"))?
-            {
-                Inner::Gpu(model) => model.n_features(),
-                Inner::Cpu(model) => model.n_features(),
-            },
-        )
+        Ok(inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("fitted model unavailable"))?
+            .n_features())
     }
 
     #[getter]
@@ -57,13 +43,10 @@ impl FittedModel {
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("fitted model lock poisoned"))?;
-        let embedding = match inner
+        let embedding = inner
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("fitted model unavailable"))?
-        {
-            Inner::Gpu(model) => model.embedding(),
-            Inner::Cpu(model) => model.embedding(),
-        };
+            .embedding();
         let rows = embedding.len();
         let columns = embedding.first().map_or(0, Vec::len);
         let values = embedding.iter().flatten().map(|&v| v as f32).collect();
@@ -86,10 +69,7 @@ impl FittedModel {
         let model = inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("fitted model unavailable"))?;
-        let expected = match &model {
-            Inner::Gpu(model) => model.n_features(),
-            Inner::Cpu(model) => model.n_features(),
-        };
+        let expected = model.n_features();
         let data: Vec<Vec<f64>> = array
             .rows()
             .into_iter()
@@ -102,20 +82,13 @@ impl FittedModel {
             )));
         }
         let (model, output) = py.detach(move || {
-            let output = match &model {
-                Inner::Gpu(model) => model.transform(data),
-                Inner::Cpu(model) => model.transform(data),
-            };
+            let output = model.transform(data);
             (model, output)
         });
+        let cols = output
+            .first()
+            .map_or_else(|| model.config().n_components, Vec::len);
         *inner = Some(model);
-        let cols = output.first().map_or_else(
-            || match inner.as_ref().expect("model restored") {
-                Inner::Gpu(model) => model.config().n_components,
-                Inner::Cpu(model) => model.config().n_components,
-            },
-            Vec::len,
-        );
         let values = output.into_iter().flatten().map(|v| v as f32).collect();
         let shape = if rows == 0 { (0, cols) } else { (rows, cols) };
         Ok(Array2::from_shape_vec(shape, values)
@@ -124,14 +97,7 @@ impl FittedModel {
     }
 }
 
-fn fit_impl<B: fast_umap::backend::AutodiffBackend>(
-    x: Vec<Vec<f32>>,
-    config: UmapConfig,
-) -> PyResult<FittedUmap<B>>
-where
-    B: burn::tensor::backend::AutodiffBackend,
-    f32: num::Float + num::FromPrimitive + burn::tensor::Element,
-{
+fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<FittedUmap> {
     validate_fit_data(&config, &x).map_err(PyValueError::new_err)?;
     let (exit_tx, exit_rx) = unbounded();
     let interrupt = Arc::new(Mutex::new(None));
@@ -144,7 +110,7 @@ where
             let _ = exit_tx.send(());
         }
     });
-    let fitted = Umap::<B>::new(config).fit_with_progress(x, None, exit_rx, callback);
+    let fitted = Umap::with_device(config, device).fit_with_progress(x, None, exit_rx, callback);
     if let Some(error) = interrupt
         .lock()
         .map_err(|_| PyRuntimeError::new_err("interrupt lock poisoned"))?
@@ -197,14 +163,15 @@ fn fit(
         verbose,
         ..OptimizationParams::default()
     };
-    let model = match device {
-        "gpu" => Inner::Gpu(py.detach(|| fit_impl::<GpuBackend>(data, config))?),
-        "cpu" => Inner::Cpu(py.detach(|| fit_impl::<CpuBackend>(data, config))?),
+    let (backend_device, device_name) = match device {
+        "gpu" => (Device::wgpu(DeviceKind::DefaultDevice).autodiff(), "gpu"),
+        "cpu" => (Device::flex().autodiff(), "cpu"),
         _ => return Err(PyValueError::new_err("device must be 'gpu' or 'cpu'")),
     };
+    let model = py.detach(|| fit_impl(data, config, backend_device))?;
     Ok(FittedModel {
-        inner: Mutex::new(Some(model)),
-        device: device.to_owned(),
+        inner: Mutex::new(Some(Box::new(model))),
+        device: device_name.to_owned(),
     })
 }
 

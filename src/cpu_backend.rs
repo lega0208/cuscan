@@ -4,8 +4,6 @@
 //! Currently implements utility functions and provides a foundation for full CPU support.
 
 use crate::{distances::*, train::*, utils::*};
-use burn::tensor::{Device, Tensor};
-use ndarray::Array2;
 use num::Float;
 use std::time::Instant;
 

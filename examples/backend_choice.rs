@@ -1,11 +1,11 @@
-/// Runtime backend selection: gpu, mlx, or cpu.
+/// Runtime device selection: wgpu or Flex CPU.
 ///
 /// Usage:
-///     cargo run --release --features gpu          --example backend_choice -- gpu
-///     cargo run --release --features mlx          --example backend_choice -- mlx
-///     cargo run --release --features gpu,cpu      --example backend_choice -- cpu
+///     cargo run --release --features gpu --example backend_choice -- wgpu
+///     cargo run --release --example backend_choice -- flex
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
-use rand::Rng;
+use rand::RngExt;
 
 fn main() {
     let num_samples = 100;
@@ -19,90 +19,46 @@ fn main() {
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    let backend_choice = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            // Auto-detect best available backend
-            if cfg!(feature = "mlx") { "mlx" }
-            else if cfg!(feature = "gpu") { "gpu" }
-            else if cfg!(feature = "cpu") { "cpu" }
-            else { "gpu" }
-        }.to_string());
+    let device_choice = std::env::args().nth(1).unwrap_or_else(|| {
+        if cfg!(feature = "gpu") {
+            "wgpu"
+        } else {
+            "flex"
+        }
+        .to_string()
+    });
 
-    println!("Running UMAP with {backend_choice} backend");
+    println!("Running UMAP with {device_choice} device");
 
-    match backend_choice.as_str() {
-        "mlx" => run_mlx_umap(data),
-        "gpu" | "wgpu" => run_gpu_umap(data),
-        "cpu" => run_cpu_umap(data),
+    let device = match device_choice.as_str() {
+        "wgpu" | "gpu" => {
+            #[cfg(feature = "gpu")]
+            {
+                Device::wgpu(DeviceKind::DiscreteGpu(0))
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                eprintln!("WGPU device not available. Compile with --features gpu");
+                std::process::exit(1);
+            }
+        }
+        "flex" | "cpu" => Device::flex(),
         _ => {
-            eprintln!("Unknown backend '{backend_choice}'. Use: mlx, gpu, or cpu");
+            eprintln!("Unknown device '{device_choice}'. Use: wgpu or flex");
             std::process::exit(1);
         }
-    }
-}
+    };
 
-fn run_mlx_umap(data: Vec<Vec<f64>>) {
-    #[cfg(feature = "mlx")]
-    {
-        type B = burn::backend::Autodiff<burn_mlx::Mlx>;
+    let config = UmapConfig::default();
+    let fitted = Umap::with_device(config, device).fit(data.clone(), None);
 
-        let config = UmapConfig::default();
-        let umap = fast_umap::Umap::<B>::new(config);
-        let fitted = umap.fit(data.clone(), None);
+    let embedding = fitted.embedding();
+    println!(
+        "Embedding shape: {} x {}",
+        embedding.len(),
+        embedding[0].len()
+    );
 
-        let embedding = fitted.embedding();
-        println!("MLX Embedding shape: {} x {}", embedding.len(), embedding[0].len());
-
-        let _new = fitted.transform(data);
-        println!("MLX backend successfully transformed new data");
-    }
-    #[cfg(not(feature = "mlx"))]
-    {
-        eprintln!("MLX backend not available. Compile with --features mlx");
-        std::process::exit(1);
-    }
-}
-
-fn run_gpu_umap(data: Vec<Vec<f64>>) {
-    #[cfg(feature = "gpu")]
-    {
-        type B = burn::backend::Autodiff<
-            burn::backend::wgpu::CubeBackend<cubecl::wgpu::WgpuRuntime, f32, i32, u32>,
-        >;
-
-        let config = UmapConfig::default();
-        let umap = fast_umap::Umap::<B>::new(config);
-        let fitted = umap.fit(data.clone(), None);
-
-        let embedding = fitted.embedding();
-        println!("GPU Embedding shape: {} x {}", embedding.len(), embedding[0].len());
-
-        let _new = fitted.transform(data);
-        println!("GPU backend successfully transformed new data");
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        eprintln!("GPU backend not available. Compile with --features gpu");
-        std::process::exit(1);
-    }
-}
-
-fn run_cpu_umap(data: Vec<Vec<f64>>) {
-    #[cfg(feature = "cpu")]
-    {
-        use fast_umap::cpu_backend::api as cpu_api;
-
-        let config = UmapConfig::default();
-        let fitted = cpu_api::fit_cpu(config, data, None);
-
-        let embedding = fitted.embedding();
-        println!("CPU Embedding shape: {} x {}", embedding.len(), embedding[0].len());
-        println!("Note: CPU backend does not support transforming new data");
-    }
-    #[cfg(not(feature = "cpu"))]
-    {
-        eprintln!("CPU backend not available. Compile with --features cpu");
-        std::process::exit(1);
-    }
+    let _new = fitted.transform(data);
+    println!("{device_choice} device successfully transformed new data");
 }

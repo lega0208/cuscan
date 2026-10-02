@@ -3,11 +3,11 @@
 //! This example shows how to implement a robust fallback mechanism
 //! that automatically uses CPU backend when GPU is unavailable.
 
-use rand::Rng;
+use rand::RngExt;
 
 fn main() {
     println!("=== GPU to CPU Fallback Demo ===");
-    
+
     // Generate test data
     let num_samples = 100;
     let num_features = 3;
@@ -18,26 +18,37 @@ fn main() {
         .chunks_exact(num_features)
         .map(|chunk| chunk.to_vec())
         .collect();
-    
-    println!("Generated {} samples with {} features each", num_samples, num_features);
+
+    println!(
+        "Generated {} samples with {} features each",
+        num_samples, num_features
+    );
     println!();
-    
+
     // Try GPU first, fall back to CPU if needed
     match try_gpu_backend(data.clone()) {
         Ok(gpu_result) => {
             println!("✓ GPU backend succeeded:");
-            println!("  Embedding shape: {} × {}", gpu_result.len(), gpu_result[0].len());
+            println!(
+                "  Embedding shape: {} × {}",
+                gpu_result.len(),
+                gpu_result[0].len()
+            );
             println!("  Transform support: ✅ Yes");
         }
         Err(gpu_error) => {
             println!("⚠ GPU backend failed: {}", gpu_error);
             println!("Falling back to CPU backend...");
-            
+
             match try_cpu_backend(data.clone()) {
                 Ok(cpu_result) => {
                     println!("✓ CPU backend succeeded:");
-                    println!("  Embedding shape: {} × {}", cpu_result.len(), cpu_result[0].len());
-                    println!("  Transform support: ❌ No (classical UMAP limitation)");
+                    println!(
+                        "  Embedding shape: {} × {}",
+                        cpu_result.len(),
+                        cpu_result[0].len()
+                    );
+                    println!("  Transform support: ✅ Yes");
                 }
                 Err(cpu_error) => {
                     println!("❌ CPU backend also failed: {}", cpu_error);
@@ -47,7 +58,7 @@ fn main() {
             }
         }
     }
-    
+
     println!();
     println!("=== Fallback Demo Complete ===");
     println!("This demonstrates robust error handling and automatic fallback.");
@@ -57,21 +68,17 @@ fn main() {
 fn try_gpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     #[cfg(feature = "gpu")]
     {
-        use burn::backend::Autodiff;
-        use cubecl::wgpu::WgpuRuntime;
         use fast_umap::prelude::*;
-        
+
         println!("Attempting GPU backend...");
-        
-        type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-        type MyAutodiffBackend = Autodiff<MyBackend>;
-        
+
         let config = UmapConfig::default();
-        let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
-        
+        let device = burn::tensor::Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
+        let umap = fast_umap::Umap::with_device(config, device);
+
         // GPU fit can panic on errors, so we wrap in catch_unwind
         use std::panic::catch_unwind;
-        
+
         match catch_unwind(|| umap.fit(data.clone(), None)) {
             Ok(fitted) => {
                 let embedding = fitted.embedding().clone();
@@ -90,7 +97,7 @@ fn try_gpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
             }
         }
     }
-    
+
     #[cfg(not(feature = "gpu"))]
     {
         Err("GPU feature not compiled. Use --features gpu".to_string())
@@ -99,17 +106,17 @@ fn try_gpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
 
 /// Try CPU backend with proper error handling
 fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
-    #[cfg(feature = "cpu")]
     {
-        use fast_umap::{prelude::*, cpu_backend::api as cpu_api};
-        
+        use fast_umap::prelude::*;
+
         println!("Attempting CPU backend...");
-        
+
         let config = UmapConfig::default();
+        let umap = fast_umap::Umap::with_device(config, burn::tensor::Device::flex());
         // CPU fit can also panic, so we wrap in catch_unwind
         use std::panic::catch_unwind;
-        
-        match catch_unwind(|| cpu_api::fit_cpu(config, data, None)) {
+
+        match catch_unwind(|| umap.fit(data.clone(), None)) {
             Ok(fitted) => Ok(fitted.embedding().clone()),
             Err(e) => {
                 if let Some(s) = e.downcast_ref::<&str>() {
@@ -121,10 +128,5 @@ fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
                 }
             }
         }
-    }
-    
-    #[cfg(not(feature = "cpu"))]
-    {
-        Err("CPU feature not compiled. Use --features cpu".to_string())
     }
 }

@@ -1,8 +1,8 @@
-use burn::tensor::ops::{FloatTensor, IntTensor};
+use burn::backend::tensor::{FloatTensor, IntTensor};
 use cubecl::CubeDim;
 
-use crate::backend::Backend;
-use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
+use crate::backend::UmapOps;
+use burn_cubecl::CubeBackend;
 
 mod euclidean;
 mod knn;
@@ -13,21 +13,19 @@ mod knn;
 /// matches the typical warp/wavefront size on WGPU targets (Metal, Vulkan,
 /// DX12) and maximises occupancy for the matrix-shaped dispatch patterns used
 /// by the Euclidean and k-NN kernels.
-pub const DEFAULT_CUBE_DIM: CubeDim = CubeDim { x: 32, y: 32, z: 1 };
+pub const DEFAULT_CUBE_DIM: CubeDim = CubeDim::new_2d(32, 32);
 
-/// GPU implementation of the fast-umap [`Backend`] trait for [`CubeBackend`].
+/// GPU implementation of the fast-umap [`UmapOps`] extension for [`CubeBackend`].
 ///
 /// Each method dispatches to the corresponding CubeCL kernel in the
 /// [`euclidean`] or [`knn`] sub-modules.
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
-    for CubeBackend<R, F, I, BT>
-{
+impl UmapOps for CubeBackend {
     /// Launch the Euclidean pairwise distance forward kernel.
     ///
     /// Computes the full `[n, n]` symmetric distance matrix for an `[n, d]`
     /// input using one GPU thread per `(row, col)` upper-triangle pair.
     fn euclidean_pairwise_distance(x: FloatTensor<Self>) -> FloatTensor<Self> {
-        euclidean::forward::forward::<R, F, I, BT>(x)
+        euclidean::forward::forward(x)
     }
 
     /// Launch the Euclidean pairwise distance backward kernel.
@@ -41,7 +39,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
         x: FloatTensor<Self>,
         pairwise: FloatTensor<Self>,
     ) -> FloatTensor<Self> {
-        euclidean::forward::backward::<R, F, I, BT>(grad_pairwise, x, pairwise)
+        euclidean::forward::backward(grad_pairwise, x, pairwise)
     }
 
     /// Launch the k-NN forward kernel.
@@ -49,7 +47,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
     /// Selects the `k` nearest neighbours for every row using an
     /// insertion-sort approach — one GPU thread per row.
     fn knn(pairwise_distances: FloatTensor<Self>, k: u32) -> (IntTensor<Self>, FloatTensor<Self>) {
-        knn::forward::forward::<R, F, I, BT>(pairwise_distances, k)
+        knn::forward::forward(pairwise_distances, k)
     }
 
     /// Launch the k-NN backward kernel.
@@ -62,10 +60,8 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
         k: u32,
         grad_output: FloatTensor<Self>,
     ) -> FloatTensor<Self> {
-        knn::forward::backward::<R, F, I, BT>(pairwise_distances, k, grad_output)
+        knn::forward::backward(pairwise_distances, k, grad_output)
     }
 }
 
-// Note: The Autodiff<B, C> impl of Backend has been moved to
-// src/autodiff_ops.rs so it is available for all backends (MLX, WGPU, etc.),
-// not just CubeBackend.
+// The autodiff implementation is handwritten in src/autodiff_ops.rs.

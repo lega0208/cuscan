@@ -2,9 +2,9 @@
 //!
 //! Computes the top-k principal components of centered data using the
 //! covariance-eigendecomposition approach via power iteration. Works on
-//! any Burn backend (CPU, WGPU, MLX) without external linear algebra deps.
+//! any Burn backend (Flex CPU, WGPU, CUDA) without external linear algebra deps.
 
-use burn::tensor::{backend::Backend, Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 
 /// Compute PCA projection of `data` [n, d] down to `n_components` dimensions.
 ///
@@ -12,12 +12,12 @@ use burn::tensor::{backend::Backend, Tensor, TensorData};
 /// - `projected`  — `[n, n_components]` PCA-projected data
 /// - `components` — `[n_components, d]` principal component vectors (rows)
 /// - `mean`       — `[1, d]` column means used for centering
-pub fn pca<B: Backend>(
+pub fn pca(
     data: &[f32],
     n_samples: usize,
     n_features: usize,
     n_components: usize,
-    device: &burn::tensor::Device<B>,
+    device: &Device,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     // 1. Compute column means
     let mut mean = vec![0.0f64; n_features];
@@ -40,7 +40,7 @@ pub fn pca<B: Backend>(
 
     // 3. Compute covariance matrix C = X^T X / (n-1), shape [d, d]
     //    Use Burn tensors for the matmul (GPU-accelerated if available)
-    let x: Tensor<B, 2> = Tensor::from_data(
+    let x: Tensor<2> = Tensor::from_data(
         TensorData::new(centered.clone(), [n_samples, n_features]),
         device,
     );
@@ -51,7 +51,7 @@ pub fn pca<B: Backend>(
         .div_scalar((n_samples - 1) as f32);
 
     // 4. Extract eigenvectors via power iteration with deflation
-    let mut cov_data: Vec<f32> = cov.to_data().to_vec::<f32>().unwrap();
+    let mut cov_data: Vec<f32> = cov.to_data().try_to_vec::<f32>().unwrap();
     let mut components = Vec::with_capacity(n_components * n_features);
 
     for _comp in 0..n_components {

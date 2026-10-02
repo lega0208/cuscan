@@ -1,21 +1,25 @@
-#![cfg(feature = "gpu")]
-
+use burn::tensor::Device;
 use fast_umap::prelude::*;
-use fast_umap::{Umap, FittedUmap};
-use cubecl::wgpu::WgpuRuntime;
+use fast_umap::{FittedUmap, Umap};
 
 use std::path::PathBuf;
 
-type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
+fn flex() -> Device {
+    Device::flex()
+}
 
 fn generate_test_data(num_samples: usize, num_features: usize) -> Vec<Vec<f64>> {
-    (0..num_samples).map(|i| {
-        (0..num_features).map(|j| {
-            let base = (i as f64) / (num_samples as f64) * 10.0;
-            base + ((j as f64) / (num_features as f64)) + (rand::random::<f64>() - 0.5) * 0.1
-        }).collect()
-    }).collect()
+    (0..num_samples)
+        .map(|i| {
+            (0..num_features)
+                .map(|j| {
+                    let base = (i as f64) / (num_samples as f64) * 10.0;
+                    base + ((j as f64) / (num_features as f64))
+                        + (rand::random::<f64>() - 0.5) * 0.1
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[test]
@@ -44,54 +48,58 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = Umap::<MyAutodiffBackend>::new(config.clone());
+    let umap = Umap::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
-    
+
     // Save the model to a temporary file
-    let model_path = PathBuf::from("/tmp/test_umap_model.bin");
-    
+    let model_path = PathBuf::from("/tmp/test_umap_model.burnpack");
+
     // Clean up any existing file
     if model_path.exists() {
         std::fs::remove_file(&model_path)?;
     }
-    
+
     // Debug: Check if path is valid
     println!("Saving to: {:?}", model_path);
-    assert!(model_path.parent().unwrap().exists(), "Parent directory should exist");
-    
+    assert!(
+        model_path.parent().unwrap().exists(),
+        "Parent directory should exist"
+    );
+
     let save_result = fitted.save(&model_path);
     if let Err(e) = save_result {
         panic!("Save failed with error: {:?}", e);
     }
-    
+
     // Verify file exists and has reasonable size
     assert!(model_path.exists(), "File should exist after save");
     let file_metadata = std::fs::metadata(&model_path)?;
     println!("File size: {} bytes", file_metadata.len());
     assert!(file_metadata.len() > 0, "File should not be empty");
-    assert!(file_metadata.len() < 100_000, "File should be less than 100KB: {} bytes", file_metadata.len());
-    
+    assert!(
+        file_metadata.len() < 100_000,
+        "File should be less than 100KB: {} bytes",
+        file_metadata.len()
+    );
+
     // Load the model
-    let loaded_fitted = FittedUmap::<MyAutodiffBackend>::load(
+    let loaded_fitted = FittedUmap::load(
         &model_path,
         config,
         4, // Input size
-        Default::default(),
+        flex(),
     )?;
 
     // Test that the loaded model can transform data
-    let new_data: Vec<Vec<f64>> = vec![
-        vec![1.5, 2.5, 3.5, 4.5],
-        vec![2.5, 3.5, 4.5, 5.5],
-    ];
+    let new_data: Vec<Vec<f64>> = vec![vec![1.5, 2.5, 3.5, 4.5], vec![2.5, 3.5, 4.5, 5.5]];
 
     let embedding = loaded_fitted.transform(new_data);
-    
+
     // Basic checks
     assert_eq!(embedding.len(), 2); // Two new data points
     assert_eq!(embedding[0].len(), 2); // 2D embedding
     assert_eq!(embedding[1].len(), 2);
-    
+
     // Check that the embedding values are reasonable (not NaN, not infinite)
     for point in &embedding {
         for &coord in point {
@@ -99,6 +107,8 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
             assert!(!coord.is_nan());
         }
     }
+
+    std::fs::remove_file(&model_path)?;
 
     Ok(())
 }
@@ -124,32 +134,28 @@ fn test_load_with_sample() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = Umap::<MyAutodiffBackend>::new(config.clone());
+    let umap = Umap::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
-    
+
     // Save the model
-    let model_path = PathBuf::from("/tmp/test_umap_model_2.bin");
+    let model_path = PathBuf::from("/tmp/test_umap_model_2.burnpack");
     if model_path.exists() {
         std::fs::remove_file(&model_path)?;
     }
     fitted.save(&model_path)?;
+    assert!(model_path.is_file());
 
     // Test load_with_sample method
     let sample_data = vec![0.0; num_features]; // Sample with correct dimensionality
-    let loaded_fitted = FittedUmap::<MyAutodiffBackend>::load_with_sample(
-        &model_path,
-        config,
-        sample_data,
-        Default::default(),
-    )?;
+    let loaded_fitted = FittedUmap::load_with_sample(&model_path, config, sample_data, flex())?;
 
     // Test transformation
     let test_data = vec![data[0].clone(), data[1].clone()];
     let embedding = loaded_fitted.transform(test_data);
-    
+
     assert_eq!(embedding.len(), 2);
     assert_eq!(embedding[0].len(), 2);
-    
+
     // Verify embeddings are valid
     for point in &embedding {
         for &coord in point {
@@ -157,6 +163,8 @@ fn test_load_with_sample() -> Result<(), Box<dyn std::error::Error>> {
             assert!(!coord.is_nan());
         }
     }
+
+    std::fs::remove_file(&model_path)?;
 
     Ok(())
 }
@@ -181,44 +189,47 @@ fn test_multiple_save_load_cycles() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = Umap::<MyAutodiffBackend>::new(config.clone());
+    let umap = Umap::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
-    
+
     // Save to temporary file
-    let model_path = PathBuf::from("/tmp/test_umap_model_3.bin");
+    let model_path = PathBuf::from("/tmp/test_umap_model_3.burnpack");
     if model_path.exists() {
         std::fs::remove_file(&model_path)?;
     }
-    
+
     // Test multiple save/load cycles
     for i in 0..3 {
         // Save
         fitted.save(&model_path)?;
-        
+        assert!(model_path.is_file());
+
         // Verify file exists
         assert!(model_path.exists());
-        
+
         // Load
-        let loaded_fitted = FittedUmap::<MyAutodiffBackend>::load(
+        let loaded_fitted = FittedUmap::load(
             &model_path,
             config.clone(),
             10, // Input size
-            Default::default(),
+            flex(),
         )?;
-        
+
         // Test transformation
         let test_data = vec![data[i as usize].clone()];
         let embedding = loaded_fitted.transform(test_data);
-        
+
         assert_eq!(embedding.len(), 1);
         assert_eq!(embedding[0].len(), 3); // 3D embedding
-        
+
         // Verify embeddings are valid
         for &coord in &embedding[0] {
             assert!(coord.is_finite());
             assert!(!coord.is_nan());
         }
     }
+
+    std::fs::remove_file(&model_path)?;
 
     Ok(())
 }
@@ -232,9 +243,10 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         (75, 15, vec![8, 4], 4),
     ];
 
-    for (i, (num_samples, num_features, hidden_sizes, n_neighbors)) in test_cases.iter().enumerate() {
+    for (i, (num_samples, num_features, hidden_sizes, n_neighbors)) in test_cases.iter().enumerate()
+    {
         println!("Testing configuration {}", i + 1);
-        
+
         // Generate test data
         let data = generate_test_data(*num_samples, *num_features);
 
@@ -254,37 +266,35 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Train and save
-        let umap = Umap::<MyAutodiffBackend>::new(config.clone());
+        let umap = Umap::with_device(config.clone(), flex().autodiff());
         let fitted = umap.fit(data.clone(), None);
-        
-        let model_path = PathBuf::from(format!("/tmp/test_umap_model_{}.bin", i));
+
+        let model_path = PathBuf::from(format!("/tmp/test_umap_model_{i}.burnpack"));
         if model_path.exists() {
             std::fs::remove_file(&model_path)?;
         }
-        
+
         fitted.save(&model_path)?;
-        
+        assert!(model_path.is_file());
+
         // Load and test
         let model_path_ref = &model_path;
-        let loaded_fitted = FittedUmap::<MyAutodiffBackend>::load(
-            model_path_ref,
-            config,
-            *num_features,
-            Default::default(),
-        )?;
+        let loaded_fitted = FittedUmap::load(model_path_ref, config, *num_features, flex())?;
 
         // Test transformation
         let test_data = vec![data[0].clone()];
         let embedding = loaded_fitted.transform(test_data);
-        
+
         assert_eq!(embedding.len(), 1);
         assert_eq!(embedding[0].len(), 2);
-        
+
         // Verify embeddings are valid
         for &coord in &embedding[0] {
             assert!(coord.is_finite());
             assert!(!coord.is_nan());
         }
+
+        std::fs::remove_file(&model_path)?;
     }
 
     Ok(())
@@ -293,15 +303,10 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_file_not_found_error() {
     let config = UmapConfig::default();
-    let nonexistent_path = PathBuf::from("nonexistent_model.bin");
-    
-    let result = FittedUmap::<MyAutodiffBackend>::load(
-        &nonexistent_path,
-        config,
-        10,
-        Default::default(),
-    );
-    
+    let nonexistent_path = PathBuf::from("nonexistent_model.burnpack");
+
+    let result = FittedUmap::load(&nonexistent_path, config, 10, flex());
+
     // Should return an error
     assert!(result.is_err());
 }
@@ -309,15 +314,22 @@ fn test_file_not_found_error() {
 #[test]
 fn test_invalid_path_error() {
     let config = UmapConfig::default();
-    let invalid_path = PathBuf::from("/invalid/directory/model.bin");
-    
-    let result = FittedUmap::<MyAutodiffBackend>::load(
-        &invalid_path,
-        config,
-        10,
-        Default::default(),
-    );
-    
+    let invalid_path = PathBuf::from("/invalid/directory/model.burnpack");
+
+    let result = FittedUmap::load(&invalid_path, config, 10, flex());
+
     // Should return an error
     assert!(result.is_err());
+}
+
+#[test]
+fn test_corrupt_burnpack_error() -> Result<(), Box<dyn std::error::Error>> {
+    let corrupt_path = PathBuf::from("/tmp/test_corrupt_model.burnpack");
+    std::fs::write(&corrupt_path, b"not a valid Burnpack record")?;
+
+    let result = FittedUmap::load(&corrupt_path, UmapConfig::default(), 10, flex());
+    assert!(result.is_err(), "corrupt Burnpack data must fail to load");
+
+    std::fs::remove_file(corrupt_path)?;
+    Ok(())
 }

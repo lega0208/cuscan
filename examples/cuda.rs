@@ -1,10 +1,10 @@
-use fast_umap::cuda_backend::{device, device_count, CudaAutodiff};
+use fast_umap::cuda_backend::device_count;
 use fast_umap::prelude::{GraphParams, OptimizationParams, UmapConfig};
-use rand::Rng;
+use rand::RngExt;
 
 fn main() {
-    let device = device(0).expect("CUDA device 0 is required to run this example");
     println!("CUDA device count: {}", device_count());
+    let device = burn::tensor::Device::cuda(0);
 
     let mut rng = rand::rng();
     let data: Vec<Vec<f64>> = (0..50)
@@ -24,7 +24,7 @@ fn main() {
         ..Default::default()
     };
 
-    let fitted = fast_umap::Umap::<CudaAutodiff>::with_device(config, device).fit(data, None);
+    let fitted = fast_umap::Umap::with_device(config, device).fit(data, None);
     let embedding = fitted.embedding();
     println!(
         "Embedding shape: {} × {}",

@@ -22,13 +22,14 @@ const INFINITY: f32 = 3.40282347e+38;
 /// `local_distances` and `local_indices` have shape **[n, k]** so every thread
 /// uses its own contiguous slot `[row*k .. row*k+k]` — no data races.
 #[cube(launch)]
-pub fn knn_kernel<F: Float + CubePrimitive, I: Int>(
+pub fn knn_kernel<F: Float, I: Int>(
     pairwise_distances: &Tensor<F>,  // [n, n]
     k: u32,                          // number of nearest neighbours
     local_distances: &mut Tensor<F>, // [n, k] scratch — one slice per row
     local_indices: &mut Tensor<I>,   // [n, k] scratch — one slice per row
     indices: &mut Tensor<I>,         // [n, k] output
     distances: &mut Tensor<F>,       // [n, k] output
+    #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let row = ABSOLUTE_POS_X as usize;
     let n = pairwise_distances.shape(0);
@@ -84,13 +85,14 @@ pub fn knn_kernel<F: Float + CubePrimitive, I: Int>(
 /// Re-runs the forward KNN pass to recover which neighbours were selected, then
 /// propagates gradients from `grad_output` back to `grad_pairwise_distances`.
 #[cube(launch)]
-pub fn knn_backward_kernel<F: Float + CubePrimitive, I: Int>(
+pub fn knn_backward_kernel<F: Float, I: Int>(
     pairwise_distances: &Tensor<F>, // [n, n]
     k: u32,
     local_distances: &mut Tensor<F>,         // [n, k] scratch
     local_indices: &mut Tensor<I>,           // [n, k] scratch
     grad_output: &Tensor<F>,                 // [n, k] gradient w.r.t. KNN distances
     grad_pairwise_distances: &mut Tensor<F>, // [n, n] gradient output
+    #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let row = ABSOLUTE_POS_X as usize;
     let n = pairwise_distances.shape(0);

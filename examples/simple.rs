@@ -1,6 +1,6 @@
-use cubecl::wgpu::WgpuRuntime;
+use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
-use rand::Rng;
+use rand::RngExt;
 
 fn main() {
     // Number of samples in the dataset
@@ -20,17 +20,19 @@ fn main() {
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    type MyBackend = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-    type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
-
     // ── New API (mirrors umap-rs) ────────────────────────────────────────────
     let config = UmapConfig::default(); // 2-D output, Euclidean, default hyperparameters
-    let umap = fast_umap::Umap::<MyAutodiffBackend>::new(config);
+    let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
+    let umap = Umap::with_device(config, device);
     let fitted = umap.fit(data.clone(), None);
 
     // Get the embedding
     let embedding = fitted.embedding();
-    println!("Embedding shape: {} × {}", embedding.len(), embedding[0].len());
+    println!(
+        "Embedding shape: {} × {}",
+        embedding.len(),
+        embedding[0].len()
+    );
 
     // Transform new data through the trained model
     let _new_embedding = fitted.transform(data.clone());

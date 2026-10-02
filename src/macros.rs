@@ -7,7 +7,10 @@
 /// # Example
 ///
 /// ```rust
+/// use fast_umap::print_if;
 /// const VERBOSE: bool = true;
+/// let epoch = 1;
+/// let loss = 0.25;
 /// print_if!(VERBOSE, "step {} loss = {:.4}", epoch, loss);
 /// ```
 #[macro_export]
