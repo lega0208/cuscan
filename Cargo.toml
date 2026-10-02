@@ -118,7 +118,7 @@ name = "bench_report"
 required-features = ["gpu"]
 
 [features]
-default = ["gpu", "verbose"]
+default = ["cuda", "verbose"]
 # Core backend features
 gpu = ["burn/wgpu", "burn/fusion", "dep:burn-cubecl", "dep:cubecl", "cubecl/wgpu"]  # GPU backend with WGPU support
 # CUDA is intentionally excluded from `all` and the default features because it requires a CUDA toolkit.

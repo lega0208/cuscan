@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use burn::tensor::{Device, DeviceKind};
+use burn::tensor::{Device, DeviceIndex, DeviceKind};
 use crossbeam_channel::unbounded;
 use fast_umap::{
     validate_fit_data, FittedUmap, GraphParams, ManifoldParams, Metric, OptimizationParams, Umap,
@@ -121,7 +121,23 @@ fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<Fi
     Ok(fitted)
 }
 
-#[pyfunction(signature = (x, *, device="gpu", n_components=2, n_neighbors=15, min_dist=0.1, spread=1.0, hidden_sizes=vec![100], n_epochs=100, learning_rate=0.001, repulsion_strength=1.0, negative_sample_rate=5, patience=None, timeout=None, seed=9999, verbose=false))]
+#[pyfunction(signature = (
+  x,
+  *,
+  device="gpu",
+  n_components=2,
+  n_neighbors=15,
+  min_dist=0.1,
+  spread=1.0,
+  hidden_sizes=vec![100],
+  n_epochs=100,
+  learning_rate=0.001,
+  repulsion_strength=1.0,
+  negative_sample_rate=5,
+  patience=None,
+  timeout=None,
+  seed=9999,
+  verbose=false))]
 #[allow(clippy::too_many_arguments)]
 fn fit(
     py: Python<'_>,
@@ -164,9 +180,14 @@ fn fit(
         ..OptimizationParams::default()
     };
     let (backend_device, device_name) = match device {
-        "gpu" => (Device::wgpu(DeviceKind::DefaultDevice).autodiff(), "gpu"),
+        "cuda" => (Device::cuda(DeviceIndex::Default).autodiff(), "cuda"),
+        "wgpu" => (Device::wgpu(DeviceKind::DefaultDevice).autodiff(), "wgpu"),
         "cpu" => (Device::flex().autodiff(), "cpu"),
-        _ => return Err(PyValueError::new_err("device must be 'gpu' or 'cpu'")),
+        _ => {
+            return Err(PyValueError::new_err(
+                "device must be 'cuda', 'wgpu' or 'cpu'",
+            ))
+        }
     };
     let model = py.detach(|| fit_impl(data, config, backend_device))?;
     Ok(FittedModel {

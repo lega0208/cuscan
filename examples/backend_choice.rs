@@ -1,6 +1,7 @@
 /// Runtime device selection: wgpu or Flex CPU.
 ///
 /// Usage:
+///     cargo run --release --features cuda --example backend_choice -- cuda
 ///     cargo run --release --features gpu --example backend_choice -- wgpu
 ///     cargo run --release --example backend_choice -- flex
 use burn::tensor::{Device, DeviceKind};
@@ -20,7 +21,9 @@ fn main() {
         .collect();
 
     let device_choice = std::env::args().nth(1).unwrap_or_else(|| {
-        if cfg!(feature = "gpu") {
+        if cfg!(feature = "cuda") {
+            "cuda"
+        } else if cfg!(feature = "gpu") {
             "wgpu"
         } else {
             "flex"
