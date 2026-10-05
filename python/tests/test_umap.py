@@ -160,18 +160,30 @@ def test_non_euclidean_metric_rejected() -> None:
         estimator(metric="manhattan").fit(x)
 
 
-def test_transform_uses_training_standardization() -> None:
+def test_fit_uses_raw_inputs_instead_of_automatic_standardization() -> None:
     x, _ = blobs()
-    model = estimator().fit(x)
-    transformed = model.transform(x)
-    np.testing.assert_allclose(transformed, model.embedding_, atol=1e-5)
+    feature_scales = np.array([1.0, 2.0, 4.0, 8.0, 16.0], dtype=np.float32)
+    raw = np.column_stack((x * feature_scales, np.full(len(x), 7.0, dtype=np.float32)))
+    externally_centered = raw.copy()
+    externally_centered[:, -1] = 0.0
+
+    raw_model = estimator(n_epochs=1).fit(raw)
+    centered_model = estimator(n_epochs=1).fit(externally_centered)
+    raw_embedding = raw_model.transform(raw)
+    centered_embedding = centered_model.transform(externally_centered)
+
+    # Automatic z-scoring maps both constant columns to exactly zero, making
+    # these same-seed fits identical. Raw inputs must preserve the sentinel 7.
+    assert not np.allclose(raw_embedding, centered_embedding, atol=1e-4, rtol=1e-4)
 
 
 def test_gpu_smoke_when_adapter_available() -> None:
     x, _ = blobs(n_per_cluster=6)
     try:
-        result = UMAP(n_neighbors=3, n_epochs=2, hidden_sizes=(4,), device="gpu").fit_transform(x)
+        result = UMAP(n_neighbors=3, n_epochs=2, hidden_sizes=(4,), device="wgpu").fit_transform(x)
     except BaseException as error:
-        pytest.skip(f"GPU adapter unavailable or backend initialization failed: {error}")
+        if "NoAdapterFound" in str(error) or "No adapter found" in str(error):
+            pytest.skip(f"GPU adapter unavailable: {error}")
+        raise
     assert result.shape == (18, 2)
     assert np.isfinite(result).all()

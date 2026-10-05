@@ -18,7 +18,9 @@ class UMAP:
     The learned parametric model makes ``transform`` a deterministic forward pass.
     Embeddings are float32; supervised UMAP and inverse transforms are unsupported,
     and learning-rate semantics differ from umap-learn. A fitted model is bound to
-    the thread that created it.
+    the thread that created it. Inputs are used without automatic feature scaling;
+    if preprocessing is needed, apply the same caller-owned transformation before
+    both ``fit`` and ``transform``.
     """
 
     def __init__(

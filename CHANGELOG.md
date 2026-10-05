@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `transform` now applies the standardization learned during training; previously it transformed raw input without that standardization.
+- **Breaking: primary `Umap` and Python `UMAP` no longer standardize features internally.** Fit and transform receive caller-provided values as-is; public sparse `train_sparse` training also uses those values when constructing the neighborhood graph. Feature scales therefore affect geometry. Weights trained with the former internal standardization require the original external preprocessing at inference or retraining; no automatic migration is provided.
 - Dropped the Burn `train` feature to provide deterministic CPU execution.
 - Python `transform` handles empty inputs and reports feature-count mismatches as `ValueError`.
 

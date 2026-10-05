@@ -8,12 +8,12 @@
 
 - `src/lib.rs` exposes `Umap`, `FittedUmap`, input validation, fitting, transformation, and persistence. Prefer this API over the deprecated `UMAP` API.
 - Fitting validates rectangular input, seeds the device, flattens rows, creates the MLP, maps `UmapConfig` into training configuration, and calls `src/train/train_sparse.rs`.
-- Sparse training normalizes features, computes a global k-NN graph once, samples positive edges and negatives, and optimizes the embedding with Adam. Optional `nn-descent` handles approximate neighbor search for large inputs; `pca` enables a warm start.
-- `src/model.rs` implements Linear/ReLU hidden layers and a linear output layer. Finalization disables autodiff and stores feature normalization statistics; transformation reuses those statistics.
+- Sparse training uses caller-provided feature values as-is, computes a global k-NN graph once, samples positive edges and negatives, and optimizes the embedding with Adam. Optional `nn-descent` handles approximate neighbor search for large inputs; `pca` enables a warm start.
+- The primary `Umap` and Python fit/transform paths do not fit or apply feature scaling, and fitted models have no normalization statistics. `src/model.rs` implements Linear/ReLU hidden layers and a linear output layer; saved and loaded weights therefore operate consistently on the caller-provided inputs. The deprecated dense `UMAP` route remains distinct, and existing scaling helpers remain available; neither implies scaling in the primary path.
 - `src/backend.rs` defines the `UmapOps` backend extension. `src/generic_backend.rs` and `src/flex_backend.rs` implement Flex operations; `src/kernels/` implements CubeCL GPU kernels; `src/autodiff_ops.rs` supplies gradients.
 - `src/train/mod.rs` also contains the legacy dense trainer. Avoid confusing its batch-local graph and disk checkpoints with the sparse public API path.
 
-**Behavioral caveats:** model persistence currently saves weights, not fitted normalization statistics; loaded models use identity normalization. Several exposed graph/optimization settings are not honored by training (including metric selection and public API batch size). Trace actual consumers before documenting or changing configuration behavior. The feature-gated `src/cpu_backend.rs` is a placeholder, not the Flex training implementation.
+**Behavioral caveats:** several exposed graph/optimization settings are not honored by training (including metric selection and public API batch size). Trace actual consumers before documenting or changing configuration behavior. The feature-gated `src/cpu_backend.rs` is a placeholder, not the Flex training implementation.
 
 ## Key Directories
 

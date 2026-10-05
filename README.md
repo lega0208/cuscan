@@ -429,6 +429,13 @@ let config = UmapConfig {
 Because fast-umap is *parametric* (neural network), it can project new
 unseen data — something classical UMAP cannot do:
 
+The primary `Umap` API and Python `UMAP` pass feature values through as
+provided; they do not fit or apply feature scaling. Preprocessing is optional
+and caller-owned. If you scale features, fit the scaler on training data and
+apply that same transform to both the training data and every inference batch.
+Feature scales affect distances and therefore the neighborhood geometry and
+embedding.
+
 ```rust
 let fitted = umap.fit(training_data, None);
 

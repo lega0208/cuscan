@@ -13,7 +13,7 @@
 
 #[cfg(feature = "plotters")]
 use crate::chart::{self, plot_loss, ChartConfigBuilder};
-use crate::{format_duration, model::UMAPModel, normalize_data, utils::convert_vector_to_tensor};
+use crate::{format_duration, model::UMAPModel, utils::convert_vector_to_tensor};
 use burn::{
     module::Module,
     optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams},
@@ -64,12 +64,43 @@ pub struct EpochProgress {
     pub epoch_ms: f64,
 }
 
+#[cfg(feature = "nn-descent")]
+const NN_DESCENT_THRESHOLD: usize = 10_000;
+
+fn sparse_inputs<F: Float + ToPrimitive + burn::tensor::Element>(
+    data: Vec<F>,
+    num_samples: usize,
+    num_features: usize,
+    k: usize,
+    device: &Device,
+) -> (Tensor<2>, Vec<i32>) {
+    let all_data_tensor = convert_vector_to_tensor(data.clone(), num_samples, num_features, device);
+    #[cfg(feature = "nn-descent")]
+    let use_nn_descent = num_samples >= NN_DESCENT_THRESHOLD;
+
+    #[cfg(feature = "nn-descent")]
+    if use_nn_descent {
+        let data_f32: Vec<f32> = data
+            .iter()
+            .map(|x| num::ToPrimitive::to_f32(x).unwrap())
+            .collect();
+        let (indices, _distances) =
+            crate::nn_descent::nn_descent(&data_f32, num_samples, num_features, k);
+        return (all_data_tensor, indices);
+    }
+
+    let pairwise = pairwise_distances(all_data_tensor.clone());
+    let flat: Vec<f32> = pairwise.to_data().try_to_vec::<f32>().unwrap();
+    let (indices, _distances) = knn_from_pairwise_cpu(&flat, num_samples, k);
+    (all_data_tensor, indices)
+}
+
 pub fn train_sparse<F: Float>(
     name: &str,
     mut model: UMAPModel,
     num_samples: usize,
     num_features: usize,
-    mut data: Vec<F>,
+    data: Vec<F>,
     config: &TrainingConfig,
     device: Device,
     exit_rx: Receiver<()>,
@@ -128,12 +159,7 @@ where
         );
     }
 
-    // ── Z-score normalise input features ─────────────────────────────────────
-    normalize_data(&mut data, num_samples, num_features);
-
     // ── Precompute global KNN once ───────────────────────────────────────────
-    #[cfg(feature = "nn-descent")]
-    const NN_DESCENT_THRESHOLD: usize = 10_000;
     #[cfg(feature = "nn-descent")]
     let use_nn_descent = num_samples >= NN_DESCENT_THRESHOLD;
     #[cfg(not(feature = "nn-descent"))]
@@ -148,31 +174,7 @@ where
     }
     let knn_start = Instant::now();
 
-    let all_data_tensor: Tensor<2> =
-        convert_vector_to_tensor(data.clone(), num_samples, num_features, &device);
-
-    let knn_indices: Vec<i32>;
-    #[cfg(feature = "nn-descent")]
-    if use_nn_descent {
-        let data_f32: Vec<f32> = data
-            .iter()
-            .map(|x| num::ToPrimitive::to_f32(x).unwrap())
-            .collect();
-        let (idx, _dist) = crate::nn_descent::nn_descent(&data_f32, num_samples, num_features, k);
-        knn_indices = idx;
-    } else {
-        let hd_pairwise = pairwise_distances(all_data_tensor.clone());
-        let flat: Vec<f32> = hd_pairwise.to_data().try_to_vec::<f32>().unwrap();
-        let (idx, _dist) = knn_from_pairwise_cpu(&flat, num_samples, k);
-        knn_indices = idx;
-    }
-    #[cfg(not(feature = "nn-descent"))]
-    {
-        let hd_pairwise = pairwise_distances(all_data_tensor.clone());
-        let flat: Vec<f32> = hd_pairwise.to_data().try_to_vec::<f32>().unwrap();
-        let (idx, _dist) = knn_from_pairwise_cpu(&flat, num_samples, k);
-        knn_indices = idx;
-    }
+    let (all_data_tensor, knn_indices) = sparse_inputs(data, num_samples, num_features, k, &device);
 
     let n_all_edges = num_samples * k;
 
@@ -582,4 +584,65 @@ where
     }
 
     (model, losses, best_loss)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sparse_inputs;
+    use burn::tensor::Device;
+
+    #[test]
+    fn sparse_preparation_uses_raw_values_for_knn_and_encoder_input() {
+        let data = vec![
+            0.0f32, 0.0, 7.0, // A
+            0.0, 100.0, 7.0, // B
+            10.0, 1.0, 7.0, // C
+            0.0, 10_000.0, 7.0, // scale outlier
+        ];
+        let (encoder_input, knn_indices) = sparse_inputs(data, 4, 3, 1, &Device::flex());
+
+        // In raw space A is closest to C; z-scoring would make B closer.
+        assert_eq!(knn_indices[0], 2);
+        let encoder_values = encoder_input.to_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(
+            encoder_values,
+            vec![0.0, 0.0, 7.0, 0.0, 100.0, 7.0, 10.0, 1.0, 7.0, 0.0, 10_000.0, 7.0,]
+        );
+    }
+
+    #[cfg(feature = "nn-descent")]
+    #[test]
+    fn approximate_sparse_preparation_preserves_raw_values_at_threshold() {
+        let num_samples = super::NN_DESCENT_THRESHOLD;
+        let data: Vec<f32> = (0..num_samples)
+            .flat_map(|index| match index {
+                0 => [0.0, 0.0, 7.0],
+                _ => {
+                    let jitter = (index / 3) as f32 * 0.000_001;
+                    match index % 3 {
+                        0 => [0.0, 100.0 + jitter, 7.0],
+                        1 => [10.0, 1.0 + jitter, 7.0],
+                        _ => [0.0, 10_000.0 + jitter, 7.0],
+                    }
+                }
+            })
+            .collect();
+        let k = 15;
+        let (encoder_input, indices) =
+            sparse_inputs(data.clone(), num_samples, 3, k, &Device::flex());
+
+        // Raw query neighbors come from [10, ~1, 7]; z-scoring the
+        // NN-Descent-only input instead would select [0, ~100, 7].
+        for &neighbor in &indices[..k] {
+            assert_eq!(data[neighbor as usize * 3], 10.0);
+        }
+        assert_eq!(encoder_input.to_data().try_to_vec::<f32>().unwrap(), data);
+        assert_eq!(indices.len(), num_samples * k);
+        for (sample, neighbors) in indices.chunks_exact(k).enumerate() {
+            for &neighbor in neighbors {
+                assert!(neighbor >= 0 && (neighbor as usize) < num_samples);
+                assert_ne!(neighbor as usize, sample);
+            }
+        }
+    }
 }

@@ -250,7 +250,9 @@ impl Umap {
     /// Fit the UMAP model to the given data.
     ///
     /// Trains a parametric neural network to learn a low-dimensional embedding
-    /// of the input data. The model can then be used to transform new data.
+    /// of the input data. Features are used as provided, without automatic
+    /// scaling; apply any desired preprocessing consistently before fitting and
+    /// transforming. The model can then transform new data.
     ///
     /// # Arguments
     ///
@@ -480,10 +482,7 @@ impl Umap {
         let model = model.valid();
         let device = device.without_autodiff();
 
-        let mut normalized_data = train_data;
-        let (feature_mean, feature_std) =
-            normalize_data(&mut normalized_data, num_samples, num_features);
-        let global = convert_vector_to_tensor(normalized_data, num_samples, num_features, &device);
+        let global = convert_vector_to_tensor(train_data, num_samples, num_features, &device);
         let embedding_tensor = model.forward(global);
         let embedding: Vec<Vec<f64>> = convert_tensor_to_vector(embedding_tensor);
 
@@ -493,8 +492,6 @@ impl Umap {
             config,
             embedding,
             num_features,
-            feature_mean,
-            feature_std,
         }
     }
 }
@@ -517,8 +514,6 @@ pub struct FittedUmap {
     config: UmapConfig,
     embedding: Vec<Vec<f64>>,
     num_features: usize,
-    feature_mean: Vec<f64>,
-    feature_std: Vec<f64>,
 }
 
 impl FittedUmap {
@@ -556,8 +551,8 @@ impl FittedUmap {
     /// Transform new data points into the embedding space.
     ///
     /// Projects new, unseen data through the trained neural network to obtain
-    /// low-dimensional coordinates. This is possible because fast-umap uses a
-    /// parametric (neural network) approach.
+    /// low-dimensional coordinates. Input features are used as provided; apply
+    /// any desired preprocessing consistently before fitting and transforming.
     ///
     /// # Arguments
     ///
@@ -572,6 +567,7 @@ impl FittedUmap {
     }
 
     /// Transform new data into the embedding space, returning a tensor.
+    /// Input features are used as provided, without automatic scaling.
     ///
     /// # Arguments
     ///
@@ -599,15 +595,7 @@ impl FittedUmap {
             "transform data rows must all have {num_features} features"
         );
 
-        let train_data: Vec<f64> = data
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(|(index, value)| {
-                let feature = index % num_features;
-                (value - self.feature_mean[feature]) / self.feature_std[feature]
-            })
-            .collect();
+        let train_data: Vec<f64> = data.into_iter().flatten().collect();
 
         let global = convert_vector_to_tensor(train_data, num_samples, num_features, &self.device);
 
@@ -646,11 +634,9 @@ impl FittedUmap {
 
     /// Load a model's weights from a file into a new FittedUmap instance.
     ///
-    /// Creates a new FittedUmap with the loaded weights. Loaded models use
-    /// identity input normalization (zero means and unit standard deviations),
-    /// because normalization statistics are not stored with model weights. The
-    /// configuration must match the saved model (same input size, hidden layer
-    /// sizes, and output size).
+    /// Creates a new FittedUmap with the loaded weights. The configuration must
+    /// match the saved model (same input size, hidden layer sizes, and output
+    /// size). Input features are used as provided, just as they were during fit.
     ///
     /// # Arguments
     ///
@@ -702,8 +688,6 @@ impl FittedUmap {
             config,
             embedding: Vec::new(),
             num_features: input_size,
-            feature_mean: vec![0.0; input_size],
-            feature_std: vec![1.0; input_size],
         })
     }
 
@@ -839,5 +823,60 @@ impl UMAP {
     pub fn transform(&self, data: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
         let local = self.transform_to_tensor(data);
         convert_tensor_to_vector(local)
+    }
+}
+
+#[cfg(test)]
+mod raw_input_tests {
+    use super::*;
+
+    #[test]
+    fn fitted_embedding_and_transform_forward_raw_feature_values() {
+        let data = vec![
+            vec![0.0f64, 0.0, 7.0],
+            vec![0.0, 100.0, 7.0],
+            vec![10.0, 1.0, 7.0],
+            vec![0.0, 10_000.0, 7.0],
+            vec![2.0, 250.0, 7.0],
+        ];
+        let config = UmapConfig {
+            graph: GraphParams {
+                n_neighbors: 2,
+                ..Default::default()
+            },
+            optimization: OptimizationParams {
+                n_epochs: 1,
+                verbose: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_exit_tx, exit_rx) = crossbeam_channel::unbounded();
+        let fitted = Umap::with_device(config, Device::flex().autodiff()).fit_with_signal(
+            data.clone(),
+            None,
+            exit_rx,
+        );
+
+        let raw_training_tensor = convert_vector_to_tensor(
+            data.clone().into_iter().flatten().collect(),
+            data.len(),
+            3,
+            &fitted.device,
+        );
+        let expected_training_embedding: Vec<Vec<f64>> =
+            convert_tensor_to_vector(fitted.model.forward(raw_training_tensor));
+        assert_eq!(*fitted.embedding(), expected_training_embedding);
+
+        let probe = vec![vec![2.0, 250.0, 7.0]];
+        let raw_probe_tensor = convert_vector_to_tensor(
+            probe.clone().into_iter().flatten().collect(),
+            1,
+            3,
+            &fitted.device,
+        );
+        let expected_probe_embedding: Vec<Vec<f64>> =
+            convert_tensor_to_vector(fitted.model.forward(raw_probe_tensor));
+        assert_eq!(fitted.transform(probe), expected_probe_embedding);
     }
 }

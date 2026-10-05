@@ -3,6 +3,9 @@ use fast_umap::{
     validate_fit_data, validate_fit_input, OptimizationParams, TrainingConfig, Umap, UmapConfig,
 };
 
+// Flex seeding is process-global; seeded training cases must not race each other.
+static TRAINING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn sample_data() -> Vec<Vec<f32>> {
     (0..60)
         .map(|sample| {
@@ -35,7 +38,8 @@ fn fit(seed: u64, data: Vec<Vec<f32>>) -> fast_umap::FittedUmap {
 }
 
 #[test]
-fn flex_cpu_fit_transform_is_finite_reproducible_and_normalized_consistently() {
+fn flex_cpu_fit_transform_is_finite_reproducible_and_consistent() {
+    let _training_guard = TRAINING_LOCK.lock().unwrap();
     let data = sample_data();
     let first = fit(9999, data.clone());
     let same_seed = fit(9999, data.clone());
@@ -71,6 +75,37 @@ fn flex_cpu_fit_transform_is_finite_reproducible_and_normalized_consistently() {
         first.transform_to_tensor(vec![vec![0.0; 4]])
     }));
     assert!(mismatch.is_err());
+}
+
+#[test]
+fn fit_and_transform_keep_unequal_scale_features_raw() {
+    let _training_guard = TRAINING_LOCK.lock().unwrap();
+    let data = vec![
+        vec![0.0f32, 0.0, 7.0],
+        vec![0.0, 100.0, 7.0],
+        vec![10.0, 1.0, 7.0],
+        vec![0.0, 10_000.0, 7.0],
+        vec![1.0, 5_000.0, 7.0],
+        vec![9.0, 2_000.0, 7.0],
+    ];
+    let mut standardized: Vec<f32> = data.iter().flatten().copied().collect();
+    fast_umap::utils::normalize_data(&mut standardized, data.len(), 3);
+    let standardized = standardized
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|row| row.to_vec())
+        .collect();
+    let raw_fitted = fit(321, data);
+    let standardized_fitted = fit(321, standardized);
+
+    // An automatic scaler would erase this deliberate geometry/input difference.
+    assert!(raw_fitted
+        .embedding()
+        .iter()
+        .flatten()
+        .zip(standardized_fitted.embedding().iter().flatten())
+        .any(|(raw, scaled)| (raw - scaled).abs() > 1e-3));
 }
 
 #[test]

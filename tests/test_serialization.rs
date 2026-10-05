@@ -93,7 +93,10 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
     // Test that the loaded model can transform data
     let new_data: Vec<Vec<f64>> = vec![vec![1.5, 2.5, 3.5, 4.5], vec![2.5, 3.5, 4.5, 5.5]];
 
+    let expected_embedding = fitted.transform(new_data.clone());
     let embedding = loaded_fitted.transform(new_data);
+
+    assert_eq!(embedding, expected_embedding);
 
     // Basic checks
     assert_eq!(embedding.len(), 2); // Two new data points
