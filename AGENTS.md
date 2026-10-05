@@ -49,6 +49,12 @@ uv run ruff format --check
 uv run ty check
 ```
 
+Run Python scripts with `uv`. For scripts that need the release-built extension, build it first and disable syncing for the script run so uv does not replace it:
+
+```sh
+uv run maturin develop --release && uv run --no-sync myscript.py
+```
+
 `scripts/run_all.sh` and `scripts/bench.sh` write outputs and may download MNIST. Their feature assumptions are stale; prefer explicit Cargo commands and check each example's `required-features` in `Cargo.toml`.
 
 ## Code Conventions & Common Patterns

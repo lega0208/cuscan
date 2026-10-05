@@ -11,6 +11,8 @@ dependencies = ["numpy>=1.24"]
 [dependency-groups]
 dev = [
     "maturin",
+    "plotly>=7.1.0",
+    "polars>=1.44.2",
     "pytest",
     "ruff",
     "ty",

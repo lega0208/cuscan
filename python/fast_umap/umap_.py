@@ -35,7 +35,7 @@ class UMAP:
         negative_sample_rate: int = 5,
         random_state: int | np.random.RandomState | np.random.Generator | None = None,
         verbose: bool = False,
-        device: Literal["gpu", "cpu"] = "gpu",
+        device: Literal["cuda", "wgpu", "cpu"] = "cuda",
         hidden_sizes: tuple[int, ...] = (100,),
         patience: int | None = None,
         timeout: int | None = None,
@@ -59,8 +59,8 @@ class UMAP:
     def _validate_params(self) -> int:
         if self.metric != "euclidean":
             raise ValueError("only metric='euclidean' is supported")
-        if self.device not in ("gpu", "cpu"):
-            raise ValueError("device must be 'gpu' or 'cpu'")
+        if self.device not in ("cuda", "wgpu", "cpu"):
+            raise ValueError("device must be 'cuda', 'wgpu', or 'cpu'")
         state = self.random_state
         if state is None:
             return 9999

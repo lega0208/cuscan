@@ -7,7 +7,7 @@ __version__: str
 
 class FittedModel:
     @property
-    def device(self) -> Literal["gpu", "cpu"]: ...
+    def device(self) -> Literal["cuda", "wgpu", "cpu"]: ...
     @property
     def n_features(self) -> int: ...
     @property
@@ -17,7 +17,7 @@ class FittedModel:
 def fit(
     x: NDArray[np.float32],
     *,
-    device: Literal["gpu", "cpu"] = "gpu",
+    device: Literal["cuda", "wgpu", "cpu"] = "cuda",
     n_components: int = 2,
     n_neighbors: int = 15,
     min_dist: float = 0.1,

@@ -8,3 +8,6 @@ data/*
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+
+comparison/*.parquet
+comparison/umap_comparison.html
