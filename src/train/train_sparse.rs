@@ -6,7 +6,7 @@
 //! 2. **Edge subsampling** — cap edges per epoch so cost is O(E_max), not O(n·k).
 //! 3. **Negative sampling** — `neg_rate` random non-neighbor pairs per sampled edge.
 //! 4. **In-memory checkpointing** — best model weights kept in RAM, no disk I/O.
-//! 5. **Pre-batched edge samples** — uploaded to GPU once, cycled per epoch.
+//! 5. **Weighted edge draws** — fresh, bounded integer-count samples each epoch.
 //! 6. **Fused row selection** — positive + negative indices merged into 2 selects (not 4).
 //! 7. **Async loss readback** — GPU→CPU sync only every N epochs for progress display.
 //! 8. **Lazy loss plotting** — charts rendered only every N epochs, not every epoch.
@@ -26,15 +26,11 @@ use super::get_distance_by_metric::*;
 use crossbeam_channel::Receiver;
 use indicatif::{ProgressBar, ProgressStyle};
 use num::{Float, FromPrimitive, ToPrimitive};
-use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{thread, time::Instant};
-
-/// Number of pre-generated edge sample batches kept on GPU.
-/// More batches = more stochastic variety across epochs.
-const EDGE_BATCH_COUNT: usize = 16;
 
 /// How often to read loss back from GPU (every N epochs).
 const LOSS_READBACK_INTERVAL: usize = 5;
@@ -64,8 +60,341 @@ pub struct EpochProgress {
     pub epoch_ms: f64,
 }
 
-#[cfg(feature = "nn-descent")]
 const NN_DESCENT_THRESHOLD: usize = 10_000;
+
+#[derive(Debug, Clone, Copy)]
+struct WeightedEdge {
+    head: usize,
+    tail: usize,
+    weight: f32,
+}
+
+/// Reference smooth-kNN bandwidths. Rows include self in slot zero.
+fn smooth_knn_dist(
+    distances: &[f32],
+    n: usize,
+    k: usize,
+    local_connectivity: f64,
+    bandwidth: f64,
+) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(distances.len(), n * k);
+    assert!(n > 0 && k >= 2);
+    assert!(local_connectivity.is_finite() && local_connectivity >= 0.0);
+    assert!(bandwidth.is_finite() && bandwidth > 0.0);
+    assert!(distances.iter().all(|d| d.is_finite() && *d >= 0.0));
+
+    let target = (k as f64).log2() * bandwidth;
+    let mean = distances.iter().sum::<f32>() / distances.len() as f32;
+    let mut sigmas = Vec::with_capacity(n);
+    let mut rhos = Vec::with_capacity(n);
+
+    for row in distances.chunks_exact(k) {
+        let positive: Vec<f32> = row.iter().copied().filter(|d| *d > 0.0).collect();
+        let mut rho = 0.0f32;
+
+        if !positive.is_empty() {
+            if positive.len() as f64 >= local_connectivity {
+                let index = local_connectivity.floor() as usize;
+                let interpolation = local_connectivity - index as f64;
+                if index > 0 {
+                    rho = positive[index - 1];
+                    if interpolation > 1e-5 {
+                        rho +=
+                            (interpolation * (positive[index] - positive[index - 1]) as f64) as f32;
+                    }
+                } else {
+                    rho = (interpolation * positive[0] as f64) as f32;
+                }
+            } else {
+                rho = positive.iter().copied().fold(0.0f32, f32::max);
+            }
+        }
+
+        let mut lo = 0.0f64;
+        let mut hi = f32::MAX as f64;
+        let mut mid = 1.0f64;
+
+        for _ in 0..64 {
+            let sum: f64 = row[1..]
+                .iter()
+                .map(|distance| {
+                    let d = *distance - rho;
+                    if d > 0.0 {
+                        (-(d as f64 / mid)).exp()
+                    } else {
+                        1.0
+                    }
+                })
+                .sum();
+
+            if (sum - target).abs() < 1e-5 {
+                break;
+            }
+
+            if sum > target {
+                hi = mid;
+                mid = (lo + hi) / 2.0;
+            } else {
+                lo = mid;
+                mid = if hi >= f32::MAX as f64 {
+                    mid * 2.0
+                } else {
+                    (lo + hi) / 2.0
+                };
+            }
+        }
+
+        let floor_mean = if rho > 0.0 {
+            row.iter().sum::<f32>() / k as f32
+        } else {
+            mean
+        };
+
+        let sigma = (mid as f32).max(1e-3 * floor_mean);
+
+        sigmas.push(sigma);
+        rhos.push(rho);
+    }
+
+    (sigmas, rhos)
+}
+
+fn directed_memberships(
+    indices: &[i32],
+    distances: &[f32],
+    sigmas: &[f32],
+    rhos: &[f32],
+    k: usize,
+) -> BTreeMap<(usize, usize), f32> {
+    let n = sigmas.len();
+    assert_eq!(rhos.len(), n);
+    assert_eq!(indices.len(), n * k);
+    assert_eq!(distances.len(), n * k);
+    let mut edges = BTreeMap::new();
+
+    for head in 0..n {
+        for slot in 0..k {
+            let offset = head * k + slot;
+            let tail = indices[offset];
+            if tail == -1 || tail == head as i32 {
+                continue;
+            }
+            assert!(tail >= 0 && (tail as usize) < n, "invalid neighbor index");
+            let d = distances[offset] - rhos[head];
+            let weight = if d <= 0.0 || sigmas[head] == 0.0 {
+                1.0
+            } else {
+                (-d / sigmas[head]).exp()
+            };
+            if weight > 0.0 {
+                *edges.entry((head, tail as usize)).or_insert(0.0) += weight;
+            }
+        }
+    }
+
+    edges
+}
+
+fn symmetrize(directed: &BTreeMap<(usize, usize), f32>, mix: f64) -> Vec<WeightedEdge> {
+    assert!(mix.is_finite() && (0.0..=1.0).contains(&mix));
+    let mix = mix as f32;
+    let mut pairs = BTreeMap::new();
+
+    for &(head, tail) in directed.keys() {
+        pairs.insert((head.min(tail), head.max(tail)), ());
+    }
+
+    let mut edges = Vec::with_capacity(pairs.len() * 2);
+
+    for ((head, tail), ()) in pairs {
+        let a = directed.get(&(head, tail)).copied().unwrap_or(0.0);
+        let b = directed.get(&(tail, head)).copied().unwrap_or(0.0);
+        let intersection = a * b;
+        let weight = mix * (a + b - intersection) + (1.0 - mix) * intersection;
+        if weight > 0.0 {
+            edges.push(WeightedEdge { head, tail, weight });
+            edges.push(WeightedEdge {
+                head: tail,
+                tail: head,
+                weight,
+            });
+        }
+    }
+
+    edges.sort_by_key(|edge| (edge.head, edge.tail));
+
+    edges
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EdgePreparationError {
+    InvalidEpochs,
+    InvalidWeight,
+    CountOverflow,
+    EmptySupport,
+}
+
+struct EdgeSampler {
+    edges: Vec<(usize, usize)>,
+    prefixes: Vec<u64>,
+    total: u64,
+}
+
+fn repetition_counts(weights: &[f32], epochs: usize) -> Result<Vec<u64>, EdgePreparationError> {
+    if epochs == 0 {
+        return Err(EdgePreparationError::InvalidEpochs);
+    }
+    if weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(EdgePreparationError::InvalidWeight);
+    }
+
+    let max = weights.iter().copied().fold(0.0f32, f32::max);
+    let threshold = max / epochs as f32;
+
+    weights
+        .iter()
+        .map(|weight| {
+            if *weight < threshold {
+                return Ok(0);
+            }
+            // NumPy's float32 array product rounds before integer conversion.
+            // Widening the weight first would turn 0.7 * 10 into count 6, not 7.
+            let count = (*weight * epochs as f32).floor();
+            if !count.is_finite() || count >= u64::MAX as f32 {
+                Err(EdgePreparationError::CountOverflow)
+            } else {
+                Ok(count as u64)
+            }
+        })
+        .collect()
+}
+
+impl EdgeSampler {
+    fn new(edges: &[WeightedEdge], epochs: usize) -> Result<Self, EdgePreparationError> {
+        let counts = repetition_counts(
+            &edges.iter().map(|edge| edge.weight).collect::<Vec<_>>(),
+            epochs,
+        )?;
+        Self::from_counts(edges, &counts)
+    }
+
+    fn from_counts(edges: &[WeightedEdge], counts: &[u64]) -> Result<Self, EdgePreparationError> {
+        assert_eq!(edges.len(), counts.len());
+        let mut support = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut total = 0u64;
+
+        for (edge, &count) in edges.iter().zip(counts) {
+            if count == 0 {
+                continue;
+            }
+            total = total
+                .checked_add(count)
+                .ok_or(EdgePreparationError::CountOverflow)?;
+            support.push((edge.head, edge.tail));
+            prefixes.push(total);
+        }
+
+        if total == 0 {
+            return Err(EdgePreparationError::EmptySupport);
+        }
+
+        Ok(Self {
+            edges: support,
+            prefixes,
+            total,
+        })
+    }
+
+    fn draw_count(&self) -> usize {
+        self.total.min(MAX_POS_EDGES_PER_EPOCH as u64) as usize
+    }
+
+    fn edge_for_ticket(&self, ticket: u64) -> (usize, usize) {
+        assert!(ticket < self.total);
+        self.edges[self.prefixes.partition_point(|prefix| *prefix <= ticket)]
+    }
+
+    fn sample_batch(
+        &self,
+        num_samples: usize,
+        neg_rate: usize,
+        rng: &mut impl RngExt,
+    ) -> (Vec<i64>, Vec<i64>) {
+        let n_pos = self.draw_count();
+        let n_neg = n_pos
+            .checked_mul(neg_rate)
+            .expect("negative sample count overflow")
+            .max(num_samples);
+        let total = n_pos.checked_add(n_neg).expect("edge batch size overflow");
+        let mut heads = Vec::with_capacity(total);
+        let mut tails = Vec::with_capacity(total);
+
+        for _ in 0..n_pos {
+            let (head, tail) = self.edge_for_ticket(rng.random_range(0..self.total));
+            heads.push(head as i64);
+            tails.push(tail as i64);
+        }
+
+        for _ in 0..n_neg {
+            let head = rng.random_range(0..num_samples);
+            let mut tail = rng.random_range(0..num_samples - 1);
+            if tail >= head {
+                tail += 1;
+            }
+            heads.push(head as i64);
+            tails.push(tail as i64);
+        }
+
+        (heads, tails)
+    }
+}
+
+fn with_self_slots(
+    indices: Vec<i32>,
+    distances: Vec<f32>,
+    n: usize,
+    k: usize,
+) -> (Vec<i32>, Vec<f32>) {
+    assert!(k >= 2);
+    assert_eq!(indices.len(), n * (k - 1));
+    assert_eq!(distances.len(), indices.len());
+    let mut out_indices = Vec::with_capacity(n * k);
+    let mut out_distances = Vec::with_capacity(n * k);
+
+    for head in 0..n {
+        out_indices.push(head as i32);
+        out_distances.push(0.0);
+        let mut seen = std::collections::BTreeSet::new();
+        let start = head * (k - 1);
+        for slot in start..start + k - 1 {
+            let tail = indices[slot];
+            if tail == head as i32 {
+                continue;
+            }
+            assert!(
+                tail >= 0 && (tail as usize) < n && seen.insert(tail),
+                "invalid or duplicate neighbor row"
+            );
+            assert!(
+                distances[slot].is_finite() && distances[slot] >= 0.0,
+                "invalid neighbor distance"
+            );
+            out_indices.push(tail);
+            out_distances.push(distances[slot]);
+        }
+        assert_eq!(
+            out_indices.len(),
+            (head + 1) * k,
+            "short neighbor row after self removal"
+        );
+    }
+
+    (out_indices, out_distances)
+}
 
 fn sparse_inputs<F: Float + ToPrimitive + burn::tensor::Element>(
     data: Vec<F>,
@@ -73,8 +402,9 @@ fn sparse_inputs<F: Float + ToPrimitive + burn::tensor::Element>(
     num_features: usize,
     k: usize,
     device: &Device,
-) -> (Tensor<2>, Vec<i32>) {
+) -> (Tensor<2>, Vec<i32>, Vec<f32>) {
     let all_data_tensor = convert_vector_to_tensor(data.clone(), num_samples, num_features, device);
+
     #[cfg(feature = "nn-descent")]
     let use_nn_descent = num_samples >= NN_DESCENT_THRESHOLD;
 
@@ -84,15 +414,21 @@ fn sparse_inputs<F: Float + ToPrimitive + burn::tensor::Element>(
             .iter()
             .map(|x| num::ToPrimitive::to_f32(x).unwrap())
             .collect();
-        let (indices, _distances) =
-            crate::nn_descent::nn_descent(&data_f32, num_samples, num_features, k);
-        return (all_data_tensor, indices);
+
+        let (indices, distances) =
+            crate::nn_descent::nn_descent(&data_f32, num_samples, num_features, k - 1);
+
+        let (indices, distances) = with_self_slots(indices, distances, num_samples, k);
+
+        return (all_data_tensor, indices, distances);
     }
 
     let pairwise = pairwise_distances(all_data_tensor.clone());
     let flat: Vec<f32> = pairwise.to_data().try_to_vec::<f32>().unwrap();
-    let (indices, _distances) = knn_from_pairwise_cpu(&flat, num_samples, k);
-    (all_data_tensor, indices)
+    let (indices, distances) = knn_from_pairwise_cpu(&flat, num_samples, k - 1);
+    let (indices, distances) = with_self_slots(indices, distances, num_samples, k);
+
+    (all_data_tensor, indices, distances)
 }
 
 pub fn train_sparse<F: Float>(
@@ -142,6 +478,11 @@ where
     let neg_rate = config.neg_sample_rate;
     let verbose = config.verbose;
 
+    assert!(
+        k >= 2,
+        "k_neighbors must include self and at least one other sample"
+    );
+    assert!(config.epochs > 0, "epochs must be positive");
     if num_samples <= k {
         panic!("num_samples ({num_samples}) must be > k_neighbors ({k}).");
     }
@@ -174,89 +515,55 @@ where
     }
     let knn_start = Instant::now();
 
-    let (all_data_tensor, knn_indices) = sparse_inputs(data, num_samples, num_features, k, &device);
+    // PCA also needs the caller's unmodified feature values.
+    #[cfg(feature = "pca")]
+    let pca_data = data.clone();
+    let (all_data_tensor, knn_indices, knn_distances) =
+        sparse_inputs(data, num_samples, num_features, k, &device);
 
-    let n_all_edges = num_samples * k;
+    let (sigmas, rhos) = smooth_knn_dist(
+        &knn_distances,
+        num_samples,
+        k,
+        config.local_connectivity,
+        config.bandwidth,
+    );
 
-    // Build full positive edge arrays (used as pool for subsampling)
-    let mut all_pos_edges: Vec<(i64, i64)> = Vec::with_capacity(n_all_edges);
-    for i in 0..num_samples {
-        for j in 0..k {
-            all_pos_edges.push((i as i64, knn_indices[i * k + j] as i64));
-        }
-    }
+    let directed = directed_memberships(&knn_indices, &knn_distances, &sigmas, &rhos, k);
+    let weighted_edges = symmetrize(&directed, config.set_op_mix_ratio);
+    let maximum_weight = weighted_edges
+        .iter()
+        .map(|edge| edge.weight)
+        .fold(0.0f32, f32::max);
 
-    // Determine how many positive edges to sample per epoch
-    let n_pos = n_all_edges.min(MAX_POS_EDGES_PER_EPOCH);
-    let subsampling = n_pos < n_all_edges;
-    let n_neg = (n_pos * neg_rate).max(num_samples);
-    let n_total = n_pos + n_neg;
+    let prune_threshold = maximum_weight / config.epochs as f32;
 
-    // ── Pre-generate fused edge-sample batches on GPU ────────────────────────
+    let retained_edges = weighted_edges
+        .iter()
+        .filter(|edge| edge.weight >= prune_threshold)
+        .count();
+
+    let sampler = EdgeSampler::new(&weighted_edges, config.epochs)
+        .unwrap_or_else(|error| panic!("fuzzy edge preparation failed: {error:?}"));
+
+    let n_pos = sampler.draw_count();
+
+    let n_neg = n_pos
+        .checked_mul(neg_rate)
+        .expect("negative sample count overflow")
+        .max(num_samples);
+
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
-
-    let fused_batches: Vec<(Tensor<1, Int>, Tensor<1, Int>, usize, usize)> = (0..EDGE_BATCH_COUNT)
-        .map(|_| {
-            // Sample positive edges (with replacement if subsampling)
-            let pos_sample: Vec<&(i64, i64)> = if subsampling {
-                let mut indices: Vec<usize> = (0..n_all_edges).collect();
-                indices.shuffle(&mut rng);
-                indices
-                    .iter()
-                    .take(n_pos)
-                    .map(|&i| &all_pos_edges[i])
-                    .collect()
-            } else {
-                all_pos_edges.iter().collect()
-            };
-
-            let actual_n_pos = pos_sample.len();
-
-            let mut all_head: Vec<i64> = Vec::with_capacity(n_total);
-            let mut all_tail: Vec<i64> = Vec::with_capacity(n_total);
-
-            // Positive edges
-            for &(h, t) in &pos_sample {
-                all_head.push(*h);
-                all_tail.push(*t);
-            }
-
-            // Negative samples
-            let actual_n_neg = n_neg;
-            for _ in 0..actual_n_neg {
-                let i = rng.random_range(0..num_samples);
-                let mut j = rng.random_range(0..num_samples - 1);
-                if j >= i {
-                    j += 1;
-                }
-                all_head.push(i as i64);
-                all_tail.push(j as i64);
-            }
-
-            let total = actual_n_pos + actual_n_neg;
-            let h = Tensor::from_data(TensorData::new(all_head, [total]), &device);
-            let t = Tensor::from_data(TensorData::new(all_tail, [total]), &device);
-            (h, t, actual_n_pos, total)
-        })
-        .collect();
 
     let knn_elapsed = knn_start.elapsed();
     if verbose {
         println!(
-            "[fast-umap] k-NN done in {:.2}s — {n_all_edges} total edges{}",
+            "[fast-umap] Fuzzy graph done in {:.2}s — {} directed, {} symmetric, {} positive-count edges; integer mass={}",
             knn_elapsed.as_secs_f64(),
-            if subsampling {
-                format!(
-                    ", subsampling {n_pos} positive + {n_neg} negative per epoch \
-                     (neg_rate={neg_rate}, {EDGE_BATCH_COUNT} pre-batched shuffles)"
-                )
-            } else {
-                format!(
-                    ", {n_pos} positive + {n_neg} negative edges per epoch \
-                     (neg_rate={neg_rate})"
-                )
-            }
+            directed.len(), weighted_edges.len(), sampler.edges.len(), sampler.total,
         );
+        println!("[fast-umap]   local_connectivity={} bandwidth={} set_op_mix_ratio={}; fresh {n_pos} positive + {n_neg} negative draws per epoch", config.local_connectivity, config.bandwidth, config.set_op_mix_ratio);
+        println!("[fast-umap]   coalesced={} symmetric={} retained_after_pruning={retained_edges} positive_count_support={} max_weight={maximum_weight} prune_threshold={prune_threshold}; NN-descent threshold={NN_DESCENT_THRESHOLD}", directed.len(), weighted_edges.len(), sampler.edges.len());
         println!("[fast-umap] Training started …");
     }
 
@@ -266,7 +573,7 @@ where
         let pca_epochs = 10;
         let pca_lr = 1e-2;
 
-        let data_f32: Vec<f32> = data
+        let data_f32: Vec<f32> = pca_data
             .iter()
             .map(|x| num::ToPrimitive::to_f32(x).unwrap())
             .collect();
@@ -352,14 +659,17 @@ where
         let embeddings = model.forward(all_data_tensor.clone()); // [n, output_dim]
 
         // ── Fused row selection ─────────────────────────────────────────────
-        let (fused_h, fused_t, batch_n_pos, batch_n_total) =
-            &fused_batches[epoch % EDGE_BATCH_COUNT];
-        let batch_n_pos = *batch_n_pos;
-        let batch_n_total = *batch_n_total;
+        let (heads, tails) = sampler.sample_batch(num_samples, neg_rate, &mut rng);
+        let batch_n_pos = n_pos;
+        let batch_n_total = heads.len();
+        let fused_h: Tensor<1, Int> =
+            Tensor::from_data(TensorData::new(heads, [batch_n_total]), &device);
+        let fused_t: Tensor<1, Int> =
+            Tensor::from_data(TensorData::new(tails, [batch_n_total]), &device);
 
         let (all_head_emb, all_tail_emb) = (
-            embeddings.clone().select(0, fused_h.clone()),
-            embeddings.select(0, fused_t.clone()),
+            embeddings.clone().select(0, fused_h),
+            embeddings.select(0, fused_t),
         );
 
         let diff = all_head_emb - all_tail_emb;
@@ -588,8 +898,281 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::sparse_inputs;
+    use super::*;
     use burn::tensor::Device;
+
+    fn floats(value: &serde_json::Value) -> Vec<f32> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    fn close(actual: &[f32], expected: &[f32], context: &str) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                a.is_finite() && (*a - *b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                "{context}[{index}]: {a} != {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_graph_fixtures_match_memberships_and_symmetrization() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/umap_learn_0.5.12_fuzzy_graph.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["reference_version"], "0.5.12");
+        for case in fixture["cases"].as_array().unwrap() {
+            let n = case["n"].as_u64().unwrap() as usize;
+            let k = case["k"].as_u64().unwrap() as usize;
+            let name = case["name"].as_str().unwrap();
+            let indices: Vec<i32> = case["indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            let distances = floats(&case["distances"]);
+            let (sigmas, rhos) = smooth_knn_dist(
+                &distances,
+                n,
+                k,
+                case["local_connectivity"].as_f64().unwrap(),
+                case["bandwidth"].as_f64().unwrap(),
+            );
+            close(&sigmas, &floats(&case["sigma"]), name);
+            close(&rhos, &floats(&case["rho"]), name);
+            let directed = directed_memberships(&indices, &distances, &sigmas, &rhos, k);
+            let mut dense = vec![0.0; n * n];
+            for (&(head, tail), &weight) in &directed {
+                dense[head * n + tail] = weight;
+            }
+            close(&dense, &floats(&case["directed"]), name);
+            let edges = symmetrize(&directed, case["set_op_mix_ratio"].as_f64().unwrap());
+            let mut symmetric = vec![0.0; n * n];
+            for edge in &edges {
+                symmetric[edge.head * n + edge.tail] = edge.weight;
+                assert_eq!(
+                    edge.weight,
+                    edges
+                        .iter()
+                        .find(|other| other.head == edge.tail && other.tail == edge.head)
+                        .unwrap()
+                        .weight
+                );
+            }
+            close(&symmetric, &floats(&case["symmetric"]), name);
+            let expected_counts: Vec<u64> = case["counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap())
+                .collect();
+            assert_eq!(
+                repetition_counts(&symmetric, case["epochs"].as_u64().unwrap() as usize).unwrap(),
+                expected_counts,
+                "{name} counts"
+            );
+            for i in 0..n {
+                assert_eq!(symmetric[i * n + i], 0.0);
+            }
+        }
+        for case in fixture["count_cases"].as_array().unwrap() {
+            let expected: Vec<u64> = case["counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap())
+                .collect();
+            assert_eq!(
+                repetition_counts(
+                    &floats(&case["weights"]),
+                    case["epochs"].as_u64().unwrap() as usize
+                )
+                .unwrap(),
+                expected,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_memberships_coalesce_without_confusing_self() {
+        let directed =
+            directed_memberships(&[0, 1, 1, 1, 0, -1], &[0.0; 6], &[0.0; 2], &[0.0; 2], 3);
+        assert_eq!(directed.len(), 2);
+        assert_eq!(directed[&(0, 1)], 2.0);
+        assert_eq!(directed[&(1, 0)], 1.0);
+        let asymmetric = BTreeMap::from([((0, 1), 0.5), ((1, 0), 0.2), ((1, 2), 0.8)]);
+        let union = symmetrize(&asymmetric, 1.0);
+        close(
+            &union.iter().map(|edge| edge.weight).collect::<Vec<_>>(),
+            &[0.6, 0.6, 0.8, 0.8],
+            "union",
+        );
+        let intersection = symmetrize(&asymmetric, 0.0);
+        assert_eq!(intersection.len(), 2);
+        close(
+            &intersection
+                .iter()
+                .map(|edge| edge.weight)
+                .collect::<Vec<_>>(),
+            &[0.1, 0.1],
+            "intersection",
+        );
+    }
+
+    #[test]
+    fn integer_counts_pin_f32_boundaries_and_explicit_errors() {
+        assert_eq!(
+            repetition_counts(&[1.0, 0.2, 0.001], 10).unwrap(),
+            vec![10, 2, 0]
+        );
+        assert_eq!(repetition_counts(&[0.7], 10).unwrap(), vec![7]);
+        let boundary = 0.1f32;
+        assert_eq!(
+            repetition_counts(
+                &[
+                    1.0,
+                    f32::from_bits(boundary.to_bits() - 1),
+                    boundary,
+                    f32::from_bits(boundary.to_bits() + 1)
+                ],
+                10
+            )
+            .unwrap(),
+            vec![10, 0, 1, 1]
+        );
+        assert_eq!(
+            repetition_counts(&[1.0], 0),
+            Err(EdgePreparationError::InvalidEpochs)
+        );
+        assert_eq!(
+            repetition_counts(&[f32::NAN], 10),
+            Err(EdgePreparationError::InvalidWeight)
+        );
+        assert_eq!(
+            repetition_counts(&[-1.0], 10),
+            Err(EdgePreparationError::InvalidWeight)
+        );
+        assert_eq!(
+            repetition_counts(&[f32::MAX], 10),
+            Err(EdgePreparationError::CountOverflow)
+        );
+        let edges = vec![
+            WeightedEdge {
+                head: 0,
+                tail: 1,
+                weight: 1.0
+            };
+            2
+        ];
+        assert!(matches!(
+            EdgeSampler::from_counts(&edges, &[u64::MAX, 1]),
+            Err(EdgePreparationError::CountOverflow)
+        ));
+        assert!(matches!(
+            EdgeSampler::from_counts(&edges, &[0, 0]),
+            Err(EdgePreparationError::EmptySupport)
+        ));
+        assert!(matches!(
+            EdgeSampler::new(&[], 10),
+            Err(EdgePreparationError::EmptySupport)
+        ));
+        let intersection = symmetrize(&BTreeMap::from([((0, 1), 1.0)]), 0.0);
+        assert!(matches!(
+            EdgeSampler::new(&intersection, 10),
+            Err(EdgePreparationError::EmptySupport)
+        ));
+    }
+
+    #[test]
+    fn sampler_uses_exact_integer_tickets_and_fresh_seeded_epoch_draws() {
+        let edges = [
+            WeightedEdge {
+                head: 0,
+                tail: 1,
+                weight: 1.0,
+            },
+            WeightedEdge {
+                head: 1,
+                tail: 2,
+                weight: 1.0,
+            },
+            WeightedEdge {
+                head: 2,
+                tail: 0,
+                weight: 0.0,
+            },
+        ];
+        let small = EdgeSampler::from_counts(&edges, &[10, 2, 0]).unwrap();
+        assert_eq!(small.draw_count(), 12);
+        for ticket in 0..12 {
+            assert_eq!(
+                small.edge_for_ticket(ticket),
+                if ticket < 10 { (0, 1) } else { (1, 2) }
+            );
+        }
+        let sampler = EdgeSampler::from_counts(&edges, &[70_000, 30_000, 0]).unwrap();
+        assert_eq!(sampler.draw_count(), 50_000);
+        assert_eq!(
+            EdgeSampler::from_counts(&edges, &[50_000, 0, 0])
+                .unwrap()
+                .draw_count(),
+            50_000
+        );
+        assert_eq!(
+            EdgeSampler::from_counts(&edges, &[50_001, 0, 0])
+                .unwrap()
+                .draw_count(),
+            50_000
+        );
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut repeat = rand::rngs::StdRng::seed_from_u64(42);
+        let first = sampler.sample_batch(3, 2, &mut rng);
+        assert_eq!(first, sampler.sample_batch(3, 2, &mut repeat));
+        let second = sampler.sample_batch(3, 2, &mut rng);
+        assert_eq!(second, sampler.sample_batch(3, 2, &mut repeat));
+        assert_ne!(first.0[..50_000], second.0[..50_000]); // Fixed deterministic nondegenerate fixture.
+        assert_ne!(first.1[50_000..], second.1[50_000..]);
+        assert_eq!(sampler.total, 100_000); // Draws/early completion cannot change configured-E mass.
+        assert_eq!(first.0.len(), 150_000);
+        let first_edge_count = first.0[..50_000].iter().filter(|head| **head == 0).count();
+        assert!((first_edge_count as f64 / 50_000.0 - 0.7).abs() < 0.01);
+        for (head, tail) in first.0.iter().zip(&first.1) {
+            assert_ne!(head, tail);
+        }
+        assert!(first.0[..50_000]
+            .iter()
+            .all(|head| *head == 0 || *head == 1));
+        let (heads, tails) = small.sample_batch(100, 0, &mut rng);
+        assert_eq!(heads.len(), 12 + 100);
+        assert_eq!(heads.len(), tails.len());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| small.sample_batch(
+                3,
+                usize::MAX,
+                &mut rng
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn self_slot_preserves_duplicate_zero_neighbors_and_rejects_short_rows() {
+        let (indices, distances) = with_self_slots(vec![1, 0], vec![0.0, 0.0], 2, 2);
+        assert_eq!(indices, vec![0, 1, 1, 0]);
+        assert_eq!(distances, vec![0.0; 4]);
+        assert!(
+            std::panic::catch_unwind(|| with_self_slots(vec![0, 1], vec![0.0; 2], 2, 2)).is_err()
+        );
+    }
 
     #[test]
     fn sparse_preparation_uses_raw_values_for_knn_and_encoder_input() {
@@ -599,10 +1182,12 @@ mod tests {
             10.0, 1.0, 7.0, // C
             0.0, 10_000.0, 7.0, // scale outlier
         ];
-        let (encoder_input, knn_indices) = sparse_inputs(data, 4, 3, 1, &Device::flex());
+        let (encoder_input, knn_indices, distances) = sparse_inputs(data, 4, 3, 2, &Device::flex());
 
         // In raw space A is closest to C; z-scoring would make B closer.
-        assert_eq!(knn_indices[0], 2);
+        assert_eq!(knn_indices[..2], [0, 2]);
+        assert_eq!(distances[0], 0.0);
+        assert!((distances[1] - 101.0f32.sqrt()).abs() < 1e-5);
         let encoder_values = encoder_input.to_data().try_to_vec::<f32>().unwrap();
         assert_eq!(
             encoder_values,
@@ -628,18 +1213,20 @@ mod tests {
             })
             .collect();
         let k = 15;
-        let (encoder_input, indices) =
+        let (encoder_input, indices, distances) =
             sparse_inputs(data.clone(), num_samples, 3, k, &Device::flex());
 
         // Raw query neighbors come from [10, ~1, 7]; z-scoring the
         // NN-Descent-only input instead would select [0, ~100, 7].
-        for &neighbor in &indices[..k] {
+        for &neighbor in &indices[1..k] {
             assert_eq!(data[neighbor as usize * 3], 10.0);
         }
         assert_eq!(encoder_input.to_data().try_to_vec::<f32>().unwrap(), data);
         assert_eq!(indices.len(), num_samples * k);
         for (sample, neighbors) in indices.chunks_exact(k).enumerate() {
-            for &neighbor in neighbors {
+            assert_eq!(neighbors[0] as usize, sample);
+            assert_eq!(distances[sample * k], 0.0);
+            for &neighbor in &neighbors[1..] {
                 assert!(neighbor >= 0 && (neighbor as usize) < num_samples);
                 assert_ne!(neighbor as usize, sample);
             }

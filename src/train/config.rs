@@ -195,6 +195,15 @@ pub struct GraphParams {
     /// Default: 15
     pub n_neighbors: usize,
 
+    /// Local connectivity used when constructing fuzzy memberships.
+    pub local_connectivity: f64,
+
+    /// Bandwidth multiplier for fuzzy membership construction.
+    pub bandwidth: f64,
+
+    /// Balance between fuzzy union and intersection during symmetrization.
+    pub set_op_mix_ratio: f64,
+
     /// The distance metric to use for building the k-NN graph.
     ///
     /// Default: Euclidean
@@ -215,6 +224,9 @@ impl Default for GraphParams {
     fn default() -> Self {
         Self {
             n_neighbors: 15,
+            local_connectivity: 1.0,
+            bandwidth: 1.0,
+            set_op_mix_ratio: 1.0,
             metric: Metric::Euclidean,
             normalized: true,
             minkowski_p: 1.0,
@@ -460,6 +472,12 @@ pub struct TrainingConfig {
     pub loss_reduction: LossReduction,
     /// The number of nearest neighbors to consider.
     pub k_neighbors: usize,
+    /// Local connectivity used when constructing fuzzy memberships.
+    pub local_connectivity: f64,
+    /// Bandwidth multiplier for fuzzy membership construction.
+    pub bandwidth: f64,
+    /// Balance between fuzzy union and intersection during symmetrization.
+    pub set_op_mix_ratio: f64,
     /// Minimum desired loss to achieve before stopping early.
     pub min_desired_loss: Option<f64>,
     /// Maximum training time in seconds.
@@ -517,6 +535,9 @@ impl From<&UmapConfig> for TrainingConfig {
             patience: config.optimization.patience,
             loss_reduction: config.optimization.loss_reduction.clone(),
             k_neighbors: config.graph.n_neighbors,
+            local_connectivity: config.graph.local_connectivity,
+            bandwidth: config.graph.bandwidth,
+            set_op_mix_ratio: config.graph.set_op_mix_ratio,
             min_desired_loss: config.optimization.min_desired_loss,
             timeout: config.optimization.timeout,
             normalized: config.graph.normalized,
@@ -545,6 +566,9 @@ impl From<&TrainingConfig> for UmapConfig {
             manifold: ManifoldParams::default(),
             graph: GraphParams {
                 n_neighbors: config.k_neighbors,
+                local_connectivity: config.local_connectivity,
+                bandwidth: config.bandwidth,
+                set_op_mix_ratio: config.set_op_mix_ratio,
                 metric: config.metric.clone(),
                 normalized: config.normalized,
                 minkowski_p: config.minkowski_p,
@@ -592,6 +616,9 @@ pub struct TrainingConfigBuilder {
     patience: Option<i32>,
     loss_reduction: Option<LossReduction>,
     k_neighbors: Option<usize>,
+    local_connectivity: Option<f64>,
+    bandwidth: Option<f64>,
+    set_op_mix_ratio: Option<f64>,
     min_desired_loss: Option<f64>,
     timeout: Option<u64>,
     normalized: Option<bool>,
@@ -663,6 +690,21 @@ impl TrainingConfigBuilder {
         self
     }
 
+    pub fn with_local_connectivity(mut self, local_connectivity: f64) -> Self {
+        self.local_connectivity = Some(local_connectivity);
+        self
+    }
+
+    pub fn with_bandwidth(mut self, bandwidth: f64) -> Self {
+        self.bandwidth = Some(bandwidth);
+        self
+    }
+
+    pub fn with_set_op_mix_ratio(mut self, set_op_mix_ratio: f64) -> Self {
+        self.set_op_mix_ratio = Some(set_op_mix_ratio);
+        self
+    }
+
     pub fn with_min_desired_loss(mut self, min_desired_loss: f64) -> Self {
         self.min_desired_loss = Some(min_desired_loss);
         self
@@ -729,6 +771,9 @@ impl TrainingConfigBuilder {
             patience: self.patience,
             loss_reduction: self.loss_reduction.unwrap_or(LossReduction::Sum),
             k_neighbors: self.k_neighbors.unwrap_or(15),
+            local_connectivity: self.local_connectivity.unwrap_or(1.0),
+            bandwidth: self.bandwidth.unwrap_or(1.0),
+            set_op_mix_ratio: self.set_op_mix_ratio.unwrap_or(1.0),
             min_desired_loss: self.min_desired_loss,
             timeout: self.timeout,
             normalized: self.normalized.unwrap_or(true),

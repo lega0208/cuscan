@@ -1,17 +1,17 @@
+use burn::tensor::{Device, DeviceIndex};
+use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
 /// Test NN-Descent on a large dataset (50K samples).
 /// This would OOM with the exact pairwise distance approach (10GB matrix).
 ///
 /// Usage:
 ///     cargo run --release --features nn-descent --example large_scale
 use std::time::Instant;
-use burn::tensor::{Device, DeviceKind, DeviceIndex};
-use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
 
 fn device() -> Device {
     cfg_select! {
-      feature = "cuda" => Device::cuda(DeviceIndex::Default),
-      feature = "gpu" => Device::wgpu(DeviceKind::DefaultDevice),
-      _ => Device::flex(),
+        feature = "cuda" => Device::cuda(DeviceIndex::Default),
+        feature = "gpu" => Device::wgpu(DeviceKind::DefaultDevice),
+        _ => Device::flex(),
     }
 }
 

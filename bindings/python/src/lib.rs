@@ -127,6 +127,9 @@ fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<Fi
   device="gpu",
   n_components=2,
   n_neighbors=15,
+  local_connectivity=1.0,
+  bandwidth=1.0,
+  set_op_mix_ratio=1.0,
   min_dist=0.1,
   spread=1.0,
   hidden_sizes=vec![100],
@@ -145,6 +148,9 @@ fn fit(
     device: &str,
     n_components: usize,
     n_neighbors: usize,
+    local_connectivity: f64,
+    bandwidth: f64,
+    set_op_mix_ratio: f64,
     min_dist: f32,
     spread: f32,
     hidden_sizes: Vec<usize>,
@@ -164,6 +170,9 @@ fn fit(
     config.hidden_sizes = hidden_sizes;
     config.graph = GraphParams {
         n_neighbors,
+        local_connectivity,
+        bandwidth,
+        set_op_mix_ratio,
         metric: Metric::Euclidean,
         ..GraphParams::default()
     };

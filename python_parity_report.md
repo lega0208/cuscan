@@ -2,9 +2,9 @@
 
 ## Verdict and scope
 
-**Algorithmic and mathematical parity is not present.** The main Rust implementation is a parametric, binary-kNN contrastive embedding algorithm, not a faithful implementation of the installed `umap-learn` ParametricUMAP pipeline. The most consequential differences are the missing fuzzy graph, a different cross-entropy formula, different attraction/repulsion weighting, and different sampling and optimization schedules. Matching parameter names does not make the objectives equivalent.
+**Full algorithmic and mathematical parity is not present.** The primary Rust implementation now has density-adaptive fuzzy memberships, fuzzy symmetrization, self-inclusive neighborhoods, and integer-weighted positive sampling. Reference-labelled fixtures cover graph-helper mathematics on identical neighbor lists and float32 pruning/counts. Cross-entropy, attraction/repulsion aggregation, negative sampling, finite-pass training schedules, and optimization remain different. Matching graph mathematics does not make the objectives equivalent.
 
-Audited current checkout: Rust `fast-umap` 1.6.0, HEAD `6b68d5e59cbc2eac86c0cc5081c23e2cef5517ce`; installed `umap-learn` **0.5.12**. Line numbers refer to the current files, not an upstream branch. Existing changes to `pyproject.toml` and `uv.lock` were left untouched. No product source was changed.
+Original audited checkout: Rust `fast-umap` 1.6.0, HEAD `6b68d5e59cbc2eac86c0cc5081c23e2cef5517ce`; installed `umap-learn` **0.5.12**. Original numeric source citations below describe that audit revision. The original audit did not change source; subsequent approved primary-route remediations are identified explicitly below. Unrelated findings remain historical audit findings, not newly reverified parity claims.
 
 Primary Rust route: `Umap::fit` / `fit_with_signal` / `fit_with_progress` → `train_sparse` (`src/lib.rs:272-383,389-465`). The deprecated `UMAP` route and feature-gated `CpuUmap` are separately identified below; their behavior must not be attributed to the primary route.
 
@@ -30,6 +30,17 @@ This is a source-level algorithm audit with targeted numerical checks, **not an 
 3. The installed Python `convert_distance_to_log_probability`, `compute_cross_entropy`, and `get_graph_elements` functions were extracted using Python AST and executed with NumPy equivalents of the required Keras operations. Their algebra and weighted edge repetition were checked by assertions. No replacement training implementation was used.
 4. The actual current Rust `fit_ab` function was extracted, compiled with `rustc`, and run; its results were compared with the AST-executed installed Python `find_ab_params` using SciPy's `curve_fit`.
 
+Subsequent graph/count remediation verification: 6 Rust sparse helper tests, 7 with
+`nn-descent` (including its actual 10K-sample preparation route), and 6 with `pca`.
+The CPU API suite passed all nine tests: eight primary API/configuration regressions
+and one seeded dense-trainer control-isolation regression. Seven weight-only
+serialization tests also passed. The
+release-built Python extension passed all 22 CPU tests; the separate WGPU smoke
+test failed on this WSL adapter with `No tile size is available for the problem`.
+That hardware-specific failure is not converted to a skip or GPU correctness claim.
+The reference fixture generator was rerun successfully. Build warnings remain:
+Burn/CubeCL future incompatibilities and unavailable `patchelf` for wheel rpath.
+
 **Limitations:** TensorFlow and Keras are not installed in this environment, so the complete `ParametricUMAP` class cannot be instantiated. No TensorFlow training run, gradient comparison, GPU comparison, trustworthiness comparison, or statistical quality ranking was performed. Effects below follow from source/math, not measured quality gains or regressions. Keras dependency defaults were corroborated with its [Dense documentation](https://keras.io/api/layers/core_layers/dense/) and [Adam documentation](https://keras.io/api/optimizers/adam/); these are supplementary documentation, not proof of a locally installed Keras version.
 
 ## Common ground — but not proof of parity
@@ -51,37 +62,29 @@ Labels: **Core mismatch** changes the default mathematics; **Defect** is mislead
 - **Verification:** Raw-space nearest-neighbor and exact encoder-input assertions use unequal feature scales and a constant column with value `7`; direct model-forward comparisons cover finalization and transform. Restoring feature scaling in a temporary mutation made the nearest-neighbor regression fail (neighbor `1` instead of `2`); the mutation was removed. Rust persistence tests compare probe outputs before and after save/load. `cargo test --no-default-features` passed (64 tests; 10 ignored); two `nn-descent` sparse-preparation regressions passed, including the actual approximate branch at its 10,000-sample threshold. After rebuilding the native extension, `uv run --no-sync pytest python/tests/test_umap.py -k 'not gpu_smoke'` passed (13 tests; one hardware test deselected), including a real CPU constant-column preservation regression. The GPU smoke selector was corrected to `wgpu` and its skip handling narrowed to missing-adapter errors; attempting the hardware test aborted inside the host graphics driver, so GPU behavior is not verified. These checks establish the CPU preprocessing contract, not complete Python algorithm parity.
 - **Notes:** Deprecated routes and shared scaling helpers remain unchanged. Previously saved weights trained on internally standardized inputs still need their original external preprocessing or retraining; there is no migration. Other numbered findings retain their original audit context and have not been re-audited here. Python's optional correlation-loss z-scoring is not graph/encoder preprocessing.
 
-### 2. No local-connectivity radii, bandwidth search, or fuzzy memberships — Core mismatch
+### 2. Local-connectivity radii, bandwidth search, and fuzzy memberships — Addressed in primary route
 
-- **Rust:** `src/train/train_sparse.rs:154-185` discards neighbor distances and creates binary edges. There is no rho/sigma calculation in this path.
+- **Current Rust:** `sparse_inputs` retains distances; `smooth_knn_dist` computes rho interpolation, 64-step sigma search, and row/global sigma floors. `directed_memberships` distinguishes explicit self from duplicate zero-distance observations and skips missing index -1. Primary Rust/Python expose finite `local_connectivity >= 0` and `bandwidth > 0` (defaults 1).
 - **Python:** `U:153-254,420-435,578-590`. Computes local radius rho and searches sigma so that the local membership sum approximates `log2(k)*bandwidth`; memberships are 1 inside rho and `exp(-(d-rho)/sigma)` outside it.
-- **Effects:** Removes UMAP's density-adaptive local geometry. Near and distant selected neighbors exert equal positive influence in Rust, changing local structure and density sensitivity (negative for parity); simpler graph preparation is positive for implementation cost.
-- **Remediation:** Retain neighbor distances and implement `smooth_knn_dist` and `compute_membership_strengths`, including local connectivity, duplicate/zero-distance handling, and sigma floors.
-- **Notes:** A distance-based loss on the embedding is not a substitute for these high-dimensional membership weights.
+- **Evidence:** `tests/fixtures/umap_learn_0.5.12_fuzzy_graph.json` is generated from installed helpers with NumPy 2.5.3. Rust fixtures compare rho/sigma, directed memberships, and symmetric weights on identical supplied neighbor lists, including duplicates, fractional connectivity, bandwidth, floors, and -1 skipping. This does not establish approximate-neighbor identity or embedding-quality parity.
 
-### 3. No fuzzy union/intersection of directed neighborhoods — Core mismatch
+### 3. Fuzzy union/intersection of directed neighborhoods — Addressed in primary route
 
-- **Rust:** `src/train/train_sparse.rs:177-185` retains directed kNN entries independently.
+- **Current Rust:** `directed_memberships` coalesces repeated coordinates; `symmetrize` applies the reference formula, removes zeros, and retains one coordinate in each direction. `set_op_mix_ratio` is exposed in Rust/Python, defaults to 1, and must be finite in [0,1].
 - **Python:** `U:593-603` combines membership matrix A with its transpose using `mix*(A+Aᵀ-A∘Aᵀ)+(1-mix)*(A∘Aᵀ)`; the default is fuzzy union.
-- **Effects:** Mutual Rust neighbors contribute twice as many positive entries as one-way neighbors. Python's symmetrized fuzzy weights use a different relative weighting. There are no `set_op_mix_ratio` controls (negative for parity/capability).
-- **Remediation:** Symmetrize fuzzy memberships with the reference set operations; expose the mix parameter only once its semantics are implemented.
-- **Notes:** The distance loss is symmetric, so edge orientation itself is not the issue. Relative pair multiplicities/weights are. Simply adding reverse binary edges is insufficient.
+- **Evidence:** Fixed asymmetric/mutual graph fixtures cover mix 0, 0.5, and 1, reverse-weight symmetry, self zeroing, and duplicate-coordinate coalescing. Pure intersection with no surviving positive mass fails explicitly instead of falling back to union.
 
-### 4. Uniform positive-edge training replaces weight-based pruning and repetition — Core mismatch
+### 4. Weight-based pruning and integer positive distribution — Addressed; schedule remains different
 
-- **Rust:** `src/train/train_sparse.rs:177-209` uses all binary edges or uniformly samples at most 50,000 without replacement.
+- **Current Rust:** `repetition_counts` prunes strictly below `max(w)/E` and computes `floor(E*w)` with float32 operations using configured epochs E. `EdgeSampler` uses checked u64 counts/prefixes and fresh independent replacement draws, `min(50_000,sum(counts))` per epoch, with probability `count/sum(counts)`. It never expands the repeated-edge dataset; zero mass and overflow are explicit errors. Early stopping does not recompute counts.
 - **Python:** `P:618-634,905-923` sums duplicate COO entries, prunes `w < max(w)/n_epochs`, and repeats each edge `int(n_epochs*w)` times before shuffling.
-- **Effects:** Weak, strong, and marginal neighbors have the same influence in Rust. Python's sampling distribution is proportional to fuzzy weights, with integer truncation. Rust saves work through its cap (positive) but changes the attraction field (negative for parity).
-- **Remediation:** After building the fuzzy graph, reproduce pruning and integer-weight repetition, or define and test a weighted sampler with the intended equivalent distribution.
-- **Notes:** Measured helper check: weights `[1,0.2,0.001]` at `n_epochs=10` retain the first two and produce `[10,2]` repetitions. Binary Rust edges do not implement this. Sampling the continuous weights is not exactly the same as Python's finite integer expansion.
+- **Evidence:** Versioned fixtures and boundary tests pin `[1,0.2,0.001]`, E=10 -> `[10,2,0]`, threshold equality/adjacent float32 values, and `[0.7]`, E=10 -> 7 (widening before multiplication incorrectly yields 6). Ticket boundaries and seeded probability tests cover exact count distribution. Replacement batches do not reproduce Python's finite shuffled-pass exposure, optimizer-step count, or scheduling.
 
-### 5. `n_neighbors` counts different numbers of non-self neighbors — Core mismatch
+### 5. Self-inclusive `n_neighbors` — Addressed dependency; public semantic break
 
-- **Rust:** `src/train/get_distance_by_metric.rs:29-47`; `src/nn_descent.rs:35-43`. Explicitly excludes self and retains k other samples. `src/lib.rs:145-150` permits k=1 and requires n>k.
+- **Current Rust:** Primary `sparse_inputs` requests k-1 non-self candidates from unchanged shared search helpers, validates row lengths/identities/distances, and prepends explicit `(sample_id,0)` at slot zero. Primary validation requires k>=2 and n>k. This is a deliberate breaking change: k=15 now selects 14 other samples, not 15. Deprecated dense and shared search conventions remain unchanged.
 - **Python:** `UT:14-35`; `U:192,223,426-427,1784-1785`. Its ordinary within-dataset neighbor list includes self; self membership is zero and smooth-kNN processing skips the first distance. Requires `n_neighbors>=2`.
-- **Effects:** At k=15, Rust selects 15 other samples, while the ordinary Python convention has 14 non-self slots. Equal settings describe different neighborhood sizes (negative for parity).
-- **Remediation:** Match Python's neighbor-list convention and sigma target together; do not only subtract one after fuzzy graph construction.
-- **Notes:** Duplicate zero distances can complicate self ordering. Handle those explicitly rather than assuming the first zero must always identify the queried row.
+- **Evidence:** Exact and actual threshold-triggered NN-descent preparation tests assert explicit self layout, distance retention and valid non-self neighbors. Duplicate zero-distance observations remain distinct by identity. ANN tests assert validity, not identical search results or seeded ANN parity.
 
 ### 6. Advertised graph metrics and distance options are ignored — Defect
 
@@ -141,13 +144,11 @@ Labels: **Core mismatch** changes the default mathematics; **Defect** is mislead
 - **Remediation:** Reproduce the within-batch repeated-tail shuffle for reference parity.
 - **Notes:** Python's shuffle is a finite permutation, not independent sampling. True neighbors can be negatives on both sides; neither implements an exclusively non-edge sampler in the primary route.
 
-### 13. Only 16 frozen edge/negative samples cycle through training — Tradeoff
+### 13. Fresh edge/negative samples — Addressed consequence of weighted integration
 
-- **Rust:** `src/train/train_sparse.rs:35-37,193-239,353-356` generates 16 fused sample tensors once, then selects `epoch % 16`.
+- **Current Rust:** The cached 16-batch cycle is removed. Each epoch advances one seeded stream through fresh integer-weighted positives and fresh uniform non-self negatives. Index tensor uploads are now per-epoch rather than cached.
 - **Python:** `P:925-936,1213-1221` continuously shuffles its repeated edge dataset and draws a new negative permutation during loss evaluation.
-- **Effects:** Rust reduces CPU/GPU sampling overhead (positive), but stochastic support is restricted. With subsampling, edges outside the union of the 16 selected pools are never trained, regardless of additional epochs; negatives also repeat exactly (negative for coverage/parity).
-- **Remediation:** Refresh samples/permutations during training, ideally through a bounded prefetch queue rather than rebuilding the entire graph.
-- **Notes:** If all positive edges fit under the 50,000 cap, positives are fully covered; it is still the same frozen negative pool. The subsampling code samples without replacement despite its comment saying otherwise.
+- **Limits:** Fresh draws remove the fixed-pool coverage restriction but are not the reference finite-pass schedule or negative permutation law. CPU tests verify seeded repeatability, state advancement, bounded positives, and non-self negatives; no throughput or GPU correctness claim follows.
 
 ### 14. Epochs, batches, and optimization budgets have incompatible meanings — Core mismatch
 

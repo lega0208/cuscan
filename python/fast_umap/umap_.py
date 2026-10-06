@@ -31,6 +31,9 @@ class UMAP:
         metric: str = "euclidean",
         n_epochs: int | None = None,
         learning_rate: float = 0.001,
+        local_connectivity: float = 1.0,
+        bandwidth: float = 1.0,
+        set_op_mix_ratio: float = 1.0,
         min_dist: float = 0.1,
         spread: float = 1.0,
         repulsion_strength: float = 1.0,
@@ -47,6 +50,9 @@ class UMAP:
         self.metric = metric
         self.n_epochs = n_epochs
         self.learning_rate = learning_rate
+        self.local_connectivity = local_connectivity
+        self.bandwidth = bandwidth
+        self.set_op_mix_ratio = set_op_mix_ratio
         self.min_dist = min_dist
         self.spread = spread
         self.repulsion_strength = repulsion_strength
@@ -59,6 +65,25 @@ class UMAP:
         self.timeout = timeout
 
     def _validate_params(self) -> int:
+        if self.n_neighbors < 2:
+            raise ValueError("n_neighbors must be at least 2 (including self)")
+        if self.n_epochs is not None and self.n_epochs <= 0:
+            raise ValueError("n_epochs must be positive")
+        for name, value in (
+            ("local_connectivity", self.local_connectivity),
+            ("bandwidth", self.bandwidth),
+            ("set_op_mix_ratio", self.set_op_mix_ratio),
+        ):
+            if not isinstance(value, (int, float, np.integer, np.floating)) or not np.isfinite(
+                value
+            ):
+                raise ValueError(f"{name} must be finite")
+        if self.local_connectivity < 0:
+            raise ValueError("local_connectivity must be non-negative")
+        if self.bandwidth <= 0:
+            raise ValueError("bandwidth must be positive")
+        if not 0 <= self.set_op_mix_ratio <= 1:
+            raise ValueError("set_op_mix_ratio must be between 0 and 1")
         if self.metric != "euclidean":
             raise ValueError("only metric='euclidean' is supported")
         if self.device not in ("cuda", "wgpu", "cpu"):
@@ -93,14 +118,17 @@ class UMAP:
         if y is not None:
             raise NotImplementedError("supervised UMAP is not supported")
         x = self._input_array(X)
+        seed = self._validate_params()
         if x.shape[0] <= self.n_neighbors:
             raise ValueError("n_samples must be greater than n_neighbors")
-        seed = self._validate_params()
         model = _fast_umap.fit(
             x,
             device=self.device,
             n_components=self.n_components,
             n_neighbors=self.n_neighbors,
+            local_connectivity=self.local_connectivity,
+            bandwidth=self.bandwidth,
+            set_op_mix_ratio=self.set_op_mix_ratio,
             min_dist=self.min_dist,
             spread=self.spread,
             hidden_sizes=list(self.hidden_sizes),
@@ -149,6 +177,9 @@ class UMAP:
             "metric",
             "n_epochs",
             "learning_rate",
+            "local_connectivity",
+            "bandwidth",
+            "set_op_mix_ratio",
             "min_dist",
             "spread",
             "repulsion_strength",

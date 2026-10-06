@@ -110,6 +110,8 @@ def test_validation_errors() -> None:
         estimator().fit(invalid)
     with pytest.raises(ValueError, match="n_samples"):
         UMAP(n_neighbors=len(x), device="cpu").fit(x)
+    with pytest.raises(ValueError, match="at least 2"):
+        UMAP(n_neighbors=1, device="cpu").fit(x)
     with pytest.raises(ValueError, match="non-negative"):
         estimator(random_state=-1).fit(x)
     with pytest.raises(ValueError, match="metric"):
@@ -120,6 +122,25 @@ def test_validation_errors() -> None:
         estimator().fit(x).transform(x[:, :-1])
     with pytest.raises(NotImplementedError):
         estimator().fit(x, np.zeros(len(x)))
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("local_connectivity", -0.1, "non-negative"),
+        ("local_connectivity", np.inf, "finite"),
+        ("bandwidth", 0.0, "positive"),
+        ("bandwidth", np.nan, "finite"),
+        ("set_op_mix_ratio", -0.01, "between 0 and 1"),
+        ("set_op_mix_ratio", 1.01, "between 0 and 1"),
+        ("set_op_mix_ratio", np.inf, "finite"),
+        ("n_epochs", 0, "n_epochs must be positive"),
+    ],
+)
+def test_invalid_graph_parameters_rejected(parameter: str, value: float, message: str) -> None:
+    x, _ = blobs()
+    with pytest.raises(ValueError, match=message):
+        estimator(**{parameter: value}).fit(x)
 
 
 def test_float64_integer_and_noncontiguous_inputs() -> None:
@@ -142,6 +163,14 @@ def test_params_repr_and_random_state_generators() -> None:
     assert clone.get_params() == clone_params
     assert list(clone_params) == list(inspect.signature(UMAP.__init__).parameters)[1:]
     assert "n_components=3" in repr(model)
+    controlled = UMAP(local_connectivity=0.5, bandwidth=2.0, set_op_mix_ratio=0.25)
+    assert controlled.get_params()["local_connectivity"] == 0.5
+    assert controlled.get_params()["bandwidth"] == 2.0
+    assert controlled.get_params()["set_op_mix_ratio"] == 0.25
+    assert "local_connectivity=0.5" in repr(controlled)
+    assert "bandwidth=2.0" in repr(controlled)
+    assert "set_op_mix_ratio=0.25" in repr(controlled)
+    assert UMAP().set_params(**controlled.get_params()).get_params() == controlled.get_params()
     params_model = UMAP()
     assert params_model.set_params(device="cpu") is params_model
     random_model = UMAP(random_state=np.random.RandomState(1))
@@ -175,6 +204,20 @@ def test_fit_uses_raw_inputs_instead_of_automatic_standardization() -> None:
     # Automatic z-scoring maps both constant columns to exactly zero, making
     # these same-seed fits identical. Raw inputs must preserve the sentinel 7.
     assert not np.allclose(raw_embedding, centered_embedding, atol=1e-4, rtol=1e-4)
+
+
+def test_cpu_fit_transform_with_custom_graph_controls() -> None:
+    x, _ = blobs()
+    embedding = estimator(
+        n_neighbors=8,
+        n_epochs=2,
+        local_connectivity=0.5,
+        bandwidth=2.0,
+        set_op_mix_ratio=0.25,
+    ).fit_transform(x)
+    assert embedding.shape == (90, 2)
+    assert embedding.dtype == np.float32
+    assert np.isfinite(embedding).all()
 
 
 def test_gpu_smoke_when_adapter_available() -> None:

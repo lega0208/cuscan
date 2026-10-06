@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `UMAP` estimator, selectable GPU (WGPU) or CPU (NdArray) backend via `device=`.
 - Added `OptimizationParams.seed`; the sampling RNG is seeded as well as the model RNG.
 - Added `validate_fit_input` and `validate_fit_data` to reject invalid fit inputs before training.
+- Added primary Rust/Python `local_connectivity`, `bandwidth`, and `set_op_mix_ratio` controls (all default to 1), with reference-labelled umap-learn 0.5.12 graph fixtures.
 
 ### Changed
 
+- **Breaking: primary `n_neighbors` now includes self and must be at least 2.** A fixed value selects one fewer non-self neighbor. Exact and optional NN-descent preparation retain distances and insert explicit self at slot zero; duplicate observations remain distinct neighbors. Shared search helpers and deprecated dense graph behavior are unchanged.
+- Primary sparse training now computes smooth-kNN rho/sigma, density-adaptive directed memberships, and fuzzy union/intersection weights. Configured positive epochs E fix float32 pruning (`w < max(w)/E`) and integer counts (`floor(E*w)`) before training. Checked u64 prefix sampling draws `min(50_000, sum(counts))` positives independently with replacement each epoch, without expanding repeated edges. Empty mass or count overflow fails explicitly. Fresh uniform non-self negatives replace the cached 16-batch cycle. This does not reproduce the reference training schedule, negative distribution, loss, or optimizer.
 - **Breaking: primary `Umap` and Python `UMAP` no longer standardize features internally.** Fit and transform receive caller-provided values as-is; public sparse `train_sparse` training also uses those values when constructing the neighborhood graph. Feature scales therefore affect geometry. Weights trained with the former internal standardization require the original external preprocessing at inference or retraining; no automatic migration is provided.
 - Dropped the Burn `train` feature to provide deterministic CPU execution.
 - Python `transform` handles empty inputs and reports feature-count mismatches as `ValueError`.

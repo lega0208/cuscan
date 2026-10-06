@@ -50,8 +50,8 @@ fast-umap runs 50 epochs (parametric, GPU); umap-rs runs 200 epochs
 | Technique | Effect |
 |-----------|--------|
 | Sparse edge-based loss | O(n·k) per epoch instead of O(n²) |
-| Edge subsampling | Caps edges/epoch at 50K regardless of n |
-| Pre-batched negative samples on GPU | Zero per-epoch CPU→GPU transfers |
+| Integer-weighted positive draws | Caps positive draws/epoch at 50K without expanding repeated edges |
+| Fresh positive and negative batches | Seeded CPU sampling and bounded index uploads each epoch |
 | Fused index gather | 2 GPU `select()` calls instead of 4 |
 | Async loss readback | GPU→CPU sync every 5 epochs, not every epoch |
 | In-memory checkpointing | No disk I/O during training |
@@ -200,7 +200,10 @@ new_embedding = model.transform(X[:5])
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `n_neighbors` | `15` | Number of neighbors used to construct the neighborhood graph. |
+| `n_neighbors` | `15` | Neighborhood size including self; at least 2, with 14 non-self neighbors by default. |
+| `local_connectivity` | `1.0` | Finite non-negative local connectivity; fractional values interpolate rho. |
+| `bandwidth` | `1.0` | Finite positive multiplier of the smooth-kNN target. |
+| `set_op_mix_ratio` | `1.0` | Fuzzy intersection (0) to union (1); finite and in [0, 1]. |
 | `n_components` | `2` | Number of embedding dimensions. |
 | `metric` | `"euclidean"` | Input-space distance metric; only Euclidean is supported. |
 | `n_epochs` | `None` (100 epochs) | Number of training epochs. |
@@ -227,6 +230,14 @@ new_embedding = model.transform(X[:5])
 - `learning_rate` defaults to `0.001` (Adam), and `n_epochs` defaults to `100`.
 - `n_neighbors >= n_samples` raises `ValueError` rather than warning and
   adjusting the neighbor count.
+- The primary Rust and Python routes compute local fuzzy memberships and symmetric
+  union/intersection weights. Configured positive epochs E determine pruning at
+  `w < max(w)/E` and integer counts `floor(E*w)`, using float32 arithmetic.
+  Each epoch independently draws `min(50_000, sum(counts))` positives with
+  replacement, with probability `count/sum(counts)`, and fresh uniform non-self
+  negatives. Empty positive mass is an error; no unweighted fallback is used.
+  This matches graph-helper mathematics on identical neighbor lists, not the
+  reference's finite-pass training schedule, negative law, loss, or optimizer.
 - A fitted model is bound to the thread that created it. Ctrl-C is checked every
   few epochs and only on the main thread.
 - With a fixed `random_state`, CPU execution is bit-identical.
@@ -376,7 +387,7 @@ The public API mirrors [`umap-rs`](https://crates.io/crates/umap-rs):
 | [`FittedUmap`](https://docs.rs/fast-umap/latest/fast_umap/struct.FittedUmap.html) | Backend-independent fitted model — `.embedding()`, `.transform()`, `.into_embedding()`, `.config()` |
 | [`UmapConfig`](https://docs.rs/fast-umap/latest/fast_umap/struct.UmapConfig.html) | Configuration with nested `GraphParams` + `OptimizationParams` |
 | [`ManifoldParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.ManifoldParams.html) | `min_dist`, `spread` — control cluster tightness and separation |
-| [`GraphParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.GraphParams.html) | `n_neighbors`, `metric`, `normalized`, `minkowski_p` |
+| [`GraphParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.GraphParams.html) | `n_neighbors`, `local_connectivity`, `bandwidth`, `set_op_mix_ratio`, `metric`, `normalized`, `minkowski_p` |
 | [`OptimizationParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.OptimizationParams.html) | `n_epochs`, `learning_rate`, `patience`, `timeout`, `verbose`, `neg_sample_rate`, … |
 | [`Metric`](https://docs.rs/fast-umap/latest/fast_umap/enum.Metric.html) | `Euclidean`, `EuclideanKNN`, `Manhattan`, `Cosine` |
 
@@ -410,7 +421,10 @@ let config = UmapConfig {
 | `hidden_sizes` | `[100, 100, 100]` | Neural network hidden layer sizes |
 | `min_dist` | 0.1 | Min distance in embedding — smaller = tighter clusters |
 | `spread` | 1.0 | Effective scale of embedded points |
-| `n_neighbors` | 15 | KNN graph neighbours |
+| `n_neighbors` | 15 | KNN neighborhood size including self (primary route) |
+| `local_connectivity` | 1.0 | Local rho interpolation, finite and non-negative |
+| `bandwidth` | 1.0 | Smooth-kNN target multiplier, finite and positive |
+| `set_op_mix_ratio` | 1.0 | Fuzzy intersection (0) to union (1) |
 | `n_epochs` | 200 | Training epochs |
 | `learning_rate` | 1e-3 | Adam step size |
 | `batch_size` | 1 000 | Samples per batch |
@@ -701,15 +715,15 @@ Input data [n, features]
     ├─ n ≥ 10K ──→ NN-Descent approximate KNN (O(n·k))  [nn-descent]
     │
     ▼
-KNN graph (n·k edges)
+Self-inclusive KNN → local fuzzy memberships → symmetric fuzzy graph
     │
     ├─── [pca] PCA warm-start: pre-train network to match PCA output
     │
     ▼
 ┌─── Per epoch (cost: O(min(n·k, 50K))) ───┐
 │  Forward pass: data → neural net → [n, 2] │
-│  Edge subsampling from KNN graph           │
-│  Negative sampling (random non-neighbors)  │
+│  Fresh integer-weighted positive draws    │
+│  Fresh uniform non-self negative draws    │
 │  UMAP cross-entropy loss                   │
 │  Backward pass + Adam optimizer step       │
 └────────────────────────────────────────────┘

@@ -142,11 +142,25 @@ pub fn validate_fit_input(
     if config.n_components == 0 {
         return Err("n_components must be greater than zero".to_string());
     }
-    if config.graph.n_neighbors == 0 {
-        return Err("n_neighbors must be greater than zero".to_string());
+    if config.graph.n_neighbors < 2 {
+        return Err("n_neighbors must be at least two (including self)".to_string());
     }
     if n_samples <= config.graph.n_neighbors {
         return Err("n_samples must be greater than n_neighbors".to_string());
+    }
+    if !config.graph.local_connectivity.is_finite() || config.graph.local_connectivity < 0.0 {
+        return Err("local_connectivity must be finite and nonnegative".to_string());
+    }
+    if !config.graph.bandwidth.is_finite() || config.graph.bandwidth <= 0.0 {
+        return Err("bandwidth must be finite and greater than zero".to_string());
+    }
+    if !config.graph.set_op_mix_ratio.is_finite()
+        || !(0.0..=1.0).contains(&config.graph.set_op_mix_ratio)
+    {
+        return Err("set_op_mix_ratio must be finite and between zero and one".to_string());
+    }
+    if config.optimization.n_epochs == 0 {
+        return Err("n_epochs must be greater than zero".to_string());
     }
     if config.hidden_sizes.is_empty() {
         return Err("hidden_sizes must not be empty".to_string());
@@ -347,6 +361,9 @@ impl Umap {
             patience: self.config.optimization.patience,
             loss_reduction: self.config.optimization.loss_reduction.clone(),
             k_neighbors: self.config.graph.n_neighbors,
+            local_connectivity: self.config.graph.local_connectivity,
+            bandwidth: self.config.graph.bandwidth,
+            set_op_mix_ratio: self.config.graph.set_op_mix_ratio,
             min_desired_loss: self.config.optimization.min_desired_loss,
             timeout: self.config.optimization.timeout,
             normalized: self.config.graph.normalized,
@@ -432,6 +449,9 @@ impl Umap {
             patience: self.config.optimization.patience,
             loss_reduction: self.config.optimization.loss_reduction.clone(),
             k_neighbors: self.config.graph.n_neighbors,
+            local_connectivity: self.config.graph.local_connectivity,
+            bandwidth: self.config.graph.bandwidth,
+            set_op_mix_ratio: self.config.graph.set_op_mix_ratio,
             min_desired_loss: self.config.optimization.min_desired_loss,
             timeout: self.config.optimization.timeout,
             normalized: self.config.graph.normalized,
