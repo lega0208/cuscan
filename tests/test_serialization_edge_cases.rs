@@ -1,7 +1,6 @@
 use burn::tensor::Device;
 use fast_umap::prelude::*;
-use fast_umap::{FittedUmap, Umap};
-use std::path::PathBuf;
+use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 
 fn flex() -> Device {
     Device::flex()
@@ -26,32 +25,30 @@ fn test_single_sample_transform() -> Result<(), Box<dyn std::error::Error>> {
     // Test transforming single sample
     let data = generate_test_data(30, 15);
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 3,
         hidden_sizes: vec![10],
         graph: GraphParams {
             n_neighbors: 3,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 15,
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let umap = Umap::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data, None);
 
-    let model_path = PathBuf::from("/tmp/test_edge_single.burnpack");
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-    }
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_edge_single.burnpack");
 
     fitted.save(&model_path)?;
     assert!(model_path.is_file());
 
-    let loaded_fitted = FittedUmap::load(&model_path, config, 15, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 15, flex())?;
 
     // Test with single sample
     let single_data: Vec<Vec<f64>> = vec![vec![
@@ -79,32 +76,30 @@ fn test_large_batch_transform() -> Result<(), Box<dyn std::error::Error>> {
     // Test transforming large batch
     let data = generate_test_data(100, 20);
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![15, 10],
         graph: GraphParams {
             n_neighbors: 5,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 25,
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let umap = Umap::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data, None);
 
-    let model_path = PathBuf::from("/tmp/test_edge_large.burnpack");
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-    }
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_edge_large.burnpack");
 
     fitted.save(&model_path)?;
     assert!(model_path.is_file());
 
-    let loaded_fitted = FittedUmap::load(&model_path, config, 20, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 20, flex())?;
 
     // Test with large batch
     let large_batch: Vec<Vec<f64>> = generate_test_data(500, 20);
@@ -133,32 +128,31 @@ fn test_different_output_dimensions() -> Result<(), Box<dyn std::error::Error>> 
     let data = generate_test_data(80, 12);
 
     for n_components in [1, 2, 3, 5] {
-        let config = UmapConfig {
+        let config = ParametricUMAPConfig {
             n_components,
             hidden_sizes: vec![10],
             graph: GraphParams {
                 n_neighbors: 4,
                 ..Default::default()
             },
-            optimization: OptimizationParams {
+            optimization: ParametricUMAPOptimizationParams {
                 n_epochs: 15,
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        let umap = Umap::with_device(config.clone(), flex().autodiff());
+        let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
         let fitted = umap.fit(data.clone(), None);
 
-        let model_path = PathBuf::from(format!("/tmp/test_edge_{n_components}d.burnpack"));
-        if model_path.exists() {
-            std::fs::remove_file(&model_path)?;
-        }
-
+        let temp_dir = tempfile::tempdir()?;
+        let model_path = temp_dir
+            .path()
+            .join(format!("test_edge_{n_components}d.burnpack"));
         fitted.save(&model_path)?;
         assert!(model_path.is_file());
 
-        let loaded_fitted = FittedUmap::load(&model_path, config, 12, flex())?;
+        let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 12, flex())?;
 
         // Test transformation
         let test_data = vec![data[0].clone()];
@@ -174,7 +168,6 @@ fn test_different_output_dimensions() -> Result<(), Box<dyn std::error::Error>> 
         }
 
         // Clean up
-        std::fs::remove_file(&model_path)?;
     }
 
     Ok(())
@@ -186,24 +179,25 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     let data1 = generate_test_data(50, 10);
     let data2 = generate_test_data(60, 10); // Different data
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![8],
         graph: GraphParams {
             n_neighbors: 3,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 15,
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let model_path = PathBuf::from("/tmp/test_edge_overwrite.burnpack");
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_edge_overwrite.burnpack");
 
     // Save first model
-    let umap1 = Umap::with_device(config.clone(), flex().autodiff());
+    let umap1 = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted1 = umap1.fit(data1, None);
     fitted1.save(&model_path)?;
     assert!(model_path.is_file());
@@ -212,7 +206,7 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     assert!(file_size_1 > 0);
 
     // Save second model (should overwrite)
-    let umap2 = Umap::with_device(config.clone(), flex().autodiff());
+    let umap2 = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted2 = umap2.fit(data2, None);
     fitted2.save(&model_path)?;
     assert!(model_path.is_file());
@@ -221,7 +215,7 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     assert!(file_size_2 > 0);
 
     // Load the second model
-    let loaded_fitted = FittedUmap::load(&model_path, config, 10, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 10, flex())?;
 
     // Test transformation
     let test_data = vec![vec![1.0; 10]]; // Neutral test data

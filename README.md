@@ -19,7 +19,7 @@ See [docs.rs](https://docs.rs/crate/fast-umap/latest) for the full API reference
   [`transform()`](#transform-new-data) new unseen data instantly
 - **Runtime-selected Burn devices** — WGPU (Metal/Vulkan/DX12), CUDA (NVIDIA), or CPU Flex
 - **PCA warm-start** — optional PCA pre-training for faster convergence
-- **API mirrors umap-rs** — use `Umap::new(config).fit(data, labels)`
+- **Parametric Rust API** — use `ParametricUMAP::new(config).fit(data, labels)`
 
 ---
 
@@ -154,9 +154,9 @@ let data: Vec<Vec<f64>> = generate_test_data(100, 10)
     .map(|c| c.iter().map(|&x: &f32| x as f64).collect())
     .collect();
 
-// Fit UMAP (default: 2-D output, Euclidean distance)
-let config = UmapConfig::default();
-let umap = fast_umap::Umap::with_device(
+// Fit parametric UMAP (default: 2-D output, Euclidean distance)
+let config = ParametricUMAPConfig::default();
+let umap = fast_umap::ParametricUMAP::with_device(
     config,
     Device::wgpu(DeviceKind::DefaultDevice),
 );
@@ -190,10 +190,10 @@ pip install .
 
 ```python
 import numpy as np
-from fast_umap import UMAP
+from fast_umap import ParametricUMAP
 
 X = np.random.default_rng(42).normal(size=(100, 10)).astype(np.float32)
-model = UMAP(device="cpu")  # choose "gpu" for GPU execution
+model = ParametricUMAP(device="cpu")  # choose "gpu" for GPU execution
 embedding = model.fit_transform(X)
 new_embedding = model.transform(X[:5])
 ```
@@ -266,12 +266,12 @@ For GPU-accelerated execution (requires WGPU-compatible GPU):
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-let config = UmapConfig::default();
-let umap = fast_umap::Umap::with_device(
+let config = ParametricUMAPConfig::default();
+let estimator = ParametricUMAP::with_device(
     config,
     Device::wgpu(DeviceKind::DefaultDevice),
 );
-let fitted = umap.fit(data, None);
+let fitted = estimator.fit(data, None);
 ```
 
 **Features:**
@@ -283,53 +283,27 @@ let fitted = umap.fit(data, None);
 
 ### Runtime device selection
 
-`Umap` and `FittedUmap` are backend-independent. Select a Burn device at
+`ParametricUMAP` and `FittedParametricUMAP` are backend-independent. Select a Burn device at
 runtime; use Flex for CPU computation or WGPU for GPU computation:
 
 ```rust
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-let config = UmapConfig::default();
-let cpu = Umap::with_device(config.clone(), Device::flex());
-let gpu = Umap::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
+let config = ParametricUMAPConfig::default();
+let cpu = ParametricUMAP::with_device(config.clone(), Device::flex());
+let gpu = ParametricUMAP::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
 let fitted = cpu.fit(data, None);
 ```
 
 The WGPU device requires the `gpu` feature. CUDA can also be selected through
 Burn's runtime device API when compiled with the `cuda` feature.
 
-### CPU Backend - Full Functionality with umap-rs Fallback
+### CPU execution
 
-For CPU-only execution or when GPU is not available, fast-umap provides a complete CPU backend that uses classical UMAP computation:
-
-```rust
-#[cfg(feature = "cpu")]
-{
-    use fast_umap::cpu_backend::api as cpu_api;
-    
-    // Full CPU UMAP with umap-rs backend
-    let config = UmapConfig::default();
-    let fitted = cpu_api::fit_cpu(config, data, None);
-    let embedding = fitted.embedding();
-}
-```
-
-**Features:**
-- ✅ Complete UMAP functionality using classical UMAP algorithm
-- ✅ No GPU required
-- ✅ Same API as GPU backend for consistency
-- ✅ Full configuration support (n_components, n_neighbors, etc.)
-- ✅ Excellent for environments without GPU access
-- ❌ Cannot transform new data (classical UMAP limitation)
-
-**When to use CPU backend:**
-- Development and testing environments without GPU
-- Cloud environments with CPU-only instances
-- Edge devices without GPU acceleration
-- Fallback when GPU drivers are unavailable
-
-See [`cpu_training_demo` example](examples/cpu_training_demo.rs) for complete CPU usage.
+For CPU-only execution, use the Flex device with the same parametric estimator:
+`ParametricUMAP::with_device(config, Device::flex())`. There is no classical
+UMAP implementation or non-parametric CPU fallback in this crate.
 
 ## Feature-Based Compilation
 
@@ -342,8 +316,8 @@ cargo build --release
 # Flex CPU device without GPU dependencies
 cargo build --release --no-default-features
 
-# Optional classical umap-rs CPU fallback and PCA/NN-Descent
-cargo build --release --features cpu,pca,nn-descent
+# Optional PCA warm-start and approximate NN-Descent
+cargo build --release --features pca,nn-descent
 
 # All features (development)
 cargo build --release --features all
@@ -372,46 +346,33 @@ For working CPU examples, see the test suite:
 cargo test --lib
 ```
 
-The tests in `tests/tests.rs` exercise the Burn Flex CPU device. The `cpu`
-Cargo feature separately enables the classical `umap-rs` fallback API.
+The tests in `tests/tests.rs` exercise the Burn Flex CPU device for parametric
+training. This crate does not provide a classical `umap-rs` fallback.
 
 ---
 
 ## API Overview
 
-The public API mirrors [`umap-rs`](https://crates.io/crates/umap-rs):
+The public API is explicitly parametric; graph and manifold types are shared
+with graph utilities:
 
 | Type | Description |
 |------|-------------|
-| [`Umap`](https://docs.rs/fast-umap/latest/fast_umap/struct.Umap.html) | Backend-independent main algorithm — `Umap::new(config)` or `Umap::with_device(config, device)` |
-| [`FittedUmap`](https://docs.rs/fast-umap/latest/fast_umap/struct.FittedUmap.html) | Backend-independent fitted model — `.embedding()`, `.transform()`, `.into_embedding()`, `.config()` |
-| [`UmapConfig`](https://docs.rs/fast-umap/latest/fast_umap/struct.UmapConfig.html) | Configuration with nested `GraphParams` + `OptimizationParams` |
+| [`ParametricUMAP`](https://docs.rs/fast-umap/latest/fast_umap/struct.ParametricUMAP.html) | Backend-independent neural estimator — `ParametricUMAP::new(config)` or `ParametricUMAP::with_device(config, device)` |
+| [`FittedParametricUMAP`](https://docs.rs/fast-umap/latest/fast_umap/struct.FittedParametricUMAP.html) | Fitted neural model — `.embedding()`, `.transform()`, `.into_embedding()`, `.config()` |
+| [`ParametricUMAPConfig`](https://docs.rs/fast-umap/latest/fast_umap/struct.ParametricUMAPConfig.html) | Estimator configuration with shared graph/manifold settings and parametric optimization settings |
 | [`ManifoldParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.ManifoldParams.html) | `min_dist`, `spread` — control cluster tightness and separation |
 | [`GraphParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.GraphParams.html) | `n_neighbors`, `local_connectivity`, `bandwidth`, `set_op_mix_ratio`, `metric`, `normalized`, `minkowski_p` |
-| [`OptimizationParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.OptimizationParams.html) | `n_epochs`, `learning_rate`, `patience`, `timeout`, `verbose`, `neg_sample_rate`, … |
-| [`Metric`](https://docs.rs/fast-umap/latest/fast_umap/enum.Metric.html) | `Euclidean`, `EuclideanKNN`, `Manhattan`, `Cosine` |
+| [`ParametricUMAPOptimizationParams`](https://docs.rs/fast-umap/latest/fast_umap/struct.ParametricUMAPOptimizationParams.html) | `n_epochs`, `learning_rate`, `patience`, `timeout`, `verbose`, `neg_sample_rate`, … |
+| [`Metric`](https://docs.rs/fast-umap/latest/fast_umap/enum.Metric.html) | Shared graph distance metric settings |
 
 ### Configuration
 
-```rust
-let config = UmapConfig {
-    n_components: 2,
-    hidden_sizes: vec![128],
-    graph: GraphParams {
-        n_neighbors: 15,
-        metric: Metric::Euclidean,
-        ..Default::default()
-    },
-    optimization: OptimizationParams {
-        n_epochs: 200,
-        learning_rate: 1e-3,
-        patience: Some(50),
-        verbose: true,
-        ..Default::default()
-    },
-    ..Default::default()
-};
-```
+Use `ParametricUMAPConfig` for estimator settings, with shared `GraphParams`
+and `ManifoldParams` plus `ParametricUMAPOptimizationParams`. Model architecture
+is described by the `ParametricUMAPModelConfig` builder; loss reduction and
+epoch callbacks are named `ParametricUMAPLossReduction` and
+`ParametricUMAPEpochProgress`.
 
 ### Key parameters
 
@@ -443,7 +404,7 @@ let config = UmapConfig {
 Because fast-umap is *parametric* (neural network), it can project new
 unseen data — something classical UMAP cannot do:
 
-The primary `Umap` API and Python `UMAP` pass feature values through as
+The Rust `ParametricUMAP` API and Python `ParametricUMAP` pass feature values through as
 provided; they do not fit or apply feature scaling. Preprocessing is optional
 and caller-owned. If you scale features, fit the scaler on training data and
 apply that same transform to both the training data and every inference batch.
@@ -493,28 +454,11 @@ cargo run --release --example simple
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-fn main() {
-
-    let data: Vec<Vec<f64>> = (0..100 * 3)
-        .map(|_| rand::rng().random::<f64>())
-        .collect::<Vec<_>>()
-        .chunks_exact(3)
-        .map(|c| c.to_vec())
-        .collect();
-
-    let config = UmapConfig::default();
-    let umap = fast_umap::Umap::with_device(
-        config,
-        Device::wgpu(DeviceKind::DefaultDevice),
-    );
-    let fitted = umap.fit(data.clone(), None);
-
-    let embedding = fitted.embedding();
-    println!("Embedding shape: {} × {}", embedding.len(), embedding[0].len());
-
-    // Transform new unseen data through the trained model
-    let _new_embedding = fitted.transform(data);
-}
+let config = ParametricUMAPConfig::default();
+let estimator = ParametricUMAP::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
+let fitted = estimator.fit(data.clone(), None);
+let embedding = fitted.embedding();
+let new_embedding = fitted.transform(data);
 ```
 
 ### Advanced — 1 000 samples, custom config
@@ -527,40 +471,13 @@ cargo run --release --example advanced
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
-fn main() {
-
-    let train_data: Vec<f32> = generate_test_data(1000, 100);
-    let data: Vec<Vec<f32>> = train_data.chunks(100).map(|c| c.to_vec()).collect();
-
-    let config = UmapConfig {
-        n_components: 2,
-        hidden_sizes: vec![100, 100, 100],
-        graph: GraphParams {
-            n_neighbors: 10,
-            metric: Metric::Euclidean,
-            ..Default::default()
-        },
-        optimization: OptimizationParams {
-            n_epochs: 100,
-            batch_size: 1000,
-            learning_rate: 0.001,
-            verbose: true,
-            min_desired_loss: Some(0.001),
-            timeout: Some(60),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let umap = fast_umap::Umap::with_device(
-        config,
-        Device::wgpu(DeviceKind::DefaultDevice),
-    );
-    let fitted = umap.fit(data, None);
-
-    println!("Embedding: {} samples × {} dims",
-        fitted.embedding().len(), fitted.embedding()[0].len());
-}
+let config = ParametricUMAPConfig::default();
+let estimator = ParametricUMAP::with_device(
+    config,
+    Device::wgpu(DeviceKind::DefaultDevice),
+);
+let fitted: FittedParametricUMAP = estimator.fit(data, None);
+let embedding = fitted.embedding();
 ```
 
 ### MNIST — 10 000 hand-written digits projected to 2-D
@@ -578,31 +495,10 @@ digits (784 features → 2-D).
 | ![MNIST embedding](figures/mnist.png) | ![MNIST loss](figures/losses_model.png) |
 
 ```rust
-let config = UmapConfig {
-    n_components: 2,
-    hidden_sizes: vec![256],
-    graph: GraphParams {
-        n_neighbors: 15,
-        metric: Metric::Euclidean,
-        ..Default::default()
-    },
-    optimization: OptimizationParams {
-        n_epochs: 1_000,
-        learning_rate: 1e-3,
-        patience: Some(100),
-        repulsion_strength: 3.0,
-        penalty: 1e-6,
-        verbose: true,
-        ..Default::default()
-    },
-    ..Default::default()
-};
-
-let umap = fast_umap::Umap::with_device(
-        config,
-        Device::wgpu(DeviceKind::DefaultDevice),
-    );
-let fitted = umap.fit(data, Some(labels));
+let config = ParametricUMAPConfig::default();
+let estimator = ParametricUMAP::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
+let fitted = estimator.fit(data, Some(labels));
+let embedding = fitted.embedding();
 ```
 
 ---
@@ -660,7 +556,6 @@ cargo run --release --example cpu_training_demo
 The feature-based compilation system provides:
 
 **✅ Faster Compilation**
-- Compile the umap-rs CPU fallback only when needed: `cargo build --release --features cpu`
 - Minimal builds: `cargo build --release --no-default-features`
 - Feature-specific examples and documentation
 
@@ -675,7 +570,6 @@ The feature-based compilation system provides:
 |---------|-------------|--------------|
 | `gpu` | GPU backend (WGPU) | Cross-platform GPU, large datasets |
 | `cuda` | GPU backend (CUDA) | NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`) at runtime; `nvcc`/CUDA toolkit optional at build time; excluded from `all` and default features |
-| `cpu` | Classical UMAP fallback via umap-rs | Non-parametric CPU UMAP |
 | `pca` | PCA warm-start for embeddings | Better convergence quality |
 | `nn-descent` | Approximate KNN for large data | Datasets > 10K samples (avoids O(n^2) memory) |
 | `verbose` | Progress output | Development, debugging |
@@ -693,17 +587,11 @@ See [`feature_demo` example](examples/feature_demo.rs) for complete feature guid
 
 ## Architecture
 
-fast-umap uses a **parametric** approach — a small feed-forward neural network
-is trained with the UMAP cross-entropy loss:
-
-```text
-attraction  =  mean_{k-NN edges}      [ −log q_ij ]
-repulsion   =  mean_{negative samples} [ −log (1 − q_ij) ]
-loss        =  attraction  +  repulsion_strength × repulsion
-```
-
-where `q_ij = 1 / (1 + a · d_ij^(2b))` is the UMAP kernel applied to embedding
-distances (`a` and `b` are fitted from `min_dist` / `spread`).
+`ParametricUMAP` learns a feed-forward neural encoder; `FittedParametricUMAP`
+uses that model to transform unseen samples. Its sparse graph/training schedule,
+loss aggregation, negative sampling, and optimizer are not algorithmically
+identical to umap-learn; see the [parity report](python_parity_report.md) for
+the audited caveats.
 
 ### Training pipeline
 
@@ -729,15 +617,15 @@ Self-inclusive KNN → local fuzzy memberships → symmetric fuzzy graph
 └────────────────────────────────────────────┘
     │
     ▼
-FittedUmap with .embedding() and .transform()
+FittedParametricUMAP with .embedding() and .transform()
 ```
 
 ### Modules
 
 | Module | Feature | Description |
 |--------|---------|-------------|
-| [`model`] | -- | `UMAPModel` neural network and config builder |
-| [`train`] | -- | Training loop, `UmapConfig`, sparse training, loss computation |
+| [`parametric_umap`] | -- | Parametric estimator/model, private trainer, and weight persistence |
+| [`graph`] | -- | Shared graph, metric, and manifold math/configuration |
 | [`backend`] | -- | Backend trait extension for custom kernel dispatch |
 | [`generic_backend`] | -- | Backend ops via standard Burn tensor math (works on any backend) |
 | [`autodiff_ops`] | -- | Autodiff backward registration for custom ops |
@@ -745,7 +633,6 @@ FittedUmap with .embedding() and .transform()
 | [`pca`] | `pca` | PCA warm-start for initial embedding |
 | [`nn_descent`] | `nn-descent` | NN-Descent approximate KNN graph construction |
 | [`chart`] | `plotters` | 2-D scatter plots and loss curves |
-| [`cpu_backend`] | `cpu` | CPU fallback via umap-rs |
 | [`distances`] | -- | CPU-side distance functions (Euclidean, cosine, Minkowski) |
 | [`utils`] | -- | Data generation, tensor conversion, normalisation |
 | [`prelude`] | -- | Re-exports of the most commonly used items |
@@ -754,17 +641,17 @@ FittedUmap with .embedding() and .transform()
 
 ## Convenience API
 
-The convenience `UMAP` API is nongeneric and uses the default Burn device:
+The convenience `ParametricUMAP` API is nongeneric and uses the default Burn device:
 
 ```rust
 use fast_umap::prelude::*;
 
-let fitted = fast_umap::umap(data.clone());
+let fitted = fast_umap::parametric_umap(data.clone());
 let embedding = fitted.embedding();
 let transformed = fitted.transform(data);
 ```
 
-For explicit device selection or configuration, use `Umap::with_device(config, device)`.
+For explicit device selection or configuration, use `ParametricUMAP::with_device(config, device)`.
 
 ---
 
@@ -784,9 +671,9 @@ cargo test
 | `tensor_convert` | round-trip `Vec → Tensor → Vec`, NaN → 0 |
 | `normalize_tensor` | output in `[0, 1]`, constant-input safety |
 | `layer_normalize` | no NaN, shape preserved |
-| `UMAPModelConfigBuilder` | defaults and custom values |
-| `TrainingConfig` | builder, `Metric::from(&str)`, invalid-metric panic |
-| `UMAPModel` | 2-D / 3-D output, deep network, determinism, no NaN |
+| `ParametricUMAPModelConfig` builder | defaults and custom values |
+| `ParametricUMAPOptimizationParams` | parametric optimizer settings |
+| `ParametricUMAPModel` | neural model output shape and inference |
 | Distance math | Euclidean self=0, 3-4-5 triangle, symmetry; Manhattan |
 
 ---
@@ -900,7 +787,7 @@ Full detail files:
 - [x] CubeCL kernels for distance computation
 - [x] Hyperparameter testbench (`patience` vs `n_features` vs `epochs` …)
 - [x] Unit tests (36) and hardware benchmarks
-- [x] New API mirroring umap-rs (`Umap`, `FittedUmap`, `UmapConfig`)
+- [x] Historical v1.6.0 API mirrored umap-rs; current API is explicitly parametric (`ParametricUMAP`, `FittedParametricUMAP`, `ParametricUMAPConfig`)
 - [x] Sparse training with edge subsampling + negative sampling
 - [x] Crate comparison benchmark (fast-umap vs umap-rs)
 - [x] Historical MLX backend benchmark (runtime backend removed)

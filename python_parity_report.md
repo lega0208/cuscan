@@ -2,11 +2,11 @@
 
 ## Verdict and scope
 
-**Full algorithmic and mathematical parity is not present.** The primary Rust implementation now has density-adaptive fuzzy memberships, fuzzy symmetrization, self-inclusive neighborhoods, and integer-weighted positive sampling. Reference-labelled fixtures cover graph-helper mathematics on identical neighbor lists and float32 pruning/counts. Cross-entropy, attraction/repulsion aggregation, negative sampling, finite-pass training schedules, and optimization remain different. Matching graph mathematics does not make the objectives equivalent.
+**Full algorithmic and mathematical parity is not present.** The current `ParametricUMAP` implementation has density-adaptive fuzzy memberships, fuzzy symmetrization, self-inclusive neighborhoods, and integer-weighted positive sampling. Reference-labelled fixtures cover graph-helper mathematics on identical neighbor lists and float32 pruning/counts. Cross-entropy, attraction/repulsion aggregation, negative sampling, finite-pass training schedules, and optimization remain different. Matching graph mathematics does not make the objectives equivalent.
 
-Original audited checkout: Rust `fast-umap` 1.6.0, HEAD `6b68d5e59cbc2eac86c0cc5081c23e2cef5517ce`; installed `umap-learn` **0.5.12**. Original numeric source citations below describe that audit revision. The original audit did not change source; subsequent approved primary-route remediations are identified explicitly below. Unrelated findings remain historical audit findings, not newly reverified parity claims.
+This report preserves a historical source audit of Rust `fast-umap` 1.6.0, HEAD `6b68d5e59cbc2eac86c0cc5081c23e2cef5517ce`, against installed `umap-learn` **0.5.12**. Unless a passage explicitly says current, source paths, line numbers, and results below refer to that audited revision; they are not a fresh verification of this refactor. Subsequent primary-route remediations are named as such. Unrelated findings remain historical audit findings, not newly reverified parity claims.
 
-Primary Rust route: `Umap::fit` / `fit_with_signal` / `fit_with_progress` → `train_sparse` (`src/lib.rs:272-383,389-465`). The deprecated `UMAP` route and feature-gated `CpuUmap` are separately identified below; their behavior must not be attributed to the primary route.
+Current Rust route: `ParametricUMAP` / `FittedParametricUMAP`, with estimator, model, private sparse trainer, and weight persistence owned by `src/parametric_umap/`; shared graph math/configuration lives in `src/graph/`. The route cited by the original source audit was `Umap::fit` → `train_sparse` and has since been renamed and relocated. The deprecated dense API was removed; the feature-gated CPU placeholder remains, with its imports migrated, and is not the Flex parametric training backend. Historical dense/placeholder behavior must not be attributed to the current parametric route. The Python package remains `fast_umap` and exports `ParametricUMAP`.
 
 ### Reference-file shorthand
 
@@ -23,12 +23,12 @@ Dependency citations use **BN** = `/home/marc/.cargo/registry/src/index.crates.i
 
 ## Evidence and verification
 
-This is a source-level algorithm audit with targeted numerical checks, **not an end-to-end embedding-quality benchmark**:
+The checks/results in this section are retained historical evidence from the original audit and subsequent pre-refactor remediation work; they were not rerun against the renamed/moved modules in this documentation update. This is a source-level algorithm audit with targeted numerical checks, **not an end-to-end embedding-quality benchmark**:
 
-1. Three independent read-only reviews covered graph mathematics, training, and model/API capabilities; their findings were consolidated and checked against the current sources.
-2. `cargo test --no-default-features --test test_core_python_prereqs`: **4 tests passed**. These exercise the current Flex CPU fit/transform, reproducibility, and input/configuration behavior; they do not assert Python parity.
+1. Three independent read-only reviews covered graph mathematics, training, and model/API capabilities; their findings were consolidated and checked against the audited sources.
+2. `cargo test --no-default-features --test test_core_python_prereqs`: **4 tests passed** in the historical verification run. These exercised Flex CPU fit/transform, reproducibility, and input/configuration behavior; they did not assert Python parity.
 3. The installed Python `convert_distance_to_log_probability`, `compute_cross_entropy`, and `get_graph_elements` functions were extracted using Python AST and executed with NumPy equivalents of the required Keras operations. Their algebra and weighted edge repetition were checked by assertions. No replacement training implementation was used.
-4. The actual current Rust `fit_ab` function was extracted, compiled with `rustc`, and run; its results were compared with the AST-executed installed Python `find_ab_params` using SciPy's `curve_fit`.
+4. The Rust `fit_ab` function from the audited revision was extracted, compiled with `rustc`, and run; its results were compared with the AST-executed installed Python `find_ab_params` using SciPy's `curve_fit`.
 
 Subsequent graph/count remediation verification: 6 Rust sparse helper tests, 7 with
 `nn-descent` (including its actual 10K-sample preparation route), and 6 with `pca`.
@@ -41,7 +41,7 @@ That hardware-specific failure is not converted to a skip or GPU correctness cla
 The reference fixture generator was rerun successfully. Build warnings remain:
 Burn/CubeCL future incompatibilities and unavailable `patchelf` for wheel rpath.
 
-**Limitations:** TensorFlow and Keras are not installed in this environment, so the complete `ParametricUMAP` class cannot be instantiated. No TensorFlow training run, gradient comparison, GPU comparison, trustworthiness comparison, or statistical quality ranking was performed. Effects below follow from source/math, not measured quality gains or regressions. Keras dependency defaults were corroborated with its [Dense documentation](https://keras.io/api/layers/core_layers/dense/) and [Adam documentation](https://keras.io/api/optimizers/adam/); these are supplementary documentation, not proof of a locally installed Keras version.
+**Historical limitations:** TensorFlow and Keras were not installed in the audit environment, so the reference Python `ParametricUMAP` class could not be instantiated. No TensorFlow training run, gradient comparison, GPU comparison, trustworthiness comparison, or statistical quality ranking was performed. Effects below follow from source/math, not measured quality gains or regressions. Keras dependency defaults were corroborated with its [Dense documentation](https://keras.io/api/layers/core_layers/dense/) and [Adam documentation](https://keras.io/api/optimizers/adam/); these are supplementary documentation, not proof of a locally installed Keras version.
 
 ## Common ground — but not proof of parity
 
@@ -56,11 +56,11 @@ Labels: **Core mismatch** changes the default mathematics; **Defect** is mislead
 ### 1. Mandatory feature standardization changes the input geometry — Addressed in primary route
 
 - **Original finding:** At the audited revision above, every feature was population-z-scored with `std + 1e-6` before graph construction and encoder training, with statistics reused for transforms. This was unconditional, not controlled by `graph.normalized`.
-- **Current Rust:** `src/train/train_sparse.rs::sparse_inputs` passes caller-supplied values to both neighbor construction and encoder training. `Umap::finalize` and `FittedUmap::transform_to_tensor` forward inputs without feature scaling; `FittedUmap` no longer stores feature means or standard deviations. Newly fitted and loaded weights therefore use the same input contract.
+- **Current Rust:** `src/graph/sparse.rs::sparse_inputs` passes caller-supplied values to both neighbor construction and encoder training. `ParametricUMAP::finalize` in `src/parametric_umap/mod.rs` and `FittedParametricUMAP::transform_to_tensor` forward inputs without feature scaling; `FittedParametricUMAP` stores no feature means or standard deviations. Newly fitted and loaded weights therefore use the same input contract.
 - **Python:** `U:2367-2379,2550-2555,2624-2646`; `P:333-375,874-884,288-292`. The graph and encoder receive input X without equivalent automatic scaling.
 - **Remediation:** Removed automatic feature scaling from the primary Rust and delegated Python paths. Callers own any optional preprocessing and must apply it consistently before fit and transform. Feature units now affect geometry directly; `graph.normalized` remains a separate distance setting.
 - **Verification:** Raw-space nearest-neighbor and exact encoder-input assertions use unequal feature scales and a constant column with value `7`; direct model-forward comparisons cover finalization and transform. Restoring feature scaling in a temporary mutation made the nearest-neighbor regression fail (neighbor `1` instead of `2`); the mutation was removed. Rust persistence tests compare probe outputs before and after save/load. `cargo test --no-default-features` passed (64 tests; 10 ignored); two `nn-descent` sparse-preparation regressions passed, including the actual approximate branch at its 10,000-sample threshold. After rebuilding the native extension, `uv run --no-sync pytest python/tests/test_umap.py -k 'not gpu_smoke'` passed (13 tests; one hardware test deselected), including a real CPU constant-column preservation regression. The GPU smoke selector was corrected to `wgpu` and its skip handling narrowed to missing-adapter errors; attempting the hardware test aborted inside the host graphics driver, so GPU behavior is not verified. These checks establish the CPU preprocessing contract, not complete Python algorithm parity.
-- **Notes:** Deprecated routes and shared scaling helpers remain unchanged. Previously saved weights trained on internally standardized inputs still need their original external preprocessing or retraining; there is no migration. Other numbered findings retain their original audit context and have not been re-audited here. Python's optional correlation-loss z-scoring is not graph/encoder preprocessing.
+- **Notes:** Shared scaling helpers remain unchanged; the deprecated dense route was subsequently removed during the parametric namespace separation. Previously saved weights trained on internally standardized inputs still need their original external preprocessing or retraining; there is no migration. Other numbered findings retain their original audit context and have not been re-audited here. Python's optional correlation-loss z-scoring is not graph/encoder preprocessing.
 
 ### 2. Local-connectivity radii, bandwidth search, and fuzzy memberships — Addressed in primary route
 
@@ -293,27 +293,26 @@ Labels: **Core mismatch** changes the default mathematics; **Defect** is mislead
 
 ### 30. Save/load loses preprocessing and changes future transforms — Defect
 
-- **Rust:** `src/lib.rs:640-645,678-707`. Saves weights only; load requires external architecture/configuration, uses empty cached embedding, and resets means/stds to 0/1.
+- **Historical Rust finding:** `src/lib.rs:640-645,678-707` in the audited revision saved weights only and reset means/stds to 0/1. That implementation has been superseded.
 - **Python:** `P:458-510,981-1025`. Saves encoder, optional decoder, full model, and estimator pickle; loads the encoder and estimator used by transform.
 - **Effects:** Rust predictions on raw inputs after reload generally differ from predictions before save, because training standardization is lost (negative output/usability). Supplying the same model configuration cannot recover missing statistics.
-- **Remediation:** Persist the preprocessing statistics and architecture/configuration together with weights, and test raw-input transform equality across the round trip.
+- **Current contract:** Fit and transform use caller-provided raw feature values; there are no fitted normalization statistics to persist. The parametric weight loader preserves the Burn weight payload structure and loaded weights use the same caller-input contract. This report's historical verification results below are not a new cross-refactor artifact/load test.
 - **Notes:** Reference persistence is not perfect either: save writes `parametric_model.keras` (`P:475-479`) but load searches for `parametric_model` without that extension (`P:1019-1022`). Therefore full training-model/optimizer restoration must not be assumed. Encoder-based inference restoration is a narrower supported comparison. Rust's f64 result containers also do not imply f64 learned coordinates; `src/utils.rs:127-145` extracts f32 values.
 
-### 31. Deprecated dense route optimizes a third objective and skips transform scaling — Defect/alternate route
+### 31. Historical finding: dense route optimized a third objective — Removed route
 
-- **Rust:** `src/lib.rs:763-816,825-835`; `src/train/mod.rs:117,141-191,249-277,322-328,415-417`. Deprecated UMAP::fit calls dense training. Direct dense train calls construct kNN within fixed contiguous batches and repel every within-batch non-neighbor; legacy fit uses a single full-data batch. Legacy transform forwards raw data despite standardized training. Dense checkpoints use `/tmp/{name}.burnpack` (`src/train/mod.rs:85`).
+- **Historical Rust:** In the audited revision, deprecated `UMAP::fit` called a dense trainer, with batch-local graph construction and `/tmp/{name}.burnpack` checkpoints. The dense estimator/trainer are removed from the current API; these observations are not current behavior.
 - **Python:** `U:2550-2676`; `P:359-375,905-936,1209-1254,272-292`. Global fuzzy graph, edge minibatches, sampled negatives, and matching encoder-input semantics.
 - **Effects:** Different results from Python and the primary Rust sparse route. Direct smaller batches lose cross-batch neighbors; legacy transforms have inconsistent scaling (negative). Shared checkpoint names can interfere across concurrent dense runs.
-- **Remediation:** Remove the obsolete parallel implementation and route callers through the corrected primary path; preserve preprocessing in every transform path and avoid shared checkpoint filenames.
+- **Current status:** Removed with the dense API. Current callers use the parametric estimator/private sparse trainer; feature preprocessing remains caller-owned and saved weights preserve this raw-input contract.
 - **Notes:** Custom Euclidean-distance autodiff (`src/autodiff_ops.rs:37-76`) matters to dense embedding-distance gradients, not the primary sparse loss, which uses standard select/subtract/square/sum operations. Custom backward registration is not evidence that primary parity is achieved.
 
-### 32. Feature-gated CpuUmap is not UMAP at all — Defect/alternate route
+### 32. Historical finding: feature-gated CpuUmap was a placeholder — Removed route
 
-- **Rust:** `src/lib.rs:103-104`; `src/cpu_backend.rs:23-45,63-77,104-105,114-123`. Public CPU-specific fit returns the first two standardized features multiplied by 10, always two dimensions; no neighbor graph or learning. Its transform panics.
+- **Historical Rust:** In the audited revision, `CpuUmap` was a feature-gated projection placeholder, not a learned implementation. It was removed; Flex remains the working CPU backend for parametric training.
 - **Python:** `P:333-447,272-292,804-814`. Trains a learned encoder and can transform new data.
 - **Effects:** CPU-specific API does not provide manifold learning or parametric projection and ignores the requested embedding dimension (negative). Its source calls it a demonstration/placeholder; that does not make it a parity-capable backend.
-- **Remediation:** Remove this placeholder API or route it to the working Flex CPU primary implementation.
-- **Notes:** **Do not confuse this with Umap on Flex CPU.** The latter is the real parametric sparse route tested above and works without the gpu feature; it is not this projection stub.
+- **Current status:** No classical UMAP implementation or CPU placeholder API is provided. Flex CPU execution trains the parametric model.
 
 ### 33. Public distance helpers do not implement their advertised formulas — Defect outside primary route
 

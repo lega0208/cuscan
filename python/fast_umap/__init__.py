@@ -1,5 +1,5 @@
 from fast_umap._fast_umap import __version__
 
-from .umap_ import UMAP, NotFittedError
+from .parametric_umap import NotFittedError, ParametricUMAP
 
-__all__ = ["UMAP", "NotFittedError", "__version__"]
+__all__ = ["NotFittedError", "ParametricUMAP", "__version__"]

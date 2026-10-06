@@ -68,13 +68,13 @@ fn main() {
 fn try_gpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     #[cfg(feature = "gpu")]
     {
-        use fast_umap::prelude::*;
+        use fast_umap::{ParametricUMAP, ParametricUMAPConfig};
 
         println!("Attempting GPU backend...");
 
-        let config = UmapConfig::default();
+        let config = ParametricUMAPConfig::default();
         let device = burn::tensor::Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
-        let umap = fast_umap::Umap::with_device(config, device);
+        let umap = ParametricUMAP::with_device(config, device);
 
         // GPU fit can panic on errors, so we wrap in catch_unwind
         use std::panic::catch_unwind;
@@ -107,12 +107,12 @@ fn try_gpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
 /// Try CPU backend with proper error handling
 fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     {
-        use fast_umap::prelude::*;
+        use fast_umap::{ParametricUMAP, ParametricUMAPConfig};
 
         println!("Attempting CPU backend...");
 
-        let config = UmapConfig::default();
-        let umap = fast_umap::Umap::with_device(config, burn::tensor::Device::flex());
+        let config = ParametricUMAPConfig::default();
+        let umap = ParametricUMAP::with_device(config, burn::tensor::Device::flex());
         // CPU fit can also panic, so we wrap in catch_unwind
         use std::panic::catch_unwind;
 

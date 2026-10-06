@@ -6,14 +6,13 @@
 
 ## Architecture & Data Flow
 
-- `src/lib.rs` exposes `Umap`, `FittedUmap`, input validation, fitting, transformation, and persistence. Prefer this API over the deprecated `UMAP` API.
-- Fitting validates rectangular input, seeds the device, flattens rows, creates the MLP, maps `UmapConfig` into training configuration, and calls `src/train/train_sparse.rs`.
+- `src/parametric_umap/` owns `ParametricUMAP`, `FittedParametricUMAP`, `ParametricUMAPConfig`, the neural model, private sparse trainer, and weight persistence. There is no classical UMAP implementation.
+- `src/graph/` owns shared graph/math APIs such as `Metric`, `GraphParams`, and `ManifoldParams`; fitting delegates shared graph preparation and parametric training to their respective modules.
 - Sparse training uses caller-provided feature values as-is and computes a global self-inclusive k-NN graph once (`n_neighbors >= 2`). It retains distances, computes smooth-kNN rho/sigma and directed memberships, then mixes fuzzy union/intersection using `local_connectivity`, `bandwidth`, and `set_op_mix_ratio` (defaults 1). Configured positive epochs E fix float32 pruning and `floor(E*w)` counts; checked u64 prefix tickets drive fresh capped replacement positives and uniform non-self negatives each epoch. Empty support/overflow is an explicit failure, not a fallback. Optional `nn-descent` handles approximate neighbor search for large inputs; `pca` enables a warm start. Graph-helper parity on identical neighbor lists does not imply full reference training parity.
-- The primary `Umap` and Python fit/transform paths do not fit or apply feature scaling, and fitted models have no normalization statistics. `src/model.rs` implements Linear/ReLU hidden layers and a linear output layer; saved and loaded weights therefore operate consistently on the caller-provided inputs. The deprecated dense `UMAP` route remains distinct, and existing scaling helpers remain available; neither implies scaling in the primary path.
+- The Rust and Python estimator fit/transform paths do not fit or apply feature scaling, and fitted models have no normalization statistics. The parametric model uses Linear/ReLU hidden layers and a linear output layer; saved and loaded weights operate consistently on caller-provided inputs.
 - `src/backend.rs` defines the `UmapOps` backend extension. `src/generic_backend.rs` and `src/flex_backend.rs` implement Flex operations; `src/kernels/` implements CubeCL GPU kernels; `src/autodiff_ops.rs` supplies gradients.
-- `src/train/mod.rs` also contains the legacy dense trainer. Avoid confusing its batch-local graph and disk checkpoints with the sparse public API path.
 
-**Behavioral caveats:** several exposed graph/optimization settings are not honored by training (including metric selection and public API batch size). Trace actual consumers before documenting or changing configuration behavior. The feature-gated `src/cpu_backend.rs` is a placeholder, not the Flex training implementation.
+**Behavioral caveats:** some exposed graph/optimization settings are not honored by training (including metric selection and public API batch size). Trace actual consumers before documenting or changing configuration behavior. Flex is the real CPU training backend.
 
 ## Key Directories
 
@@ -61,17 +60,16 @@ uv run maturin develop --release && uv run --no-sync myscript.py
 
 - Use standard rustfmt formatting, Rust naming conventions, module documentation, and existing configuration struct-update patterns (`..Default::default()`). Python uses Ruff with a 100-character line limit.
 - Burn uses dynamic dispatch: `Tensor<2>` and `Device`, not backend-generic public tensors. Training uses `.autodiff()`; inference uses `model.valid()` and `.without_autodiff()`.
-- Device selection is explicit through `Umap::with_device`; keep backend-specific logic behind feature gates and backend extensions.
+- Device selection is explicit through `ParametricUMAP::with_device`; keep backend-specific logic behind feature gates and backend extensions.
 - Data conversion uses row-major flat vectors plus sample/feature counts; reuse utilities in `src/utils.rs`.
 - Existing fitting/shape validation panics, while save/load returns `Result`. Preserve intentional error contracts and test invalid inputs; do not introduce silent recovery.
-- Training is synchronous. Cancellation uses a crossbeam receiver; progress uses an `EpochProgress` callback. Learned model and normalization state belong in `FittedUmap`.
+- Training is synchronous. Cancellation uses a crossbeam receiver; progress uses a `ParametricUMAPEpochProgress` callback. Learned model state belongs in `FittedParametricUMAP`.
 
 ## Important Files
 
 - `Cargo.toml` / `Cargo.lock`: workspace, dependencies, features, and example prerequisites.
-- `src/train/config.rs`: nested configuration, defaults, metrics, and UMAP curve fitting.
-- `src/train/get_distance_by_metric.rs`: distance dispatch and CPU neighbor selection.
-- `src/serialize.rs`: Burn weight persistence; `src/prelude.rs`: public convenience exports.
+- `src/parametric_umap/`: estimator/configuration, neural model/training, and Burn weight persistence.
+- `src/graph/`: shared graph/math/configuration; `src/prelude.rs`: public convenience exports.
 - `pyproject.toml` / `uv.lock`: Maturin packaging and Python QA tooling.
 
 ## Runtime/Tooling Preferences

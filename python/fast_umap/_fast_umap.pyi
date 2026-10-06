@@ -5,7 +5,7 @@ from numpy.typing import NDArray
 
 __version__: str
 
-class FittedModel:
+class FittedParametricUMAP:
     @property
     def device(self) -> Literal["cuda", "wgpu", "cpu"]: ...
     @property
@@ -14,7 +14,7 @@ class FittedModel:
     def embedding(self) -> NDArray[np.float32]: ...
     def transform(self, x: NDArray[np.float32]) -> NDArray[np.float32]: ...
 
-def fit(
+def fit_parametric_umap(
     x: NDArray[np.float32],
     *,
     device: Literal["cuda", "wgpu", "cpu"] = "cuda",
@@ -34,4 +34,4 @@ def fit(
     timeout: int | None = None,
     seed: int = 9999,
     verbose: bool = False,
-) -> FittedModel: ...
+) -> FittedParametricUMAP: ...

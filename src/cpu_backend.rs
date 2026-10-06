@@ -3,18 +3,18 @@
 //! This module provides CPU-based UMAP functionality as a fallback when GPU is not available.
 //! Currently implements utility functions and provides a foundation for full CPU support.
 
-use crate::{distances::*, train::*, utils::*};
+use crate::{distances::*, utils::*, ParametricUMAPConfig};
 use num::Float;
 use std::time::Instant;
 
 /// CPU-specific UMAP implementation
 pub struct CpuUmap {
-    config: UmapConfig,
+    config: ParametricUMAPConfig,
 }
 
 impl CpuUmap {
     /// Create a new CPU UMAP instance
-    pub fn new(config: UmapConfig) -> Self {
+    pub fn new(config: ParametricUMAPConfig) -> Self {
         Self { config }
     }
 
@@ -80,7 +80,7 @@ fn create_simple_embedding(n_samples: usize, n_features: usize, data: &[f64]) ->
 /// Fitted UMAP model for CPU backend
 pub struct CpuFittedUmap {
     embedding: Vec<Vec<f64>>,
-    config: UmapConfig,
+    config: ParametricUMAPConfig,
 }
 
 impl CpuFittedUmap {
@@ -95,7 +95,7 @@ impl CpuFittedUmap {
     }
 
     /// Get a reference to the configuration
-    pub fn config(&self) -> &UmapConfig {
+    pub fn config(&self) -> &ParametricUMAPConfig {
         &self.config
     }
 
@@ -112,7 +112,7 @@ pub mod api {
 
     /// CPU-specific UMAP fit function
     pub fn fit_cpu<F: Float>(
-        config: UmapConfig,
+        config: ParametricUMAPConfig,
         data: Vec<Vec<F>>,
         labels: Option<Vec<String>>,
     ) -> CpuFittedUmap

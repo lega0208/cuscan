@@ -60,18 +60,18 @@ fn main() {
     );
     println!();
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         graph: GraphParams {
             n_neighbors: 5,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 2,
             ..Default::default()
         },
         ..Default::default()
     };
-    let fitted = Umap::with_device(config, Device::flex()).fit(data, None);
+    let fitted = ParametricUMAP::with_device(config, Device::flex()).fit(data, None);
     println!(
         "Flex CPU UMAP embedding: {} samples × {} dimensions",
         fitted.embedding().len(),

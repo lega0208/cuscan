@@ -23,7 +23,7 @@ fn main() {
     let labels: Vec<String> = trn_lbl.iter().map(|d| format!("{d}")).collect();
 
     // ── New API (mirrors umap-rs) ────────────────────────────────────────────
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![256],
         graph: GraphParams {
@@ -31,7 +31,7 @@ fn main() {
             metric: Metric::Euclidean,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 1_000,
             batch_size: 2_000,
             learning_rate: 1e-3,
@@ -44,7 +44,7 @@ fn main() {
         ..Default::default()
     };
 
-    let umap = fast_umap::Umap::with_device(config, device);
+    let umap = fast_umap::ParametricUMAP::with_device(config, device);
     let fitted = umap.fit(data, Some(labels.clone()));
 
     println!(

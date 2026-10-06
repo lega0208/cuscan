@@ -1,5 +1,5 @@
 use fast_umap::prelude::*;
-use fast_umap::{FittedUmap, Umap};
+use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Training UMAP model...");
 
     // Configure and fit UMAP
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![10], // Small network for quick demo
         graph: GraphParams {
@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = Umap::new(config.clone());
+    let umap = ParametricUMAP::new(config.clone());
     let fitted = umap.fit(data.clone(), None);
 
     println!("Original embedding:");
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the model
     println!("\nLoading model from {:?}...", model_path);
-    let loaded_fitted = FittedUmap::load(
+    let loaded_fitted = FittedParametricUMAP::load(
         &model_path,
         config,
         4, // Input size (number of features)

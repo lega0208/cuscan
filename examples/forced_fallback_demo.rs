@@ -97,14 +97,14 @@ fn try_gpu_backend_with_forced_failure(_data: Vec<Vec<f64>>) -> Result<Vec<Vec<f
 #[allow(unused_variables)]
 fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     {
-        use fast_umap::prelude::*;
+        use fast_umap::{ParametricUMAP, ParametricUMAPConfig};
         use std::panic::catch_unwind;
 
         println!("  CPU initialization... SUCCESS");
         println!("  CPU processing... COMPLETE");
 
-        let config = UmapConfig::default();
-        let umap = fast_umap::Umap::with_device(config, burn::tensor::Device::flex());
+        let config = ParametricUMAPConfig::default();
+        let umap = ParametricUMAP::with_device(config, burn::tensor::Device::flex());
         match catch_unwind(|| umap.fit(data, None)) {
             Ok(fitted) => Ok(fitted.embedding().clone()),
             Err(e) => {

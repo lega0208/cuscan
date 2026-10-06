@@ -9,19 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Renamed the active Rust and Python estimator APIs to `ParametricUMAP`, `FittedParametricUMAP`, and `ParametricUMAPConfig`; neural types are `ParametricUMAPModel*`, `ParametricUMAPOptimizationParams`, `ParametricUMAPLossReduction`, and `ParametricUMAPEpochProgress`. Shared `Metric`, `GraphParams`, and `ManifoldParams` remain graph APIs. The estimator/model/private trainer/weight persistence now belong to `src/parametric_umap/`, while shared graph math belongs to `src/graph/`. Removed the deprecated dense API and compatibility aliases; this crate does not implement classical UMAP. The `fast-umap` package/crate identity is unchanged.
+- The model type/module relocation preserves the Burn weight payload structure; inputs remain caller-provided raw values and no scaler state is introduced.
+
 ### Added
 
 - Added an optional CUDA backend that reuses the CubeCL kernels; enable it with the `cuda` feature. Runtime requires an NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`); `nvcc`/CUDA toolkit are optional at build time.
-- **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `UMAP` estimator, selectable GPU (WGPU) or CPU (NdArray) backend via `device=`.
-- Added `OptimizationParams.seed`; the sampling RNG is seeded as well as the model RNG.
-- Added `validate_fit_input` and `validate_fit_data` to reject invalid fit inputs before training.
+- **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `ParametricUMAP` estimator, selectable GPU (WGPU) or CPU (Flex) backend via `device=`.
+- Added `ParametricUMAPOptimizationParams.seed`; the sampling RNG is seeded as well as the model RNG.
+- Added `validate_parametric_umap_input` and `validate_parametric_umap_data` to reject invalid fit inputs before training.
 - Added primary Rust/Python `local_connectivity`, `bandwidth`, and `set_op_mix_ratio` controls (all default to 1), with reference-labelled umap-learn 0.5.12 graph fixtures.
 
 ### Changed
 
 - **Breaking: primary `n_neighbors` now includes self and must be at least 2.** A fixed value selects one fewer non-self neighbor. Exact and optional NN-descent preparation retain distances and insert explicit self at slot zero; duplicate observations remain distinct neighbors. Shared search helpers and deprecated dense graph behavior are unchanged.
 - Primary sparse training now computes smooth-kNN rho/sigma, density-adaptive directed memberships, and fuzzy union/intersection weights. Configured positive epochs E fix float32 pruning (`w < max(w)/E`) and integer counts (`floor(E*w)`) before training. Checked u64 prefix sampling draws `min(50_000, sum(counts))` positives independently with replacement each epoch, without expanding repeated edges. Empty mass or count overflow fails explicitly. Fresh uniform non-self negatives replace the cached 16-batch cycle. This does not reproduce the reference training schedule, negative distribution, loss, or optimizer.
-- **Breaking: primary `Umap` and Python `UMAP` no longer standardize features internally.** Fit and transform receive caller-provided values as-is; public sparse `train_sparse` training also uses those values when constructing the neighborhood graph. Feature scales therefore affect geometry. Weights trained with the former internal standardization require the original external preprocessing at inference or retraining; no automatic migration is provided.
+- **Breaking: `ParametricUMAP` fit and transform do not standardize features internally.** They receive caller-provided values as-is, so feature scales affect geometry. Saved weights preserve the caller-input contract; weights trained with former internal standardization require the original external preprocessing at inference or retraining; no automatic migration is provided.
 - Dropped the Burn `train` feature to provide deterministic CPU execution.
 - Python `transform` handles empty inputs and reports feature-count mismatches as `ValueError`.
 

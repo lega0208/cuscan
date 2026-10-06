@@ -22,7 +22,7 @@ use rayon::prelude::*;
 ///
 /// # Returns
 /// `(indices, distances)` each flat row-major of length `n * k`.
-/// Same format as [`knn_from_pairwise_cpu`](crate::train::get_distance_by_metric::knn_from_pairwise_cpu).
+/// Same format as [`knn_from_pairwise_cpu`](crate::graph::get_distance_by_metric::knn_from_pairwise_cpu).
 pub fn nn_descent(data: &[f32], n: usize, d: usize, k: usize) -> (Vec<i32>, Vec<f32>) {
     assert!(k < n, "k ({k}) must be < n ({n})");
     let max_iters = 12;

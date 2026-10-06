@@ -73,3 +73,49 @@ pub fn knn_tensors_from_cpu(
     let knn_dist: Tensor<2> = Tensor::from_data(TensorData::new(dist_flat, [n, k]), device);
     (knn_indices, knn_dist)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::knn_from_pairwise_cpu;
+
+    #[test]
+    fn knn_sorts_exact_distance_ties_by_candidate_order() {
+        let distances = [0.0f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        let (indices, selected) = knn_from_pairwise_cpu(&distances, 3, 2);
+        assert_eq!(indices, [1, 2, 0, 2, 0, 1]);
+        assert_eq!(selected, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn knn_partial_selection_preserves_pre_move_cutoff_ties() {
+        // Independently captured from the old helper at b9d5bbd6: three tied
+        // candidates compete for two slots, exercising select_nth_unstable_by.
+        let mut distances = vec![1.0f32; 16];
+        for i in 0..4 {
+            distances[i * 4 + i] = 0.0;
+        }
+        let (indices, selected) = knn_from_pairwise_cpu(&distances, 4, 2);
+        assert_eq!(indices, [1, 2, 0, 2, 0, 1, 0, 1]);
+        assert_eq!(selected, [1.0; 8]);
+    }
+
+    #[test]
+    fn knn_handles_zero_neighbors_and_rejects_out_of_range_k() {
+        assert_eq!(knn_from_pairwise_cpu::<f32>(&[], 0, 0), (vec![], vec![]));
+        assert_eq!(knn_from_pairwise_cpu::<f32>(&[], 3, 0), (vec![], vec![]));
+
+        let distances = [0.0f32, 2.0, 1.0, 2.0, 0.0, 3.0, 1.0, 3.0, 0.0];
+        assert_eq!(
+            knn_from_pairwise_cpu(&distances, 3, 2).0,
+            [2, 1, 0, 2, 0, 1]
+        );
+        assert!(std::panic::catch_unwind(|| knn_from_pairwise_cpu(&distances, 3, 3)).is_err());
+        assert!(std::panic::catch_unwind(|| knn_from_pairwise_cpu::<f32>(&[], 0, 1)).is_err());
+    }
+
+    #[test]
+    fn knn_short_pairwise_storage_panics_when_row_is_indexed() {
+        let short = [0.0f32, 1.0, 1.0, 0.0, 1.0];
+        assert!(std::panic::catch_unwind(|| knn_from_pairwise_cpu(&short, 3, 1)).is_err());
+    }
+}

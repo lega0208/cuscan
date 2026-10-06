@@ -7,19 +7,22 @@ use burn::backend::Dispatch;
 ///   - Tensor round-trips (convert_vector_to_tensor / convert_tensor_to_vector)
 ///   - Model construction and forward-pass shapes
 ///   - Layer normaliser
-///   - Configuration builders (TrainingConfig, UMAPModelConfig)
+///   - Parametric estimator and model configuration
 ///   - Distance functions (euclidean, manhattan, cosine, minkowski)
 ///     via the standard-backend overloads in distances.rs
 use burn::tensor::{DType, Device, Tensor, TensorData};
 use fast_umap::backend::UmapOps;
 use fast_umap::{
-    model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize,
-    train::{Metric, TrainingConfig},
+    parametric_umap::{
+        model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},
+        ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    },
     utils::{
         convert_tensor_to_vector, convert_vector_to_tensor, format_duration, generate_test_data,
         normalize_data, normalize_tensor,
     },
+    Metric,
 };
 use std::time::Duration;
 
@@ -245,12 +248,12 @@ fn normalizer_shape_preserved() {
 }
 
 // ===========================================================================
-// UMAPModelConfigBuilder
+// ParametricUMAPModelConfigBuilder
 // ===========================================================================
 
 #[test]
 fn model_config_defaults() {
-    let cfg = UMAPModelConfigBuilder::default().build().unwrap();
+    let cfg = ParametricUMAPModelConfigBuilder::default().build().unwrap();
     assert_eq!(cfg.input_size, 100);
     assert_eq!(cfg.output_size, 2);
     assert!(!cfg.hidden_sizes.is_empty());
@@ -258,7 +261,7 @@ fn model_config_defaults() {
 
 #[test]
 fn model_config_custom() {
-    let cfg = UMAPModelConfigBuilder::default()
+    let cfg = ParametricUMAPModelConfigBuilder::default()
         .input_size(28)
         .hidden_sizes(vec![64, 32])
         .output_size(3)
@@ -270,44 +273,54 @@ fn model_config_custom() {
 }
 
 // ===========================================================================
-// TrainingConfig builder
+// Parametric estimator configuration
 // ===========================================================================
 
 #[test]
-fn training_config_defaults() {
-    let cfg = TrainingConfig::builder().build().unwrap();
-    assert_eq!(cfg.metric, Metric::Euclidean);
-    assert!(cfg.epochs > 0);
-    assert!(cfg.learning_rate > 0.0);
-    assert!(cfg.patience.is_none());
-    assert!(cfg.timeout.is_none());
-    assert!(cfg.min_desired_loss.is_none());
+fn parametric_umap_config_defaults() {
+    let cfg = ParametricUMAPConfig::default();
+    assert_eq!(cfg.graph.metric, Metric::Euclidean);
+    assert!(cfg.optimization.n_epochs > 0);
+    assert!(cfg.optimization.learning_rate > 0.0);
+    assert!(cfg.optimization.patience.is_none());
+    assert!(cfg.optimization.timeout.is_none());
+    assert!(cfg.optimization.min_desired_loss.is_none());
 }
 
 #[test]
-fn training_config_custom() {
-    let cfg = TrainingConfig::builder()
-        .with_epochs(50)
-        .with_batch_size(32)
-        .with_learning_rate(0.01)
-        .with_beta1(0.85)
-        .with_beta2(0.99)
-        .with_penalty(1e-4)
-        .with_verbose(true)
-        .with_patience(5)
-        .with_k_neighbors(10)
-        .with_min_desired_loss(0.001)
-        .with_timeout(120)
-        .with_metric(Metric::Manhattan)
-        .build()
-        .unwrap();
-    assert_eq!(cfg.epochs, 50);
-    assert_eq!(cfg.batch_size, 32);
-    assert!((cfg.learning_rate - 0.01).abs() < 1e-10);
-    assert_eq!(cfg.patience, Some(5));
-    assert_eq!(cfg.k_neighbors, 10);
-    assert_eq!(cfg.timeout, Some(120));
-    assert_eq!(cfg.metric, Metric::Manhattan);
+fn parametric_umap_config_custom() {
+    let cfg = ParametricUMAPConfig {
+        n_components: 3,
+        hidden_sizes: vec![64, 32],
+        graph: fast_umap::GraphParams {
+            n_neighbors: 10,
+            metric: Metric::Manhattan,
+            ..Default::default()
+        },
+        optimization: ParametricUMAPOptimizationParams {
+            n_epochs: 50,
+            batch_size: 32,
+            learning_rate: 0.01,
+            beta1: 0.85,
+            beta2: 0.99,
+            penalty: 1e-4,
+            verbose: true,
+            patience: Some(5),
+            min_desired_loss: Some(0.001),
+            timeout: Some(120),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(cfg.n_components, 3);
+    assert_eq!(cfg.hidden_sizes, vec![64, 32]);
+    assert_eq!(cfg.optimization.n_epochs, 50);
+    assert_eq!(cfg.optimization.batch_size, 32);
+    assert!((cfg.optimization.learning_rate - 0.01).abs() < 1e-10);
+    assert_eq!(cfg.optimization.patience, Some(5));
+    assert_eq!(cfg.graph.n_neighbors, 10);
+    assert_eq!(cfg.optimization.timeout, Some(120));
+    assert_eq!(cfg.graph.metric, Metric::Manhattan);
 }
 
 #[test]
@@ -326,17 +339,17 @@ fn metric_from_invalid_str_panics() {
 }
 
 // ===========================================================================
-// UMAPModel construction and forward pass
+// ParametricUMAPModel construction and forward pass
 // ===========================================================================
 
-fn make_model(input: usize, hidden: Vec<usize>, output: usize) -> UMAPModel {
-    let cfg = UMAPModelConfigBuilder::default()
+fn make_model(input: usize, hidden: Vec<usize>, output: usize) -> ParametricUMAPModel {
+    let cfg = ParametricUMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden)
         .output_size(output)
         .build()
         .unwrap();
-    UMAPModel::new(&cfg, &cpu())
+    ParametricUMAPModel::new(&cfg, &cpu())
 }
 
 #[test]
@@ -654,7 +667,7 @@ fn flex_knn_f64_dispatch_preserves_order_dtype_and_backward() {
 #[test]
 fn knn_cpu_selector_allows_empty_neighbor_count() {
     let (indices, distances) =
-        fast_umap::train::get_distance_by_metric::knn_from_pairwise_cpu(&[0.0f32; 4], 2, 0);
+        fast_umap::graph::get_distance_by_metric::knn_from_pairwise_cpu(&[0.0f32; 4], 2, 0);
     assert!(indices.is_empty());
     assert!(distances.is_empty());
 }

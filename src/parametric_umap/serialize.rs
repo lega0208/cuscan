@@ -1,7 +1,7 @@
 use burn::{module::Module, tensor::Device};
 use std::path::Path;
 
-use crate::model::UMAPModel;
+use super::model::ParametricUMAPModel;
 
 /// Save a UMAP model's weights to a file.
 ///
@@ -16,13 +16,13 @@ use crate::model::UMAPModel;
 /// use fast_umap::prelude::*;
 /// use burn::tensor::Device;
 /// let device = Device::flex();
-/// let config = UmapConfig::default();
-/// let umap = Umap::with_device(config, device.clone());
+/// let config = ParametricUMAPConfig::default();
+/// let umap = ParametricUMAP::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);
 /// fitted.save("model.umap").expect("Failed to save model");
 /// ```
 pub fn save_model(
-    model: &UMAPModel,
+    model: &ParametricUMAPModel,
     path: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     model
@@ -45,16 +45,16 @@ pub fn save_model(
 /// use fast_umap::prelude::*;
 /// use burn::tensor::Device;
 /// let device = Device::flex();
-/// let config = UmapConfig::default();
-/// let umap = Umap::with_device(config, device.clone());
+/// let config = ParametricUMAPConfig::default();
+/// let umap = ParametricUMAP::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);
 /// fitted.save("model.umap").expect("Failed to save model");
 ///
 /// // Later...
-/// let loaded_fitted = FittedUmap::load("model.umap", config, device)?;
+/// let loaded_fitted = FittedParametricUMAP::load("model.umap", config, device)?;
 /// ```
 pub fn load_model(
-    model: &mut UMAPModel,
+    model: &mut ParametricUMAPModel,
     path: impl AsRef<Path>,
     device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {

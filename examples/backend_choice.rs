@@ -4,7 +4,9 @@
 ///     cargo run --release --features cuda --example backend_choice -- cuda
 ///     cargo run --release --features gpu --example backend_choice -- wgpu
 ///     cargo run --release --example backend_choice -- flex
-use burn::tensor::{Device, DeviceKind};
+use burn::tensor::Device;
+#[cfg(feature = "gpu")]
+use burn::tensor::DeviceKind;
 use fast_umap::prelude::*;
 use rand::RngExt;
 
@@ -52,8 +54,8 @@ fn main() {
         }
     };
 
-    let config = UmapConfig::default();
-    let fitted = Umap::with_device(config, device).fit(data.clone(), None);
+    let config = ParametricUMAPConfig::default();
+    let fitted = ParametricUMAP::with_device(config, device).fit(data.clone(), None);
 
     let embedding = fitted.embedding();
     println!(

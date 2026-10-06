@@ -21,9 +21,9 @@ fn main() {
         .collect();
 
     // ── New API (mirrors umap-rs) ────────────────────────────────────────────
-    let config = UmapConfig::default(); // 2-D output, Euclidean, default hyperparameters
+    let config = ParametricUMAPConfig::default(); // 2-D output, Euclidean, default hyperparameters
     let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
-    let umap = Umap::with_device(config, device);
+    let umap = ParametricUMAP::with_device(config, device);
     let fitted = umap.fit(data.clone(), None);
 
     // Get the embedding

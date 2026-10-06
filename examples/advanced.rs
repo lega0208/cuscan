@@ -15,7 +15,7 @@ fn main() {
         .collect();
 
     // ── New API (mirrors umap-rs) ────────────────────────────────────────────
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![100, 100, 100],
         graph: GraphParams {
@@ -23,7 +23,7 @@ fn main() {
             metric: Metric::Euclidean,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 100,
             batch_size: 1000,
             learning_rate: 0.001,
@@ -36,7 +36,7 @@ fn main() {
     };
 
     let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
-    let umap = Umap::with_device(config, device);
+    let umap = ParametricUMAP::with_device(config, device);
     let fitted = umap.fit(data, None);
 
     // Access the embedding

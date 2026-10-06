@@ -17,8 +17,8 @@
 /// so the README always links to the latest run.
 use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
 use fast_umap::{
-    model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize as layer_normalize,
+    parametric_umap::model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},
     utils::{
         convert_tensor_to_vector, convert_vector_to_tensor, generate_test_data, normalize_data,
         normalize_tensor,
@@ -277,14 +277,19 @@ struct Group {
 
 // ─── Model helpers ────────────────────────────────────────────────────────────
 
-fn build_model(input: usize, hidden: &[usize], output: usize, device: &Device) -> UMAPModel {
-    let cfg = UMAPModelConfigBuilder::default()
+fn build_model(
+    input: usize,
+    hidden: &[usize],
+    output: usize,
+    device: &Device,
+) -> ParametricUMAPModel {
+    let cfg = ParametricUMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden.to_vec())
         .output_size(output)
         .build()
         .unwrap();
-    UMAPModel::new(&cfg, device)
+    ParametricUMAPModel::new(&cfg, device)
 }
 
 // ─── CPU benchmark suite ──────────────────────────────────────────────────────

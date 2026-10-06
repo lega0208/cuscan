@@ -1,5 +1,12 @@
-use burn::tensor::{Device, DeviceIndex};
-use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
+use burn::tensor::Device;
+#[cfg(feature = "cuda")]
+use burn::tensor::DeviceIndex;
+#[cfg(all(feature = "gpu", not(feature = "cuda")))]
+use burn::tensor::DeviceKind;
+use fast_umap::{
+    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
+    ParametricUMAPOptimizationParams,
+};
 /// Test NN-Descent on a large dataset (50K samples).
 /// This would OOM with the exact pairwise distance approach (10GB matrix).
 ///
@@ -33,14 +40,14 @@ fn main() {
         .map(|c| c.iter().map(|&x| x as f64).collect())
         .collect();
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![128],
         graph: GraphParams {
             n_neighbors: 15,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: epochs,
             batch_size: n,
             learning_rate: 1e-3,
@@ -52,7 +59,7 @@ fn main() {
 
     let start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
-    let umap = Umap::with_device(config, device());
+    let umap = ParametricUMAP::with_device(config, device());
     let fitted = umap.fit_with_signal(data, None, exit_rx);
     let elapsed = start.elapsed().as_secs_f64();
 

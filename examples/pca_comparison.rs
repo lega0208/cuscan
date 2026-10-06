@@ -4,7 +4,10 @@
 ///     cargo run --release --features gpu,pca --example pca_comparison
 use std::time::Instant;
 
-use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
+use fast_umap::{
+    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
+    ParametricUMAPOptimizationParams,
+};
 
 fn device() -> burn::tensor::Device {
     #[cfg(feature = "gpu")]
@@ -24,14 +27,14 @@ fn run(n_samples: usize, n_features: usize, epochs: usize) {
         .map(|c| c.iter().map(|&x| x as f64).collect())
         .collect();
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![128],
         graph: GraphParams {
             n_neighbors: 15,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: epochs,
             batch_size: n_samples,
             learning_rate: 1e-3,
@@ -43,7 +46,7 @@ fn run(n_samples: usize, n_features: usize, epochs: usize) {
 
     let start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
-    let umap = Umap::with_device(config, device());
+    let umap = ParametricUMAP::with_device(config, device());
     let fitted = umap.fit_with_signal(data, None, exit_rx);
     let elapsed = start.elapsed().as_secs_f64();
 

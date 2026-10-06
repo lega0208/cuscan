@@ -12,7 +12,10 @@ use std::{io::Write as _, time::Instant};
 
 #[cfg(feature = "gpu")]
 use burn::tensor::{Device, DeviceKind};
-use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
+use fast_umap::{
+    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
+    ParametricUMAPOptimizationParams,
+};
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -134,15 +137,15 @@ fn gen_data(n_samples: usize, n_features: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-fn make_config(sc: &Scenario) -> UmapConfig {
-    UmapConfig {
+fn make_config(sc: &Scenario) -> ParametricUMAPConfig {
+    ParametricUMAPConfig {
         n_components: sc.n_components,
         hidden_sizes: sc.hidden_sizes.clone(),
         graph: GraphParams {
             n_neighbors: sc.n_neighbors,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: sc.n_epochs,
             batch_size: sc.n_samples,
             learning_rate: 1e-3,
@@ -170,7 +173,7 @@ fn run_flex(sc: &Scenario) -> TimingResult {
     let data = gen_data(sc.n_samples, sc.n_features);
     let fit_start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
-    let fitted = Umap::new(make_config(sc)).fit_with_signal(data, None, exit_rx);
+    let fitted = ParametricUMAP::new(make_config(sc)).fit_with_signal(data, None, exit_rx);
     let fit_secs = fit_start.elapsed().as_secs_f64();
     let _ = fitted.into_embedding();
     TimingResult {
@@ -188,7 +191,8 @@ fn run_wgpu(sc: &Scenario) -> TimingResult {
     let fit_start = Instant::now();
     let (_, exit_rx) = crossbeam_channel::unbounded();
     let device = Device::wgpu(DeviceKind::DefaultDevice);
-    let fitted = Umap::with_device(make_config(sc), device).fit_with_signal(data, None, exit_rx);
+    let fitted =
+        ParametricUMAP::with_device(make_config(sc), device).fit_with_signal(data, None, exit_rx);
     let fit_secs = fit_start.elapsed().as_secs_f64();
     let _ = fitted.into_embedding();
     TimingResult {

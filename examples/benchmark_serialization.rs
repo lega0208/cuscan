@@ -1,5 +1,5 @@
 use fast_umap::prelude::*;
-use fast_umap::{FittedUmap, Umap};
+use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -29,14 +29,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Data generation complete.");
 
     // Configure UMAP with reasonable settings for the dataset size
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![50, 30], // Slightly larger network
         graph: GraphParams {
             n_neighbors: 15,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 50, // Reduced for benchmarking
             ..Default::default()
         },
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Training UMAP model...");
     let train_start = Instant::now();
-    let umap = Umap::new(config.clone());
+    let umap = ParametricUMAP::new(config.clone());
     let fitted = umap.fit(data.clone(), None);
     let train_duration = train_start.elapsed();
     println!(
@@ -75,7 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Benchmark loading
     println!("\n=== LOAD BENCHMARK ===");
     let load_start = Instant::now();
-    let loaded_fitted = FittedUmap::load(&model_path, config, num_features, Default::default())?;
+    let loaded_fitted =
+        FittedParametricUMAP::load(&model_path, config, num_features, Default::default())?;
     let load_duration = load_start.elapsed();
 
     println!("Load time: {:.3} seconds", load_duration.as_secs_f64());

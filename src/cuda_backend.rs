@@ -233,18 +233,18 @@ mod tests {
         let Some(device) = available_device_or_skip() else {
             return;
         };
-        use crate::prelude::{GraphParams, OptimizationParams, UmapConfig};
+        use crate::prelude::{GraphParams, ParametricUMAPConfig, ParametricUMAPOptimizationParams};
 
         let mut rng = rand::rng();
         let data: Vec<Vec<f64>> = (0..50)
             .map(|_| (0..5).map(|_| rng.random::<f64>()).collect())
             .collect();
-        let config = UmapConfig {
+        let config = ParametricUMAPConfig {
             graph: GraphParams {
                 n_neighbors: 5,
                 ..Default::default()
             },
-            optimization: OptimizationParams {
+            optimization: ParametricUMAPOptimizationParams {
                 n_epochs: 2,
                 batch_size: 50,
                 verbose: false,
@@ -253,7 +253,7 @@ mod tests {
             ..Default::default()
         };
 
-        let fitted = crate::Umap::with_device(config, device.autodiff()).fit(data, None);
+        let fitted = crate::ParametricUMAP::with_device(config, device.autodiff()).fit(data, None);
         let embedding = fitted.embedding();
         assert_eq!(embedding.len(), 50);
         assert!(embedding.iter().all(|row| row.len() == 2));
@@ -265,22 +265,21 @@ mod tests {
         let Some(device) = available_device_or_skip() else {
             return Ok(());
         };
-        use crate::prelude::{GraphParams, OptimizationParams, UmapConfig};
+        use crate::prelude::{GraphParams, ParametricUMAPConfig, ParametricUMAPOptimizationParams};
 
-        // Each feature has mean zero and standard deviation one, matching the
-        // identity normalization used when loading serialized model weights.
+        // The primary path uses caller values raw; no fitted normalization is applied.
         let data = vec![
             vec![-1.0, -1.0],
             vec![-1.0, 1.0],
             vec![1.0, -1.0],
             vec![1.0, 1.0],
         ];
-        let config = UmapConfig {
+        let config = ParametricUMAPConfig {
             graph: GraphParams {
                 n_neighbors: 3,
                 ..Default::default()
             },
-            optimization: OptimizationParams {
+            optimization: ParametricUMAPOptimizationParams {
                 n_epochs: 2,
                 batch_size: 4,
                 verbose: false,
@@ -289,14 +288,14 @@ mod tests {
             ..Default::default()
         };
 
-        let fitted = crate::Umap::with_device(config.clone(), device.clone().autodiff())
+        let fitted = crate::ParametricUMAP::with_device(config.clone(), device.clone().autodiff())
             .fit(data.clone(), None);
         let temp_dir = tempfile::Builder::new()
             .prefix("fast-umap-cuda-")
             .tempdir_in(std::env::temp_dir())?;
         let model_path = temp_dir.path().join("model.bin");
         fitted.save(&model_path)?;
-        let loaded = crate::FittedUmap::load(&model_path, config, 2, device.autodiff())?;
+        let loaded = crate::FittedParametricUMAP::load(&model_path, config, 2, device.autodiff())?;
 
         let original_embedding = fitted.transform(data.clone());
         let loaded_embedding = loaded.transform(data);

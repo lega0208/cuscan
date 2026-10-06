@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import inspect
+import subprocess
+import sys
+import textwrap
+import threading
 from typing import Any
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-from fast_umap import UMAP, NotFittedError
+import fast_umap
+from fast_umap import NotFittedError, ParametricUMAP, _fast_umap
 
 
 def blobs(
@@ -22,7 +27,7 @@ def blobs(
     return data, labels
 
 
-def estimator(**kwargs: object) -> UMAP:
+def estimator(**kwargs: object) -> ParametricUMAP:
     params: dict[str, Any] = {
         "n_neighbors": 8,
         "n_epochs": 20,
@@ -31,7 +36,18 @@ def estimator(**kwargs: object) -> UMAP:
         "hidden_sizes": (16,),
     }
     params.update(kwargs)
-    return UMAP(**params)
+    return ParametricUMAP(**params)
+
+
+def test_parametric_exports() -> None:
+    assert "ParametricUMAP" in fast_umap.__all__
+    assert "UMAP" not in fast_umap.__all__
+    assert not hasattr(fast_umap, "UMAP")
+
+    assert hasattr(_fast_umap, "FittedParametricUMAP")
+    assert hasattr(_fast_umap, "fit_parametric_umap")
+    assert not hasattr(_fast_umap, "FittedUMAP")
+    assert not hasattr(_fast_umap, "fit_umap")
 
 
 def test_fit_transform_shape_dtype_finite() -> None:
@@ -109,9 +125,9 @@ def test_validation_errors() -> None:
     with pytest.raises(ValueError, match="finite"):
         estimator().fit(invalid)
     with pytest.raises(ValueError, match="n_samples"):
-        UMAP(n_neighbors=len(x), device="cpu").fit(x)
+        ParametricUMAP(n_neighbors=len(x), device="cpu").fit(x)
     with pytest.raises(ValueError, match="at least 2"):
-        UMAP(n_neighbors=1, device="cpu").fit(x)
+        ParametricUMAP(n_neighbors=1, device="cpu").fit(x)
     with pytest.raises(ValueError, match="non-negative"):
         estimator(random_state=-1).fit(x)
     with pytest.raises(ValueError, match="metric"):
@@ -159,25 +175,28 @@ def test_float64_integer_and_noncontiguous_inputs() -> None:
 def test_params_repr_and_random_state_generators() -> None:
     model = estimator(n_components=3)
     clone_params = model.get_params()
-    clone = UMAP().set_params(**clone_params)
+    clone = ParametricUMAP().set_params(**clone_params)
     assert clone.get_params() == clone_params
-    assert list(clone_params) == list(inspect.signature(UMAP.__init__).parameters)[1:]
+    assert list(clone_params) == list(inspect.signature(ParametricUMAP.__init__).parameters)[1:]
     assert "n_components=3" in repr(model)
-    controlled = UMAP(local_connectivity=0.5, bandwidth=2.0, set_op_mix_ratio=0.25)
+    controlled = ParametricUMAP(local_connectivity=0.5, bandwidth=2.0, set_op_mix_ratio=0.25)
     assert controlled.get_params()["local_connectivity"] == 0.5
     assert controlled.get_params()["bandwidth"] == 2.0
     assert controlled.get_params()["set_op_mix_ratio"] == 0.25
     assert "local_connectivity=0.5" in repr(controlled)
     assert "bandwidth=2.0" in repr(controlled)
     assert "set_op_mix_ratio=0.25" in repr(controlled)
-    assert UMAP().set_params(**controlled.get_params()).get_params() == controlled.get_params()
-    params_model = UMAP()
+    assert (
+        ParametricUMAP().set_params(**controlled.get_params()).get_params()
+        == controlled.get_params()
+    )
+    params_model = ParametricUMAP()
     assert params_model.set_params(device="cpu") is params_model
-    random_model = UMAP(random_state=np.random.RandomState(1))
+    random_model = ParametricUMAP(random_state=np.random.RandomState(1))
     assert random_model._validate_params() == int(
         np.random.RandomState(1).randint(0, np.iinfo(np.int32).max)
     )
-    generator_model = UMAP(random_state=np.random.default_rng(1))
+    generator_model = ParametricUMAP(random_state=np.random.default_rng(1))
     assert generator_model._validate_params() == int(
         np.random.default_rng(1).integers(0, np.iinfo(np.int32).max)
     )
@@ -220,10 +239,75 @@ def test_cpu_fit_transform_with_custom_graph_controls() -> None:
     assert np.isfinite(embedding).all()
 
 
+def test_fitted_model_rejects_transform_from_another_thread() -> None:
+    x, _ = blobs()
+    model = estimator().fit(x)
+    errors: list[BaseException] = []
+
+    def transform_from_worker() -> None:
+        try:
+            model.transform(x[:1])
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=transform_from_worker)
+    worker.start()
+    worker.join()
+
+    assert len(errors) == 1
+    assert type(errors[0]).__name__ == "PanicException"
+    assert type(errors[0]).__module__ == "pyo3_runtime"
+    assert "FittedParametricUMAP is unsendable, but sent to another thread" in str(errors[0])
+
+
+def test_sigint_interrupts_cpu_fit_in_child_process() -> None:
+    script = textwrap.dedent(
+        """
+        import os
+        import signal
+        import threading
+
+        import numpy as np
+        from fast_umap import ParametricUMAP
+
+        rng = np.random.default_rng(17)
+        x = rng.normal(size=(90, 5)).astype(np.float32)
+        interrupt = threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGINT))
+        try:
+            interrupt.start()
+            ParametricUMAP(
+                n_neighbors=8,
+                n_epochs=20000,
+                random_state=17,
+                device="cpu",
+                hidden_sizes=(16,),
+            ).fit(x)
+        except KeyboardInterrupt:
+            print("PARAMETRIC_UMAP_SIGINT_CAUGHT", flush=True)
+        else:
+            raise AssertionError("CPU fit completed without propagating SIGINT")
+        finally:
+            interrupt.cancel()
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PARAMETRIC_UMAP_SIGINT_CAUGHT" in result.stdout
+
+
 def test_gpu_smoke_when_adapter_available() -> None:
     x, _ = blobs(n_per_cluster=6)
     try:
-        result = UMAP(n_neighbors=3, n_epochs=2, hidden_sizes=(4,), device="wgpu").fit_transform(x)
+        result = ParametricUMAP(
+            n_neighbors=3, n_epochs=2, hidden_sizes=(4,), device="wgpu"
+        ).fit_transform(x)
     except BaseException as error:
         if "NoAdapterFound" in str(error) or "No adapter found" in str(error):
             pytest.skip(f"GPU adapter unavailable: {error}")

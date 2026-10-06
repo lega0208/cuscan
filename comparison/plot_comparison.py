@@ -12,14 +12,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "feedback_clustered.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "umap_comparison.html"
 SAMPLE_SEED = 42
-N_NEIGHBORS = 15
+N_NEIGHBORS = 30
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare umap-learn and fast_umap on one reproducible data sample."
     )
-    parser.add_argument("--sample-size", type=int, default=50_000)
+    parser.add_argument("--sample-size", type=int, default=10_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--device", choices=("cuda", "cpu", "wgpu"), default="cuda")
@@ -71,6 +71,7 @@ def main() -> None:
         "n_components": 2,
         "random_state": None,
         "min_dist": 0.0,
+        "verbose": True,
     }
     if args.n_epochs is not None:
         if args.n_epochs <= 0:
@@ -79,14 +80,14 @@ def main() -> None:
 
     import umap
 
-    from fast_umap import UMAP as FastUMAP
+    from fast_umap import ParametricUMAP as FastUMAP
 
     umap_config = {**config, "unique": True}
     fast_config = {**config, "device": args.device, "n_epochs": 2500}
-    
+
     print("starting umap-learn")
     started = perf_counter()
-    umap_embedding = umap.UMAP(**umap_config, verbose=True).fit_transform(X)
+    umap_embedding = umap.UMAP(**umap_config).fit_transform(X)
     umap_seconds = perf_counter() - started
     validate_embedding(umap_embedding, X.shape[0], "umap-learn")
 

@@ -1,156 +1,103 @@
-use burn::{module::Module as _, prelude::*};
+use burn::{prelude::*, tensor::DeviceKind};
 use crossbeam_channel::{unbounded, Receiver};
-use fast_umap::chart;
-#[allow(unused)]
 use fast_umap::{
-    chart::*,
-    model::*,
-    prelude::*,
-    train::{train, LossReduction},
-    utils::*,
+    chart::{self, ChartConfigBuilder},
+    utils::convert_vector_to_tensor,
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPLossReduction,
 };
 use mnist::*;
+use std::sync::{Arc, Mutex};
 
 fn generate_model_name(
-    prefix: &str,
     learning_rate: f64,
-    batch_size: usize,
-    penalty: f64,
-    hidden_sizes: &Vec<usize>,
+    penalty: f32,
+    hidden_sizes: &[usize],
     epochs: usize,
 ) -> String {
     let hidden_sizes = hidden_sizes
         .iter()
-        .map(|size| format!("{size}"))
-        .collect::<Vec<String>>()
+        .map(|size| size.to_string())
+        .collect::<Vec<_>>()
         .join("_");
     format!(
-        "{prefix}_lr_{:.0e}_bs_{:04}_pen_{:.0e}_hs_{hidden_sizes}_ep_{epochs}",
-        learning_rate, batch_size, penalty
+        "mnist_sparse_parametric_lr_{learning_rate:.0e}_pen_{penalty:.0e}_hs_{hidden_sizes}_ep_{epochs}"
     )
 }
 
 fn execute(
     name: String,
-    num_features: usize,
     num_samples: usize,
-    hidden_sizes: Vec<usize>,
-    output_size: usize,
-    device: Device,
-    train_data: Vec<f64>,
+    train_data: Vec<Vec<f32>>,
     labels: Vec<String>,
-    config: TrainingConfig,
+    config: ParametricUMAPConfig,
+    device: Device,
     exit_rx: Receiver<()>,
 ) -> f64 {
-    // Configure the UMAP model with the specified input size, hidden layer size, and output size
-    let model_config = UMAPModelConfigBuilder::default()
-        .input_size(num_features)
-        .hidden_sizes(hidden_sizes)
-        .output_size(output_size)
-        .build()
-        .unwrap();
-
-    // Initialize the UMAP model with the defined configuration and the selected device
-    let model = UMAPModel::new(&model_config, &device);
-
-    // Start training the UMAP model with the specified training data and configuration
-    let (model, _, best_loss) = train(
-        name.as_str(),
-        model,              // The model to train
-        num_samples,        // Total number of training samples
-        num_features,       // Number of features per sample
-        train_data.clone(), // The training data
-        &config,            // The training configuration
-        device.clone(),
+    let best_loss = Arc::new(Mutex::new(f64::MAX));
+    let observed_best_loss = Arc::clone(&best_loss);
+    let fitted = ParametricUMAP::with_device(config, device.clone()).fit_with_progress(
+        train_data,
+        Some(labels.clone()),
         exit_rx,
-        None, // no labels for benchmark runs
+        Box::new(move |progress| {
+            *observed_best_loss.lock().unwrap() = progress.best_loss;
+        }),
     );
 
-    // Validate the trained model after training
-    let model = model.valid();
-
-    // Convert the training data into a tensor for model input
-    let global = convert_vector_to_tensor(train_data, num_samples, num_features, &device);
-
-    // Perform a forward pass through the model to obtain the low-dimensional (local) representation
-    let local = model.forward(global.clone());
-
+    let embedding: Vec<f64> = fitted.embedding().iter().flatten().copied().collect();
+    let embedding_tensor = convert_vector_to_tensor(embedding, num_samples, 2, &device);
     let chart_config = ChartConfigBuilder::default()
-        .caption(name.as_str())
+        .caption(&name)
         .path(format!("figures/{name}.png").as_str())
         .build();
+    chart::chart_tensor(embedding_tensor, Some(labels), Some(chart_config));
 
-    // Visualize the 2D embedding (local representation) using a chart
-    chart::chart_tensor(local, Some(labels), Some(chart_config));
-
-    best_loss
+    let result = *best_loss.lock().unwrap();
+    result
 }
 
 fn find_best_hyperparameters(
-    num_features: usize,
-    num_samples: usize,
-    train_data: Vec<f64>,
+    train_data: Vec<Vec<f32>>,
     labels: Vec<String>,
     device: Device,
-    config: TrainingConfig,
-    learning_rates: Vec<f64>,
-    batch_sizes: Vec<usize>,
-    penalties: Vec<f64>,
-    hidden_size_options: Vec<Vec<usize>>,
-    epochs_options: Vec<usize>, // Added epochs as an array of values
+    config: ParametricUMAPConfig,
+    learning_rates: &[f64],
+    penalties: &[f32],
+    hidden_size_options: &[Vec<usize>],
+    epochs_options: &[usize],
     exit_rx: Receiver<()>,
 ) -> (String, f64) {
     let mut best_loss = f64::MAX;
     let mut best_config = String::new();
-    let output_size = 2; // 2D UMAP 2 dimensions
+    let num_samples = train_data.len();
 
-    // let (exit_tx, exit_rx) = channel();
+    for &learning_rate in learning_rates {
+        for &penalty in penalties {
+            for hidden_sizes in hidden_size_options {
+                for &epochs in epochs_options {
+                    let model_name =
+                        generate_model_name(learning_rate, penalty, hidden_sizes, epochs);
+                    println!("{model_name}");
 
-    // ctrlc::set_handler(move || exit_tx.send(()).expect("Could not send signal on channel."))
-    //     .expect("Error setting Ctrl-C handler");
+                    let mut current_config = config.clone();
+                    current_config.hidden_sizes = hidden_sizes.clone();
+                    current_config.optimization.learning_rate = learning_rate;
+                    current_config.optimization.penalty = penalty;
+                    current_config.optimization.n_epochs = epochs;
 
-    // Iterate over all combinations of the hyperparameters
-    for &learning_rate in &learning_rates {
-        for &batch_size in &batch_sizes {
-            for &penalty in &penalties {
-                for hidden_sizes in &hidden_size_options {
-                    for &epochs in &epochs_options {
-                        // Generate a model name for the current combination
-                        let model_name = generate_model_name(
-                            "mnist",
-                            learning_rate,
-                            batch_size,
-                            penalty,
-                            hidden_sizes,
-                            epochs,
-                        );
+                    let loss = execute(
+                        model_name.clone(),
+                        num_samples,
+                        train_data.clone(),
+                        labels.clone(),
+                        current_config,
+                        device.clone(),
+                        exit_rx.clone(),
+                    );
 
-                        println!("{model_name}");
-
-                        // Modify the configuration with the current batch_size and epochs
-                        let mut current_config = config.clone(); // Copy the config for each iteration
-                        current_config.batch_size = batch_size;
-                        current_config.epochs = epochs;
-
-                        // Execute training and get the loss for this configuration
-                        let loss = execute(
-                            model_name.clone(),
-                            num_features,
-                            num_samples,
-                            hidden_sizes.clone(),
-                            output_size,
-                            device.clone(),
-                            train_data.clone(),
-                            labels.clone(),
-                            current_config,
-                            exit_rx.clone(),
-                        );
-
-                        // Update the best configuration if the current loss is smaller
-                        if loss < best_loss {
-                            best_loss = loss;
-                            best_config = model_name;
-                        }
+                    if loss < best_loss {
+                        best_loss = loss;
+                        best_config = model_name;
                     }
                 }
             }
@@ -160,34 +107,18 @@ fn find_best_hyperparameters(
     (best_config, best_loss)
 }
 
-// Example usage in main:
-
 fn main() {
     let (exit_tx, exit_rx) = unbounded();
+    ctrlc::set_handler(move || {
+        let _ = exit_tx.send(());
+    })
+    .expect("failed to install Ctrl-C handler");
 
-    ctrlc::set_handler(move || exit_tx.send(()).expect("Could not send signal on channel."))
-        .expect("Error setting Ctrl-C handler");
-
-    // Initialize the GPU device for computation
-    let device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice).autodiff();
-
-    // Set training parameters and configuration
-    let num_samples = 10_000 as usize;
+    let device = Device::wgpu(DeviceKind::DefaultDevice).autodiff();
+    let num_samples = 10_000;
     let num_features = 28 * 28;
-    let k_neighbors = 15;
-    let learning_rate = 1e-4;
-    let penalty = 1e-6;
-    let beta1 = 0.9;
-    let beta2 = 0.999;
-    let seed = 9999;
-    let verbose = true;
-    let min_desired_loss = 1e-4;
-    let metric = Metric::Euclidean;
-    let loss_reduction = LossReduction::Mean;
-    let normalized = true;
 
-    // Seed the random number generator to ensure reproducibility
-    device.seed(seed);
+    device.seed(9999);
 
     let Mnist {
         trn_img, trn_lbl, ..
@@ -197,66 +128,61 @@ fn main() {
         .training_set_length(num_samples as u32)
         .finalize();
 
-    let train_data: Vec<f64> = trn_img.into_iter().map(|byte| byte as f64).collect();
-    let labels: Vec<String> = trn_lbl.iter().map(|digit| format!("{digit}")).collect();
+    let train_data: Vec<Vec<f32>> = trn_img
+        .chunks_exact(num_features)
+        .map(|sample| sample.iter().map(|&byte| byte as f32).collect())
+        .collect();
+    let labels: Vec<String> = trn_lbl.iter().map(|digit| digit.to_string()).collect();
 
-    // Set up the training configuration with the specified hyperparameters
-    let config = TrainingConfig::builder() // This is a default value; will be overridden in the search
-        .with_learning_rate(learning_rate)
-        .with_beta1(beta1)
-        .with_beta2(beta2)
-        .with_verbose(verbose)
-        .with_metric(metric.into())
-        .with_k_neighbors(k_neighbors)
-        .with_min_desired_loss(min_desired_loss)
-        .with_loss_reduction(loss_reduction)
-        .with_normalized(normalized)
-        .with_penalty(penalty)
-        .build()
-        .expect("Failed to build TrainingConfig");
+    let mut config = ParametricUMAPConfig::default();
+    config.graph = GraphParams {
+        n_neighbors: 15,
+        ..Default::default()
+    };
+    config.optimization.seed = 9999;
+    config.optimization.beta1 = 0.9;
+    config.optimization.beta2 = 0.999;
+    config.optimization.verbose = true;
+    config.optimization.min_desired_loss = Some(1e-4);
+    config.optimization.loss_reduction = ParametricUMAPLossReduction::Mean;
 
-    // Define the arrays of hyperparameters to search
-    let learning_rates = vec![1e-4, 1e-3, 1e-5];
-    let batch_sizes = vec![500, 1000, 2000];
-    let penalties = vec![1e-6, 1e-7, 1e-8];
+    let learning_rates = [1e-4, 1e-3, 1e-5];
+    let penalties = [1e-6_f32, 1e-7, 1e-8];
     let hidden_size_options = vec![
         vec![100],
         vec![200],
         vec![300],
-        vec![500],  // One hidden layer with 500 neurons
-        vec![1000], // One hidden layer with 1000 neurons
-        vec![1500], // One hidden layer with 1500 neurons
+        vec![500],
+        vec![1000],
+        vec![1500],
         vec![100, 100],
         vec![200, 200],
         vec![300, 300],
-        vec![500, 500],   // Two hidden layers, each with 500 neurons
-        vec![1000, 1000], // One hidden layer with 1000 neurons, another with 500
-        vec![1500, 1500], // One hidden layer with 1000 neurons, another with 500
+        vec![500, 500],
+        vec![1000, 1000],
+        vec![1500, 1500],
         vec![100, 100, 100],
         vec![200, 200, 200],
         vec![300, 300, 300],
         vec![500, 500, 500],
     ];
-    // let epochs_options = vec![100, 200, 500, 1000, 2000, 5000]; // Different epochs options to test
-    let epochs_options = vec![500];
+    let epochs_options = [500];
 
-    // Find the best hyperparameters
+    println!(
+        "Sparse parametric MNIST results are not comparable with historical dense benchmark results."
+    );
     let (best_config, best_loss) = find_best_hyperparameters(
-        num_features,
-        num_samples,
         train_data,
         labels,
         device,
         config,
-        learning_rates,
-        batch_sizes,
-        penalties,
-        hidden_size_options,
-        epochs_options,
+        &learning_rates,
+        &penalties,
+        &hidden_size_options,
+        &epochs_options,
         exit_rx,
     );
 
-    // Print the best configuration and its corresponding loss
-    println!("Best model configuration: {}", best_config);
-    println!("Best loss: {}", best_loss);
+    println!("Best sparse parametric model configuration: {best_config}");
+    println!("Best sparse parametric loss: {best_loss}");
 }

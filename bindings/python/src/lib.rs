@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use burn::tensor::{Device, DeviceIndex, DeviceKind};
 use crossbeam_channel::unbounded;
 use fast_umap::{
-    validate_fit_data, FittedUmap, GraphParams, ManifoldParams, Metric, OptimizationParams, Umap,
-    UmapConfig,
+    validate_parametric_umap_data, FittedParametricUMAP as RustFittedParametricUMAP, GraphParams,
+    ManifoldParams, Metric, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
@@ -13,13 +13,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 #[pyclass(frozen, unsendable)]
-struct FittedModel {
-    inner: Mutex<Option<Box<FittedUmap>>>,
+struct FittedParametricUMAP {
+    inner: Mutex<Option<Box<RustFittedParametricUMAP>>>,
     device: String,
 }
 
 #[pymethods]
-impl FittedModel {
+impl FittedParametricUMAP {
     #[getter]
     fn device(&self) -> &str {
         &self.device
@@ -97,12 +97,16 @@ impl FittedModel {
     }
 }
 
-fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<FittedUmap> {
-    validate_fit_data(&config, &x).map_err(PyValueError::new_err)?;
+fn fit_impl(
+    x: Vec<Vec<f32>>,
+    config: ParametricUMAPConfig,
+    device: Device,
+) -> PyResult<RustFittedParametricUMAP> {
+    validate_parametric_umap_data(&config, &x).map_err(PyValueError::new_err)?;
     let (exit_tx, exit_rx) = unbounded();
     let interrupt = Arc::new(Mutex::new(None));
     let callback_interrupt = Arc::clone(&interrupt);
-    let callback = Box::new(move |_progress: fast_umap::EpochProgress| {
+    let callback = Box::new(move |_progress: fast_umap::ParametricUMAPEpochProgress| {
         if let Err(error) = Python::attach(|py| py.check_signals()) {
             if let Ok(mut stored) = callback_interrupt.lock() {
                 *stored = Some(error);
@@ -110,7 +114,8 @@ fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<Fi
             let _ = exit_tx.send(());
         }
     });
-    let fitted = Umap::with_device(config, device).fit_with_progress(x, None, exit_rx, callback);
+    let fitted =
+        ParametricUMAP::with_device(config, device).fit_with_progress(x, None, exit_rx, callback);
     if let Some(error) = interrupt
         .lock()
         .map_err(|_| PyRuntimeError::new_err("interrupt lock poisoned"))?
@@ -142,7 +147,7 @@ fn fit_impl(x: Vec<Vec<f32>>, config: UmapConfig, device: Device) -> PyResult<Fi
   seed=9999,
   verbose=false))]
 #[allow(clippy::too_many_arguments)]
-fn fit(
+fn fit_parametric_umap(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f32>,
     device: &str,
@@ -162,10 +167,10 @@ fn fit(
     timeout: Option<u64>,
     seed: u64,
     verbose: bool,
-) -> PyResult<FittedModel> {
+) -> PyResult<FittedParametricUMAP> {
     let x = x.as_array();
     let data: Vec<Vec<f32>> = x.rows().into_iter().map(|row| row.to_vec()).collect();
-    let mut config = UmapConfig::default();
+    let mut config = ParametricUMAPConfig::default();
     config.n_components = n_components;
     config.hidden_sizes = hidden_sizes;
     config.graph = GraphParams {
@@ -177,7 +182,7 @@ fn fit(
         ..GraphParams::default()
     };
     config.manifold = ManifoldParams { min_dist, spread };
-    config.optimization = OptimizationParams {
+    config.optimization = ParametricUMAPOptimizationParams {
         seed,
         n_epochs,
         learning_rate,
@@ -186,7 +191,7 @@ fn fit(
         patience,
         timeout,
         verbose,
-        ..OptimizationParams::default()
+        ..ParametricUMAPOptimizationParams::default()
     };
     let (backend_device, device_name) = match device {
         "cuda" => (Device::cuda(DeviceIndex::Default).autodiff(), "cuda"),
@@ -199,7 +204,7 @@ fn fit(
         }
     };
     let model = py.detach(|| fit_impl(data, config, backend_device))?;
-    Ok(FittedModel {
+    Ok(FittedParametricUMAP {
         inner: Mutex::new(Some(Box::new(model))),
         device: device_name.to_owned(),
     })
@@ -208,7 +213,7 @@ fn fit(
 #[pymodule]
 fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    module.add_class::<FittedModel>()?;
-    module.add_function(wrap_pyfunction!(fit, module)?)?;
+    module.add_class::<FittedParametricUMAP>()?;
+    module.add_function(wrap_pyfunction!(fit_parametric_umap, module)?)?;
     Ok(())
 }

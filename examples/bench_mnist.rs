@@ -42,7 +42,7 @@ fn main() {
     println!();
 
     // ── Train ────────────────────────────────────────────────────────────────
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![256],
         graph: GraphParams {
@@ -50,7 +50,7 @@ fn main() {
             metric: Metric::Euclidean,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 1_000,
             batch_size: 2_000,
             learning_rate: 1e-3,
@@ -69,7 +69,7 @@ fn main() {
     );
     let fit_start = Instant::now();
 
-    let umap = fast_umap::Umap::with_device(config, device);
+    let umap = fast_umap::ParametricUMAP::with_device(config, device);
     let fitted = umap.fit(data, Some(labels.clone()));
 
     let fit_secs = fit_start.elapsed().as_secs_f64();

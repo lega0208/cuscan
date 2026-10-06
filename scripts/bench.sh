@@ -56,7 +56,7 @@ Benchmarks:
   comparison    fast-umap vs umap-rs on 6 dataset sizes
                 → figures/crate_comparison.{json,svg,md}
 
-  mnist         UMAP on 10K MNIST digits (downloads ~11 MB on first run)
+  mnist         Sparse ParametricUMAP on 10K MNIST digits (downloads ~11 MB on first run)
                 → figures/mnist.png, figures/losses_model.png
 
   criterion     Criterion statistical harness

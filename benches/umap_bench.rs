@@ -7,14 +7,14 @@
 ///   • normalize_data      – in-place Z-score normalisation
 ///   • generate_test_data  – random data generation
 ///   • tensor_convert      – Vec<F> ↔ Tensor round-trips
-///   • model_forward       – UMAPModel forward pass at various sizes
+///   • model_forward       – ParametricUMAPModel forward pass at various sizes
 ///   • normalize_tensor    – 1-D min-max normalisation
 ///   • layer_normalize     – 2-D layer normalisation
 use burn::tensor::{Device, Tensor, TensorData};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use fast_umap::{
-    model::{UMAPModel, UMAPModelConfigBuilder},
     normalizer::normalize as layer_normalize,
+    parametric_umap::model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},
     utils::{
         convert_tensor_to_vector, convert_vector_to_tensor, generate_test_data, normalize_data,
         normalize_tensor,
@@ -28,14 +28,14 @@ fn cpu() -> Device {
 // ---------------------------------------------------------------------------
 // Helper: build a model
 // ---------------------------------------------------------------------------
-fn build_model(input: usize, hidden: &[usize], output: usize) -> UMAPModel {
-    let cfg = UMAPModelConfigBuilder::default()
+fn build_model(input: usize, hidden: &[usize], output: usize) -> ParametricUMAPModel {
+    let cfg = ParametricUMAPModelConfigBuilder::default()
         .input_size(input)
         .hidden_sizes(hidden.to_vec())
         .output_size(output)
         .build()
         .unwrap();
-    UMAPModel::new(&cfg, &cpu())
+    ParametricUMAPModel::new(&cfg, &cpu())
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ fn bench_tensor_convert(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// UMAPModel::forward
+// ParametricUMAPModel::forward
 // ---------------------------------------------------------------------------
 fn bench_model_forward(c: &mut Criterion) {
     let mut group = c.benchmark_group("model_forward");

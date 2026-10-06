@@ -56,7 +56,7 @@ pub fn knn(pairwise_distances: FloatTensor<Flex>, k: u32) -> (IntTensor<Flex>, F
     let k = k as usize;
     let flat = pw.to_data_dtype(DType::F64).try_to_vec::<f64>().unwrap();
     let (idx_flat, dist_flat) =
-        crate::train::get_distance_by_metric::knn_from_pairwise_cpu(&flat, n, k);
+        crate::graph::get_distance_by_metric::knn_from_pairwise_cpu(&flat, n, k);
 
     let indices: Tensor<2, Int> = Tensor::from_data(TensorData::new(idx_flat, [n, k]), &device);
     let distances: Tensor<2> =
@@ -97,7 +97,7 @@ pub fn knn_backward(
         .try_to_vec::<f64>()
         .unwrap();
     let k = k as usize;
-    let (indices, _) = crate::train::get_distance_by_metric::knn_from_pairwise_cpu(&flat, n, k);
+    let (indices, _) = crate::graph::get_distance_by_metric::knn_from_pairwise_cpu(&flat, n, k);
 
     let mut grad_pairwise = vec![0.0f64; n * n];
     for row in 0..n {

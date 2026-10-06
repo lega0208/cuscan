@@ -12,7 +12,7 @@ class NotFittedError(ValueError, AttributeError):
     """Raised when a transform is requested before fitting the estimator."""
 
 
-class UMAP:
+class ParametricUMAP:
     """Parametric UMAP estimator.
 
     The learned parametric model makes ``transform`` a deterministic forward pass.
@@ -41,7 +41,7 @@ class UMAP:
         random_state: int | np.random.RandomState | np.random.Generator | None = None,
         verbose: bool = False,
         device: Literal["cuda", "wgpu", "cpu"] = "cuda",
-        hidden_sizes: tuple[int, ...] = (100,),
+        hidden_sizes: tuple[int, ...] = (100, 100, 100),
         patience: int | None = None,
         timeout: int | None = None,
     ) -> None:
@@ -114,14 +114,14 @@ class UMAP:
             raise ValueError("X must contain only finite values")
         return np.ascontiguousarray(array, dtype=np.float32)
 
-    def fit(self, X: ArrayLike, y: ArrayLike | None = None) -> UMAP:
+    def fit(self, X: ArrayLike, y: ArrayLike | None = None) -> ParametricUMAP:
         if y is not None:
             raise NotImplementedError("supervised UMAP is not supported")
         x = self._input_array(X)
         seed = self._validate_params()
         if x.shape[0] <= self.n_neighbors:
             raise ValueError("n_samples must be greater than n_neighbors")
-        model = _fast_umap.fit(
+        model = _fast_umap.fit_parametric_umap(
             x,
             device=self.device,
             n_components=self.n_components,
@@ -151,7 +151,7 @@ class UMAP:
 
     def transform(self, X: ArrayLike) -> NDArray[np.float32]:
         if not hasattr(self, "_model"):
-            raise NotFittedError("This UMAP instance is not fitted yet")
+            raise NotFittedError("This ParametricUMAP instance is not fitted yet")
         x = self._input_array(X)
         if x.shape[1] != self.n_features_in_:
             raise ValueError(f"expected {self.n_features_in_} features, got {x.shape[1]}")
@@ -161,7 +161,7 @@ class UMAP:
         del deep
         return {name: getattr(self, name) for name in self._parameter_names()}
 
-    def set_params(self, **params: Any) -> UMAP:
+    def set_params(self, **params: Any) -> ParametricUMAP:
         unknown = params.keys() - self._parameter_names()
         if unknown:
             raise ValueError(f"invalid parameter(s): {', '.join(sorted(unknown))}")
@@ -200,4 +200,4 @@ class UMAP:
             for name, value in params.items()
             if value != getattr(defaults, name)
         ]
-        return f"UMAP({', '.join(non_defaults)})"
+        return f"ParametricUMAP({', '.join(non_defaults)})"

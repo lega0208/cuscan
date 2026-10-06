@@ -16,7 +16,10 @@ use std::{fs, io::Write as _, path::Path, time::Instant};
 use ndarray;
 
 // ── fast-umap imports ────────────────────────────────────────────────────────
-use fast_umap::{utils::generate_test_data, GraphParams, OptimizationParams, Umap, UmapConfig};
+use fast_umap::{
+    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
+    ParametricUMAPOptimizationParams,
+};
 
 // ── umap-rs imports ──────────────────────────────────────────────────────────
 use umap_rs::{Umap as UmapRs, UmapConfig as UmapRsConfig};
@@ -83,6 +86,7 @@ fn scenarios() -> Vec<Scenario> {
 // Number of epochs for each crate (keep small for benchmarking)
 const FAST_UMAP_EPOCHS: usize = 50;
 const UMAP_RS_EPOCHS: usize = 200; // classical UMAP uses more epochs by convention
+const FAST_UMAP_LABEL: &str = "fast-umap";
 
 // ─── Data generation ─────────────────────────────────────────────────────────
 
@@ -170,14 +174,14 @@ fn run_fast_umap(sc: &Scenario) -> TimingResult {
 
     // Fit
     let fit_start = Instant::now();
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: sc.n_components,
         hidden_sizes: vec![128],
         graph: GraphParams {
             n_neighbors: sc.n_neighbors,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: FAST_UMAP_EPOCHS,
             batch_size: sc.n_samples, // one batch
             learning_rate: 1e-3,
@@ -189,7 +193,7 @@ fn run_fast_umap(sc: &Scenario) -> TimingResult {
 
     let (exit_tx, exit_rx) = crossbeam_channel::unbounded();
     // Don't set ctrlc handler here — may already be set
-    let umap = Umap::new(config);
+    let umap = ParametricUMAP::new(config);
     let fitted = umap.fit_with_signal(data, None, exit_rx);
     let fit_secs = fit_start.elapsed().as_secs_f64();
 
@@ -200,7 +204,7 @@ fn run_fast_umap(sc: &Scenario) -> TimingResult {
 
     TimingResult {
         scenario: sc.label.clone(),
-        crate_name: "fast-umap".into(),
+        crate_name: FAST_UMAP_LABEL.into(),
         total_secs,
         fit_secs,
         epochs: FAST_UMAP_EPOCHS,
@@ -264,13 +268,13 @@ fn write_json(path: &str, results: &[TimingResult]) {
 
 fn write_md(path: &str, results: &[TimingResult]) {
     let mut md = String::new();
-    md.push_str("# fast-umap vs umap-rs — Crate Comparison\n\n");
+    md.push_str("# fast-umap (parametric) vs umap-rs — Crate Comparison\n\n");
     md.push_str(&format!(
         "> **Date:** {}  \n",
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
     ));
     md.push_str(&format!(
-        "> **fast-umap:** {} epochs (parametric, GPU)  \n",
+        "> **fast-umap (parametric):** {} epochs (GPU)  \n",
         FAST_UMAP_EPOCHS
     ));
     md.push_str(&format!(
@@ -282,7 +286,7 @@ fn write_md(path: &str, results: &[TimingResult]) {
 
     md.push_str("## Total Time (data prep + fit + extract)\n\n");
     md.push_str(
-        "| Dataset | fast-umap | umap-rs | Speedup |\n\
+        "| Dataset | fast-umap (parametric) | umap-rs | Speedup |\n\
          |---------|-----------|---------|--------|\n",
     );
 
@@ -290,7 +294,7 @@ fn write_md(path: &str, results: &[TimingResult]) {
     for sc in &scenarios {
         let fu = results
             .iter()
-            .find(|r| r.scenario == sc.label && r.crate_name == "fast-umap");
+            .find(|r| r.scenario == sc.label && r.crate_name == FAST_UMAP_LABEL);
         let ur = results
             .iter()
             .find(|r| r.scenario == sc.label && r.crate_name == "umap-rs");
@@ -306,7 +310,7 @@ fn write_md(path: &str, results: &[TimingResult]) {
 
     md.push_str("\n## Fit Time Only\n\n");
     md.push_str(
-        "| Dataset | fast-umap | umap-rs | Speedup |\n\
+        "| Dataset | fast-umap (parametric) | umap-rs | Speedup |\n\
          |---------|-----------|---------|--------|\n",
     );
 
@@ -388,7 +392,7 @@ fn write_svg(path: &str, results: &[TimingResult]) {
     // Title
     writeln!(
         w,
-        "<text x=\"{:.0}\" y=\"30\" text-anchor=\"middle\" font-size=\"16\" font-weight=\"bold\" fill=\"#222\">fast-umap vs umap-rs \u{2014} Performance Comparison</text>",
+        "<text x=\"{:.0}\" y=\"30\" text-anchor=\"middle\" font-size=\"16\" font-weight=\"bold\" fill=\"#222\">fast-umap (parametric) vs umap-rs \u{2014} Performance Comparison</text>",
         SVG_W / 2.0
     ).unwrap();
     writeln!(
@@ -401,7 +405,7 @@ fn write_svg(path: &str, results: &[TimingResult]) {
     let ly = TITLE_H + 5.0;
     let lx = SVG_W / 2.0 - 130.0;
     writeln!(w, "<rect x=\"{lx:.0}\" y=\"{ly:.0}\" width=\"14\" height=\"12\" rx=\"2\" fill=\"{fu_colour}\"/>").unwrap();
-    writeln!(w, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"#333\">fast-umap (GPU, parametric)</text>", lx + 18.0, ly + 10.0).unwrap();
+    writeln!(w, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"#333\">fast-umap (parametric, GPU)</text>", lx + 18.0, ly + 10.0).unwrap();
     writeln!(w, "<rect x=\"{:.0}\" y=\"{ly:.0}\" width=\"14\" height=\"12\" rx=\"2\" fill=\"{ur_colour}\"/>", lx + 200.0).unwrap();
     writeln!(w, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"#333\">umap-rs (CPU, classical)</text>", lx + 218.0, ly + 10.0).unwrap();
 
@@ -534,10 +538,13 @@ fn write_svg(path: &str, results: &[TimingResult]) {
 fn main() {
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║       fast-umap vs umap-rs — Crate Comparison          ║");
+    println!("║ fast-umap (parametric) vs umap-rs — Crate Comparison  ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
-    println!("  fast-umap: {} epochs (parametric, GPU)", FAST_UMAP_EPOCHS);
+    println!(
+        "  fast-umap (parametric): {} epochs (GPU)",
+        FAST_UMAP_EPOCHS
+    );
     println!("  umap-rs:   {} epochs (classical, CPU)", UMAP_RS_EPOCHS);
     println!();
 
@@ -577,7 +584,7 @@ fn main() {
         results.push(ur);
 
         // Run fast-umap
-        print!("  fast-umap … ");
+        print!("  fast-umap (parametric) … ");
         std::io::stdout().flush().unwrap();
         let fu = run_fast_umap(sc);
         println!("total={:.3}s  fit={:.3}s", fu.total_secs, fu.fit_secs);
@@ -598,7 +605,7 @@ fn main() {
             .total_secs;
         let speedup = ur_total / fu_total;
         if speedup >= 1.0 {
-            println!("  → fast-umap is {:.2}× faster", speedup);
+            println!("  → fast-umap (parametric) is {:.2}× faster", speedup);
         } else {
             println!("  → umap-rs is {:.2}× faster", 1.0 / speedup);
         }

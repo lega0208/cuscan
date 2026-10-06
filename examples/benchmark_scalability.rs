@@ -1,5 +1,5 @@
 use fast_umap::prelude::*;
-use fast_umap::{FittedUmap, Umap};
+use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -28,14 +28,14 @@ fn benchmark_model(
 
     let data = generate_data(num_samples, num_features);
 
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: hidden_sizes.clone(),
         graph: GraphParams {
             n_neighbors,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 20,
             ..Default::default()
         },
@@ -44,7 +44,7 @@ fn benchmark_model(
 
     // Train
     let train_start = Instant::now();
-    let umap = Umap::new(config.clone());
+    let umap = ParametricUMAP::new(config.clone());
     let fitted = umap.fit(data, None);
     let train_duration = train_start.elapsed();
 
@@ -73,7 +73,8 @@ fn benchmark_model(
 
     // Load
     let load_start = Instant::now();
-    let _loaded_fitted = FittedUmap::load(&model_path, config, num_features, Default::default())?;
+    let _loaded_fitted =
+        FittedParametricUMAP::load(&model_path, config, num_features, Default::default())?;
     let load_duration = load_start.elapsed();
 
     // Clean up

@@ -1,8 +1,6 @@
 use burn::tensor::Device;
 use fast_umap::prelude::*;
-use fast_umap::{FittedUmap, Umap};
-
-use std::path::PathBuf;
+use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 
 fn flex() -> Device {
     Device::flex()
@@ -34,30 +32,26 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     // Configure and fit UMAP
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![10],
         graph: GraphParams {
             n_neighbors: 3,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 50, // More epochs for stability
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let umap = Umap::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save the model to a temporary file
-    let model_path = PathBuf::from("/tmp/test_umap_model.burnpack");
-
-    // Clean up any existing file
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-    }
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_umap_model.burnpack");
 
     // Debug: Check if path is valid
     println!("Saving to: {:?}", model_path);
@@ -83,7 +77,7 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Load the model
-    let loaded_fitted = FittedUmap::load(
+    let loaded_fitted = FittedParametricUMAP::load(
         &model_path,
         config,
         4, // Input size
@@ -111,8 +105,6 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    std::fs::remove_file(&model_path)?;
-
     Ok(())
 }
 
@@ -123,34 +115,33 @@ fn test_load_with_sample() -> Result<(), Box<dyn std::error::Error>> {
     let num_features = data[0].len();
 
     // Configure and fit UMAP
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 2,
         hidden_sizes: vec![15, 10],
         graph: GraphParams {
             n_neighbors: 5,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 30,
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let umap = Umap::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save the model
-    let model_path = PathBuf::from("/tmp/test_umap_model_2.burnpack");
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-    }
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_umap_model_2.burnpack");
     fitted.save(&model_path)?;
     assert!(model_path.is_file());
 
     // Test load_with_sample method
     let sample_data = vec![0.0; num_features]; // Sample with correct dimensionality
-    let loaded_fitted = FittedUmap::load_with_sample(&model_path, config, sample_data, flex())?;
+    let loaded_fitted =
+        FittedParametricUMAP::load_with_sample(&model_path, config, sample_data, flex())?;
 
     // Test transformation
     let test_data = vec![data[0].clone(), data[1].clone()];
@@ -178,28 +169,26 @@ fn test_multiple_save_load_cycles() -> Result<(), Box<dyn std::error::Error>> {
     let data = generate_test_data(50, 10);
 
     // Configure and fit UMAP
-    let config = UmapConfig {
+    let config = ParametricUMAPConfig {
         n_components: 3, // 3D embedding
         hidden_sizes: vec![8],
         graph: GraphParams {
             n_neighbors: 3,
             ..Default::default()
         },
-        optimization: OptimizationParams {
+        optimization: ParametricUMAPOptimizationParams {
             n_epochs: 20,
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let umap = Umap::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save to temporary file
-    let model_path = PathBuf::from("/tmp/test_umap_model_3.burnpack");
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-    }
+    let temp_dir = tempfile::tempdir()?;
+    let model_path = temp_dir.path().join("test_umap_model_3.burnpack");
 
     // Test multiple save/load cycles
     for i in 0..3 {
@@ -211,7 +200,7 @@ fn test_multiple_save_load_cycles() -> Result<(), Box<dyn std::error::Error>> {
         assert!(model_path.exists());
 
         // Load
-        let loaded_fitted = FittedUmap::load(
+        let loaded_fitted = FittedParametricUMAP::load(
             &model_path,
             config.clone(),
             10, // Input size
@@ -254,14 +243,14 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         let data = generate_test_data(*num_samples, *num_features);
 
         // Configure UMAP
-        let config = UmapConfig {
+        let config = ParametricUMAPConfig {
             n_components: 2,
             hidden_sizes: hidden_sizes.clone(),
             graph: GraphParams {
                 n_neighbors: *n_neighbors,
                 ..Default::default()
             },
-            optimization: OptimizationParams {
+            optimization: ParametricUMAPOptimizationParams {
                 n_epochs: 15,
                 ..Default::default()
             },
@@ -269,20 +258,20 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Train and save
-        let umap = Umap::with_device(config.clone(), flex().autodiff());
+        let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
         let fitted = umap.fit(data.clone(), None);
 
-        let model_path = PathBuf::from(format!("/tmp/test_umap_model_{i}.burnpack"));
-        if model_path.exists() {
-            std::fs::remove_file(&model_path)?;
-        }
-
+        let temp_dir = tempfile::tempdir()?;
+        let model_path = temp_dir
+            .path()
+            .join(format!("test_umap_model_{i}.burnpack"));
         fitted.save(&model_path)?;
         assert!(model_path.is_file());
 
         // Load and test
         let model_path_ref = &model_path;
-        let loaded_fitted = FittedUmap::load(model_path_ref, config, *num_features, flex())?;
+        let loaded_fitted =
+            FittedParametricUMAP::load(model_path_ref, config, *num_features, flex())?;
 
         // Test transformation
         let test_data = vec![data[0].clone()];
@@ -296,8 +285,6 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
             assert!(coord.is_finite());
             assert!(!coord.is_nan());
         }
-
-        std::fs::remove_file(&model_path)?;
     }
 
     Ok(())
@@ -305,10 +292,11 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_file_not_found_error() {
-    let config = UmapConfig::default();
-    let nonexistent_path = PathBuf::from("nonexistent_model.burnpack");
+    let config = ParametricUMAPConfig::default();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nonexistent_path = temp_dir.path().join("nonexistent_model.burnpack");
 
-    let result = FittedUmap::load(&nonexistent_path, config, 10, flex());
+    let result = FittedParametricUMAP::load(&nonexistent_path, config, 10, flex());
 
     // Should return an error
     assert!(result.is_err());
@@ -316,10 +304,11 @@ fn test_file_not_found_error() {
 
 #[test]
 fn test_invalid_path_error() {
-    let config = UmapConfig::default();
-    let invalid_path = PathBuf::from("/invalid/directory/model.burnpack");
+    let config = ParametricUMAPConfig::default();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let invalid_path = temp_dir.path();
 
-    let result = FittedUmap::load(&invalid_path, config, 10, flex());
+    let result = FittedParametricUMAP::load(invalid_path, config, 10, flex());
 
     // Should return an error
     assert!(result.is_err());
@@ -327,12 +316,13 @@ fn test_invalid_path_error() {
 
 #[test]
 fn test_corrupt_burnpack_error() -> Result<(), Box<dyn std::error::Error>> {
-    let corrupt_path = PathBuf::from("/tmp/test_corrupt_model.burnpack");
+    let temp_dir = tempfile::tempdir()?;
+    let corrupt_path = temp_dir.path().join("test_corrupt_model.burnpack");
     std::fs::write(&corrupt_path, b"not a valid Burnpack record")?;
 
-    let result = FittedUmap::load(&corrupt_path, UmapConfig::default(), 10, flex());
+    let result =
+        FittedParametricUMAP::load(&corrupt_path, ParametricUMAPConfig::default(), 10, flex());
     assert!(result.is_err(), "corrupt Burnpack data must fail to load");
 
-    std::fs::remove_file(corrupt_path)?;
     Ok(())
 }
