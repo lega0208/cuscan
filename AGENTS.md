@@ -57,6 +57,9 @@ uv run maturin develop --release && uv run --no-sync myscript.py
 
 `scripts/run_all.sh` and `scripts/bench.sh` write outputs and may download MNIST. Their feature assumptions are stale; prefer explicit Cargo commands and check each example's `required-features` in `Cargo.toml`.
 
+## References
+- [Burn Tensor ops](references/burn_tensor_ops.md): A list of available tensor ops and utilities for Burn Tensors, along with their pytorch equivalents.
+
 ## Code Conventions & Common Patterns
 
 - Use standard rustfmt formatting, Rust naming conventions, module documentation, and existing configuration struct-update patterns (`..Default::default()`). Python uses Ruff with a 100-character line limit.
@@ -75,9 +78,9 @@ uv run maturin develop --release && uv run --no-sync myscript.py
 
 ## Runtime/Tooling Preferences
 
-Use Cargo for Rust (edition 2021) and uv for Python (3.10+). Maturin builds the native Python module. No Rust toolchain pin or CI configuration is present.
+Use Cargo for Rust (edition 2024) and uv for Python (3.10+). Maturin builds the native Python module. No Rust toolchain pin or CI configuration is present.
 
-The manifest defaults are currently `cuda,verbose`, despite older documentation claiming WGPU defaults. `--no-default-features` selects a portable Flex build. `gpu` enables WGPU; `cuda` needs NVIDIA runtime support. The `all` feature does not include CUDA, but adding it without disabling defaults still retains CUDA. Python bindings currently inherit CUDA defaults and also enable WGPU.
+The manifest defaults are currently `cuda,cpu,verbose`, despite older documentation claiming WGPU defaults. `--no-default-features` selects a portable Flex build. `gpu` enables WGPU; `cuda` needs NVIDIA runtime support. Python bindings currently inherit CUDA defaults and also enable WGPU.
 
 Burn/CubeCL dependencies use exact prerelease pins; keep related versions aligned across root and binding manifests. Tests have a Git-sourced MNIST dependency, so initial dependency resolution can require network access.
 
@@ -88,7 +91,7 @@ Rust uses `#[test]` integration/unit tests and Criterion benchmarks; Python uses
 For required CUDA coverage rather than silent hardware skips:
 
 ```sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test --no-default-features --features cuda --lib cuda_backend -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 cargo test --lib cuda_backend -- --nocapture
 ```
 
 Test observable shape, finite outputs, numerical tolerances, deterministic seeds, gradients, validation failures, cancellation, and persistence errors. New backend operations should share forward/gradient assertions across devices. Use `tempfile` for new filesystem tests; existing serialization tests contain potentially colliding `/tmp` paths.
