@@ -1,14 +1,14 @@
 use super::kernel::*;
 use burn::{
     backend::{
+        TensorMetadata,
         cubecl::dtype_to_storage_type,
         tensor::{FloatTensor, IntTensor},
-        TensorMetadata,
     },
+    cubecl::prelude::*,
     tensor::{DType, Shape},
 };
-use burn_cubecl::{kernel::into_contiguous, tensor::CubeTensor, CubeBackend};
-use cubecl::prelude::*;
+use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
 const KNN_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 

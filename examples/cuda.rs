@@ -1,3 +1,5 @@
+#![cfg(feature = "parametric")]
+
 use fast_umap::cuda_backend::device_count;
 use fast_umap::prelude::{GraphParams, ParametricUMAPConfig, ParametricUMAPOptimizationParams};
 use rand::RngExt;

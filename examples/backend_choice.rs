@@ -1,3 +1,5 @@
+#![cfg(feature = "parametric")]
+
 /// Runtime device selection: wgpu or Flex CPU.
 ///
 /// Usage:

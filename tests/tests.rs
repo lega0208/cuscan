@@ -12,18 +12,22 @@ use burn::backend::Dispatch;
 ///     via the standard-backend overloads in distances.rs
 use burn::tensor::{DType, Device, Tensor, TensorData};
 use fast_umap::backend::UmapOps;
+#[cfg(feature = "parametric")]
+use fast_umap::{
+    Metric,
+    parametric_umap::{
+        ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+        model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},
+    },
+};
 use fast_umap::{
     normalizer::normalize,
-    parametric_umap::{
-        model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},
-        ParametricUMAPConfig, ParametricUMAPOptimizationParams,
-    },
     utils::{
         convert_tensor_to_vector, convert_vector_to_tensor, format_duration, generate_test_data,
         normalize_data, normalize_tensor,
     },
-    Metric,
 };
+
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -252,6 +256,7 @@ fn normalizer_shape_preserved() {
 // ===========================================================================
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_config_defaults() {
     let cfg = ParametricUMAPModelConfigBuilder::default().build().unwrap();
     assert_eq!(cfg.input_size, 100);
@@ -260,6 +265,7 @@ fn model_config_defaults() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_config_custom() {
     let cfg = ParametricUMAPModelConfigBuilder::default()
         .input_size(28)
@@ -277,6 +283,7 @@ fn model_config_custom() {
 // ===========================================================================
 
 #[test]
+#[cfg(feature = "parametric")]
 fn parametric_umap_config_defaults() {
     let cfg = ParametricUMAPConfig::default();
     assert_eq!(cfg.graph.metric, Metric::Euclidean);
@@ -288,6 +295,7 @@ fn parametric_umap_config_defaults() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn parametric_umap_config_custom() {
     let cfg = ParametricUMAPConfig {
         n_components: 3,
@@ -324,6 +332,7 @@ fn parametric_umap_config_custom() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn metric_from_str() {
     assert_eq!(Metric::from("euclidean"), Metric::Euclidean);
     assert_eq!(Metric::from("euclidean_knn"), Metric::EuclideanKNN);
@@ -333,11 +342,13 @@ fn metric_from_str() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 #[should_panic]
 fn metric_from_invalid_str_panics() {
     let _ = Metric::from("invalid_metric");
 }
 
+#[cfg(feature = "parametric")]
 // ===========================================================================
 // ParametricUMAPModel construction and forward pass
 // ===========================================================================
@@ -353,6 +364,7 @@ fn make_model(input: usize, hidden: Vec<usize>, output: usize) -> ParametricUMAP
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_forward_output_shape_2d() {
     let device = cpu();
     let model = make_model(10, vec![32], 2);
@@ -366,6 +378,7 @@ fn model_forward_output_shape_2d() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_forward_output_shape_3d() {
     let device = cpu();
     let model = make_model(8, vec![16, 8], 3);
@@ -379,6 +392,7 @@ fn model_forward_output_shape_3d() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_forward_no_nan() {
     let device = cpu();
     let model = make_model(16, vec![32, 16], 2);
@@ -394,6 +408,7 @@ fn model_forward_no_nan() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_forward_deterministic() {
     // Same input → same output (model is not stochastic at inference)
     let device = cpu();
@@ -417,6 +432,7 @@ fn model_forward_deterministic() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_single_hidden_layer() {
     let model = make_model(4, vec![8], 2);
     let device = cpu();
@@ -426,6 +442,7 @@ fn model_single_hidden_layer() {
 }
 
 #[test]
+#[cfg(feature = "parametric")]
 fn model_deep_network() {
     let model = make_model(20, vec![64, 32, 16, 8], 2);
     let device = cpu();
@@ -433,12 +450,13 @@ fn model_deep_network() {
     let input: Tensor<2> = Tensor::from_data(TensorData::new(data, [4, 20]), &device);
     let out = model.forward(input);
     assert_eq!(out.dims(), [4, 2]);
-    assert!(out
-        .to_data()
-        .try_to_vec::<f32>()
-        .unwrap()
-        .iter()
-        .all(|v| v.is_finite()));
+    assert!(
+        out.to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite())
+    );
 }
 
 // ===========================================================================
@@ -453,7 +471,7 @@ fn euclidean_distances_cpu(x: Tensor<2>) -> Tensor<2> {
     let x3 = x.clone().unsqueeze::<3>(); // [1, n, d]
     let xt = x.unsqueeze_dim(1); // [n, 1, d]
     let diff = x3 - xt; // [n, n, d]
-                        // sum_dim keeps the dim (gives [n,n,1]), then squeeze to [n,n]
+    // sum_dim keeps the dim (gives [n,n,1]), then squeeze to [n,n]
     let sq_sum: Tensor<3> = diff.powi_scalar(2).sum_dim(2);
     sq_sum.squeeze_dim::<2>(2).sqrt() // [n, n]
 }

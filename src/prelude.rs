@@ -2,15 +2,19 @@
 
 #[cfg(feature = "plotters")]
 pub use crate::chart::{chart_tensor, chart_vector};
-pub use crate::utils::generate_test_data;
-pub use crate::{
-    FittedParametricUMAP, FittedUMAP, GraphParams, ManifoldParams, Metric, ParametricUMAP,
-    ParametricUMAPConfig, ParametricUMAPEpochProgress, ParametricUMAPLossReduction,
-    ParametricUMAPOptimizationParams, UMAP,
+#[cfg(feature = "parametric")]
+pub use crate::parametric_umap::{
+    FittedParametricUMAP, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPEpochProgress,
+    ParametricUMAPLossReduction, ParametricUMAPModel, ParametricUMAPModelConfig,
+    ParametricUMAPModelConfigBuilder, ParametricUMAPOptimizationParams,
 };
+pub use crate::utils::generate_test_data;
+pub use crate::{FittedUMAP, GraphParams, ManifoldParams, Metric, UMAP};
+
 use num::Float;
 
 /// Fit a parametric embedding using default settings and the default Burn device.
+#[cfg(feature = "parametric")]
 pub fn parametric_umap<F>(data: Vec<Vec<F>>) -> FittedParametricUMAP
 where
     F: Float + num::FromPrimitive + burn::tensor::Element,
@@ -19,6 +23,7 @@ where
 }
 
 /// Fit a parametric embedding with the requested output dimensionality.
+#[cfg(feature = "parametric")]
 pub fn parametric_umap_size<F>(data: Vec<Vec<F>>, output_size: usize) -> FittedParametricUMAP
 where
     F: Float + num::FromPrimitive + burn::tensor::Element,

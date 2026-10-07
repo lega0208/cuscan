@@ -1,3 +1,5 @@
+#![cfg(feature = "parametric")]
+
 /// Criterion benchmarks for fast-umap.
 ///
 /// All benchmarks run on Burn's Flex CPU device so no GPU is

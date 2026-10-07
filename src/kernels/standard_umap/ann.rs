@@ -1,11 +1,11 @@
 //! Direct CubeCL NN-Descent kernel for the CUDA standard-UMAP path.
 
 use burn::{
-    backend::{cubecl::dtype_to_storage_type, tensor::FloatTensor, TensorMetadata},
+    backend::{TensorMetadata, cubecl::dtype_to_storage_type, tensor::FloatTensor},
+    cubecl::prelude::*,
     tensor::{DType, Shape},
 };
-use burn_cubecl::{kernel::into_contiguous, tensor::CubeTensor, CubeBackend};
-use cubecl::prelude::*;
+use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
 use crate::standard_umap::ann::candidate_width;
 

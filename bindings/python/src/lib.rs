@@ -1,12 +1,16 @@
+#[cfg(feature = "parametric")]
 use std::sync::{Arc, Mutex};
 
-use burn::tensor::{Device, DeviceIndex, DeviceKind};
+#[cfg(feature = "parametric")]
 use crossbeam_channel::unbounded;
 use fast_umap::{
-    validate_parametric_umap_data, BackendChoice, FittedParametricUMAP as RustFittedParametricUMAP,
-    FittedUMAP as RustFittedUMAP, GraphParams, Init, ManifoldParams, Metric, NeighborSearch,
-    ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams, UMAPConfig, UmapError,
-    UMAP,
+    BackendChoice, FittedUMAP as RustFittedUMAP, Init, NeighborSearch, UMAP, UMAPConfig, UmapError,
+};
+#[cfg(feature = "parametric")]
+use fast_umap::{
+    Device, DeviceIndex, DeviceKind, FittedParametricUMAP as RustFittedParametricUMAP, GraphParams,
+    ManifoldParams, Metric, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    validate_parametric_umap_data,
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
@@ -15,6 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 #[pyclass(frozen, unsendable)]
+#[cfg(feature = "parametric")]
 struct FittedParametricUMAP {
     inner: Mutex<Option<Box<RustFittedParametricUMAP>>>,
     device: String,
@@ -118,7 +123,7 @@ fn fit_umap(
         _ => {
             return Err(PyValueError::new_err(
                 "neighbor_search must be 'auto', 'exact' or 'approximate'",
-            ))
+            ));
         }
     };
     let config = UMAPConfig {
@@ -149,6 +154,7 @@ fn fit_umap(
 }
 
 #[pymethods]
+#[cfg(feature = "parametric")]
 impl FittedParametricUMAP {
     #[getter]
     fn device(&self) -> &str {
@@ -227,6 +233,7 @@ impl FittedParametricUMAP {
     }
 }
 
+#[cfg(feature = "parametric")]
 fn fit_impl(
     x: Vec<Vec<f32>>,
     config: ParametricUMAPConfig,
@@ -276,6 +283,7 @@ fn fit_impl(
   timeout=None,
   seed=9999,
   verbose=false))]
+#[cfg(feature = "parametric")]
 #[allow(clippy::too_many_arguments)]
 fn fit_parametric_umap(
     py: Python<'_>,
@@ -330,7 +338,7 @@ fn fit_parametric_umap(
         _ => {
             return Err(PyValueError::new_err(
                 "device must be 'cuda', 'wgpu' or 'cpu'",
-            ))
+            ));
         }
     };
     let model = py.detach(|| fit_impl(data, config, backend_device))?;
@@ -343,8 +351,10 @@ fn fit_parametric_umap(
 #[pymodule]
 fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "parametric")]
     module.add_class::<FittedParametricUMAP>()?;
     module.add_class::<FittedUMAP>()?;
+    #[cfg(feature = "parametric")]
     module.add_function(wrap_pyfunction!(fit_parametric_umap, module)?)?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
     Ok(())

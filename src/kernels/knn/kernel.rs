@@ -1,5 +1,5 @@
+use burn::cubecl::{cube, prelude::*};
 use core::f32;
-use cubecl::{cube, prelude::*};
 
 /// Cast a `u32` to `f32` inside a CubeCL kernel.
 ///

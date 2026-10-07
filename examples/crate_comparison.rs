@@ -22,6 +22,7 @@ use fast_umap::{
 };
 
 // ── umap-rs imports ──────────────────────────────────────────────────────────
+#[cfg(feature = "umap-rs")]
 use umap_rs::{Umap as UmapRs, UmapConfig as UmapRsConfig};
 
 // ─── Configuration ───────────────────────────────────────────────────────────

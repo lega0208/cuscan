@@ -1,3 +1,5 @@
+#![cfg(feature = "parametric")]
+
 /// Benchmark the Flex CPU backend across a range of workloads.
 ///
 /// Usage:

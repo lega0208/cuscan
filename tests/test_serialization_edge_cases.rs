@@ -1,3 +1,6 @@
+
+#![cfg(feature = "parametric")]
+
 use burn::tensor::Device;
 use fast_umap::prelude::*;
 use fast_umap::{FittedParametricUMAP, ParametricUMAP};

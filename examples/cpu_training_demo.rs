@@ -1,3 +1,5 @@
+#![cfg(feature = "parametric")]
+
 //! CPU training demonstration using Burn's Flex backend.
 //!
 //! Flex provides pure-Rust CPU execution for parametric UMAP without a GPU.

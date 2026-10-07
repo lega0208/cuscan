@@ -1,3 +1,6 @@
+// Currently only used for the parametric UMAP implementation, remove the feature guard if needed elsewhere.
+#![cfg(feature = "parametric")]
+
 use burn::tensor::{Device, Tensor};
 use num::{Float, ToPrimitive};
 use std::collections::{BTreeMap, BTreeSet};
@@ -341,14 +344,14 @@ mod tests {
 
     #[test]
     fn self_slot_rejects_duplicate_self_and_invalid_neighbor_indices() {
-        assert!(std::panic::catch_unwind(|| {
-            with_self_slots(vec![1, 1, 0, 2], vec![0.0; 4], 2, 3)
-        })
-        .is_err());
-        assert!(std::panic::catch_unwind(|| {
-            with_self_slots(vec![0, 0, 1, 2], vec![0.0; 4], 2, 3)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { with_self_slots(vec![1, 1, 0, 2], vec![0.0; 4], 2, 3) })
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| { with_self_slots(vec![0, 0, 1, 2], vec![0.0; 4], 2, 3) })
+                .is_err()
+        );
         assert!(
             std::panic::catch_unwind(|| { with_self_slots(vec![-2, 0], vec![0.0; 2], 2, 2) })
                 .is_err()
@@ -362,20 +365,24 @@ mod tests {
     #[test]
     fn self_slot_rejects_invalid_distances_for_valid_neighbors() {
         for distance in [f32::NAN, f32::INFINITY, -1.0] {
-            assert!(std::panic::catch_unwind(|| {
-                with_self_slots(vec![1, 0], vec![distance, 0.0], 2, 2)
-            })
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    with_self_slots(vec![1, 0], vec![distance, 0.0], 2, 2)
+                })
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn directed_memberships_rejects_non_sentinel_invalid_indices() {
         for index in [-2, 2] {
-            assert!(std::panic::catch_unwind(|| {
-                directed_memberships(&[0, index], &[0.0, 1.0], &[1.0], &[0.0], 2)
-            })
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    directed_memberships(&[0, index], &[0.0, 1.0], &[1.0], &[0.0], 2)
+                })
+                .is_err()
+            );
         }
     }
 
@@ -422,7 +429,9 @@ mod tests {
         let encoder_values = encoder_input.to_data().try_to_vec::<f32>().unwrap();
         assert_eq!(
             encoder_values,
-            vec![0.0, 0.0, 7.0, 0.0, 100.0, 7.0, 10.0, 1.0, 7.0, 0.0, 10_000.0, 7.0,]
+            vec![
+                0.0, 0.0, 7.0, 0.0, 100.0, 7.0, 10.0, 1.0, 7.0, 0.0, 10_000.0, 7.0,
+            ]
         );
     }
 

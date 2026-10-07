@@ -1,3 +1,4 @@
+#![cfg(feature = "parametric")]
 use burn::tensor::Device;
 use fast_umap::{
     validate_parametric_umap_data, validate_parametric_umap_input, ParametricUMAP,

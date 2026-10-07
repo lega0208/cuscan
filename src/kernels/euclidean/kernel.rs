@@ -1,4 +1,4 @@
-use cubecl::{cube, prelude::*};
+use burn::cubecl::{cube, prelude::*};
 
 /// Forward kernel — one thread per (row, col) upper-triangle pair.
 ///

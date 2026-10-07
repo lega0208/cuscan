@@ -9,7 +9,12 @@ repository = "https://github.com/eugenehp/fast-map"
 homepage = "https://github.com/eugenehp/fast-map"
 documentation = "https://docs.rs/fast-umap/latest/fast_umap/"
 license = "MIT"
-edition = "2021"
+edition = "2024"
+
+[workspace]
+members = [".", "bindings/python"]
+default-members = ["."]
+resolver = "2"
 
 # docs.rs build configuration.
 # `all-features = true`  — build docs with every feature enabled so nothing
@@ -24,19 +29,20 @@ rustdoc-args = ["--cfg", "docsrs"]
 exclude = ["figures/*"]
 
 [dependencies]
-burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+burn = { version = "0.22.0", default-features = false, features = [
   "std",
-  "autodiff",
   "autotune",
-  "optim",
+  "autodiff",
+  "cubecl",
   "extension",
+  "linalg",
   "store",
   "flex",
 ] }
-burn-cubecl = { version = "=0.22.0-pre.4", optional = true }
+burn-cubecl = { version = "0.22.0", default-features = false }
 crossbeam-channel = "0.5.17"
 ctrlc = "3.5.2"
-cubecl = { version = "=0.11.0-pre.4", optional = true }
+cubecl = { version = "0.11.0", default-features = false }
 cudarc = { version = "0.19.10", features = [
   "std",
   "driver",
@@ -53,16 +59,14 @@ num = "0.4.3"
 num-traits = "0.2.19"
 plotters = { version = "0.3.7", optional = true }
 prettytable = "0.10.0"
-umap-rs = { version = "0.4.5", optional = true }
 rand = "0.10.3"
 rayon = "1.12.0"
 serde = "1.0.229"
+umap-rs = { version = "0.4.5", optional = true }
 
 [dev-dependencies]
-burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+burn = { version = "0.22.0", default-features = false, features = [
   "std",
-  "autodiff",
-  "optim",
   "extension",
   "store",
   "flex",
@@ -72,13 +76,48 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 mnist = { version = "0.6.0", git = "https://github.com/eugenehp/mnist.git", features = [
   "download",
 ] }
-umap-rs = "0.4.5"
 serde_json = "1.0.151"
 chrono = "0.4.45"
 zip = "=0.6.6"
 
+[features]
+default = ["cuda", "cpu", "verbose"]
+# Core backend features
+gpu = [
+  "burn/cubecl",
+  "burn/wgpu",
+  "burn/fusion",
+] # GPU backend with WGPU support
+# CUDA is intentionally excluded from `all` and the default features because it requires a CUDA toolkit.
+cuda = [
+  "burn/cubecl",
+  "burn/cuda",
+  "burn/fusion",
+  "dep:cudarc",
+] # NVIDIA CUDA backend
+cpu = [
+  "burn/x86-v4",
+  "burn/simd",
+  "burn/rayon",
+] # Flex backend optimization features
+
+tracing = ["burn/tracing"]
+
+parametric = ["burn/optim"] # Parametric UMAP support
+
+# Optional features
+pca = []                               # PCA warm-start for initial embedding
+nn-descent = []                        # Approximate KNN via NN-Descent for large datasets
+verbose = []                           # Verbose output and progress bars
+plotters = ["dep:plotters", "dep:hsl"] # Plotting support
+
+
+# Crate comparison
+umap-rs = ["dep:umap-rs"]
+
 [[bench]]
 name = "umap_bench"
+required-features = ["parametric"]
 harness = false
 
 [[example]]
@@ -103,7 +142,7 @@ required-features = ["gpu", "plotters"]
 
 [[example]]
 name = "crate_comparison"
-required-features = ["plotters"]
+required-features = ["umap-rs", "plotters"]
 
 [[example]]
 name = "advanced"
@@ -111,6 +150,11 @@ required-features = ["gpu"]
 
 [[example]]
 name = "backend_choice"
+required-features = ["parametric"]
+
+[[example]]
+name = "cpu_training_demo"
+required-features = ["parametric"]
 
 [[example]]
 name = "simple"
@@ -126,6 +170,7 @@ required-features = ["gpu", "cpu"]
 
 [[example]]
 name = "backend_benchmark"
+required-features = ["parametric"]
 
 [[example]]
 name = "pca_comparison"
@@ -137,41 +182,8 @@ required-features = ["nn-descent"]
 
 [[example]]
 name = "cuda"
-required-features = ["cuda"]
+required-features = ["cuda", "parametric"]
 
 [[bin]]
 name = "bench_report"
 required-features = ["gpu"]
-
-[features]
-default = ["cuda", "nn-descent", "verbose"]
-# Core backend features
-gpu = [
-  "burn/wgpu",
-  "burn/fusion",
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "cubecl/wgpu",
-] # GPU backend with WGPU support
-# CUDA is intentionally excluded from `all` and the default features because it requires a CUDA toolkit.
-cuda = [
-  "burn/cuda",
-  "burn/fusion",
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "cubecl/cuda",
-  "dep:cudarc",
-] # NVIDIA CUDA backend
-cpu = ["dep:umap-rs"] # CPU backend with umap-rs fallback
-# Optional features
-pca = []                               # PCA warm-start for initial embedding
-nn-descent = []                        # Approximate KNN via NN-Descent for large datasets
-verbose = []                           # Verbose output and progress bars
-plotters = ["dep:plotters", "dep:hsl"] # Plotting support
-# Combined features for convenience
-all = ["gpu", "cpu", "pca", "nn-descent", "verbose", "plotters"]
-
-[workspace]
-members = [".", "bindings/python"]
-default-members = ["."]
-resolver = "2"

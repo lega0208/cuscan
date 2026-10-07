@@ -1,8 +1,10 @@
-use burn::backend::tensor::{FloatTensor, IntTensor};
-use cubecl::CubeDim;
+use burn::{
+    backend::tensor::{FloatTensor, IntTensor},
+    cubecl::CubeDim,
+};
+use burn_cubecl::CubeBackend;
 
 use crate::backend::UmapOps;
-use burn_cubecl::CubeBackend;
 
 mod euclidean;
 mod knn;

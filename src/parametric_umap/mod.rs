@@ -1,3 +1,4 @@
+#![cfg(feature = "parametric")]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
@@ -82,7 +83,7 @@ use num::Float;
 
 use self::config::TrainerConfig;
 use self::trainer::train_sparse;
-use crate::graph::{fit_ab, GraphParams};
+use crate::graph::{GraphParams, fit_ab};
 use crate::utils::{convert_tensor_to_vector, convert_vector_to_tensor};
 
 mod config;

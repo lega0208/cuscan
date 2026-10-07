@@ -229,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parametric")]
     fn cuda_umap_fit_smoke_test_when_available() {
         let Some(device) = available_device_or_skip() else {
             return;
@@ -261,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parametric")]
     fn cuda_umap_save_load_round_trip_when_available() -> Result<(), Box<dyn std::error::Error>> {
         let Some(device) = available_device_or_skip() else {
             return Ok(());

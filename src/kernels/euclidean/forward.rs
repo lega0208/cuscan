@@ -1,11 +1,11 @@
 use super::kernel::*;
-use crate::kernels::DEFAULT_CUBE_DIM;
+use crate::kernels::{CubeBackend, DEFAULT_CUBE_DIM};
 use burn::{
-    backend::{cubecl::dtype_to_storage_type, tensor::FloatTensor, TensorMetadata},
+    backend::{TensorMetadata, cubecl::dtype_to_storage_type, tensor::FloatTensor},
+    cubecl::prelude::*,
     tensor::Shape,
 };
-use burn_cubecl::{kernel::into_contiguous, tensor::CubeTensor, CubeBackend};
-use cubecl::prelude::*;
+use burn_cubecl::{kernel::into_contiguous, tensor::CubeTensor};
 
 /// Compute the `[n, n]` Euclidean pairwise distance matrix on CubeCL.
 pub fn forward(x: FloatTensor<CubeBackend>) -> FloatTensor<CubeBackend> {

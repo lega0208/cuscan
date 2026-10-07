@@ -5,6 +5,7 @@
 //! The estimator and neural configuration use explicit parametric names:
 //!
 //! ```
+//! #[cfg(feature = "parametric")]
 //! use fast_umap::{
 //!     FittedParametricUMAP, ParametricUMAP, ParametricUMAPConfig,
 //!     ParametricUMAPLossReduction, ParametricUMAPOptimizationParams,
@@ -58,8 +59,6 @@ pub mod autodiff_ops;
 pub mod backend;
 #[cfg(feature = "plotters")]
 pub mod chart;
-#[cfg(feature = "cpu")]
-pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod distances;
@@ -80,6 +79,7 @@ pub mod standard_umap;
 pub mod utils;
 
 pub use graph::{GraphParams, ManifoldParams, Metric};
+#[cfg(feature = "parametric")]
 pub use parametric_umap::{
     validate_parametric_umap_data, validate_parametric_umap_input, FittedParametricUMAP,
     ParametricUMAP, ParametricUMAPConfig, ParametricUMAPEpochProgress, ParametricUMAPLossReduction,
@@ -89,3 +89,6 @@ pub use parametric_umap::{
 pub use standard_umap::{
     BackendChoice, Embedding, FittedUMAP, Init, NeighborSearch, Result, UMAPConfig, UmapError, UMAP,
 };
+
+// export for python bindings
+pub use burn::tensor::{Device, DeviceIndex, DeviceKind};
