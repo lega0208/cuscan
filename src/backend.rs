@@ -87,3 +87,159 @@ pub trait UmapOps: Backend {
         grad_output: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 }
+
+/// Forward-only operations used by the nonparametric standard UMAP path.
+///
+/// Kept separate from [`UmapOps`] so bounded graph/search work cannot
+/// accidentally route through the differentiable full-pairwise operations.
+#[backend_extension(Cube: cfg(feature = "cuda"), Flex, Fusion: cfg(feature = "cuda"))]
+pub trait StandardUmapOps: Backend {
+    #[fusion(meta = |data, k, seed, max_iterations| {
+        let shape = [data.shape[0], *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), burn::tensor::DType::I32),
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), data.dtype),
+        )
+    })]
+    /// Approximate fit neighbors by bounded NN-Descent. Returns `[N, k]` nonself
+    /// indices and Euclidean distances sorted by `(distance, index)`.
+    fn approximate_neighbors(
+        data: FloatTensor<Self>,
+        k: u32,
+        seed: u64,
+        max_iterations: u32,
+    ) -> (IntTensor<Self>, FloatTensor<Self>);
+
+    #[fusion(meta = |query, reference, graph, k, candidate_capacity, visit_capacity, seed, query_offset| {
+        let rows = query.shape[0];
+        let shape = [rows, *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), graph.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), query.dtype),
+            burn::backend::fusion::custom::TensorSpec::new([rows, 2].into(), graph.dtype),
+        )
+    })]
+    /// Search a proximity graph with bounded retained and unique-evaluation capacities.
+    /// The last result contains `[peak_candidates, unique_evaluations]` per query;
+    /// invalid graph indices are marked by `[-1, -1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn approximate_query(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+        graph: IntTensor<Self>,
+        k: u32,
+        candidate_capacity: u32,
+        visit_capacity: u32,
+        seed: u64,
+        query_offset: u64,
+    ) -> (IntTensor<Self>, FloatTensor<Self>, IntTensor<Self>);
+
+    #[fusion(meta = |indices, distances, local_connectivity, bandwidth, set_op_mix_ratio, bipartite, n_reference| {
+        let n = indices.shape[0];
+        let k = indices.shape[1];
+        let capacity = n.checked_mul(k).and_then(|value| value.checked_mul(2)).expect("fuzzy graph capacity overflows usize");
+        (
+            burn::backend::fusion::custom::TensorSpec::new([capacity].into(), burn::tensor::DType::I32),
+            burn::backend::fusion::custom::TensorSpec::new([capacity].into(), burn::tensor::DType::I32),
+            burn::backend::fusion::custom::TensorSpec::new([capacity].into(), distances.dtype),
+            burn::backend::fusion::custom::TensorSpec::new([n].into(), distances.dtype),
+            burn::backend::fusion::custom::TensorSpec::new([n].into(), distances.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(indices.shape.clone(), distances.dtype),
+        )
+    })]
+    /// Compute smooth-kNN memberships and their sparse fuzzy symmetrization.
+    /// COO arrays are sorted by `(head, tail)`, unique, and have `2*N*K` capacity;
+    /// unused slots are zero. Bipartite query and reference ids retain their indices.
+    /// If an index other than the valid range or the `-1` disconnected marker is
+    /// present, the first COO entry is marked by head/tail `-2` and weight `-1`.
+    #[allow(clippy::type_complexity)]
+    fn fuzzy_graph(
+        indices: IntTensor<Self>,
+        distances: FloatTensor<Self>,
+        local_connectivity: f32,
+        bandwidth: f32,
+        set_op_mix_ratio: f32,
+        bipartite: bool,
+        n_reference: u32,
+    ) -> (
+        IntTensor<Self>,
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    );
+
+    #[fusion(meta = |query, reference, k, exclude_self, query_offset| {
+        let shape = [query.shape[0], *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(
+                shape.into(),
+                burn::tensor::DType::I32,
+            ),
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), query.dtype),
+        )
+    })]
+    /// Select exact nearest reference rows for a bounded query block.
+    /// Results are sorted by `(Euclidean distance, reference index)`.
+    fn exact_neighbors(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+        k: u32,
+        exclude_self: bool,
+        query_offset: u32,
+    ) -> (IntTensor<Self>, FloatTensor<Self>);
+
+    /// Compute squared Euclidean distances from a query block `[B, D]` to
+    /// reference rows `[N, D]`, returning only the bounded `[B, N]` block.
+    #[fusion(dtype = query, shape = {
+        let mut shape = query.clone();
+        shape[1] = reference[0];
+        shape
+    })]
+    fn squared_euclidean_distance_block(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    #[fusion(meta = |head_embedding, tail_embedding, heads, tails, weights, epochs_per_sample, epoch_of_next_sample, epochs_per_negative_sample, epoch_of_next_negative_sample, rng_state, epoch, a, b, gamma, alpha, negative_sample_rate, move_other, shared_embeddings| {
+        (
+            burn::backend::fusion::custom::TensorSpec::new(head_embedding.shape.clone(), head_embedding.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(tail_embedding.shape.clone(), tail_embedding.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(epoch_of_next_sample.shape.clone(), epoch_of_next_sample.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(epoch_of_next_negative_sample.shape.clone(), epoch_of_next_negative_sample.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(rng_state.shape.clone(), rng_state.dtype),
+            burn::backend::fusion::custom::TensorSpec::new([2].into(), burn::tensor::DType::I32),
+        )
+    })]
+    /// Optimize one standard UMAP epoch using only selected-backend tensors.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    fn optimize_epoch(
+        head_embedding: FloatTensor<Self>,
+        tail_embedding: FloatTensor<Self>,
+        heads: IntTensor<Self>,
+        tails: IntTensor<Self>,
+        weights: FloatTensor<Self>,
+        epochs_per_sample: FloatTensor<Self>,
+        epoch_of_next_sample: FloatTensor<Self>,
+        epochs_per_negative_sample: FloatTensor<Self>,
+        epoch_of_next_negative_sample: FloatTensor<Self>,
+        rng_state: IntTensor<Self>,
+        epoch: u32,
+        a: f32,
+        b: f32,
+        gamma: f32,
+        alpha: f32,
+        negative_sample_rate: f32,
+        move_other: bool,
+        shared_embeddings: bool,
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        IntTensor<Self>,
+        IntTensor<Self>,
+    );
+}

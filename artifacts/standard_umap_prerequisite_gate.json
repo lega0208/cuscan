@@ -1,0 +1,35 @@
+{
+  "deferredToBatch": {
+    "ranLanes": [
+      "targetedVerification"
+    ],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": [
+        "cargo fmt --all -- --check",
+        "uv run --no-sync ruff check tests/fixtures/generate_standard_umap.py python/tests/standard_umap_evaluator.py",
+        "uv run --no-sync ruff format --check tests/fixtures/generate_standard_umap.py python/tests/standard_umap_evaluator.py",
+        "cargo run --no-default-features --example standard_spectral_proof",
+        "FAST_UMAP_REQUIRE_CUDA=1 cargo test --no-default-features --features cuda --test test_standard_dispatch",
+        "uv run --no-sync python tests/fixtures/generate_standard_umap.py",
+        "uv run --no-sync python python/tests/standard_umap_evaluator.py --self-check",
+        "uv run --no-sync python python/tests/standard_umap_evaluator.py tests/fixtures/standard_umap_quality.npz --output artifacts/standard_umap_reference_self_check.json"
+      ],
+      "evidence": "Matrix-free faer0.24.4/root ndarray0.17.2 proof converges on lifted3path, connected80cycle and disconnected72/80cycles with residuals<1e-9. Forward-only native Dispatch/Fusion proof passes2 tests on Flex and actual RTX3080, including rectangular/ties/zeros/large-offset cases. Pinned Python3.14 umap0.5.12 reference fixtures/data/splits/seeds generated before implementation scoring; evaluator adversarial self-check passes, reference self-comparison reports zero quality gaps and correctly fails missing recall coverage. Prerequisites only, not estimator parity. Pinned Burn CubeCL dependency future-incompatibility warning remains recorded. Full cohort deferred to G002 boundary."
+    }
+  },
+  "amendments": [
+    {
+      "id": "F2-solver-supersession",
+      "status": "historical evidence superseded",
+      "supersedes": "deferredToBatch.targetedVerification.evidence (faer partial matrix-free solver claim)",
+      "reason": "The faer partial eigensolver has an unbounded reorthogonalization loop at exact Krylov breakdown and was removed. The shipped initializer in src/standard_umap/init.rs is a bounded restarted Lanczos/Rayleigh-Ritz driver (MAX_KRYLOV_BASIS=64, two reorthogonalization passes, operator budget 5*N per mode, faer EVD only on the <=64x64 projected matrix, residual and orthogonality checked at 1e-7). Genuine budget exhaustion, breakdown or nonconvergence returns UmapError::SpectralConvergence, which only the connected, centroid and large-component boundaries convert into the source-faithful warning plus seeded uniform [-10,10] initialization.",
+      "evidence": [
+        "cargo test --no-default-features --lib standard_umap::init (bounded Lanczos analytic path/cycle modes, forced budget failure warning, zero-span numerical error)",
+        "cargo test --no-default-features --test test_standard_init (8 tests, including the 300-cycle)",
+        "cargo test --release --no-default-features --test test_standard_quality and FAST_UMAP_REQUIRE_CUDA=1 --features cuda: five-seed fit trustworthiness@15 mean gap Flex 0.000565, CUDA 0.001126 (limit 0.02)"
+      ],
+      "removed": "examples/standard_spectral_proof.rs (faer partial proof program) deleted with the superseded solver; its command in targetedVerification is historical only."
+    }
+  ]
+}

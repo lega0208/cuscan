@@ -68,7 +68,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
-    { name = "umap-learn", specifier = ">=0.5.12" },
+    { name = "umap-learn", specifier = "==0.5.12" },
 ]
 
 [[package]]

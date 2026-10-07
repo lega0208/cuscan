@@ -11,11 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- Renamed the active Rust and Python estimator APIs to `ParametricUMAP`, `FittedParametricUMAP`, and `ParametricUMAPConfig`; neural types are `ParametricUMAPModel*`, `ParametricUMAPOptimizationParams`, `ParametricUMAPLossReduction`, and `ParametricUMAPEpochProgress`. Shared `Metric`, `GraphParams`, and `ManifoldParams` remain graph APIs. The estimator/model/private trainer/weight persistence now belong to `src/parametric_umap/`, while shared graph math belongs to `src/graph/`. Removed the deprecated dense API and compatibility aliases; this crate does not implement classical UMAP. The `fast-umap` package/crate identity is unchanged.
+- Renamed the active Rust and Python estimator APIs to `ParametricUMAP`, `FittedParametricUMAP`, and `ParametricUMAPConfig`; neural types are `ParametricUMAPModel*`, `ParametricUMAPOptimizationParams`, `ParametricUMAPLossReduction`, and `ParametricUMAPEpochProgress`. Shared `Metric`, `GraphParams`, and `ManifoldParams` remain graph APIs. The estimator/model/private trainer/weight persistence now belong to `src/parametric_umap/`, while shared graph math belongs to `src/graph/`. Removed the deprecated dense API and compatibility aliases. The `fast-umap` package/crate identity is unchanged.
 - The model type/module relocation preserves the Burn weight payload structure; inputs remain caller-provided raw values and no scaler state is introduced.
 
 ### Added
 
+- **Standard (non-parametric) UMAP:** Rust `UMAP`/`FittedUMAP` with `UMAPConfig`, `BackendChoice` (Flex or CUDA) and `NeighborSearch` (`Exact`, `Approximate`, `Auto`), plus Python `fast_umap.UMAP`. Follows umap-learn 0.5.12 (smooth-kNN fuzzy graph, bounded Lanczos spectral initialization, reference SGD schedule and Tausworthe sampling); fit and transform run neighbor search, graph construction and layout on the selected backend through the forward-only `StandardUmapOps` extension.
 - Added an optional CUDA backend that reuses the CubeCL kernels; enable it with the `cuda` feature. Runtime requires an NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`); `nvcc`/CUDA toolkit are optional at build time.
 - **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `ParametricUMAP` estimator, selectable GPU (WGPU) or CPU (Flex) backend via `device=`.
 - Added `ParametricUMAPOptimizationParams.seed`; the sampling RNG is seeded as well as the model RNG.

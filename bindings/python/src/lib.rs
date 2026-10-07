@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use burn::tensor::{Device, DeviceIndex, DeviceKind};
 use crossbeam_channel::unbounded;
 use fast_umap::{
-    validate_parametric_umap_data, FittedParametricUMAP as RustFittedParametricUMAP, GraphParams,
-    ManifoldParams, Metric, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    validate_parametric_umap_data, BackendChoice, FittedParametricUMAP as RustFittedParametricUMAP,
+    FittedUMAP as RustFittedUMAP, GraphParams, Init, ManifoldParams, Metric, NeighborSearch,
+    ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams, UMAPConfig, UmapError,
+    UMAP,
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
@@ -16,6 +18,134 @@ use pyo3::types::PyModule;
 struct FittedParametricUMAP {
     inner: Mutex<Option<Box<RustFittedParametricUMAP>>>,
     device: String,
+}
+
+#[pyclass(frozen, unsendable)]
+struct FittedUMAP {
+    inner: RustFittedUMAP,
+}
+
+#[pymethods]
+impl FittedUMAP {
+    #[getter]
+    fn embedding<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+        let embedding = self.inner.embedding();
+        let rows = embedding.len();
+        let columns = embedding.first().map_or(0, Vec::len);
+        let values = embedding.iter().flatten().copied().collect();
+        Array2::from_shape_vec((rows, columns), values)
+            .expect("embedding is rectangular")
+            .into_pyarray(py)
+    }
+
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let data: Vec<Vec<f32>> = x
+            .as_array()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect();
+        let embedding = self.inner.transform(&data).map_err(map_umap_error)?;
+        let rows = embedding.len();
+        let columns = embedding
+            .first()
+            .map_or(self.inner.embedding()[0].len(), Vec::len);
+        let values = embedding.into_iter().flatten().collect();
+        Ok(Array2::from_shape_vec((rows, columns), values)
+            .expect("transform output is rectangular")
+            .into_pyarray(py))
+    }
+}
+
+fn map_umap_error(error: UmapError) -> PyErr {
+    let message = error.to_string();
+    match error {
+        UmapError::InvalidConfig(_) | UmapError::InvalidInput(_) => PyValueError::new_err(message),
+        UmapError::BackendUnavailable(_)
+        | UmapError::Numerical(_)
+        | UmapError::SpectralConvergence(_)
+        | UmapError::Overflow(_) => PyRuntimeError::new_err(message),
+    }
+}
+
+#[pyfunction(signature = (
+  x, *, n_components=2, n_neighbors=15, min_dist=0.1, spread=1.0,
+  local_connectivity=1.0, set_op_mix_ratio=1.0, n_epochs=None,
+  learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0,
+  init="spectral", random_state=None, transform_seed=42,
+  transform_queue_size=4.0, backend="flex", device_index=0,
+  neighbor_search="auto"))]
+#[allow(clippy::too_many_arguments)]
+fn fit_umap(
+    py: Python<'_>,
+    x: PyReadonlyArray2<'_, f32>,
+    n_components: usize,
+    n_neighbors: usize,
+    min_dist: f32,
+    spread: f32,
+    local_connectivity: f32,
+    set_op_mix_ratio: f32,
+    n_epochs: Option<usize>,
+    learning_rate: f32,
+    negative_sample_rate: usize,
+    repulsion_strength: f32,
+    init: &str,
+    random_state: Option<u64>,
+    transform_seed: u64,
+    transform_queue_size: f64,
+    backend: &str,
+    device_index: usize,
+    neighbor_search: &str,
+) -> PyResult<FittedUMAP> {
+    let init = match init {
+        "spectral" => Init::Spectral,
+        "random" => Init::Random,
+        _ => return Err(PyValueError::new_err("init must be 'spectral' or 'random'")),
+    };
+    let backend = match backend {
+        "flex" => BackendChoice::Flex,
+        "cuda" => BackendChoice::Cuda { device_index },
+        _ => return Err(PyValueError::new_err("backend must be 'flex' or 'cuda'")),
+    };
+    let search = match neighbor_search {
+        "auto" => NeighborSearch::Auto,
+        "exact" => NeighborSearch::Exact,
+        "approximate" => NeighborSearch::Approximate,
+        _ => {
+            return Err(PyValueError::new_err(
+                "neighbor_search must be 'auto', 'exact' or 'approximate'",
+            ))
+        }
+    };
+    let config = UMAPConfig {
+        n_components,
+        n_neighbors,
+        min_dist,
+        spread,
+        local_connectivity,
+        set_op_mix_ratio,
+        n_epochs,
+        learning_rate,
+        negative_sample_rate,
+        repulsion_strength,
+        init,
+        random_state,
+        transform_seed,
+        transform_queue_size,
+    };
+    let data: Vec<Vec<f32>> = x
+        .as_array()
+        .rows()
+        .into_iter()
+        .map(|row| row.to_vec())
+        .collect();
+    py.detach(|| UMAP::new(config, backend, search).fit(&data))
+        .map(|inner| FittedUMAP { inner })
+        .map_err(map_umap_error)
 }
 
 #[pymethods]
@@ -214,6 +344,8 @@ fn fit_parametric_umap(
 fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<FittedParametricUMAP>()?;
+    module.add_class::<FittedUMAP>()?;
     module.add_function(wrap_pyfunction!(fit_parametric_umap, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
     Ok(())
 }

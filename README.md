@@ -302,8 +302,9 @@ Burn's runtime device API when compiled with the `cuda` feature.
 ### CPU execution
 
 For CPU-only execution, use the Flex device with the same parametric estimator:
-`ParametricUMAP::with_device(config, Device::flex())`. There is no classical
-UMAP implementation or non-parametric CPU fallback in this crate.
+`ParametricUMAP::with_device(config, Device::flex())`. The standard
+(non-parametric) `UMAP` estimator also runs on Flex; see
+[Standard UMAP](#standard-umap).
 
 ## Feature-Based Compilation
 
@@ -347,7 +348,50 @@ cargo test --lib
 ```
 
 The tests in `tests/tests.rs` exercise the Burn Flex CPU device for parametric
-training. This crate does not provide a classical `umap-rs` fallback.
+training.
+
+---
+
+## Standard UMAP
+
+`UMAP` / `FittedUMAP` (Rust) and `fast_umap.UMAP` (Python) are a separate,
+non-parametric estimator that follows umap-learn 0.5.12: smooth-kNN fuzzy graph,
+spectral (or random) initialization, and direct coordinate SGD with the
+reference Tausworthe negative sampling and epoch schedule. `ParametricUMAP` is
+unchanged.
+
+```rust
+use fast_umap::{BackendChoice, NeighborSearch, UMAP, UMAPConfig};
+
+let config = UMAPConfig { random_state: Some(42), ..UMAPConfig::default() };
+let fitted = UMAP::new(config, BackendChoice::Flex, NeighborSearch::Auto).fit(&data)?;
+let embedding = fitted.embedding();          // Vec<Vec<f32>>, one row per sample
+let projected = fitted.transform(&new_data)?; // place unseen rows in the fitted map
+```
+
+```python
+import fast_umap
+
+model = fast_umap.UMAP(n_neighbors=15, random_state=42, backend="cuda")
+embedding = model.fit_transform(X)
+projected = model.transform(X_new)
+```
+
+- **Backends:** `BackendChoice::Flex` (CPU) or `BackendChoice::Cuda { device_index }`
+  (`cuda` feature). The choice is explicit and never silently replaced; WGPU is
+  not supported for standard UMAP. Neighbor search, the fuzzy graph and SGD run
+  on the selected backend; spectral initialization runs on the host.
+- **Neighbor search:** `Exact` (blocked exact search, no N x N matrix),
+  `Approximate` (NN-Descent for fit, bounded graph search for transform), or
+  `Auto` (`Exact` up to `AUTO_EXACT_MAX_ROWS` rows, `Approximate` above).
+  `transform_queue_size` (default 4.0) controls approximate transform effort and
+  is rejected for exact search.
+- **Errors:** invalid input or configuration returns `UmapError`; Python raises
+  `ValueError` (input/config) or `RuntimeError` (backend/numerical). As in
+  umap-learn, a one-row fit yields a zero embedding and cannot transform, and a
+  graph with no edges (for example two rows) is an error.
+- **Quality:** five-seed trustworthiness@15 against frozen umap-learn 0.5.12
+  references is within 0.02 on Flex and CUDA (`tests/test_standard_quality.rs`).
 
 ---
 

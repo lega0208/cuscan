@@ -34,10 +34,6 @@
 //! use fast_umap::TrainingConfigBuilder;
 //! ```
 //!
-//! ```compile_fail
-//! use fast_umap::UMAP;
-//! ```
-//!
 //! Neural implementation modules are not part of the crate-level module API.
 //!
 //! ```compile_fail
@@ -80,6 +76,7 @@ pub mod parametric_umap;
 #[cfg(feature = "pca")]
 pub mod pca;
 pub mod prelude;
+pub mod standard_umap;
 pub mod utils;
 
 pub use graph::{GraphParams, ManifoldParams, Metric};
@@ -88,4 +85,7 @@ pub use parametric_umap::{
     ParametricUMAP, ParametricUMAPConfig, ParametricUMAPEpochProgress, ParametricUMAPLossReduction,
     ParametricUMAPModel, ParametricUMAPModelConfig, ParametricUMAPModelConfigBuilder,
     ParametricUMAPOptimizationParams,
+};
+pub use standard_umap::{
+    BackendChoice, Embedding, FittedUMAP, Init, NeighborSearch, Result, UMAPConfig, UmapError, UMAP,
 };

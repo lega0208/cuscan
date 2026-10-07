@@ -4,9 +4,9 @@
 pub use crate::chart::{chart_tensor, chart_vector};
 pub use crate::utils::generate_test_data;
 pub use crate::{
-    FittedParametricUMAP, GraphParams, ManifoldParams, Metric, ParametricUMAP,
+    FittedParametricUMAP, FittedUMAP, GraphParams, ManifoldParams, Metric, ParametricUMAP,
     ParametricUMAPConfig, ParametricUMAPEpochProgress, ParametricUMAPLossReduction,
-    ParametricUMAPOptimizationParams,
+    ParametricUMAPOptimizationParams, UMAP,
 };
 use num::Float;
 

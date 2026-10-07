@@ -1,0 +1,313 @@
+{
+  "archive": "tests/fixtures/standard_umap_quality.npz",
+  "trustworthiness_k": 15,
+  "fit_recall_k": 14,
+  "query_recall_k": 15,
+  "cases": {
+    "clusters": [
+      {
+        "seed": 11,
+        "fit_trustworthiness": 0.9923420852359208,
+        "fit_reference": 0.9923420852359208,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.5408823529411765,
+        "transform_reference": 0.5408823529411765,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 29,
+        "fit_trustworthiness": 0.9922374429223745,
+        "fit_reference": 0.9922374429223745,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.6071568627450981,
+        "transform_reference": 0.6071568627450981,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 47,
+        "fit_trustworthiness": 0.9915334855403348,
+        "fit_reference": 0.9915334855403348,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7187254901960785,
+        "transform_reference": 0.7187254901960785,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 71,
+        "fit_trustworthiness": 0.9920757229832572,
+        "fit_reference": 0.9920757229832572,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.6593137254901961,
+        "transform_reference": 0.6593137254901961,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 101,
+        "fit_trustworthiness": 0.9923896499238964,
+        "fit_reference": 0.9923896499238964,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7274509803921569,
+        "transform_reference": 0.7274509803921569,
+        "transform_absolute_gap": 0.0
+      }
+    ],
+    "manifold": [
+      {
+        "seed": 11,
+        "fit_trustworthiness": 0.9989155251141553,
+        "fit_reference": 0.9989155251141553,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9901960784313726,
+        "transform_reference": 0.9901960784313726,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 29,
+        "fit_trustworthiness": 0.9986967275494673,
+        "fit_reference": 0.9986967275494673,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9849019607843137,
+        "transform_reference": 0.9849019607843137,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 47,
+        "fit_trustworthiness": 0.9987442922374429,
+        "fit_reference": 0.9987442922374429,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.988921568627451,
+        "transform_reference": 0.988921568627451,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 71,
+        "fit_trustworthiness": 0.9974790715372908,
+        "fit_reference": 0.9974790715372908,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9885294117647059,
+        "transform_reference": 0.9885294117647059,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 101,
+        "fit_trustworthiness": 0.998458904109589,
+        "fit_reference": 0.998458904109589,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9864705882352941,
+        "transform_reference": 0.9864705882352941,
+        "transform_absolute_gap": 0.0
+      }
+    ],
+    "duplicates": [
+      {
+        "seed": 11,
+        "fit_trustworthiness": 0.88046783625731,
+        "fit_reference": 0.88046783625731,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.798235294117647,
+        "transform_reference": 0.798235294117647,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 29,
+        "fit_trustworthiness": 0.856827485380117,
+        "fit_reference": 0.856827485380117,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7249019607843137,
+        "transform_reference": 0.7249019607843137,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 47,
+        "fit_trustworthiness": 0.8770906432748538,
+        "fit_reference": 0.8770906432748538,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7935294117647059,
+        "transform_reference": 0.7935294117647059,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 71,
+        "fit_trustworthiness": 0.8528801169590643,
+        "fit_reference": 0.8528801169590643,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7714705882352941,
+        "transform_reference": 0.7714705882352941,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 101,
+        "fit_trustworthiness": 0.8836988304093567,
+        "fit_reference": 0.8836988304093567,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.7843137254901961,
+        "transform_reference": 0.7843137254901961,
+        "transform_absolute_gap": 0.0
+      }
+    ],
+    "ties": [
+      {
+        "seed": 11,
+        "fit_trustworthiness": 0.8947662601626016,
+        "fit_reference": 0.8947662601626016,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.8709803921568627,
+        "transform_reference": 0.8709803921568627,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 29,
+        "fit_trustworthiness": 0.9092733739837399,
+        "fit_reference": 0.9092733739837399,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9020588235294118,
+        "transform_reference": 0.9020588235294118,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 47,
+        "fit_trustworthiness": 0.8989837398373983,
+        "fit_reference": 0.8989837398373983,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.8545098039215686,
+        "transform_reference": 0.8545098039215686,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 71,
+        "fit_trustworthiness": 0.8940548780487805,
+        "fit_reference": 0.8940548780487805,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.8414705882352942,
+        "transform_reference": 0.8414705882352942,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 101,
+        "fit_trustworthiness": 0.9087652439024391,
+        "fit_reference": 0.9087652439024391,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9053921568627451,
+        "transform_reference": 0.9053921568627451,
+        "transform_absolute_gap": 0.0
+      }
+    ],
+    "disconnected": [
+      {
+        "seed": 11,
+        "fit_trustworthiness": 0.9479737442922375,
+        "fit_reference": 0.9479737442922375,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9739215686274509,
+        "transform_reference": 0.9739215686274509,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 29,
+        "fit_trustworthiness": 0.9492199391171994,
+        "fit_reference": 0.9492199391171994,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9708823529411764,
+        "transform_reference": 0.9708823529411764,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 47,
+        "fit_trustworthiness": 0.9462328767123288,
+        "fit_reference": 0.9462328767123288,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9752941176470589,
+        "transform_reference": 0.9752941176470589,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 71,
+        "fit_trustworthiness": 0.9535768645357686,
+        "fit_reference": 0.9535768645357686,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9749019607843137,
+        "transform_reference": 0.9749019607843137,
+        "transform_absolute_gap": 0.0
+      },
+      {
+        "seed": 101,
+        "fit_trustworthiness": 0.9494006849315069,
+        "fit_reference": 0.9494006849315069,
+        "fit_absolute_gap": 0.0,
+        "transform_trustworthiness": 0.9736274509803922,
+        "transform_reference": 0.9736274509803922,
+        "transform_absolute_gap": 0.0
+      }
+    ]
+  },
+  "missing": [],
+  "missing_recall": {
+    "fit": [
+      "clusters__seed101__fit_neighbors",
+      "clusters__seed11__fit_neighbors",
+      "clusters__seed29__fit_neighbors",
+      "clusters__seed47__fit_neighbors",
+      "clusters__seed71__fit_neighbors",
+      "disconnected__seed101__fit_neighbors",
+      "disconnected__seed11__fit_neighbors",
+      "disconnected__seed29__fit_neighbors",
+      "disconnected__seed47__fit_neighbors",
+      "disconnected__seed71__fit_neighbors",
+      "duplicates__seed101__fit_neighbors",
+      "duplicates__seed11__fit_neighbors",
+      "duplicates__seed29__fit_neighbors",
+      "duplicates__seed47__fit_neighbors",
+      "duplicates__seed71__fit_neighbors",
+      "manifold__seed101__fit_neighbors",
+      "manifold__seed11__fit_neighbors",
+      "manifold__seed29__fit_neighbors",
+      "manifold__seed47__fit_neighbors",
+      "manifold__seed71__fit_neighbors",
+      "ties__seed101__fit_neighbors",
+      "ties__seed11__fit_neighbors",
+      "ties__seed29__fit_neighbors",
+      "ties__seed47__fit_neighbors",
+      "ties__seed71__fit_neighbors"
+    ],
+    "query": [
+      "clusters__seed101__query_neighbors",
+      "clusters__seed11__query_neighbors",
+      "clusters__seed29__query_neighbors",
+      "clusters__seed47__query_neighbors",
+      "clusters__seed71__query_neighbors",
+      "disconnected__seed101__query_neighbors",
+      "disconnected__seed11__query_neighbors",
+      "disconnected__seed29__query_neighbors",
+      "disconnected__seed47__query_neighbors",
+      "disconnected__seed71__query_neighbors",
+      "duplicates__seed101__query_neighbors",
+      "duplicates__seed11__query_neighbors",
+      "duplicates__seed29__query_neighbors",
+      "duplicates__seed47__query_neighbors",
+      "duplicates__seed71__query_neighbors",
+      "manifold__seed101__query_neighbors",
+      "manifold__seed11__query_neighbors",
+      "manifold__seed29__query_neighbors",
+      "manifold__seed47__query_neighbors",
+      "manifold__seed71__query_neighbors",
+      "ties__seed101__query_neighbors",
+      "ties__seed11__query_neighbors",
+      "ties__seed29__query_neighbors",
+      "ties__seed47__query_neighbors",
+      "ties__seed71__query_neighbors"
+    ]
+  },
+  "summary": {
+    "implementation_mean_fit_trustworthiness": 0.9422434169983372,
+    "reference_mean_fit_trustworthiness": 0.9422434169983372,
+    "absolute_gap_of_mean_fit_trustworthiness": 0.0,
+    "implementation_mean_transform_trustworthiness": 0.852321568627451,
+    "reference_mean_transform_trustworthiness": 0.852321568627451,
+    "absolute_gap_of_mean_transform_trustworthiness": 0.0,
+    "fit_trustworthiness_gate_pass": true,
+    "transform_trustworthiness_gate_pass": true,
+    "fit_tie_aware_recall": null,
+    "query_tie_aware_recall": null,
+    "recall_gate_pass": false
+  }
+}

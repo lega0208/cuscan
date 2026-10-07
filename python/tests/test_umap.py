@@ -41,13 +41,13 @@ def estimator(**kwargs: object) -> ParametricUMAP:
 
 def test_parametric_exports() -> None:
     assert "ParametricUMAP" in fast_umap.__all__
-    assert "UMAP" not in fast_umap.__all__
-    assert not hasattr(fast_umap, "UMAP")
+    assert "UMAP" in fast_umap.__all__
+    assert fast_umap.UMAP is not fast_umap.ParametricUMAP
 
     assert hasattr(_fast_umap, "FittedParametricUMAP")
     assert hasattr(_fast_umap, "fit_parametric_umap")
-    assert not hasattr(_fast_umap, "FittedUMAP")
-    assert not hasattr(_fast_umap, "fit_umap")
+    assert hasattr(_fast_umap, "FittedUMAP")
+    assert hasattr(_fast_umap, "fit_umap")
 
 
 def test_fit_transform_shape_dtype_finite() -> None:
