@@ -200,6 +200,10 @@ required-features = ["nn-descent"]
 name = "cuda"
 required-features = ["cuda", "parametric"]
 
+[[example]]
+name = "profile_standard_cuda"
+required-features = ["cuda", "tracing"]
+
 [[bin]]
 name = "bench_report"
 required-features = ["gpu"]

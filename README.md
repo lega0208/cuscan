@@ -419,6 +419,24 @@ host-side spans, not GPU kernel timings; enabling detailed backend tracing adds
 overhead. The benches measure complete fit and transform calls, including host
 embedding readback, with deterministic inputs prepared outside the timed loop.
 
+Compare standard UMAP with **umap-learn 0.5.12**, using CUDA only:
+
+```sh
+cargo build --release --no-default-features --features cuda,tracing --example profile_standard_cuda
+uv run --no-sync python scripts/compare_umap_spans.py --output comparison.json --trace cuda-trace.json
+```
+
+The build is separate from the 115-second run deadline. Defaults are 512 samples,
+16 features, 30 epochs, 15 exact neighbors, random initialization and seed 42.
+Both implementations consume identical float32 inputs and warm up before timing.
+Python timings wrap actual reference callsites without copying its implementation.
+Initialization cannot be isolated from embedding setup; nested neighbor selection
+is subtracted from Python fuzzy-graph time. CUDA spans measure host enqueue work;
+`tensor_embedding` captures synchronization of queued work, **not just transfer**.
+The JSON reports inclusive spans, counts, residual time and explicitly labeled
+host-span ratios, not per-kernel GPU speedups. Rows are limited to 16–4095 to keep
+the reference on its exact-search branch. Missing CUDA fails without CPU fallback.
+
 ---
 
 ## API Overview
