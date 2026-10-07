@@ -1,6 +1,6 @@
 use super::{Init, Result, UMAPConfig, UmapError};
 use faer::dyn_stack::MemStack;
-use faer::linalg::evd::{self, self_adjoint_evd, self_adjoint_evd_scratch, ComputeEigenvectors};
+use faer::linalg::evd::{self, ComputeEigenvectors, self_adjoint_evd, self_adjoint_evd_scratch};
 use faer::{Mat, Par, Spec};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -24,6 +24,18 @@ const ORTHOGONALITY_TOLERANCE: f64 = 1.0e-7;
 /// The sparse graph is interpreted as weighted undirected affinity. If an edge
 /// is supplied in both directions, the larger accumulated directed weight is
 /// used, matching the symmetric graph expected by spectral initialization.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        fields(
+            rows = data.len(),
+            edges = heads.len(),
+            components = config.n_components,
+            method = ?config.init,
+        )
+    )
+)]
 pub fn initialize(
     data: &[Vec<f32>],
     heads: &[usize],
@@ -307,6 +319,10 @@ impl SolverOperator<'_> {
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip_all, fields(rows = graph.n(), dimensions))
+)]
 fn spectral_embedding(
     data: &[Vec<f32>],
     graph: &SparseGraph,
@@ -1034,10 +1050,12 @@ mod solver_tests {
         .unwrap();
         assert_eq!(first, repeated);
         assert_eq!(first_warning, repeated_warning);
-        assert!(first
-            .iter()
-            .flatten()
-            .all(|value| (-10.0..10.0).contains(value)));
+        assert!(
+            first
+                .iter()
+                .flatten()
+                .all(|value| (-10.0..10.0).contains(value))
+        );
 
         let mut warned = false;
         assert!(matches!(

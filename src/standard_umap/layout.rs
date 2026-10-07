@@ -2,8 +2,8 @@
 
 use burn::{
     backend::{
-        tensor::{FloatTensor, IntTensor},
         Flex,
+        tensor::{FloatTensor, IntTensor},
     },
     tensor::DType,
 };
@@ -16,6 +16,10 @@ use burn::{
 /// standard-UMAP orchestration.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(level = tracing::Level::TRACE, skip_all, fields(epoch = epoch))
+)]
 pub(crate) fn optimize_epoch(
     head_embedding: FloatTensor<Flex>,
     tail_embedding: FloatTensor<Flex>,

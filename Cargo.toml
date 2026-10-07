@@ -33,16 +33,16 @@ burn = { version = "0.22.0", default-features = false, features = [
   "std",
   "autotune",
   "autodiff",
-  "cubecl",
   "extension",
   "linalg",
   "store",
   "flex",
 ] }
-burn-cubecl = { version = "0.22.0", default-features = false }
+# Enable CubeCL only with a concrete GPU runtime; Flex needs neither its device nor kernels.
+burn-cubecl = { version = "0.22.0", default-features = false, optional = true }
 crossbeam-channel = "0.5.17"
 ctrlc = "3.5.2"
-cubecl = { version = "0.11.0", default-features = false }
+cubecl = { version = "0.11.0", default-features = false, optional = true }
 cudarc = { version = "0.19.10", features = [
   "std",
   "driver",
@@ -62,6 +62,7 @@ prettytable = "0.10.0"
 rand = "0.10.3"
 rayon = "1.12.0"
 serde = "1.0.229"
+tracing = { version = "0.1", optional = true }
 umap-rs = { version = "0.4.5", optional = true }
 
 [dev-dependencies]
@@ -79,17 +80,23 @@ mnist = { version = "0.6.0", git = "https://github.com/eugenehp/mnist.git", feat
 serde_json = "1.0.151"
 chrono = "0.4.45"
 zip = "=0.6.6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-chrome = "0.7"
 
 [features]
 default = ["cuda", "cpu", "verbose"]
 # Core backend features
 gpu = [
+  "dep:burn-cubecl",
+  "dep:cubecl",
   "burn/cubecl",
   "burn/wgpu",
   "burn/fusion",
 ] # GPU backend with WGPU support
 # CUDA is intentionally excluded from `all` and the default features because it requires a CUDA toolkit.
 cuda = [
+  "dep:burn-cubecl",
+  "dep:cubecl",
   "burn/cubecl",
   "burn/cuda",
   "burn/fusion",
@@ -101,7 +108,7 @@ cpu = [
   "burn/rayon",
 ] # Flex backend optimization features
 
-tracing = ["burn/tracing"]
+tracing = ["dep:tracing", "burn/tracing", "cubecl?/tracing"]
 
 parametric = ["burn/optim"] # Parametric UMAP support
 
@@ -118,6 +125,15 @@ umap-rs = ["dep:umap-rs"]
 [[bench]]
 name = "umap_bench"
 required-features = ["parametric"]
+harness = false
+
+[[bench]]
+name = "standard_umap_flex"
+harness = false
+
+[[bench]]
+name = "standard_umap_cuda"
+required-features = ["cuda"]
 harness = false
 
 [[example]]

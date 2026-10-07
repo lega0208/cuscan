@@ -2,8 +2,8 @@
 
 use burn::{
     backend::{
-        tensor::{FloatTensor, IntTensor},
         Backend, DispatchKindConversion, DispatchTensor,
+        tensor::{FloatTensor, IntTensor},
     },
     tensor::{Int, Tensor},
 };
@@ -26,6 +26,17 @@ fn row_distances(query: Tensor<2>, reference: Tensor<2>, ids: Tensor<1, Int>) ->
 /// All candidate IDs, distances, visit state, and queue updates remain tensors
 /// on `B`. The host loop only schedules at most `visit_capacity` graph steps.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        fields(
+            neighbors = k,
+            candidate_capacity,
+            visit_capacity,
+        )
+    )
+)]
 pub(crate) fn approximate_query<B: Backend>(
     query: FloatTensor<B>,
     reference: FloatTensor<B>,

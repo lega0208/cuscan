@@ -2,14 +2,14 @@ use burn::{
     backend::Dispatch,
     tensor::{DType, Device, Int, Tensor, TensorData},
 };
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::backend::StandardUmapOps;
 
 use super::{
-    approximate_query_budget, fit_curve, fit_neighbor_widths, query_neighbor_width,
-    validate_backend_choice, validate_input, validate_search_settings, Embedding, Init,
-    NeighborSearch, Result, UMAPConfig, UmapError,
+    Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
+    fit_curve, fit_neighbor_widths, query_neighbor_width, validate_backend_choice, validate_input,
+    validate_search_settings,
 };
 
 /// Auto uses exact search for small data and bounded NN-Descent above this row count.
@@ -44,6 +44,22 @@ impl UMAP {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            fields(
+                rows = data.len(),
+                features = data.first().map_or(0, Vec::len),
+                neighbors = self.config.n_neighbors,
+                components = self.config.n_components,
+                backend = ?self.backend,
+                search = ?self.search,
+                init = ?self.config.init,
+                epochs = self.config.n_epochs.unwrap_or(0),
+            )
+        )
+    )]
     pub fn fit(&self, data: &[Vec<f32>]) -> Result<FittedUMAP> {
         self.config.validate()?;
         validate_backend_choice(self.backend)?;
@@ -95,6 +111,14 @@ impl UMAP {
             ));
         }
 
+        #[cfg(feature = "tracing")]
+        let _neighbors_span = tracing::info_span!(
+            "neighbor_search",
+            rows = n,
+            neighbors = widths.nonself,
+            search = ?search,
+        )
+        .entered();
         let (nonself_indices, nonself_distances) = match search {
             NeighborSearch::Exact => {
                 let neighbors = super::neighbors::exact_neighbors(
@@ -120,6 +144,8 @@ impl UMAP {
             }
             NeighborSearch::Auto => unreachable!("search is resolved before dispatch"),
         };
+        #[cfg(feature = "tracing")]
+        drop(_neighbors_span);
         let rows = Tensor::<1, Int>::arange(0..n as i64, &device)
             .cast(burn::tensor::IntDType::I32)
             .reshape([n, 1]);
@@ -129,6 +155,10 @@ impl UMAP {
             vec![Tensor::<2>::zeros([n, 1], &device), nonself_distances],
             1,
         );
+        #[cfg(feature = "tracing")]
+        let _graph_span =
+            tracing::info_span!("fuzzy_graph", rows = n, neighbors = widths.self_inclusive)
+                .entered();
         let (heads, tails, weights, _, _, _) = <Dispatch as StandardUmapOps>::fuzzy_graph(
             indices.into_dispatch(),
             distances.into_dispatch(),
@@ -138,6 +168,8 @@ impl UMAP {
             false,
             u32::try_from(n).map_err(|_| UmapError::Overflow("reference count"))?,
         );
+        #[cfg(feature = "tracing")]
+        drop(_graph_span);
         let heads: Tensor<1, Int> = Tensor::from_dispatch(heads);
         let tails: Tensor<1, Int> = Tensor::from_dispatch(tails);
         let weights: Tensor<1> = Tensor::from_dispatch(weights);
@@ -209,6 +241,14 @@ impl UMAP {
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
+        #[cfg(feature = "tracing")]
+        let _initialization_span = tracing::info_span!(
+            "initialization",
+            rows = n,
+            components = n_components,
+            method = ?self.config.init,
+        )
+        .entered();
         let flat = super::initialize(
             data,
             &init_heads,
@@ -217,9 +257,14 @@ impl UMAP {
             &self.config,
             seed,
         )?;
+        #[cfg(feature = "tracing")]
+        drop(_initialization_span);
         let initial = Tensor::<2>::from_data(TensorData::new(flat, [n, n_components]), &device);
         let (a, b) = fit_curve(self.config.min_dist, self.config.spread)?;
         let rng = optimizer_rng(&initial, seed, &device)?;
+        #[cfg(feature = "tracing")]
+        let _optimization_span =
+            tracing::info_span!("optimization", rows = n, epochs = n_epochs).entered();
         let embedding_tensor = optimize(
             initial.clone(),
             initial,
@@ -240,6 +285,8 @@ impl UMAP {
             true,
             true,
         );
+        #[cfg(feature = "tracing")]
+        drop(_optimization_span);
         let embedding = tensor_embedding(&embedding_tensor)?;
         Ok(FittedUMAP {
             config: self.config.clone(),
@@ -259,6 +306,13 @@ impl UMAP {
     ///
     /// Mirrors Python `UMAP.fit_transform`, which fits a reusable model and returns
     /// `model.embedding_`: the returned embedding is the one stored on the model.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            fields(rows = data.len(), features = data.first().map_or(0, Vec::len))
+        )
+    )]
     pub fn fit_transform(&self, data: &[Vec<f32>]) -> Result<(FittedUMAP, Embedding)> {
         let fitted = self.fit(data)?;
         let embedding = fitted.embedding.clone();
@@ -297,6 +351,22 @@ impl FittedUMAP {
         self.n_features
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip_all,
+            fields(
+                rows = data.len(),
+                features = data.first().map_or(0, Vec::len),
+                training_rows = self.training_data.dims()[0],
+                neighbors = self.config.n_neighbors,
+                components = self.embedding_tensor.dims()[1],
+                backend = ?self.backend,
+                search = ?self.search,
+                epochs = self.config.n_epochs.unwrap_or(0),
+            )
+        )
+    )]
     pub fn transform(&self, data: &[Vec<f32>]) -> Result<Embedding> {
         let (q, query_features) = validate_input(data, Some(self.n_features))?;
         q.checked_mul(query_features)
@@ -323,6 +393,15 @@ impl FittedUMAP {
             return Err(UmapError::Overflow("transform graph COO indices"));
         }
         validate_layout_work(graph_capacity, self.config.negative_sample_rate)?;
+        #[cfg(feature = "tracing")]
+        let _neighbors_span = tracing::info_span!(
+            "neighbor_search",
+            query_rows = q,
+            training_rows = n,
+            neighbors = k,
+            search = ?self.search,
+        )
+        .entered();
         let (indices, distances) = match self.search {
             NeighborSearch::Exact => {
                 let result = super::neighbors::exact_neighbors(
@@ -373,7 +452,11 @@ impl FittedUMAP {
             }
             NeighborSearch::Auto => unreachable!("fitted search mode is resolved"),
         };
+        #[cfg(feature = "tracing")]
+        drop(_neighbors_span);
         let local_connectivity = (self.config.local_connectivity - 1.0).max(0.0);
+        #[cfg(feature = "tracing")]
+        let _graph_span = tracing::info_span!("fuzzy_graph", rows = q, neighbors = k).entered();
         let (heads, tails, weights, _, _, directed) = <Dispatch as StandardUmapOps>::fuzzy_graph(
             indices.clone().into_dispatch(),
             distances.into_dispatch(),
@@ -383,6 +466,8 @@ impl FittedUMAP {
             true,
             u32::try_from(n).map_err(|_| UmapError::Overflow("reference count"))?,
         );
+        #[cfg(feature = "tracing")]
+        drop(_graph_span);
         let heads: Tensor<1, Int> = Tensor::from_dispatch(heads);
         let tails: Tensor<1, Int> = Tensor::from_dispatch(tails);
         let weights: Tensor<1> = Tensor::from_dispatch(weights);
@@ -454,6 +539,9 @@ impl FittedUMAP {
         }
         let transform_seed = self.config.transform_seed;
         let rng = optimizer_rng(&initial, transform_seed, &device)?;
+        #[cfg(feature = "tracing")]
+        let _optimization_span =
+            tracing::info_span!("optimization", rows = q, epochs = n_epochs_u32).entered();
         let embedding = optimize(
             initial,
             self.embedding_tensor.clone(),
@@ -474,6 +562,8 @@ impl FittedUMAP {
             false,
             false,
         );
+        #[cfg(feature = "tracing")]
+        drop(_optimization_span);
         tensor_embedding(&embedding)
     }
 }
@@ -620,6 +710,13 @@ fn optimizer_rng(embedding: &Tensor<2>, seed: u64, device: &Device) -> Result<Te
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip_all,
+        fields(epochs = n_epochs, edges = heads.dims()[0], dimensions = head.dims()[1])
+    )
+)]
 fn optimize(
     mut head: Tensor<2>,
     mut tail: Tensor<2>,
@@ -648,6 +745,8 @@ fn optimize(
     next_negative = next_negative.add_scalar(0.0);
     let mut alpha = learning_rate;
     for epoch in 0..n_epochs {
+        #[cfg(feature = "tracing")]
+        let _epoch_span = tracing::trace_span!("layout_epoch", epoch, alpha).entered();
         let (new_head, new_tail, new_next_positive, new_next_negative, new_rng, _) =
             <Dispatch as StandardUmapOps>::optimize_epoch(
                 head.clone().into_dispatch(),
@@ -679,6 +778,10 @@ fn optimize(
     head
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip_all, fields(rows = tensor.dims()[0], components = tensor.dims()[1]))
+)]
 fn tensor_embedding(tensor: &Tensor<2>) -> Result<Embedding> {
     let [rows, columns] = tensor.dims();
     let values = tensor

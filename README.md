@@ -393,6 +393,32 @@ projected = model.transform(X_new)
 - **Quality:** five-seed trustworthiness@15 against frozen umap-learn 0.5.12
   references is within 0.02 on Flex and CUDA (`tests/test_standard_quality.rs`).
 
+### Profiling standard UMAP
+
+The optional `tracing` feature instruments standard UMAP phases and enables
+Burn/CubeCL tracing. The library does not install a subscriber. Profiling benches
+install one only when `FAST_UMAP_TRACE` is set; leave it unset for timing runs.
+
+```sh
+cargo bench --no-default-features --features cpu --bench standard_umap_flex
+cargo bench --no-default-features --features cuda --bench standard_umap_cuda
+
+# Chrome/Perfetto trace (import the JSON file into ui.perfetto.dev)
+FAST_UMAP_TRACE=standard-flex.json RUST_LOG=fast_umap=trace cargo bench \
+  --no-default-features --features tracing --bench standard_umap_flex -- --test
+FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench \
+  --no-default-features --features cuda,tracing --bench standard_umap_cuda -- --test
+
+# Console span timings instead of a trace file
+FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench \
+  --no-default-features --features tracing --bench standard_umap_flex -- --test
+```
+
+CUDA requires a working NVIDIA runtime and never falls back to Flex. Traces are
+host-side spans, not GPU kernel timings; enabling detailed backend tracing adds
+overhead. The benches measure complete fit and transform calls, including host
+embedding readback, with deterministic inputs prepared outside the timed loop.
+
 ---
 
 ## API Overview
