@@ -1,0 +1,404 @@
+{
+  "elapsed_seconds": 900.0671647249837,
+  "reason": "global runtime deadline expired during supervised worker execution",
+  "coverage": {
+    "baseline_repetitions_required_per_mode": 10,
+    "completed_baseline_repetitions": 19,
+    "completed_pairs": 9,
+    "modes": [
+      "exact",
+      "approximate"
+    ],
+    "pairs_required_per_mode": 5,
+    "profiles": "not requested",
+    "quality_runs": 10
+  },
+  "resource_status": "incomplete",
+  "telemetry_explanation": "nvidia-smi process telemetry unavailable (including WSL access restrictions): Command '['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory,gpu_uuid', '--format=csv,noheader,nounits']' timed out after 0.05 seconds",
+  "modes": {
+    "exact": {
+      "completed_repetitions": 10,
+      "completed_pairs": 5,
+      "reference_count_unique_pairs": 5,
+      "reference_fit_mean": 0.9512695607460355,
+      "reference_batch_means": [
+        0.9591598505661005,
+        0.9592332147019647,
+        0.9594431219821844
+      ],
+      "fit_seconds": [
+        9.600427823,
+        9.582018308,
+        10.413021612,
+        9.925939807,
+        9.779071287,
+        9.571931698,
+        9.891068119,
+        9.745744099,
+        9.302169105,
+        9.999944522
+      ],
+      "fit_median_seconds": 9.762407693,
+      "transform_three_call_totals_seconds": [
+        1.8716751870000001,
+        2.251707331,
+        2.062355606,
+        1.7845059159999999,
+        1.720587373,
+        1.9896862419999999,
+        1.734111241,
+        1.8750559779999998,
+        1.747125125,
+        2.181227962
+      ],
+      "transform_three_call_median_seconds": 1.8733655825,
+      "recorded_quality": [
+        {
+          "pair": 0,
+          "side": "A",
+          "fit_gap": 0.0003270623866714617,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0005112075424575924,
+            0.0008321105977355803,
+            0.00033705877455869615
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 0,
+          "side": "B",
+          "fit_gap": 0.00023008459522633196,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.00050229718198469,
+            1.7885760073221846e-05,
+            0.00016023039460544286
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 1,
+          "side": "B",
+          "fit_gap": 0.00018311850072505464,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0004833057567432686,
+            0.0004757612179486781,
+            0.00034518866550103944
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 1,
+          "side": "A",
+          "fit_gap": 0.00013752623505713935,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            8.585164835150927e-06,
+            8.72825091575713e-05,
+            8.39264901764114e-05
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 2,
+          "side": "A",
+          "fit_gap": 0.0002634365036009445,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0005388491716616928,
+            0.00026601003163506665,
+            0.00014903065684301886
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 2,
+          "side": "B",
+          "fit_gap": 0.0004889396631884146,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0010062203421579152,
+            0.0005166057900433119,
+            0.000707274496337118
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 3,
+          "side": "B",
+          "fit_gap": 0.00019028932019482525,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            1.105665168088521e-06,
+            0.0008777030261405416,
+            6.325705544463212e-05
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 3,
+          "side": "A",
+          "fit_gap": 0.000154831902243302,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.00012266379453884646,
+            3.954378954373894e-05,
+            0.00010962995338004156
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 4,
+          "side": "A",
+          "fit_gap": 3.785082475105117e-05,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0005097766816517524,
+            0.0008403055278055627,
+            0.0001164460539460066
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "pair": 4,
+          "side": "B",
+          "fit_gap": 0.00015260477747824908,
+          "fit_recall": 1.0,
+          "transform_gaps": [
+            0.0009264173326674063,
+            0.0003486747627372555,
+            0.0005416068306692834
+          ],
+          "transform_recall": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      ],
+      "recorded_runs_meet_gap_and_recall": true
+    },
+    "approximate": {
+      "completed_repetitions": 9,
+      "completed_pairs": 4,
+      "reference_count_unique_pairs": 5,
+      "reference_fit_mean": 0.9515360574757459,
+      "reference_batch_means": [
+        0.9590910521769898,
+        0.9594066610472861,
+        0.9595650833541459
+      ],
+      "fit_seconds": [
+        7.496491066,
+        7.59434507,
+        7.120536675,
+        7.69807508,
+        7.027744043,
+        8.123760728,
+        7.8652178809999995,
+        7.783473935,
+        7.81106141
+      ],
+      "fit_median_seconds": 7.69807508,
+      "transform_three_call_totals_seconds": [
+        6.933539129,
+        7.307548904,
+        7.120272169,
+        6.884694057,
+        7.219195528,
+        7.28504025,
+        7.682141368,
+        7.3269184450000004,
+        8.0765496
+      ],
+      "transform_three_call_median_seconds": 7.28504025,
+      "recorded_quality": [
+        {
+          "pair": 0,
+          "side": "B",
+          "fit_gap": 3.501890690904563e-05,
+          "fit_recall": 0.9923474542025862,
+          "transform_gaps": [
+            0.0004444643897768552,
+            4.3133949383933334e-05,
+            0.0005356362387612945
+          ],
+          "transform_recall": [
+            0.8897135416666667,
+            0.8936197916666667,
+            0.8924153645833334
+          ]
+        },
+        {
+          "pair": 0,
+          "side": "A",
+          "fit_gap": 0.00010532601505353067,
+          "fit_recall": 0.9923474542025862,
+          "transform_gaps": [
+            0.0007317422161171594,
+            0.0005020890567766223,
+            0.00013563259657001225
+          ],
+          "transform_recall": [
+            0.8897135416666667,
+            0.8936197916666667,
+            0.8924153645833334
+          ]
+        },
+        {
+          "pair": 1,
+          "side": "A",
+          "fit_gap": 0.0003231526448981281,
+          "fit_recall": 0.99249267578125,
+          "transform_gaps": [
+            0.00025546068514814557,
+            0.0001932182400933291,
+            0.0010590711371961659
+          ],
+          "transform_recall": [
+            0.8921549479166667,
+            0.8930338541666667,
+            0.8960286458333333
+          ]
+        },
+        {
+          "pair": 1,
+          "side": "B",
+          "fit_gap": 3.760948450826085e-05,
+          "fit_recall": 0.99249267578125,
+          "transform_gaps": [
+            0.00017500728438224478,
+            0.0005773393273393879,
+            0.00020379360223099496
+          ],
+          "transform_recall": [
+            0.8921549479166667,
+            0.8930338541666667,
+            0.8960286458333333
+          ]
+        },
+        {
+          "pair": 2,
+          "side": "B",
+          "fit_gap": 0.0002549931764180835,
+          "fit_recall": 0.9923327215786638,
+          "transform_gaps": [
+            0.0002292108932734349,
+            0.00041948936480196153,
+            0.00030401889776887625
+          ],
+          "transform_recall": [
+            0.8914713541666667,
+            0.8923502604166667,
+            0.89404296875
+          ]
+        },
+        {
+          "pair": 2,
+          "side": "A",
+          "fit_gap": 1.5715766214841054e-05,
+          "fit_recall": 0.9923327215786638,
+          "transform_gaps": [
+            0.00015686136779879956,
+            1.6793102730505716e-05,
+            0.0008243449259074387
+          ],
+          "transform_recall": [
+            0.8914713541666667,
+            0.8923502604166667,
+            0.89404296875
+          ]
+        },
+        {
+          "pair": 3,
+          "side": "A",
+          "fit_gap": 0.0005565192585137435,
+          "fit_recall": 0.9923958613954741,
+          "transform_gaps": [
+            0.0003565965284714201,
+            0.0002547062312686643,
+            0.0003129422660673731
+          ],
+          "transform_recall": [
+            0.8903971354166667,
+            0.8916666666666667,
+            0.8931315104166667
+          ]
+        },
+        {
+          "pair": 3,
+          "side": "B",
+          "fit_gap": 0.0004144463563314771,
+          "fit_recall": 0.9923958613954741,
+          "transform_gaps": [
+            0.00048188790376302304,
+            0.0011628215534466024,
+            8.155906593310114e-06
+          ],
+          "transform_recall": [
+            0.8903971354166667,
+            0.8916666666666667,
+            0.8931315104166667
+          ]
+        },
+        {
+          "pair": 4,
+          "side": "B",
+          "fit_gap": 2.44485823122087e-05,
+          "fit_recall": 0.9924042800377155,
+          "transform_gaps": [
+            0.00043997668997663997,
+            0.0003040449134199541,
+            0.0003637248168497642
+          ],
+          "transform_recall": [
+            0.8911783854166667,
+            0.8939778645833333,
+            0.89267578125
+          ]
+        }
+      ],
+      "recorded_runs_meet_gap_and_recall": false
+    }
+  },
+  "first_optimization_recommendation": null,
+  "limitation": "Summary uses only previously recorded scores/times; no new primary evaluation or profiling."
+}

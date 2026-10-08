@@ -1,0 +1,22 @@
+{
+  "exact": {
+    "embedding_0.f32le": 192,
+    "graph_0.i32le": 2784,
+    "transform_0_0.f32le": 80,
+    "transform_0_1.f32le": 80,
+    "transform_0_2.f32le": 80,
+    "query_graph_0_0.i32le": 1200,
+    "query_graph_0_1.i32le": 1200,
+    "query_graph_0_2.i32le": 1200
+  },
+  "approximate": {
+    "embedding_0.f32le": 192,
+    "graph_0.i32le": 2784,
+    "transform_0_0.f32le": 80,
+    "transform_0_1.f32le": 80,
+    "transform_0_2.f32le": 80,
+    "query_graph_0_0.i32le": 1200,
+    "query_graph_0_1.i32le": 1200,
+    "query_graph_0_2.i32le": 1200
+  }
+}

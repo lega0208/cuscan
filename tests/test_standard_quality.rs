@@ -5,11 +5,17 @@ use burn::{
 use fast_umap::{
     backend::StandardUmapOps,
     standard_umap::{
-        BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, approximate_query_budget,
+        BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, UmapError, approximate_query_budget,
     },
 };
 use serde_json::Value;
-use std::{collections::HashSet, fs::File, io::Read};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::Read,
+    io::Write,
+    process::{Command, Stdio},
+};
 use zip::ZipArchive;
 
 const REFERENCE: &str = include_str!("fixtures/standard_umap_reference.json");
@@ -19,6 +25,50 @@ const QUALITY: &str = concat!(
 );
 const TRUST_GAP_LIMIT: f64 = 0.02;
 const RECALL_LIMIT: f64 = 0.90;
+
+#[cfg(feature = "cuda")]
+fn frozen_source_digest() -> String {
+    let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
+    for args in [
+        vec!["diff", "--quiet", commit, "--", "src"],
+        vec!["diff", "--cached", "--quiet", commit, "--", "src"],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .status()
+            .expect("git must be available to verify frozen product source");
+        assert!(
+            status.success(),
+            "working product src differs from frozen source commit"
+        );
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e:src"])
+        .output()
+        .expect("git must be available to identify frozen product source");
+    assert!(
+        output.status.success(),
+        "could not resolve frozen src tree digest"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(feature = "cuda")]
+fn git_blob_digest(bytes: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "could not digest deterministic error inputs"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
 
 #[derive(Clone)]
 struct Matrix {
@@ -456,6 +506,112 @@ fn standard_quality_trustworthiness_on_cuda() {
         return;
     };
     run_quality(device);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_transform_error_source_tagged_capture_oracle() {
+    const SOURCE: &str = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
+    let Some(device) = device_for_cuda() else {
+        return;
+    };
+    let fitted = UMAP::new(
+        UMAPConfig {
+            n_neighbors: 2,
+            n_components: 2,
+            init: Init::Random,
+            random_state: Some(19),
+            ..UMAPConfig::default()
+        },
+        backend(&device),
+        NeighborSearch::Exact,
+    )
+    .fit(&[vec![1.0f32, 2.0]])
+    .unwrap();
+    let error = fitted.transform(&[vec![3.0f32, 4.0]]).unwrap_err();
+    let invalid_input = structured_error(error);
+    let invalid_config = structured_error(
+        UMAPConfig {
+            n_neighbors: 1,
+            ..UMAPConfig::default()
+        }
+        .validate()
+        .unwrap_err(),
+    );
+    let overflow =
+        structured_error(approximate_query_budget(usize::MAX, usize::MAX, f64::MAX).unwrap_err());
+    let unavailable = structured_error(
+        UMAP::new(
+            UMAPConfig {
+                n_epochs: Some(1),
+                init: Init::Random,
+                random_state: Some(19),
+                ..UMAPConfig::default()
+            },
+            BackendChoice::Cuda {
+                device_index: usize::MAX,
+            },
+            NeighborSearch::Exact,
+        )
+        .fit(&[vec![0.0f32], vec![1.0], vec![2.0]])
+        .unwrap_err(),
+    );
+    assert_eq!(invalid_input["variant"], "InvalidInput");
+    assert_eq!(invalid_config["variant"], "InvalidConfig");
+    assert_eq!(overflow["variant"], "Overflow");
+    assert_eq!(unavailable["variant"], "BackendUnavailable");
+    let mut input_bytes = [1.0f32, 2.0, 3.0, 4.0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    input_bytes.extend_from_slice(b"n_neighbors=1;budget=usize::MAX");
+    let capture = serde_json::json!({
+        "source_commit": SOURCE,
+        "product_src_tree_digest": frozen_source_digest(),
+        "schema": "fast-umap.cuda-error-capture.v1",
+        "operation": ["single-row-transform", "config-validation", "query-budget-validation", "backend-validation"],
+        "dtype": "f32/u64",
+        "shapes": [[1, 2], [0, 0]],
+        "input_digest": git_blob_digest(&input_bytes),
+        "input_f32_bits": [1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits(), 4.0f32.to_bits()],
+        "errors": { "invalid_input": invalid_input, "invalid_config": invalid_config, "overflow": overflow, "backend_unavailable": unavailable },
+        "unavailable_error_coverage": ["Numerical", "SpectralConvergence"],
+    });
+    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ERROR_CAPTURE_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ERROR_ORACLE_PATH") {
+        let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
+        assert_eq!(
+            capture, oracle,
+            "CUDA error contract differs from frozen-source oracle"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn structured_error(error: UmapError) -> serde_json::Value {
+    match error {
+        UmapError::InvalidConfig(payload) => {
+            serde_json::json!({"variant":"InvalidConfig", "payload":payload})
+        }
+        UmapError::InvalidInput(payload) => {
+            serde_json::json!({"variant":"InvalidInput", "payload":payload})
+        }
+        UmapError::BackendUnavailable(payload) => {
+            serde_json::json!({"variant":"BackendUnavailable", "payload":payload})
+        }
+        UmapError::Numerical(payload) => {
+            serde_json::json!({"variant":"Numerical", "payload":payload})
+        }
+        UmapError::SpectralConvergence(payload) => {
+            serde_json::json!({"variant":"SpectralConvergence", "payload":payload})
+        }
+        UmapError::Overflow(payload) => {
+            serde_json::json!({"variant":"Overflow", "payload":payload})
+        }
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

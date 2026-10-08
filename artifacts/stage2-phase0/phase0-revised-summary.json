@@ -1,0 +1,260 @@
+{
+  "campaign_report": "artifacts/stage2-phase0/phase0-revised.json",
+  "elapsed_seconds": 595.4154870079947,
+  "configuration": {
+    "binary": "/home/marc/projects/fast-umap/target/release/examples/profile_standard_cuda",
+    "deadline_seconds": 900.0,
+    "epochs": 100,
+    "features": 16,
+    "fit_recall_threshold": 0.9,
+    "init": "spectral",
+    "neighbors": 25,
+    "output": "artifacts/stage2-phase0/phase0-revised.json",
+    "paired_runs": 3,
+    "profile_nsys": true,
+    "query_recall_threshold": 0.87,
+    "query_rows": 1024,
+    "query_seeds": [
+      43,
+      44,
+      45
+    ],
+    "rows": 16384,
+    "suite": "stage2",
+    "trustworthiness_gap_threshold": 0.02,
+    "trustworthiness_n_neighbors": 15,
+    "warmups": 1
+  },
+  "coverage": {
+    "baseline_repetitions_required_per_mode": 6,
+    "completed_baseline_repetitions": 12,
+    "completed_pairs": 6,
+    "full_baseline_pair_coverage": true,
+    "modes": [
+      "exact",
+      "approximate"
+    ],
+    "pairs_required_per_mode": 3,
+    "profiles": {
+      "runs": {
+        "approximate": {
+          "host_trace": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/host-trace-approximate.json",
+          "report": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-nsys/approximate.nsys-rep",
+          "stats_csv": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/nsys-stats-approximate.csv",
+          "stats_csv_sha256": "84048400f76c14a33633a6fdf87af9a41fcbab0540ac4fba7ba94dd428537e48",
+          "stats_stderr": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/nsys-stats-approximate.stderr.txt",
+          "stderr": "",
+          "stdout": "              ] approximate.nsys-rep\n[1/1] [========41%                 ] approximate.nsys-rep\n[1/1] [========42%                 ] approximate.nsys-rep\n[1/1] [=========43%                ] approximate.nsys-rep\n[1/1] [=========44%                ] approximate.nsys-rep\n[1/1] [=========45%                ] approximate.nsys-rep\n[1/1] [=========46%                ] approximate.nsys-rep\n[1/1] [==========47%               ] approximate.nsys-rep\n[1/1] [==========49%               ] approximate.nsys-rep\n[1/1] [===========50%              ] approximate.nsys-rep\n[1/1] [===========51%              ] approximate.nsys-rep\n[1/1] [===========52%              ] approximate.nsys-rep\n[1/1] [===========53%              ] approximate.nsys-rep\n[1/1] [============54%             ] approximate.nsys-rep\n[1/1] [============55%             ] approximate.nsys-rep\n[1/1] [============56%             ] approximate.nsys-rep\n[1/1] [============57%             ] approximate.nsys-rep\n[1/1] [=============58%            ] approximate.nsys-rep\n[1/1] [=============59%            ] approximate.nsys-rep\n[1/1] [=============60%            ] approximate.nsys-rep\n[1/1] [==============61%           ] approximate.nsys-rep\n[1/1] [==============62%           ] approximate.nsys-rep\n[1/1] [==============63%           ] approximate.nsys-rep\n[1/1] [==============64%           ] approximate.nsys-rep\n[1/1] [===============65%          ] approximate.nsys-rep\n[1/1] [===============66%          ] approximate.nsys-rep\n[1/1] [================68%         ] approximate.nsys-rep\n[1/1] [================69%         ] approximate.nsys-rep\n[1/1] [================70%         ] approximate.nsys-rep\n[1/1] [================71%         ] approximate.nsys-rep\n[1/1] [=================72%        ] approximate.nsys-rep\n[1/1] [========================100%] approximate.nsys-rep\n[1/1] [========================100%] approximate.nsys-rep\nGenerated:\n\t/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-nsys/approximate.nsys-rep\n"
+        },
+        "exact": {
+          "host_trace": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/host-trace-exact.json",
+          "report": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-nsys/exact.nsys-rep",
+          "stats_csv": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/nsys-stats-exact.csv",
+          "stats_csv_sha256": "7c06dd97e0e0be2d8d21adae901944a5a14bb7c1e57107e966ffbf537fe291d7",
+          "stats_stderr": "/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-stage2-141fjs2k/nsys-stats-exact.stderr.txt",
+          "stderr": "",
+          "stdout": "          ] exact.nsys-rep\n[1/1] [======33%                   ] exact.nsys-rep\n[1/1] [======34%                   ] exact.nsys-rep\n[1/1] [======35%                   ] exact.nsys-rep\n[1/1] [=======36%                  ] exact.nsys-rep\n[1/1] [=======37%                  ] exact.nsys-rep\n[1/1] [=======38%                  ] exact.nsys-rep\n[1/1] [=======39%                  ] exact.nsys-rep\n[1/1] [========40%                 ] exact.nsys-rep\n[1/1] [========41%                 ] exact.nsys-rep\n[1/1] [========42%                 ] exact.nsys-rep\n[1/1] [=========43%                ] exact.nsys-rep\n[1/1] [=========44%                ] exact.nsys-rep\n[1/1] [=========45%                ] exact.nsys-rep\n[1/1] [=========46%                ] exact.nsys-rep\n[1/1] [==========47%               ] exact.nsys-rep\n[1/1] [==========48%               ] exact.nsys-rep\n[1/1] [==========49%               ] exact.nsys-rep\n[1/1] [===========50%              ] exact.nsys-rep\n[1/1] [===========51%              ] exact.nsys-rep\n[1/1] [===========52%              ] exact.nsys-rep\n[1/1] [===========53%              ] exact.nsys-rep\n[1/1] [============54%             ] exact.nsys-rep\n[1/1] [============56%             ] exact.nsys-rep\n[1/1] [============57%             ] exact.nsys-rep\n[1/1] [=============59%            ] exact.nsys-rep\n[1/1] [=============60%            ] exact.nsys-rep\n[1/1] [==============62%           ] exact.nsys-rep\n[1/1] [==============63%           ] exact.nsys-rep\n[1/1] [===============65%          ] exact.nsys-rep\n[1/1] [===============66%          ] exact.nsys-rep\n[1/1] [================68%         ] exact.nsys-rep\n[1/1] [================69%         ] exact.nsys-rep\n[1/1] [================71%         ] exact.nsys-rep\n[1/1] [=================72%        ] exact.nsys-rep\n[1/1] [========================100%] exact.nsys-rep\n[1/1] [========================100%] exact.nsys-rep\nGenerated:\n\t/home/marc/projects/fast-umap/artifacts/stage2-phase0/phase0-revised-nsys/exact.nsys-rep\n"
+        }
+      },
+      "status": "captured"
+    },
+    "quality_runs": 6,
+    "speed_gates": []
+  },
+  "resource_status": "incomplete",
+  "telemetry_explanation": "nvidia-smi process telemetry unavailable (including WSL access restrictions): Command '['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory,gpu_uuid', '--format=csv,noheader,nounits']' timed out after 0.05 seconds",
+  "modes": {
+    "exact": {
+      "completed_repetitions": 6,
+      "pairs": 3,
+      "quality_pass": true,
+      "fit_recall_min": 1.0,
+      "query_recall_min": 1.0,
+      "query_recall_max": 1.0,
+      "fit_trustworthiness_gap_max": 0.0004034915055661781,
+      "query_trustworthiness_gap_max": 0.0010008004148628347,
+      "fit_seconds": [
+        9.243947597,
+        9.620620516,
+        9.066821435,
+        9.96403117,
+        9.95364459,
+        8.993859165
+      ],
+      "fit_median_seconds": 9.4322840565,
+      "three_transform_calls_seconds": [
+        1.581776876,
+        1.7516578760000001,
+        1.746282112,
+        1.847841642,
+        1.80359827,
+        1.662378488
+      ],
+      "three_transform_call_median_seconds": 1.748969994,
+      "profiled_kernels": [
+        {
+          "name": "exact_neighbors_kernel_f_f32_i_i32_632b4cf8",
+          "gpu_total_seconds": 8.854317426,
+          "instances": 608,
+          "percent_of_profiled_kernel_time": 68.3
+        },
+        {
+          "name": "layout_vertex_atomic_kernel_f_f32_i_i64_j_i32_m_i32_80132d4d",
+          "gpu_total_seconds": 2.109384929,
+          "instances": 3299,
+          "percent_of_profiled_kernel_time": 16.3
+        },
+        {
+          "name": "memory_direct_throughput_i_f32_n_4_d31d1fd0",
+          "gpu_total_seconds": 1.101391296,
+          "instances": 53,
+          "percent_of_profiled_kernel_time": 8.5
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_4_d399a4db",
+          "gpu_total_seconds": 0.397242267,
+          "instances": 21,
+          "percent_of_profiled_kernel_time": 3.1
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_1_a0e3cb82",
+          "gpu_total_seconds": 0.285231739,
+          "instances": 16,
+          "percent_of_profiled_kernel_time": 2.2
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_2_89213cba",
+          "gpu_total_seconds": 0.068536216,
+          "instances": 5,
+          "percent_of_profiled_kernel_time": 0.5
+        },
+        {
+          "name": "launch_overhead_i_i32_n_1_4eb9a74e",
+          "gpu_total_seconds": 0.061730848,
+          "instances": 54364,
+          "percent_of_profiled_kernel_time": 0.5
+        },
+        {
+          "name": "fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78",
+          "gpu_total_seconds": 0.039053182,
+          "instances": 5,
+          "percent_of_profiled_kernel_time": 0.3
+        },
+        {
+          "name": "reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8",
+          "gpu_total_seconds": 0.017727839,
+          "instances": 4,
+          "percent_of_profiled_kernel_time": 0.1
+        },
+        {
+          "name": "layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a",
+          "gpu_total_seconds": 0.009171731,
+          "instances": 299,
+          "percent_of_profiled_kernel_time": 0.1
+        }
+      ]
+    },
+    "approximate": {
+      "completed_repetitions": 6,
+      "pairs": 3,
+      "quality_pass": false,
+      "fit_recall_min": 0.99285888671875,
+      "query_recall_min": 0.8454296875,
+      "query_recall_max": 0.8514453125,
+      "fit_trustworthiness_gap_max": 0.00031261088784984015,
+      "query_trustworthiness_gap_max": 0.0008075691669441332,
+      "fit_seconds": [
+        6.602616172,
+        6.880704608,
+        6.568720545,
+        7.165926603,
+        6.719451481,
+        7.957642872
+      ],
+      "fit_median_seconds": 6.8000780445,
+      "three_transform_calls_seconds": [
+        4.831964842,
+        4.512289693,
+        4.844547586,
+        4.6831978030000005,
+        4.547528934,
+        4.629966798
+      ],
+      "three_transform_call_median_seconds": 4.6565823005,
+      "profiled_kernels": [
+        {
+          "name": "approximate_query_kernel_f_f32_i_i32_0468f3ca",
+          "gpu_total_seconds": 7.042616033,
+          "instances": 96,
+          "percent_of_profiled_kernel_time": 45.3
+        },
+        {
+          "name": "ann_step_f_f32_i_i32_b47dcb3c",
+          "gpu_total_seconds": 4.260700249,
+          "instances": 30,
+          "percent_of_profiled_kernel_time": 27.4
+        },
+        {
+          "name": "layout_vertex_atomic_kernel_f_f32_i_i64_j_i32_m_i32_80132d4d",
+          "gpu_total_seconds": 2.11811265,
+          "instances": 3299,
+          "percent_of_profiled_kernel_time": 13.6
+        },
+        {
+          "name": "memory_direct_throughput_i_f32_n_4_d31d1fd0",
+          "gpu_total_seconds": 1.231964437,
+          "instances": 59,
+          "percent_of_profiled_kernel_time": 7.9
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_4_d399a4db",
+          "gpu_total_seconds": 0.376264872,
+          "instances": 20,
+          "percent_of_profiled_kernel_time": 2.4
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_1_a0e3cb82",
+          "gpu_total_seconds": 0.27227458,
+          "instances": 16,
+          "percent_of_profiled_kernel_time": 1.8
+        },
+        {
+          "name": "launch_overhead_i_i32_n_1_4eb9a74e",
+          "gpu_total_seconds": 0.073794773,
+          "instances": 64975,
+          "percent_of_profiled_kernel_time": 0.5
+        },
+        {
+          "name": "compute_direct_throughput_i_f32_n_2_89213cba",
+          "gpu_total_seconds": 0.069869247,
+          "instances": 5,
+          "percent_of_profiled_kernel_time": 0.4
+        },
+        {
+          "name": "fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78",
+          "gpu_total_seconds": 0.035214991,
+          "instances": 5,
+          "percent_of_profiled_kernel_time": 0.2
+        },
+        {
+          "name": "reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8",
+          "gpu_total_seconds": 0.019834608,
+          "instances": 4,
+          "percent_of_profiled_kernel_time": 0.1
+        }
+      ]
+    }
+  },
+  "profile_limitations": "Separate instrumented runs include warmup fits and repeated diagnostic query exports; kernel totals are not uninstrumented fit durations or isolated product transform durations. Host spans are not GPU durations.",
+  "first_optimization_recommendation": null,
+  "reverse_index_diagnostics": {
+    "observed_valid_edge_count": [
+      393216
+    ],
+    "observed_max_indegree": 243,
+    "construction_workspace_estimate_bytes": [
+      1835016
+    ],
+    "limitation": "Estimated construction buffers only, not authoritative concurrent resource peak or measured construction duration."
+  }
+}

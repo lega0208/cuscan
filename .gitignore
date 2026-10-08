@@ -11,3 +11,14 @@ __pycache__/
 
 comparison/*.parquet
 comparison/umap_comparison.html
+# Raw benchmark/profiling captures: regenerable and large. Reports, summaries,
+# Nsight stats CSVs and host traces next to them stay tracked.
+artifacts/**/*.f32le
+artifacts/**/*.i32le
+artifacts/**/*.nsys-rep
+artifacts/**/*.sqlite
+# Per-run copies already merged into the campaign report (reverse-graph diagnostics),
+# or duplicating the committed source (harness.diff), or empty tool stderr.
+artifacts/**/reverse-*.json
+artifacts/**/harness.diff
+artifacts/**/*.stderr.txt

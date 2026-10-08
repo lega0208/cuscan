@@ -1,0 +1,51 @@
+{
+  "report": "artifacts/stage2-phase0/phase0-final.json",
+  "elapsed_seconds": 609.0431696280139,
+  "deadline_seconds": 900,
+  "coverage": {
+    "completed_pairs": 6,
+    "completed_baseline_repetitions": 12,
+    "full_baseline_pair_coverage": true
+  },
+  "quality": {
+    "approximate": {
+      "all_runs_pass": true,
+      "query_recall_warning": true,
+      "fit_recall_min": 0.99285888671875
+    },
+    "exact": {
+      "all_runs_pass": true,
+      "query_recall_warning": false,
+      "fit_recall_min": 1.0
+    }
+  },
+  "query_recall_warnings": {
+    "count": 18,
+    "min": 0.8454296875,
+    "max": 0.8514453125,
+    "limit": 0.87,
+    "severity": "warning (deferred beyond Stage2 by user decision)"
+  },
+  "timings_median_seconds": {
+    "exact": {
+      "fit": 9.798583652,
+      "transform_total": 1.811917719
+    },
+    "approximate": {
+      "fit": 7.4589041625,
+      "transform_total": 5.0030706955
+    }
+  },
+  "gpu_memory_peak_bytes": {
+    "exact": 2249195520,
+    "approximate": 2249195520
+  },
+  "gpu_memory_cap_bytes": 7516192768,
+  "gpu_memory_method": "nsys --cuda-memory-usage allocation tracking (excludes CUDA context/module overhead); profiled run is the same fit+3-transform workload",
+  "top_gpu_kernels": {
+    "exact": "exact_neighbors_kernel 68.5% (608 launches, ~16.1ms avg); layout_vertex_atomic_kernel 16.3%",
+    "approximate": "approximate_query_kernel 44.8% (96 launches, ~82ms avg); ann_step 27.2%; layout_vertex_atomic_kernel 13.3%"
+  },
+  "kernel_totals_caveat": "Nsight totals include warmup and diagnostic query exports; not pure fit/transform durations.",
+  "gpu_memory_note": "Both modes peak at 2,249,195,520 B because the CubeCL memory pool reserves 1 GiB pages (two concurrently live 1 GiB pages dominate the peak); this is reserved device memory, an upper bound on live tensor bytes, about 3.3x under the 7 GiB cap."
+}

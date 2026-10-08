@@ -1,0 +1,144 @@
+{
+  "status": "ready",
+  "attempts": 4,
+  "baseline_commit": "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e",
+  "product_source_changes": false,
+  "report": "artifacts/stage2-phase0/phase0-final.json",
+  "summary": "artifacts/stage2-phase0/phase0-final-summary.json",
+  "contract": {
+    "paired_runs_per_mode": 3,
+    "n_neighbors": 25,
+    "fit_recall_min": 0.9,
+    "query_recall_warning_below": 0.87,
+    "trustworthiness_k": 15,
+    "trust_gap_max": 0.02,
+    "gpu_cap_bytes": 7516192768,
+    "deadline_seconds": 900
+  },
+  "user_decisions": [
+    "Query recall 0.87 is a warning, not a failure; deferred beyond Stage2 unless a defect is found",
+    "GPU peak evidence via nsys --cuda-memory-usage allocation tracking"
+  ],
+  "result": {
+    "elapsed_seconds": 609.0431696280139,
+    "complete": true,
+    "resource_status": "pass",
+    "pairs": 6,
+    "baseline_repetitions": 12,
+    "quality_all_runs_pass": {
+      "approximate": true,
+      "exact": true
+    },
+    "query_recall_warnings": {
+      "count": 18,
+      "min": 0.8454296875,
+      "max": 0.8514453125,
+      "limit": 0.87,
+      "severity": "warning (deferred beyond Stage2 by user decision)"
+    },
+    "gpu_peak_bytes": {
+      "exact": 2249195520,
+      "approximate": 2249195520
+    },
+    "timings_median_seconds": {
+      "exact": {
+        "fit": 9.798583652,
+        "transform_total": 1.811917719
+      },
+      "approximate": {
+        "fit": 7.4589041625,
+        "transform_total": 5.0030706955
+      }
+    }
+  },
+  "verification": {
+    "python_tests": "46 passed (python/tests/test_compare_umap_spans.py)",
+    "ruff": "clean",
+    "src_frozen": true,
+    "boundary_review": {
+      "architect": "CLEAR/APPROVE",
+      "cleaner": "CLEAR/APPROVE",
+      "qa": "CLEAR/APPROVE"
+    },
+    "ty": "clean"
+  },
+  "first_optimization_recommendation": {
+    "target": "exact-search parallelism (exact_neighbors_kernel)",
+    "evidence": "68.5% of exact-mode GPU time, 608 launches averaging ~16ms; exact fit median 9.80s vs approximate 7.46s",
+    "not_selected": "ANN reverse-discovery removal: reverse-index construction cost is unmeasured, so evidence does not support it yet"
+  },
+  "missing_evidence": [
+    "Measured reverse-index construction cost (estimate only: 393216 edges, max indegree 243, ~1.8MB workspace)"
+  ],
+  "history": {
+    "superseded_attempt_phase0_revised": {
+      "phase": "Stage 2 Phase 0",
+      "campaign_report": "artifacts/stage2-phase0/phase0-revised.json",
+      "campaign_summary": "artifacts/stage2-phase0/phase0-revised-summary.json",
+      "previous_reports_preserved": [
+        "artifacts/stage2-phase0/phase0.json",
+        "artifacts/stage2-phase0/phase0-corrected.json",
+        "artifacts/stage2-phase0/phase0-corrected-summary.json"
+      ],
+      "primary_campaign_attempts": 3,
+      "user_revised_contract": {
+        "matched_pairs_per_mode": 3,
+        "n_neighbors": 25,
+        "query_recall_threshold": 0.87,
+        "fit_recall_threshold": 0.9,
+        "trustworthiness_neighbors": 15,
+        "trustworthiness_absolute_gap": 0.02,
+        "deadline_seconds": 900
+      },
+      "elapsed_seconds": 595.4154870079947,
+      "termination": "Completed all planned measured repetitions, quality and profiling within deadline; readiness fails quality and lacks authoritative GPU memory proof, not a timeout or coding-error termination.",
+      "completed_primary_baseline_pairs": 6,
+      "required_primary_baseline_pairs": 6,
+      "completed_primary_repetitions": 12,
+      "required_primary_repetitions": 12,
+      "completed_reference_runs": 6,
+      "coverage_by_mode": {
+        "exact": {
+          "pairs": 3,
+          "repetitions": 6,
+          "quality_pass": true
+        },
+        "approximate": {
+          "pairs": 3,
+          "repetitions": 6,
+          "quality_pass": false
+        }
+      },
+      "quality_failure": "All six approximate repetitions fail query recall>=0.87; observed batch recalls0.8454296875-0.8514453125. Approximate fit recall>=0.99285888671875 and all recorded trustworthiness gaps pass; exact quality passes with recall1.0. No threshold silently weakened.",
+      "timing_medians_seconds": {
+        "exact_fit": 9.4322840565,
+        "approximate_fit": 6.8000780445,
+        "exact_three_transform_calls": 1.748969994,
+        "approximate_three_transform_calls": 4.6565823005
+      },
+      "timing_limitations": "Separate search modes, not baseline-vs-candidate speedups; matched baseline A/B timing distributions retained in raw report. No speed gate.",
+      "profiles": "Separate Nsight Systems reports, full kernel/API CSVs and host traces captured for both modes; see report coverage.profiles. Whole-profile kernel totals include warmup and diagnostic query exports, not isolated uninstrumented product durations.",
+      "product_baseline_commit": "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e",
+      "tooling_verification": "38 Python tests passed with4 pinned-reference warnings retained;Ruff and formatting passed. Earlier21 required CUDA tests,3 oracle captures/3 replays and both-mode small model-reuse/export checks remain valid for unchanged Rust/product code.",
+      "reverse_index_observations": "393216 valid graph edges;max observed reverse indegree243;construction counts/cursors/u64 prefixes/reverse IDs concurrent workspace estimate1835016 bytes. Estimates are not measured allocations,construction time or authoritative process peak.",
+      "missing_required_evidence": [
+        "Approximate query recall acceptance fails the user-revised0.87 gate",
+        "Authoritative attributable process GPU lifetime peak/7GiB resource acceptance",
+        "Measured reverse-index construction cost and complete concurrent GPU resource feasibility"
+      ],
+      "telemetry_limitation": "nvidia-smi returned no attributable CUDA PIDs,then its50ms process-query deadline expired. Telemetry unavailable;sampled maximum and lifetime peak null;no memory-cap pass claimed.",
+      "recommendation_reason": "Profiles show search hotspots but quality failure and unavailable authoritative resource evidence preclude admitting either first optimization under Phase0 acceptance.",
+      "continuation": "No additional campaign or product optimization is authorized by this completed revised run. Changing the frozen product/quality contract or admitting an alternative memory-evidence method requires an explicit user decision."
+    }
+  },
+  "post_campaign_tooling_cleanup": {
+    "script_sha256": "43b40dbfe206c8b4bed56a2eeb243ce14ece186787bb70b1d9b4728a2d6e5fab",
+    "changes": [
+      "nsys memory evidence: shared incomplete-evidence builder, sqlite connection closed explicitly, unknown memoryOperationType counted and treated as incomplete, peak==cap boundary tested",
+      "resource evidence: nvidia-smi telemetry nested under supplementary_nvidia_smi; authoritative_lifetime_peak_bytes now filled from the Nsight peak; dead allocator/device-wide keys removed; duplicated status epilogue folded into finalize_resource_evidence",
+      "nvidia-smi query timeout skips one sample (counted in timed_out_samples) instead of disabling the over-cap kill for the rest of the run",
+      "--query-seeds default derived from STAGE2_QUERY_SEEDS"
+    ],
+    "effect_on_final_report": "None on measurements or gates. phase0-final.json was produced by the previous script revision, so its resource_evidence uses the earlier flat layout; it was not regenerated."
+  }
+}

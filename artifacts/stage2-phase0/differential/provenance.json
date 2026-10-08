@@ -1,0 +1,115 @@
+{
+  "baseline_commit": "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e",
+  "product_diff": {
+    "argv": [
+      "git",
+      "diff",
+      "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e",
+      "--",
+      "src"
+    ],
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "product_files_sha256": {
+    "src/autodiff_ops.rs": "d87f2be30e29a45d2aa1b34238c02a8ace37e2f1ffbc72da8b76e1f78099b36a",
+    "src/backend.rs": "b3b5fd25979f7d0de5bef65dda5207367a7b3a2c23c8826b0aa2a3fc5fec5463",
+    "src/bin/bench_report.rs": "19105757b2f3ea5cfe9c3439af841d2ca8029303a1c60174fbc0a2a38f790615",
+    "src/chart.rs": "40dbb1a9cd16b6414b8075c5116701d9fc054b16f496d114f5d00ac1d0359894",
+    "src/cuda_backend.rs": "bf3f32bd77fc51deb9eeaa62c4dc83997c4d279de5b0bea0bfca3b74bdadf46f",
+    "src/distances.rs": "6b823e2668a875a7dac9e09ea14ae442da1d259de5f62c3ec5b6d94313af2a4e",
+    "src/flex_backend.rs": "88bd62a9000ef3eebc7f618c8865cd8f0d58cc6bb0780e7aa21b0e01452318ff",
+    "src/generic_backend.rs": "8b23539277e7f2d90ff4d962a2165e5a8c85fb3ca054b7b5be68be7d6c8dcc20",
+    "src/graph/config.rs": "7a2f085e4efce7a7fcb4b1e1d39ba15659105692927996a9c447a2de3372dbd2",
+    "src/graph/get_distance_by_metric.rs": "5b3658bcdb877b68a5fdf22a21423ee3473b079077f521027536a48ef88ab048",
+    "src/graph/mod.rs": "245ee2046a48ffff63897435f4b8e36fa9e5a66ba2b1afd7fd6f96626b9afb3d",
+    "src/graph/sparse.rs": "685460b8a1a474d09b6f4d07897791425c2529e6db922a765dfb59ed9c052beb",
+    "src/kernels/euclidean/forward.rs": "a0ee614b1e988437a36f2b5ffc37ceb0577462eea5a2d263f8ab5831bb7a38a7",
+    "src/kernels/euclidean/kernel.rs": "841276bf84ece00ad562ce7bc3f8d48b1c4aa38e6d4a3928d4b01c8b53c17a75",
+    "src/kernels/euclidean/mod.rs": "bc63eaf2bec538de400a17e9ce6cb315ea334ee3de7575403e11a6eb5a06dfb0",
+    "src/kernels/knn/forward.rs": "553284d17cf355ecf0c60b8b9be41a939179d405fc84385c831ed59522a12d54",
+    "src/kernels/knn/kernel.rs": "5f2aea698f4587946a4e05893e77aa88d04d41f20a83b1dd7e1dea5098c8b867",
+    "src/kernels/knn/mod.rs": "bc63eaf2bec538de400a17e9ce6cb315ea334ee3de7575403e11a6eb5a06dfb0",
+    "src/kernels/mod.rs": "d785a04bb0db186f5ac64f2b3bafb4f5d2cccac02006264ed281ea12d3b75374",
+    "src/kernels/standard_umap/ann.rs": "cab4276c3ce35e1e3601c2831fd130498161b62524aa995129b52fe2936674cf",
+    "src/kernels/standard_umap/graph.rs": "7513f2c0218a26652bb9514174bbff1d9ba73994605327143e30b5b065ace248",
+    "src/kernels/standard_umap/layout.rs": "299a57e99351b9bdadc516ffecb592144937f56167fabbfc724e0b96d5225473",
+    "src/kernels/standard_umap/mod.rs": "bfc3dda1f70a005f0f9798ed73d55fb3ba605edba8c7ac981b4f127e08674299",
+    "src/kernels/standard_umap/query.rs": "7aad9a18aeac28a579454250b0b6c90ee2a2a1fe0b595e3d21c13450e7186be8",
+    "src/lib.rs": "9684d9ece2d5d0f95189a9db27a6be8759248caba773c9fd2a274a81a278853f",
+    "src/macros.rs": "d07caad03aa28b57ee59d56361ecb1a615f3771a56028cba89a3439e23b1aef8",
+    "src/nn_descent.rs": "41dcf0813b8f6358fa70372b6bb539c16aaf1213cad910c01b06760055e68689",
+    "src/normalizer.rs": "04c37bdea4e156bff8140d3e6dec0366b491f441555ad4d564692115a7c1b810",
+    "src/parametric_umap/config.rs": "e2c1540d938b9e3dc43a039a10adb395c5d34af1c596979463bca3d929136590",
+    "src/parametric_umap/mod.rs": "380f44f914dc007777fe74f96727b4c51707eaae800e99a875d94410db333fb0",
+    "src/parametric_umap/model.rs": "26e1db2143a483dc21432d72b6ca48031b6942fb940ce8f5869b39c849423607",
+    "src/parametric_umap/serialize.rs": "35d8de6c7c9def746f6b32cb2fb9a6a40807bb83e9a029a626ea463baa449762",
+    "src/parametric_umap/trainer.rs": "38757c0d16376d7cef09fa4da94ae91995cb219cfe17a22177213619de2164b3",
+    "src/pca.rs": "89bb0281fc300f641c7794a64dac1a1751ea2465aa4a358fe1916a5e578b5f7d",
+    "src/prelude.rs": "7d7ea29fb4b2a74b033168aca0e944cf11719c61204680ea5985b3676ef359bb",
+    "src/standard_umap/ann.rs": "6d305ef6490de6fa8ed9c5d143bf413427d0d452bd01ec0dcf0e97c77226f717",
+    "src/standard_umap/config.rs": "d5f52e10486a41acc9cf3deea8d5df0b1505c178487d6acffe36ea4621dd461d",
+    "src/standard_umap/estimator.rs": "1b31e2223af7da3aaa0a4a7c45d806ef832d2c9bdeeb62a173380aaccb7c4dc9",
+    "src/standard_umap/graph.rs": "76c45b687017a9d3e191d23f0c8876fb90f574124c123cd9a82aeffde3e65f78",
+    "src/standard_umap/init.rs": "6b335396f5d8936066503db2b194462c22316752ea5108efff37f90e1c86ddfe",
+    "src/standard_umap/layout.rs": "c3c1b116f18caf95f3847438f0207c267cdae97fbbd0c944d7de997215440254",
+    "src/standard_umap/mod.rs": "c9ba57b937b32f587b2e7c122118082a6855638701e479520c374810d80a9f6b",
+    "src/standard_umap/neighbors.rs": "c035edd92488decf4a916c52c08a7c85cf85c3e56dff41d371812fbb64e5ba9c",
+    "src/standard_umap/query.rs": "0185612a9eab39002a457b0bf72a021b6c9dbe531d43515b46ca2a9051fe8c73",
+    "src/utils.rs": "3aab6a659ec5fe440494b4a30eda228c087e30e683abb99a54154029a8a1fe50"
+  },
+  "rustc": {
+    "argv": [
+      "rustc",
+      "-Vv"
+    ],
+    "exit_code": 0,
+    "stdout": "rustc 1.99.0-nightly (1a98b1e13 2026-08-07)\nbinary: rustc\ncommit-hash: 1a98b1e135b254f209c67d447b6d8bcd56a859e0\ncommit-date: 2026-08-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n",
+    "stderr": ""
+  },
+  "cargo": {
+    "argv": [
+      "cargo",
+      "--version"
+    ],
+    "exit_code": 0,
+    "stdout": "cargo 1.99.0-nightly (c79e8f894 2026-08-04)\n",
+    "stderr": ""
+  },
+  "lockfile_sha256": "8f55cfb7e1948a883d5f216d968ed22fa50194ff3cb62f15ffd790d0bf5e1953",
+  "features": [
+    "cuda",
+    "tracing"
+  ],
+  "gpu": {
+    "argv": [
+      "nvidia-smi",
+      "-q"
+    ],
+    "exit_code": 0,
+    "stdout": "\n==============NVSMI LOG==============\n\nTimestamp                                              : Thu Oct  8 16:53:20 2026\nDriver Version                                         : 617.14 [Deprecated; will be removed in CUDA 14.0. Use KMD Version instead]\nCUDA Version                                           : 13.4 [Deprecated; will be removed in CUDA 14.0. Use CUDA UMD Version instead]\nKMD Version                                            : 617.14\nCUDA UMD Version                                       : 13.4\n\nAttached GPUs                                          : 1\nGPU 00000000:01:00.0\n    Product Name                                       : NVIDIA GeForce RTX 3080\n    Product Brand                                      : GeForce\n    Product Architecture                               : Ampere\n    Display Mode                                       : Requested functionality has been deprecated\n    Display Attached                                   : Yes\n    Display Active                                     : Enabled\n    Persistence Mode                                   : Enabled\n    Addressing Mode                                    : N/A\n    MIG Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    Accounting Mode                                    : Disabled\n    Accounting Mode Buffer Size                        : 4000\n    Driver Model\n        Current                                        : WDDM\n        Pending                                        : WDDM\n    Serial Number                                      : N/A\n    GPU UUID                                           : GPU-b8c28142-ff65-2d01-3831-de9654bd006e\n    GPU PDI                                            : 0x64086b5ffc6e6a2\n    Minor Number                                       : N/A\n    VBIOS Version                                      : 94.02.26.48.68\n    MultiGPU Board                                     : No\n    Board ID                                           : 0x100\n    Board Part Number                                  : N/A\n    GPU Part Number                                    : 2206-200-A1\n    FRU Part Number                                    : N/A\n    Platform Info\n        Chassis Serial Number                          : N/A\n        Slot Number                                    : N/A\n        Tray Index                                     : N/A\n        Host ID                                        : N/A\n        Peer Type                                      : N/A\n        Module Id                                      : 1\n        GPU Fabric GUID                                : N/A\n    Inforom Version\n        Image Version                                  : G001.0000.03.03\n        OEM Object                                     : 2.0\n        ECC Object                                     : N/A\n        Power Management Object                        : N/A\n    Inforom BBX Object Flush\n        Latest Timestamp                               : N/A\n        Latest Duration                                : N/A\n    Inforom Time Data\n        Time Run                                       : N/A\n    GPU Operation Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    GPU C2C Mode                                       : N/A\n    GPU Virtualization Mode\n        Virtualization Mode                            : None\n        Host VGPU Mode                                 : N/A\n        vGPU Heterogeneous Mode                        : N/A\n    GPU Recovery Action                                : None\n    GSP Firmware Version                               : N/A\n    IBMNPU\n        Relaxed Ordering Mode                          : N/A\n    PCI\n        Bus                                            : 0x01\n        Device                                         : 0x00\n        Domain                                         : 0x0000\n        Device Id                                      : 0x220610DE\n        Bus Id                                         : 00000000:01:00.0\n        Sub System Id                                  : 0x38973842\n        GPU Link Info\n            PCIe Generation\n                Max                                    : 4\n                Current                                : 4\n                Device Current                         : 4\n                Device Max                             : 4\n                Host Max                               : 5\n            Link Width\n                Max                                    : 16x\n                Current                                : 16x\n        Bridge Chip\n            Type                                       : N/A\n            Firmware                                   : N/A\n        Replays Since Reset                            : 0\n        Replay Number Rollovers                        : 0\n        Tx Throughput                                  : 17285 KB/s\n        Rx Throughput                                  : 49560 KB/s\n        Atomic Caps Outbound                           : N/A\n        Atomic Caps Inbound                            : N/A\n    Fan Speed                                          : 37 %\n    Performance State                                  : P0\n    Clocks Event Reasons\n        Idle                                           : Active\n        Applications Clocks Setting                    : Not Active\n        SW Power Cap                                   : Not Active\n        HW Slowdown                                    : Not Active\n            HW Thermal Slowdown                        : Not Active\n            HW Power Brake Slowdown                    : Not Active\n        Sync Boost                                     : Not Active\n        SW Thermal Slowdown                            : Not Active\n        Display Clock Setting                          : Not Active\n        Board Limit                                    : Not Active\n        Reliability                                    : Not Active\n    Clocks Event Reasons Counters\n        SW Power Capping                               : 4374231431 us\n        Sync Boost                                     : 0 us\n        SW Thermal Slowdown                            : 88677195 us\n        HW Thermal Slowdown                            : 0 us\n        HW Power Braking                               : 0 us\n    Sparse Operation Mode                              : N/A\n    FB Memory Usage\n        Total                                          : 10240 MiB\n        Reserved                                       : 187 MiB\n        Used                                           : 1619 MiB\n        Free                                           : 8435 MiB\n    BAR1 Memory Usage\n        Total                                          : 256 MiB\n        Used                                           : 0 MiB\n        Free                                           : 256 MiB\n    Conf Compute Protected Memory Usage\n        Total                                          : N/A\n        Used                                           : N/A\n        Free                                           : N/A\n    Compute Mode                                       : Default\n    Utilization\n        GPU                                            : 12 %\n        Memory                                         : 4 %\n        Encoder                                        : 0 %\n        Decoder                                        : 0 %\n        JPEG                                           : 0 %\n        OFA                                            : 0 %\n    Encoder Stats\n        Active Sessions                                : 0\n        Average FPS                                    : 0\n        Average Latency                                : 0\n    FBC Stats\n        Active Sessions                                : 0\n        Average FPS                                    : 0\n        Average Latency                                : 0\n    DRAM Encryption Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    ECC Mode\n        Current                                        : N/A\n        Pending                                        : N/A\n    ECC Errors\n        Volatile\n            SRAM Correctable                           : N/A\n            SRAM Uncorrectable Parity                  : N/A\n            SRAM Uncorrectable SEC-DED                 : N/A\n            DRAM Correctable                           : N/A\n            DRAM Uncorrectable                         : N/A\n        Aggregate\n            SRAM Correctable                           : N/A\n            SRAM Uncorrectable Parity                  : N/A\n            SRAM Uncorrectable SEC-DED                 : N/A\n            DRAM Correctable                           : N/A\n            DRAM Uncorrectable                         : N/A\n            SRAM Threshold Exceeded                    : N/A\n        Aggregate Uncorrectable SRAM Sources\n            SRAM L2                                    : N/A\n            SRAM SM                                    : N/A\n            SRAM Microcontroller                       : N/A\n            SRAM PCIE                                  : N/A\n            SRAM Other                                 : N/A\n        Channel Repair Pending                         : No\n        TPC Repair Pending                             : No\n        Unrepairable Memory                            : N/A\n    Retired Pages\n        Single Bit ECC                                 : N/A\n        Double Bit ECC                                 : N/A\n        Pending Page Blacklist                         : N/A\n    Remapped Rows                                      : N/A\n    Remapped Banks                                     : N/A\n    Temperature\n        GPU Current Temp                               : 58 C\n        GPU Current Max Temp                           : N/A\n        GPU Current T.Limit Temp                       : N/A\n        GPU Shutdown Temp                              : 98 C\n        GPU Slowdown Temp                              : 95 C\n        GPU Max Operating Temp                         : 93 C\n        GPU Target Temperature Specification           : 83 C\n        Memory Current Temp                            : N/A\n        Memory Max Operating Temp                      : N/A\n    GPU Power Readings\n        Average Power Draw                             : 117.57 W\n        Instantaneous Power Draw                       : 129.64 W\n        GPU Ceiling Power Limit\n            Current Power Limit                        : 380.00 W\n            Requested Power Limit                      : 380.00 W\n            Default Power Limit                        : 380.00 W\n        GPU Base Power\n            Current Base Power                         : N/A\n            Requested Base Power                       : N/A\n            Default Base Power                         : N/A\n            Adaptive TGP Adjusted Base Power           : N/A\n        Min Power Limit                                : 100.00 W\n        Max Power Limit                                : 400.00 W\n    GPU Memory Power Readings \n        Average Power Draw                             : N/A\n        Instantaneous Power Draw                       : N/A\n    Module Power Readings\n        Average Power Draw                             : N/A\n        Instantaneous Power Draw                       : N/A\n        Current Power Limit                            : N/A\n        Requested Power Limit                          : N/A\n        Default Power Limit                            : N/A\n        Min Power Limit                                : N/A\n        Max Power Limit                                : N/A\n    Power Smoothing                                    : N/A\n    Workload Power Profiles\n        Requested Profiles                             : N/A\n        Enforced Profiles                              : N/A\n    EDPp Multiplier                                    : N/A\n    Clocks\n        Graphics                                       : 1800 MHz\n        SM                                             : 1800 MHz\n        Memory                                         : 9501 MHz\n        Video                                          : 1590 MHz\n    Applications Clocks\n        Graphics                                       : Requested functionality has been deprecated\n        Memory                                         : Requested functionality has been deprecated\n    Default Applications Clocks\n        Graphics                                       : Requested functionality has been deprecated\n        Memory                                         : Requested functionality has been deprecated\n    Deferred Clocks\n        Memory                                         : N/A\n    Max Clocks\n        Graphics                                       : 2115 MHz\n        SM                                             : 2115 MHz\n        Memory                                         : 9501 MHz\n        Video                                          : 1950 MHz\n    Max Customer Boost Clocks\n        Graphics                                       : N/A\n    Clock Policy\n        Auto Boost                                     : N/A\n        Auto Boost Default                             : N/A\n    DLA Clocks\n        Engine                                         : N/A\n        Max Engine                                     : N/A\n    Fabric\n        State                                          : N/A\n        Status                                         : N/A\n        CliqueId                                       : N/A\n        ClusterUUID                                    : N/A\n        Health\n            Summary                                    : N/A\n            Bandwidth                                  : N/A\n            Route Recovery in progress                 : N/A\n            Route Unhealthy                            : N/A\n            Access Timeout Recovery                    : N/A\n            Incorrect Configuration                    : N/A\n            Partition Assigned                         : N/A\n            Global Fabric Manager State                : N/A\n        Cliques                                        : \n    Processes                                          : None\n    Capabilities\n        EGM                                            : disabled\n\n",
+    "stderr": ""
+  },
+  "cuda_toolkit": {
+    "argv": [
+      "/opt/cuda/bin/nvcc",
+      "--version"
+    ],
+    "exit_code": 0,
+    "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Tue_Jun_09_02:43:40_PM_PDT_2026\nCuda compilation tools, release 13.3, V13.3.73\nBuild cuda_13.3.r13.3/compiler.38244171_0\n",
+    "stderr": ""
+  },
+  "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.44",
+  "oracles_sha256": {
+    "errors.json": "21723227839d5705e86eb2525905030ba537f616398519ec504c7adf39fe9a01",
+    "graph.json": "ebc413510eca1c90346296c8149e49b741688e162a3ace6eb80a484e1009df12",
+    "ann.json": "e9bcbc7c2ab000c44d2b2518359908e52190a1b5476b4dde15a377d9e69da23c"
+  },
+  "example_binary_sha256": "d9a08dcb424cffda56a8783016b76cb02eacb9454364b1d993c176ce304c78c9",
+  "evidence": "21 focused CUDA tests passed; 3 captures and 3 replay tests passed",
+  "missing": [
+    "Authoritative process GPU lifetime peak not established",
+    "Numerical/SpectralConvergence diagnostic coverage unavailable without changing product"
+  ]
+}

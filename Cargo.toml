@@ -10,10 +10,12 @@ homepage = "https://github.com/eugenehp/fast-map"
 documentation = "https://docs.rs/fast-umap/latest/fast_umap/"
 license = "MIT"
 edition = "2024"
+exclude = ["figures/*", "references/"]
 
 [workspace]
 members = [".", "bindings/python"]
 default-members = ["."]
+exclude = ["references"]
 resolver = "2"
 
 # docs.rs build configuration.
@@ -25,8 +27,6 @@ resolver = "2"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-
-exclude = ["figures/*"]
 
 [dependencies]
 burn = { version = "0.22.0", default-features = false, features = [

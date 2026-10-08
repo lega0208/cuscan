@@ -2,6 +2,11 @@ use burn::backend::Dispatch;
 use burn::tensor::{Device, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 use serde_json::Value;
+use serde_json::json;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
 const FIXTURE: &str = include_str!("fixtures/standard_umap_reference.json");
 
@@ -98,6 +103,101 @@ fn close(actual: &[f32], expected: &[f32], label: &str) {
 
 fn fixture_cases() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
+}
+
+fn frozen_source_digest() -> String {
+    let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
+    for args in [
+        vec!["diff", "--quiet", commit, "--", "src"],
+        vec!["diff", "--cached", "--quiet", commit, "--", "src"],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .status()
+            .expect("git must be available to verify frozen product source");
+        assert!(
+            status.success(),
+            "working product src differs from frozen source commit"
+        );
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e:src"])
+        .output()
+        .expect("git must be available to identify frozen product source");
+    assert!(
+        output.status.success(),
+        "could not resolve frozen src tree digest"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn git_blob_digest(bytes: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "could not digest deterministic graph inputs"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn graph_capture_case(
+    device: &Device,
+    name: &str,
+    indices: Vec<i32>,
+    distances: Vec<f32>,
+    n: usize,
+    k: usize,
+    local_connectivity: f32,
+    bandwidth: f32,
+    mix: f32,
+    bipartite: bool,
+    n_reference: usize,
+) -> Value {
+    let graph = run_graph(
+        device,
+        indices.clone(),
+        distances.clone(),
+        n,
+        k,
+        local_connectivity,
+        bandwidth,
+        mix,
+        bipartite,
+        n_reference,
+    );
+    let input = serde_json::to_vec(&json!({
+        "indices": indices,
+        "distance_bits": distances.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "shape": [n, k],
+        "local_connectivity_bits": local_connectivity.to_bits(),
+        "bandwidth_bits": bandwidth.to_bits(),
+        "mix_bits": mix.to_bits(),
+        "bipartite": bipartite,
+        "n_reference": n_reference,
+    }))
+    .unwrap();
+    json!({
+        "name": name,
+        "operation": "fuzzy_graph",
+        "dtype": "f32/i32",
+        "shape": [n, k],
+        "bipartite": bipartite,
+        "n_reference": n_reference,
+        "input_digest": git_blob_digest(&input),
+        "heads": graph.heads,
+        "tails": graph.tails,
+        "weight_bits": graph.weights.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "rho_bits": graph.rho.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "sigma_bits": graph.sigma.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "directed_bits": graph.directed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+    })
 }
 
 fn verify_reference_cases(device: &Device) {
@@ -443,4 +543,97 @@ fn standard_fuzzy_graph_matches_reference_fixtures_on_cuda() {
         return;
     };
     verify_reference_cases(&device);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn standard_fuzzy_graph_cuda_source_tagged_capture_oracle() {
+    const SOURCE: &str = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    let mut cases = Vec::new();
+    for case in fixture_cases()["graph_cases"].as_array().unwrap() {
+        let n = case["n"].as_u64().unwrap() as usize;
+        let k = case["k"].as_u64().unwrap() as usize;
+        let indices = ints(&case["indices"]);
+        let distances = floats(&case["distances"]);
+        cases.push(graph_capture_case(
+            &device,
+            case["name"].as_str().unwrap(),
+            indices,
+            distances,
+            n,
+            k,
+            case["local_connectivity"].as_f64().unwrap() as f32,
+            case["bandwidth"].as_f64().unwrap() as f32,
+            case["set_op_mix_ratio"].as_f64().unwrap() as f32,
+            false,
+            n,
+        ));
+    }
+    cases.push(graph_capture_case(
+        &device,
+        "invalid-index-marker",
+        vec![0, 3, 1, -2],
+        vec![0.0, 1.0, 0.0, 1.0],
+        2,
+        2,
+        1.0,
+        1.0,
+        1.0,
+        false,
+        2,
+    ));
+    cases.push(graph_capture_case(
+        &device,
+        "bipartite-equal-index-and-duplicates",
+        BIPARTITE_MIX_INDICES.to_vec(),
+        BIPARTITE_MIX_DISTANCES.to_vec(),
+        BIPARTITE_MIX_N,
+        BIPARTITE_MIX_K,
+        1.0,
+        1.0,
+        0.4,
+        true,
+        BIPARTITE_MIX_N_REFERENCE,
+    ));
+    cases.push(graph_capture_case(
+        &device,
+        "bipartite-hub",
+        vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 0, 1, 2],
+        vec![
+            0.0, 0.5, 1.0, 0.0, 0.25, 0.75, 0.0, 0.5, 1.0, 0.0, 0.25, 0.5,
+        ],
+        4,
+        3,
+        1.0,
+        1.0,
+        1.0,
+        true,
+        4,
+    ));
+    let capture = json!({
+        "source_commit": SOURCE,
+        "product_src_tree_digest": frozen_source_digest(),
+        "schema": "fast-umap.cuda-graph-capture.v1",
+        "operation": "fuzzy_graph",
+        "dtype": "f32/i32",
+        "cases": cases,
+    });
+    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_CAPTURE_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_ORACLE_PATH") {
+        let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
+        assert_eq!(
+            capture, oracle,
+            "CUDA graph output differs from frozen-source oracle"
+        );
+    }
 }

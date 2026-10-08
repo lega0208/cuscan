@@ -31,9 +31,18 @@ deadline is never adjusted automatically.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import csv
+import ctypes
+import datetime
+import hashlib
 import json
 import math
 import os
+import platform
+import shutil
+import signal
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -53,6 +62,512 @@ TRUST_GAP = 0.02
 RECALL_LIMIT = 0.90
 SMALL_RATIO_LIMIT = 1.10
 SPEED_RATIO_LIMIT = 0.90
+STAGE2_QUERY_SEEDS = (43, 44, 45)
+STAGE2_MODES = ("exact", "approximate")
+STAGE2_NEIGHBORS = 25
+STAGE2_TRUST_NEIGHBORS = 15
+STAGE2_FIT_RECALL_LIMIT = 0.90
+STAGE2_QUERY_RECALL_LIMIT = 0.87
+STAGE2_PAIRED_RUNS = 3
+STAGE2_GPU_CAP = 7 * 2**30
+NSYS_MEMORY_METHOD = (
+    "nsys --cuda-memory-usage allocation tracking (excludes CUDA context/module overhead)"
+)
+RESOURCE_POLL_SECONDS = 0.1
+_SUBREAPER_ENABLED = False
+
+
+def _enable_child_subreaper() -> bool:
+    """Ask Linux to reparent orphaned worker descendants here, enabling detached cleanup."""
+    global _SUBREAPER_ENABLED
+    if _SUBREAPER_ENABLED:
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        return False
+    _SUBREAPER_ENABLED = True
+    return True
+
+
+def _direct_children() -> set[int]:
+    parents, _ = _process_parents()
+    return {pid for pid, parent in parents.items() if parent == os.getpid()}
+
+
+class ResourceLimitExceeded(RuntimeError):
+    """An attributable CUDA process exceeded the Stage2 process-memory ceiling."""
+
+
+def _process_parents() -> tuple[dict[int, int], bool]:
+    """Return PID -> PPID from Linux procfs; inaccessible/exited processes are omitted."""
+    parents: dict[int, int] = {}
+    started = time.monotonic()
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return parents, False
+    complete = True
+    for entry in entries:
+        if len(parents) >= 8192 or time.monotonic() - started >= 0.025:
+            complete = False
+            break
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            parents[int(entry.name)] = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return parents, complete
+
+
+def process_descendants(root_pid: int) -> dict[str, Any]:
+    started = time.monotonic()
+    parents, complete = _process_parents()
+    lineage: dict[int, list[int]] = {root_pid: [root_pid]}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if pid not in lineage and parent in lineage:
+                lineage[pid] = [*lineage[parent], pid]
+                changed = True
+            if len(lineage) >= 4096 or time.monotonic() - started >= 0.05:
+                break
+        if len(lineage) >= 4096 or time.monotonic() - started >= 0.05:
+            break
+    complete = complete and len(lineage) < 4096 and time.monotonic() - started < 0.05
+    return {
+        "pids": sorted(lineage),
+        "ancestry": {str(pid): chain for pid, chain in lineage.items()},
+        "complete": complete,
+    }
+
+
+def _nvidia_smi(args: list[str], timeout: float = 0.08) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["nvidia-smi", *args], capture_output=True, text=True, timeout=timeout, check=True
+    )
+
+
+def gpu_device_provenance() -> dict[str, Any]:
+    """Query device, driver and CUDA runtime identity without inventing missing values."""
+    try:
+        result = _nvidia_smi(
+            ["--query-gpu=name,uuid,driver_version", "--format=csv,noheader"], timeout=1.0
+        )
+        devices = [row for row in csv.reader(result.stdout.splitlines()) if row]
+        details = _nvidia_smi([], timeout=1.0).stdout
+        version = _nvidia_smi(["--version"], timeout=1.0).stdout.splitlines()[0]
+        runtime_line = next(
+            (line for line in details.splitlines() if "CUDA Version:" in line), None
+        )
+        compatibility_version = (
+            runtime_line.split("CUDA Version:", 1)[1].strip().split()[0] if runtime_line else None
+        )
+        return {
+            "status": "available",
+            "api": "nvidia-smi",
+            "version": version,
+            "devices": [
+                {
+                    "name": row[0].strip(),
+                    "uuid": row[1].strip(),
+                    "driver_version": row[2].strip(),
+                    "driver_cuda_compatibility_version": compatibility_version,
+                    "cuda_runtime_version": None,
+                    "cuda_runtime_explanation": (
+                        "nvidia-smi does not identify the CUDA runtime loaded by this process."
+                    ),
+                }
+                for row in devices
+                if len(row) >= 3
+            ],
+        }
+    except (OSError, subprocess.SubprocessError, IndexError) as error:
+        return {
+            "status": "unavailable",
+            "api": "nvidia-smi",
+            "devices": None,
+            "cuda_runtime_version": None,
+            "cuda_runtime_explanation": (
+                "Unavailable because nvidia-smi device provenance could not be queried."
+            ),
+            "reason": (
+                f"nvidia-smi device provenance unavailable (including WSL/no-device cases): {error}"
+            ),
+        }
+
+
+class GpuProcessTelemetry:
+    """Best-effort 100 ms nvidia-smi process attribution; sampled peaks are not lifetime peaks."""
+
+    def __init__(self) -> None:
+        self.evidence: dict[str, Any] = {
+            "cap_bytes": STAGE2_GPU_CAP,
+            "method": "nvidia-smi --query-compute-apps",
+            "telemetry_api": "nvidia-smi",
+            "telemetry_version": None,
+            "units": "bytes",
+            "telemetry_source_memory_unit": "MiB, converted to bytes using 1024^2",
+            "sample_interval_seconds": RESOURCE_POLL_SECONDS,
+            "readings": [],
+            "instantaneous_process_bytes": None,
+            "sampled_max_bytes": None,
+            "timed_out_samples": 0,
+            "process_tree_attribution": ("PID ancestry via /proc; GPU process PID from nvidia-smi"),
+            "status": "pending",
+            "explanation": None,
+        }
+        self.evidence["explanation"] = (
+            "Telemetry version will be read from supervised device provenance."
+        )
+
+    def sample(self, root_pid: int, deadline: Deadline) -> None:
+        if self.evidence["status"] == "unavailable":
+            return
+        ancestry = process_descendants(root_pid)
+        if not ancestry["complete"]:
+            self.evidence.update(
+                status="unavailable",
+                explanation=(
+                    "/proc process ancestry snapshot exceeded its bounded scan budget; "
+                    "process attribution is incomplete."
+                ),
+            )
+            return
+        try:
+            remaining = deadline.remaining()
+            result = _nvidia_smi(
+                [
+                    "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=min(RESOURCE_POLL_SECONDS / 2, remaining),
+            )
+            rows = list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
+            self.evidence["telemetry_version"] = (
+                self.evidence["telemetry_version"] or "nvidia-smi (version unavailable)"
+            )
+            process_rows = []
+            total = 0
+            known_pids = set(ancestry["pids"])
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                try:
+                    pid, mib = int(row[0].strip()), int(row[1].strip())
+                except ValueError:
+                    continue
+                if pid in known_pids:
+                    used = mib * 1024 * 1024
+                    total += used
+                    process_rows.append(
+                        {
+                            "pid": pid,
+                            "ancestry": ancestry["ancestry"].get(str(pid), [pid]),
+                            "gpu_uuid": row[2].strip(),
+                            "used_bytes": used,
+                        }
+                    )
+            reading = {
+                "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "monotonic_seconds": time.monotonic(),
+                "root_pid": root_pid,
+                "telemetry_api": self.evidence["telemetry_api"],
+                "telemetry_version": self.evidence["telemetry_version"],
+                "tracked_pids": ancestry["pids"],
+                "processes": process_rows,
+                "attributable_process_bytes": total if process_rows else None,
+                "units": "bytes",
+            }
+            self.evidence["readings"].append(reading)
+            self.evidence["instantaneous_process_bytes"] = total if process_rows else None
+            if process_rows:
+                previous = self.evidence["sampled_max_bytes"] or 0
+                self.evidence["sampled_max_bytes"] = max(previous, total)
+                self.evidence["status"] = "sampled_attributable"
+                self.evidence["explanation"] = (
+                    "Observed nvidia-smi process samples; transient peaks "
+                    "between samples are not covered."
+                )
+                if total > self.evidence["cap_bytes"]:
+                    self.evidence["status"] = "violation"
+                    self.evidence["violation"] = {
+                        "timestamp_utc": reading["timestamp_utc"],
+                        "observed_bytes": total,
+                        "cap_bytes": self.evidence["cap_bytes"],
+                        "processes": process_rows,
+                    }
+                    raise ResourceLimitExceeded(
+                        f"attributable CUDA process-tree GPU memory {total} "
+                        f"exceeds {self.evidence['cap_bytes']} bytes"
+                    )
+            elif not self.evidence["readings"][:-1]:
+                self.evidence["status"] = "no_attributable_process_seen"
+                self.evidence["explanation"] = (
+                    "nvidia-smi answered but no CUDA process PID was "
+                    "attributable to the supervised worker tree."
+                )
+        except ResourceLimitExceeded:
+            raise
+        except subprocess.TimeoutExpired:
+            # A slow query skips one sample; later samples still arm the over-cap kill.
+            self.evidence["timed_out_samples"] += 1
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            self.evidence["status"] = "unavailable"
+            self.evidence["explanation"] = f"nvidia-smi process telemetry unavailable: {error}"
+
+
+def stage2_cuda_command(
+    binary: Path,
+    input_path: Path,
+    rows: int,
+    features: int,
+    epochs: int,
+    output_dir: Path,
+    mode: str,
+    seed: int,
+    warmups: int,
+    runs: int,
+    neighbors: int,
+    init: str,
+    queries: list[tuple[Path, int]],
+) -> list[str]:
+    """Construct the Rust example's positional INPUT ROWS FEATURES EPOCHS OUT_DIR CLI."""
+    command = [
+        str(binary),
+        str(input_path),
+        str(rows),
+        str(features),
+        str(epochs),
+        str(output_dir),
+        "--search",
+        mode,
+        "--warmups",
+        str(warmups),
+        "--runs",
+        str(runs),
+        "--neighbors",
+        str(neighbors),
+        "--init",
+        init,
+        "--seed",
+        str(seed),
+    ]
+    for path, query_rows in queries:
+        command.extend(["--query", str(path), "--query-rows", str(query_rows)])
+    return command
+
+
+def stage2_aggregate(
+    records: list[dict[str, Any]], references: dict[str, list[dict[str, Any]]], paired_runs: int
+) -> dict[str, Any]:
+    """Aggregate complete matched quality and timing evidence; timing never gates quality."""
+    quality: dict[str, Any] = {}
+    timings: dict[str, Any] = {}
+    diffs = []
+    warnings = []
+    full_coverage = True
+    for mode in STAGE2_MODES:
+        mode_rows = [row for row in records if row["mode"] == mode]
+        refs = references[mode]
+        fit_mean = statistics.fmean(row["fit_trustworthiness"] for row in refs)
+        batch_means = [
+            statistics.fmean(row["transform"][batch]["trustworthiness"] for row in refs)
+            for batch in range(3)
+        ]
+        for row in mode_rows:
+            row["reference_fit_trustworthiness_mean"] = fit_mean
+            row["fit_trustworthiness_gap_from_reference_mean"] = abs(
+                row["fit_trustworthiness"] - fit_mean
+            )
+            for batch_row in row["transform"]:
+                batch_mean = batch_means[batch_row["batch"]]
+                batch_row["reference_trustworthiness_mean"] = batch_mean
+                batch_row["trustworthiness_gap_from_reference_mean"] = abs(
+                    batch_row["trustworthiness"] - batch_mean
+                )
+            row["quality_pass"] = (
+                row["fit_trustworthiness_gap_from_reference_mean"] <= TRUST_GAP
+                and row["fit_recall"] >= STAGE2_FIT_RECALL_LIMIT
+                and len(row["transform"]) == 3
+                and all(
+                    batch_row["trustworthiness_gap_from_reference_mean"] <= TRUST_GAP
+                    for batch_row in row["transform"]
+                )
+            )
+            for batch_row in row["transform"]:
+                if batch_row["recall"] < STAGE2_QUERY_RECALL_LIMIT:
+                    warnings.append(
+                        {
+                            "kind": "query_recall_below_limit",
+                            "mode": mode,
+                            "pair": row["pair"],
+                            "side": row["side"],
+                            "seed": batch_row["seed"],
+                            "recall": batch_row["recall"],
+                            "limit": STAGE2_QUERY_RECALL_LIMIT,
+                        }
+                    )
+        expected = {(pair, side) for pair in range(paired_runs) for side in ("A", "B")}
+        present = {(row["pair"], row["side"]) for row in mode_rows}
+        full_coverage &= present == expected and all(
+            len(row["transform"]) == 3 for row in mode_rows
+        )
+        quality[mode] = {
+            "reference_fit_trustworthiness_mean": fit_mean,
+            "reference_transform_trustworthiness_means": batch_means,
+            "all_runs_pass": len(mode_rows) == paired_runs * 2
+            and all(row["quality_pass"] for row in mode_rows),
+            "query_recall_warning": any(item["mode"] == mode for item in warnings),
+            "runs": [
+                {
+                    "pair": row["pair"],
+                    "side": row["side"],
+                    "reference": row["reference"],
+                    "fit_trustworthiness": row["fit_trustworthiness"],
+                    "fit_recall": row["fit_recall"],
+                    "transform": row["transform"],
+                    "pass": row["quality_pass"],
+                }
+                for row in mode_rows
+            ],
+        }
+        fit = [float(row["fit_seconds"][0]) for row in mode_rows]
+        timings[mode] = {
+            "fit_seconds": fit,
+            "fit_median_seconds": statistics.median(fit) if fit else None,
+            "transform_by_batch_seconds": [
+                [
+                    row["transform"][batch]["seconds"]
+                    for row in mode_rows
+                    if len(row["transform"]) > batch
+                ]
+                for batch in range(3)
+            ],
+            "transform_total_seconds": [row["transform_total_seconds"] for row in mode_rows],
+            "warmup_policy": "one warmup for each mode/side before timed pairs",
+        }
+        for pair in range(paired_runs):
+            a = next((row for row in mode_rows if row["pair"] == pair and row["side"] == "A"), None)
+            b = next((row for row in mode_rows if row["pair"] == pair and row["side"] == "B"), None)
+            if a is None or b is None:
+                full_coverage = False
+            else:
+                diffs.append(
+                    {
+                        "pair": pair,
+                        "mode": mode,
+                        "side_a_minus_b_fit_seconds": float(a["fit_seconds"][0])
+                        - float(b["fit_seconds"][0]),
+                    }
+                )
+    return {
+        "quality": quality,
+        "timings": timings,
+        "paired_timing_differences": diffs,
+        "full_coverage": full_coverage,
+        "speed_gates": [],
+        "warnings": warnings,
+    }
+
+
+def nsys_memory_incomplete(cap_bytes: int, explanation: str) -> dict[str, Any]:
+    """Nsight memory evidence that cannot establish a lifetime peak."""
+    return {
+        "nsys_peak_live_allocation_bytes": None,
+        "allocation_event_count": 0,
+        "free_event_count": 0,
+        "unknown_event_count": 0,
+        "per_pid_device_peaks": [],
+        "method": NSYS_MEMORY_METHOD,
+        "cap_bytes": cap_bytes,
+        "pass": False,
+        "status": "incomplete",
+        "explanation": explanation,
+    }
+
+
+def nsys_cuda_memory_evidence(sqlite_path: Path, cap_bytes: int) -> dict[str, Any]:
+    """Compute CUDA allocation lifetime peaks from Nsight Systems' exported event table.
+
+    Operation type 0 is an allocation and 1 a free. Any other operation type makes the
+    evidence incomplete, because its effect on live bytes is unknown.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(sqlite_path)) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(CUDA_GPU_MEMORY_USAGE_EVENTS)")
+            }
+            required = {"start", "globalPid", "deviceId", "bytes", "memoryOperationType"}
+            if not required.issubset(columns):
+                return nsys_memory_incomplete(
+                    cap_bytes, "CUDA_GPU_MEMORY_USAGE_EVENTS table or required columns missing."
+                )
+            rows = connection.execute(
+                "SELECT globalPid, deviceId, bytes, memoryOperationType "
+                "FROM CUDA_GPU_MEMORY_USAGE_EVENTS ORDER BY start"
+            ).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        return nsys_memory_incomplete(
+            cap_bytes, f"Nsight Systems SQLite memory evidence unavailable: {error}"
+        )
+    live: dict[tuple[int, int], int] = {}
+    peaks: dict[tuple[int, int], int] = {}
+    counts = {0: 0, 1: 0}
+    unknown = 0
+    for pid, device, size, operation in rows:
+        key = (int(pid), int(device))
+        if operation == 0:
+            live[key] = live.get(key, 0) + int(size)
+        elif operation == 1:
+            live[key] = live.get(key, 0) - int(size)
+        else:
+            unknown += 1
+            continue
+        counts[operation] += 1
+        peaks[key] = max(peaks.get(key, 0), live[key])
+    evidence = nsys_memory_incomplete(cap_bytes, "")
+    evidence.update(
+        allocation_event_count=counts[0], free_event_count=counts[1], unknown_event_count=unknown
+    )
+    if counts[0] == 0:
+        evidence["explanation"] = "No CUDA allocation events were exported."
+        return evidence
+    if unknown:
+        evidence["explanation"] = f"{unknown} memory events have an unknown operation type."
+        return evidence
+    del evidence["explanation"]
+    evidence["per_pid_device_peaks"] = [
+        {"globalPid": pid, "deviceId": device, "peak_live_allocation_bytes": peak}
+        for (pid, device), peak in sorted(peaks.items())
+    ]
+    peak = max(peaks.values())
+    evidence["nsys_peak_live_allocation_bytes"] = peak
+    evidence["pass"] = peak <= cap_bytes
+    evidence["status"] = "pass" if evidence["pass"] else "fail"
+    return evidence
+
+
+def finalize_resource_evidence(evidence: dict[str, Any], telemetry: GpuProcessTelemetry) -> str:
+    """Attach supplementary telemetry and derive the resource status from Nsight evidence.
+
+    Every mode must have Nsight memory evidence that passes; any failing mode fails.
+    """
+    evidence["supplementary_nvidia_smi"] = telemetry.evidence
+    modes = [evidence["nsys_modes"].get(mode, {}) for mode in STAGE2_MODES]
+    peaks = [item.get("nsys_peak_live_allocation_bytes") for item in modes]
+    if all(peak is not None for peak in peaks):
+        evidence["authoritative_lifetime_peak_bytes"] = max(peaks)
+    if any(item.get("status") == "fail" for item in modes):
+        return "fail"
+    if all(item.get("status") == "pass" for item in modes):
+        return "pass"
+    return "incomplete"
 
 
 class DeadlineExceeded(TimeoutError):
@@ -88,13 +603,1137 @@ def run_with_deadline(
         raise DeadlineExceeded("global runtime deadline expired during worker execution") from error
 
 
-def last_json(text: str) -> dict[str, Any]:
+def run_supervised(
+    command: list[str],
+    deadline: Deadline,
+    *,
+    env: dict[str, str] | None = None,
+    telemetry: GpuProcessTelemetry | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run a killable process group, so timeout cleanup includes worker descendants."""
+    subreaper = _enable_child_subreaper()
+    if sys.platform.startswith("linux") and not subreaper:
+        raise OSError("Linux child-subreaper setup failed; detached worker cleanup is unavailable")
+    baseline_children = _direct_children() if subreaper else set()
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    seen_descendants: set[int] = set()
+    adopted_roots: set[int] = set()
+
+    def refresh_descendants() -> None:
+        snapshot = process_descendants(process.pid)
+        seen_descendants.update(snapshot["pids"])
+        parents, _ = _process_parents()
+        if subreaper:
+            adopted = {
+                pid
+                for pid, parent in parents.items()
+                if parent == os.getpid() and pid not in baseline_children and pid != process.pid
+            }
+            adopted_roots.update(adopted)
+            seen_descendants.update(adopted)
+        for pid in tuple(adopted_roots):
+            tree = process_descendants(pid)
+            seen_descendants.update(tree["pids"])
+
+    def kill_tree(*, graceful: bool) -> None:
+        if graceful:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        for pid in tuple(seen_descendants):
+            if pid == process.pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.wait()
+        if subreaper:
+            parents, _ = _process_parents()
+            seen_descendants.update(
+                pid
+                for pid, parent in parents.items()
+                if parent == os.getpid() and pid not in baseline_children and pid != process.pid
+            )
+            for pid in tuple(seen_descendants):
+                if pid == process.pid:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            reap_until = time.monotonic() + 0.5
+            for pid in tuple(seen_descendants):
+                if pid == process.pid:
+                    continue
+                while True:
+                    try:
+                        waited, _ = os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    if waited == pid:
+                        break
+                    if time.monotonic() >= reap_until:
+                        break
+                    time.sleep(0.01)
+
+    stdout = stderr = ""
+    try:
+        while True:
+            refresh_descendants()
+            if process.poll() is not None:
+                kill_tree(graceful=False)
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            if telemetry is not None:
+                telemetry.sample(process.pid, deadline)
+            remaining = deadline.remaining()
+            polling_wait = (
+                RESOURCE_POLL_SECONDS / 2 if telemetry is not None else RESOURCE_POLL_SECONDS
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=min(polling_wait, remaining))
+                break
+            except subprocess.TimeoutExpired as timeout_error:
+                stdout = timeout_error.stdout or stdout
+                stderr = timeout_error.stderr or stderr
+                continue
+    except BaseException as error:
+        kill_tree(graceful=isinstance(error, DeadlineExceeded))
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        if isinstance(error, ResourceLimitExceeded):
+            raise
+        if not isinstance(error, DeadlineExceeded):
+            raise
+        raise DeadlineExceeded(
+            "global runtime deadline expired during supervised worker execution"
+        ) from error
+    refresh_descendants()
+    kill_tree(graceful=True)
+    if check and process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def stage2_trustworthiness(matrix: Any, embedding: Any) -> float:
+    from sklearn.manifold import trustworthiness
+
+    return float(trustworthiness(matrix, embedding, n_neighbors=STAGE2_TRUST_NEIGHBORS))
+
+
+def stage2_recall(matrix: Any, actual: Any, neighbors: int) -> float:
+    """Recall with deterministic ID tie-breaking, unique IDs and inclusive radius ties."""
+    import numpy as np
+    from sklearn.metrics import pairwise_distances_chunked
+
+    actual = np.asarray(actual)
+    if actual.ndim != 2 or actual.shape[0] != matrix.shape[0]:
+        raise ValueError("neighbor IDs must cover every input row")
+    if np.any((actual < -1) | (actual >= matrix.shape[0])):
+        raise ValueError("neighbor output contains invalid IDs")
+    exact_k = min(neighbors, matrix.shape[0] - 1)
+    hits = 0
+    offset = 0
+    for block in pairwise_distances_chunked(matrix, matrix, metric="euclidean", working_memory=64):
+        local_rows = np.arange(block.shape[0])
+        block[local_rows, offset + local_rows] = np.inf
+        cutoffs = np.partition(block, exact_k - 1, axis=1)[:, exact_k - 1]
+        for local_row, ids in enumerate(actual[offset : offset + block.shape[0]]):
+            seen: set[int] = set()
+            for index in ids:
+                index = int(index)
+                if index >= 0 and index != offset + local_row and index not in seen:
+                    seen.add(index)
+                    hits += block[local_row, index] <= cutoffs[local_row]
+        offset += block.shape[0]
+    denominator = matrix.shape[0] * actual.shape[1]
+    return float(hits / denominator) if denominator else 0.0
+
+
+def stage2_query_recall(queries: Any, training: Any, actual: Any, neighbors: int) -> float:
+    """Query-to-training recall; query rows are not training/self IDs."""
+    import numpy as np
+    from sklearn.metrics import pairwise_distances_chunked
+
+    actual = np.asarray(actual)
+    if actual.ndim != 2 or actual.shape[0] != queries.shape[0]:
+        raise ValueError("query neighbor IDs must cover every query row")
+    if np.any((actual < -1) | (actual >= training.shape[0])):
+        raise ValueError("query graph contains invalid training IDs")
+    k = min(neighbors, training.shape[0])
+    hits = 0
+    offset = 0
+    for block in pairwise_distances_chunked(
+        queries, training, metric="euclidean", working_memory=64
+    ):
+        cutoffs = np.partition(block, k - 1, axis=1)[:, k - 1]
+        for local_row, ids in enumerate(actual[offset : offset + block.shape[0]]):
+            seen: set[int] = set()
+            for index in ids:
+                index = int(index)
+                if index >= 0 and index not in seen:
+                    seen.add(index)
+                    hits += block[local_row, index] <= cutoffs[local_row]
+        offset += block.shape[0]
+    return float(hits / (actual.shape[0] * actual.shape[1]))
+
+
+def reverse_graph_diagnostics(graph: Any, rows: int) -> dict[str, Any]:
+    """Describe observed reverse degrees and explicit memory estimates for a CSR-like index."""
+    import numpy as np
+
+    graph = np.asarray(graph)
+    if graph.ndim != 2:
+        raise ValueError("fit graph must be a matrix")
+    if np.any((graph < -1) | (graph >= rows)):
+        raise ValueError("fit graph contains invalid neighbor IDs")
+    ids = graph[graph >= 0].astype(np.int64, copy=False)
+    degrees = np.bincount(ids, minlength=rows).astype(np.uint64, copy=False)
+    edge_count = int(ids.size)
+    max_u32 = (1 << 32) - 1
+    max_i32 = (1 << 31) - 1
+    max_u64 = (1 << 64) - 1
+    representability = {
+        "node_count_u32": rows <= max_u32,
+        "edge_count_u32": edge_count <= max_u32,
+        "node_ids_i32": rows <= max_i32 + 1,
+        "prefix_sum_u64": edge_count <= max_u64,
+    }
+    counts_bytes = rows * 4
+    cursors_bytes = rows * 4
+    prefix_bytes = (rows + 1) * 8
+    reverse_ids_bytes = edge_count * 4
+    workspace = counts_bytes + cursors_bytes + prefix_bytes + reverse_ids_bytes
+    workspace_representable = all(
+        value <= max_u64
+        for value in (counts_bytes, cursors_bytes, prefix_bytes, reverse_ids_bytes, workspace)
+    )
+    mean = float(degrees.mean()) if rows else 0.0
+    std = float(degrees.std()) if rows else 0.0
+    return {
+        "evidence_kind": (
+            "observed graph degrees; construction sizes are estimates, not measured allocations"
+        ),
+        "graph_shape": list(graph.shape),
+        "observed_valid_edge_count": edge_count,
+        "reverse_indegree": {
+            "mean": mean,
+            "stddev": std,
+            "p50": float(np.percentile(degrees, 50)),
+            "p90": float(np.percentile(degrees, 90)),
+            "p95": float(np.percentile(degrees, 95)),
+            "p99": float(np.percentile(degrees, 99)),
+            "max": int(degrees.max(initial=0)),
+            "hub_thresholds": {
+                "greater_than_2x_mean": 2.0 * mean,
+                "count_greater_than_2x_mean": int(np.count_nonzero(degrees > 2.0 * mean)),
+                "greater_than_mean_plus_3_stddev": mean + 3.0 * std,
+                "count_greater_than_mean_plus_3_stddev": int(
+                    np.count_nonzero(degrees > mean + 3.0 * std)
+                ),
+            },
+        },
+        "representability": representability | {"workspace_bytes_u64": workspace_representable},
+        "reverse_index_workspace_estimate_bytes": {
+            "counts_u32": counts_bytes,
+            "cursors_u32": cursors_bytes,
+            "prefix_u64": prefix_bytes,
+            "reverse_ids_i32": reverse_ids_bytes,
+            "concurrent_peak_estimate": workspace if workspace_representable else None,
+            "assumptions": (
+                "counts, mutable cursors, prefix offsets, and all reverse IDs "
+                "coexist during construction"
+            ),
+            "source": ("computed from observed exported fit graph; not allocator telemetry"),
+        },
+    }
+
+
+def stage2_nonself_padded(indices: Any, width: int) -> Any:
+    """Validate raw neighbor IDs, drop self IDs and pad short rows with -1 sentinels."""
+    import numpy as np
+
+    indices = np.asarray(indices)
+    if indices.ndim != 2:
+        raise ValueError("fit graph must be a two-dimensional ID matrix")
+    rows, _ = indices.shape
+    if np.any((indices < -1) | (indices >= rows)):
+        raise ValueError("fit graph contains invalid raw neighbor IDs")
+    result = np.full((rows, width), -1, dtype=np.int64)
+    for row in range(rows):
+        selected = [int(value) for value in indices[row] if value >= 0 and value != row]
+        count = min(len(selected), width)
+        result[row, :count] = selected[:count]
+    return result
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stage2_reference_fit(matrix: Any, mode: str, seed: int, epochs: int, neighbors: int) -> Any:
+    import umap
+    from pynndescent import NNDescent
+    from sklearn.neighbors import NearestNeighbors
+
+    if umap.__version__ != "0.5.12":
+        raise ValueError(f"Stage2 requires umap-learn 0.5.12, got {umap.__version__}")
+    n_neighbors = neighbors
+    index = NNDescent(matrix, n_neighbors=n_neighbors, metric="euclidean", random_state=seed)
+    if mode == "exact":
+        distances, indices = (
+            NearestNeighbors(n_neighbors=n_neighbors, n_jobs=-1).fit(matrix).kneighbors(matrix)
+        )
+        precomputed = (indices, distances, index)
+    else:
+        precomputed = (None, None, None)
+    estimator = umap.UMAP(
+        n_neighbors=n_neighbors,
+        n_components=2,
+        n_epochs=epochs,
+        init="spectral",
+        random_state=seed,
+        transform_seed=seed,
+        metric="euclidean",
+        n_jobs=-1,
+        force_approximation_algorithm=mode == "approximate",
+        precomputed_knn=precomputed,
+        verbose=False,
+    )
+    estimator.fit(matrix)
+    if estimator._small_data:
+        raise ValueError("reference did not use indexed transform search")
+    if (
+        estimator.n_neighbors != n_neighbors
+        or estimator.init != "spectral"
+        or estimator.metric != "euclidean"
+        or estimator.random_state != seed
+        or estimator.transform_seed != seed
+    ):
+        raise ValueError(
+            "umap-learn reference fitted settings differ from the requested Stage2 contract"
+        )
+    return estimator
+
+
+def _stage2_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    """One isolated reference quality run (fit and three held-out transforms)."""
+    import numpy as np
+
+    if payload.get("kind") == "generate":
+        train_rng = np.random.default_rng(42)
+        centers = train_rng.normal(0.0, 5.0, size=(8, payload["features"])).astype(np.float32)
+        labels = np.arange(payload["rows"]) % 8
+        train_rng.shuffle(labels)
+        train = centers[labels] + train_rng.normal(
+            0.0, 0.35, (payload["rows"], payload["features"])
+        ).astype(np.float32)
+        train.astype("<f4", copy=False).tofile(payload["train"])
+        queries = []
+        for seed, path in zip(payload["seeds"], payload["query_paths"], strict=True):
+            query_rng = np.random.default_rng(seed)
+            labels = np.arange(payload["query_rows"]) % 8
+            query_rng.shuffle(labels)
+            query = centers[labels] + query_rng.normal(
+                0.0, 0.35, (payload["query_rows"], payload["features"])
+            ).astype(np.float32)
+            query.astype("<f4", copy=False).tofile(path)
+            queries.append(
+                {
+                    "path": path,
+                    "sha256": sha256_file(Path(path)),
+                    "label_counts": np.bincount(labels, minlength=8).tolist(),
+                    "labels_sha256": hashlib.sha256(labels.astype("<i8").tobytes()).hexdigest(),
+                }
+            )
+        return {
+            "train_sha256": sha256_file(Path(payload["train"])),
+            "train_label_counts": np.bincount(np.arange(payload["rows"]) % 8, minlength=8).tolist(),
+            "queries": queries,
+            "generation": {
+                "train_seed": 42,
+                "center_scale": 5.0,
+                "noise": 0.35,
+                "query_seeds": payload["seeds"],
+                "query_centers": "shared train centers",
+                "query_labels": "balanced and shuffled per seed",
+            },
+        }
+    if payload.get("kind") == "provenance":
+        import importlib.metadata
+        import shutil
+
+        names = ("numpy", "scikit-learn", "umap-learn", "pynndescent", "numba", "scipy")
+        root = Path(payload["root"])
+        harness = [Path(item) for item in payload["harness_paths"]]
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        rustc = subprocess.run(
+            ["rustc", "--version"], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "diff", payload["frozen_product"], "--", *map(str, harness)],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        diff_path = Path(payload["artifact_directory"]) / "harness.diff"
+        diff_path.write_text(diff, encoding="utf-8")
+        nvcc = shutil.which("nvcc")
+        toolkit = None
+        if nvcc:
+            toolkit = subprocess.run(
+                [nvcc, "--version"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout
+        return {
+            "dependencies": {name: importlib.metadata.version(name) for name in names},
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "gpu": gpu_device_provenance(),
+            "source": {
+                "working_head": head,
+                "rustc": rustc,
+                "binary_sha256": sha256_file(Path(payload["binary"])),
+                "script_sha256": sha256_file(root / "scripts/compare_umap_spans.py"),
+                "lockfile_sha256": sha256_file(root / "Cargo.lock"),
+                "harness_test_sha256": {
+                    str(path): sha256_file(root / path)
+                    for path in harness
+                    if (root / path).is_file()
+                },
+                "harness_diff_path": str(diff_path),
+                "harness_diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+                "cuda_toolkit_nvcc_version": toolkit,
+            },
+        }
+
+    if payload.get("kind") == "cuda-quality":
+        train = np.fromfile(payload["train"], dtype="<f4").reshape(
+            payload["rows"], payload["features"]
+        )
+        fit_embedding = np.fromfile(payload["fit_embedding"], dtype="<f4").reshape(
+            payload["rows"], 2
+        )
+        raw_fit_graph = np.fromfile(payload["fit_graph"], dtype="<i4").reshape(payload["rows"], -1)
+        if np.any((raw_fit_graph < -1) | (raw_fit_graph >= payload["rows"])):
+            raise ValueError("fit graph contains invalid raw neighbor IDs")
+        fit_width = payload["neighbors"] - 1
+        fit_graph = stage2_nonself_padded(raw_fit_graph, fit_width)
+        reverse_diagnostics = reverse_graph_diagnostics(fit_graph, payload["rows"])
+        if payload.get("diagnostic_path"):
+            atomic_write_json(Path(payload["diagnostic_path"]), reverse_diagnostics)
+        fit_scores = {
+            "trustworthiness": stage2_trustworthiness(train, fit_embedding),
+            "recall": stage2_recall(train, fit_graph, fit_width),
+        }
+        if not all(math.isfinite(value) for value in fit_scores.values()):
+            raise ValueError("fit quality evaluator produced a non-finite result")
+        transform_scores = []
+        for batch, query_path in enumerate(payload["queries"]):
+            query = np.fromfile(query_path, dtype="<f4").reshape(
+                payload["query_rows"], payload["features"]
+            )
+            embedding = np.fromfile(payload["transform_embeddings"][batch], dtype="<f4").reshape(
+                payload["query_rows"], 2
+            )
+            graph = np.fromfile(payload["query_graphs"][batch], dtype="<i4").reshape(
+                payload["query_rows"], payload["graph_width"]
+            )
+            scores = {
+                "trustworthiness": stage2_trustworthiness(query, embedding),
+                "recall": stage2_query_recall(query, train, graph, payload["neighbors"]),
+            }
+            if not all(math.isfinite(value) for value in scores.values()):
+                raise ValueError(
+                    f"query-batch {batch} quality evaluator produced a non-finite result"
+                )
+            transform_scores.append(scores)
+        return {
+            "fit": fit_scores,
+            "transform": transform_scores,
+            "reverse_graph_diagnostics": reverse_diagnostics,
+        }
+
+    train = np.fromfile(payload["train"], dtype="<f4").reshape(payload["rows"], payload["features"])
+    queries = [
+        np.fromfile(path, dtype="<f4").reshape(payload["query_rows"], payload["features"])
+        for path in payload["queries"]
+    ]
+    mode, seed = payload["mode"], payload["seed"]
+    model = _stage2_reference_fit(train, mode, seed, payload["epochs"], payload["neighbors"])
+    fit = np.asarray(model.embedding_, dtype=np.float32)
+    fit_neighbors = model._knn_indices
+    result: dict[str, Any] = {
+        "fit_trustworthiness": stage2_trustworthiness(train, fit),
+        "fit_recall": stage2_recall(
+            train, nonself(fit_neighbors, payload["neighbors"] - 1), payload["neighbors"] - 1
+        ),
+        "transform": [],
+        "reference": {
+            "package": "umap-learn",
+            "version": "0.5.12",
+            "index": "pynndescent.NNDescent",
+            "index_version": __import__("pynndescent").__version__,
+            "mode": mode,
+            "random_state": seed,
+            "transform_seed": seed,
+            "n_neighbors": payload["neighbors"],
+            "n_components": 2,
+            "n_epochs": payload["epochs"],
+            "init": "spectral",
+            "metric": "euclidean",
+            "n_jobs": -1,
+            "requested_force_approximation_algorithm": mode == "approximate",
+            "fit_neighbor_source": "sklearn_exact_precomputed"
+            if mode == "exact"
+            else "umap_approximate_search",
+            "post_fit_force_approximation_algorithm": bool(model.force_approximation_algorithm),
+            "exact_mode_fit_knn": mode == "exact",
+            "trustworthiness_n_neighbors": STAGE2_TRUST_NEIGHBORS,
+            "trustworthiness_population": "all fit rows or current query batch only",
+            "recall_truth": "euclidean input-space exact kth-distance cutoff",
+        },
+    }
+    if not math.isfinite(result["fit_trustworthiness"]) or not math.isfinite(result["fit_recall"]):
+        raise ValueError("pinned reference fit quality evaluator produced a non-finite result")
+    for query in queries:
+        embedding = np.asarray(model.transform(query), dtype=np.float32)
+        score = stage2_trustworthiness(query, embedding)
+        if not math.isfinite(score):
+            raise ValueError(
+                "pinned reference transform quality evaluator produced a non-finite result"
+            )
+        result["transform"].append({"trustworthiness": score})
+    return result
+
+
+def _stage2_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Bounded Stage2 standard UMAP baseline campaign")
+    parser.add_argument("--suite", choices=["stage2"], required=True)
+    parser.add_argument("--rows", type=int, default=16384)
+    parser.add_argument("--features", type=int, default=16)
+    parser.add_argument("--neighbors", type=int, default=STAGE2_NEIGHBORS)
+    parser.add_argument("--init", choices=["spectral"], default="spectral")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--query-rows", type=int, default=1024)
+    parser.add_argument("--query-seeds", default=",".join(map(str, STAGE2_QUERY_SEEDS)))
+    parser.add_argument(
+        "--paired-runs",
+        type=int,
+        default=STAGE2_PAIRED_RUNS,
+        help="matched A/B baseline repetitions per mode",
+    )
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--deadline-seconds", type=float, default=900.0)
+    parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--profile-nsys", action="store_true")
+    parser.add_argument("--_stage2_worker", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args._stage2_worker:
+        print(json.dumps(_stage2_worker(json.loads(args._stage2_worker))))
+        return 0
+    if args.output is None:
+        parser.error("--output is required for a Stage2 campaign")
+    if (
+        args.rows <= 2 * STAGE2_TRUST_NEIGHBORS
+        or args.features < 1
+        or args.neighbors != STAGE2_NEIGHBORS
+        or args.query_rows <= 2 * STAGE2_TRUST_NEIGHBORS
+        or args.epochs < 1
+    ):
+        parser.error(
+            f"Stage2 requires rows/query-rows>{2 * STAGE2_TRUST_NEIGHBORS}, features>=1, epochs>=1 "
+            f"and neighbors={STAGE2_NEIGHBORS}"
+        )
+    if args.paired_runs < STAGE2_PAIRED_RUNS or args.warmups != 1 or args.deadline_seconds <= 0:
+        parser.error(
+            f"Stage2 requires at least {STAGE2_PAIRED_RUNS} paired runs, a positive deadline, "
+            "and exactly one warmup"
+        )
+    seeds = tuple(int(item) for item in args.query_seeds.split(","))
+    if len(seeds) != 3 or len(set(seeds)) != 3:
+        parser.error("Stage2 requires exactly three distinct query seeds")
+    binary = args.binary.resolve()
+    if not binary.is_file():
+        parser.error(f"CUDA executable not found: {binary}")
+    deadline = Deadline(args.deadline_seconds)
+    started = time.monotonic()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    raw_artifacts = Path(
+        tempfile.mkdtemp(prefix=f"{args.output.stem}-stage2-", dir=args.output.parent.resolve())
+    )
+    configuration = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
+    output: dict[str, Any] = {
+        "suite": "stage2",
+        "complete": False,
+        "configuration": configuration
+        | {
+            "binary": str(binary),
+            "query_seeds": list(seeds),
+            "fit_recall_threshold": STAGE2_FIT_RECALL_LIMIT,
+            "query_recall_threshold": STAGE2_QUERY_RECALL_LIMIT,
+            "trustworthiness_gap_threshold": TRUST_GAP,
+            "trustworthiness_n_neighbors": STAGE2_TRUST_NEIGHBORS,
+        },
+        "pairs": [],
+        "warnings": [],
+        "reverse_graph_diagnostics": [],
+        "quality": {},
+        "resource_status": "incomplete",
+        "resource_evidence": {
+            "cap_bytes": STAGE2_GPU_CAP,
+            "units": "bytes",
+            "method": NSYS_MEMORY_METHOD,
+            "authoritative_lifetime_peak_bytes": None,
+            "nsys_modes": {},
+            "supplementary_nvidia_smi": None,
+            "explanation": (
+                "Nsight Systems CUDA allocation tracking is required for an authoritative "
+                "lifetime peak; nvidia-smi polling is supplementary only."
+            ),
+        },
+        "provenance": {
+            "binary": str(binary),
+            "binary_sha256": None,
+            "input_digests": {},
+            "source_identity": None,
+        },
+        "coverage": {
+            "modes": list(STAGE2_MODES),
+            "pairs_required_per_mode": args.paired_runs,
+            "baseline_repetitions_required_per_mode": 2 * args.paired_runs,
+            "completed_pairs": 0,
+            "completed_baseline_repetitions": 0,
+            "quality_runs": 0,
+            "profiles": "not requested",
+        },
+        "raw_artifact_directory": str(raw_artifacts),
+    }
+
+    def emit() -> None:
+        output["elapsed_seconds"] = time.monotonic() - started
+        atomic_write_json(args.output, output)
+
+    try:
+        with contextlib.nullcontext(str(raw_artifacts)) as temp_name:
+            temp = Path(temp_name)
+            telemetry = GpuProcessTelemetry()
+            output["resource_evidence"]["supplementary_nvidia_smi"] = telemetry.evidence
+            train_path = temp / "train.f32le"
+            query_paths = [temp / f"query-{seed}.f32le" for seed in seeds]
+            generated = last_json(
+                run_supervised(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--suite",
+                        "stage2",
+                        "--_stage2_worker",
+                        json.dumps(
+                            {
+                                "kind": "generate",
+                                "rows": args.rows,
+                                "features": args.features,
+                                "query_rows": args.query_rows,
+                                "seeds": list(seeds),
+                                "train": str(train_path),
+                                "query_paths": [str(path) for path in query_paths],
+                            }
+                        ),
+                    ],
+                    deadline,
+                ).stdout,
+                require_fit_seconds=False,
+            )
+            output["provenance"]["input_digests"] = {
+                train_path.name: generated["train_sha256"],
+                **{Path(item["path"]).name: item["sha256"] for item in generated["queries"]},
+            }
+            output["provenance"]["generation"] = generated["generation"] | {
+                "train_label_counts": generated["train_label_counts"],
+                "query_label_counts": {
+                    Path(item["path"]).name: item["label_counts"] for item in generated["queries"]
+                },
+                "query_label_digests": {
+                    Path(item["path"]).name: item["labels_sha256"] for item in generated["queries"]
+                },
+            }
+            frozen_product = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e"
+            product_diff = run_supervised(
+                ["git", "diff", "--quiet", frozen_product, "--", "src"], deadline, check=False
+            )
+            if product_diff.returncode:
+                raise ValueError(
+                    f"product src differs from frozen Stage2 baseline {frozen_product}"
+                )
+            untracked_product = run_supervised(
+                ["git", "ls-files", "--others", "--exclude-standard", "--", "src"], deadline
+            ).stdout.strip()
+            if untracked_product:
+                raise ValueError(
+                    f"untracked product source is outside the frozen baseline: {untracked_product}"
+                )
+            harness_paths = [
+                Path("examples/profile_standard_cuda.rs"),
+                Path("tests/test_standard_ann.rs"),
+                Path("tests/test_standard_graph.rs"),
+                Path("tests/test_standard_quality.rs"),
+                Path("python/tests/test_compare_umap_spans.py"),
+            ]
+            manifest_payload = {
+                "kind": "provenance",
+                "root": str(ROOT),
+                "harness_paths": [str(path) for path in harness_paths],
+                "frozen_product": frozen_product,
+                "artifact_directory": str(raw_artifacts),
+                "binary": str(binary),
+            }
+            manifest = last_json(
+                run_supervised(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--suite",
+                        "stage2",
+                        "--_stage2_worker",
+                        json.dumps(manifest_payload),
+                    ],
+                    deadline,
+                ).stdout,
+                require_fit_seconds=False,
+            )
+            output["provenance"].update(manifest)
+            telemetry.evidence["telemetry_version"] = manifest.get("gpu", {}).get("version")
+            if telemetry.evidence["telemetry_version"] is None:
+                telemetry.evidence["explanation"] = (
+                    "nvidia-smi version unavailable from supervised GPU provenance."
+                )
+            output["provenance"]["source_identity"] = manifest["source"] | {
+                "frozen_product_baseline": frozen_product,
+                "frozen_product_src_tree": run_supervised(
+                    ["git", "rev-parse", f"{frozen_product}:src"], deadline
+                ).stdout.strip(),
+                "working_product_src_tree": run_supervised(
+                    ["git", "rev-parse", "HEAD:src"], deadline
+                ).stdout.strip(),
+                "features": ["cuda", "tracing"],
+            }
+            output["provenance"]["binary_sha256"] = manifest["source"]["binary_sha256"]
+            if (
+                output["provenance"]["source_identity"]["frozen_product_src_tree"]
+                != output["provenance"]["source_identity"]["working_product_src_tree"]
+            ):
+                raise ValueError("HEAD product src tree is not identical to frozen Stage2 baseline")
+            reference_scores: dict[str, list[dict[str, Any]]] = {mode: [] for mode in STAGE2_MODES}
+            queries = [(path, args.query_rows) for path in query_paths]
+            # One isolated warmup for each mode/side; measured repetitions use warmups=0.
+            for mode in STAGE2_MODES:
+                for side in ("A", "B"):
+                    warm_dir = temp / f"warmup-{mode}-{side}"
+                    warm_dir.mkdir()
+                    warm_command = stage2_cuda_command(
+                        binary,
+                        train_path,
+                        args.rows,
+                        args.features,
+                        args.epochs,
+                        warm_dir,
+                        mode,
+                        42,
+                        args.warmups,
+                        1,
+                        args.neighbors,
+                        args.init,
+                        queries,
+                    )
+                    run_supervised(warm_command, deadline, telemetry=telemetry)
+                    output["resource_evidence"]["supplementary_nvidia_smi"] = telemetry.evidence
+            for pair in range(args.paired_runs):
+                seed = 42 + pair
+                mode_order = STAGE2_MODES if pair % 2 == 0 else tuple(reversed(STAGE2_MODES))
+                for mode in mode_order:
+                    ref_payload = {
+                        "train": str(train_path),
+                        "queries": [str(path) for path in query_paths],
+                        "rows": args.rows,
+                        "features": args.features,
+                        "query_rows": args.query_rows,
+                        "epochs": args.epochs,
+                        "neighbors": args.neighbors,
+                        "mode": mode,
+                        "seed": seed,
+                    }
+                    reference = last_json(
+                        run_supervised(
+                            [
+                                sys.executable,
+                                str(Path(__file__).resolve()),
+                                "--suite",
+                                "stage2",
+                                "--_stage2_worker",
+                                json.dumps(ref_payload),
+                            ],
+                            deadline,
+                        ).stdout,
+                        require_fit_seconds=False,
+                    )
+                    output["coverage"]["quality_runs"] += 1
+                    reference_scores[mode].append(reference)
+                    output.setdefault("completed_references", []).append(
+                        {"pair": pair, "mode": mode, "seed": seed, "reference": reference}
+                    )
+                    emit()
+                    side_order = (
+                        ("A", "B")
+                        if (pair + (0 if mode == "exact" else 1)) % 2 == 0
+                        else ("B", "A")
+                    )
+                    for side in side_order:
+                        cuda_dir = temp / f"cuda-{pair}-{mode}-{side}"
+                        cuda_dir.mkdir()
+                        command = stage2_cuda_command(
+                            binary,
+                            train_path,
+                            args.rows,
+                            args.features,
+                            args.epochs,
+                            cuda_dir,
+                            mode,
+                            seed,
+                            0,
+                            1,
+                            args.neighbors,
+                            args.init,
+                            queries,
+                        )
+                        result = last_json(
+                            run_supervised(command, deadline, telemetry=telemetry).stdout,
+                            require_fit_seconds=False,
+                        )
+                        output["resource_evidence"]["supplementary_nvidia_smi"] = telemetry.evidence
+                        transform_times, width = (
+                            result.get("transform_seconds"),
+                            result.get("query_graph_width"),
+                        )
+                        if (
+                            not isinstance(transform_times, list)
+                            or len(transform_times) != 1
+                            or len(transform_times[0]) != 3
+                            or not isinstance(width, int)
+                            or width != args.neighbors
+                        ):
+                            raise ValueError(
+                                "Rust Stage2 output lacks transform_seconds[run][batch] "
+                                "or query_graph_width"
+                            )
+                        fit_times = result.get("fit_seconds")
+                        if (
+                            not isinstance(fit_times, list)
+                            or len(fit_times) != 1
+                            or not math.isfinite(float(fit_times[0]))
+                            or float(fit_times[0]) < 0
+                            or any(
+                                not math.isfinite(float(value)) or float(value) < 0
+                                for value in transform_times[0]
+                            )
+                        ):
+                            raise ValueError(
+                                "Rust Stage2 output lacks a finite single-run fit_seconds value"
+                            )
+                        quality_payload = {
+                            "kind": "cuda-quality",
+                            "train": str(train_path),
+                            "queries": [str(path) for path in query_paths],
+                            "rows": args.rows,
+                            "features": args.features,
+                            "query_rows": args.query_rows,
+                            "neighbors": args.neighbors,
+                            "fit_embedding": str(cuda_dir / "embedding_0.f32le"),
+                            "fit_graph": str(cuda_dir / "graph_0.i32le"),
+                            "transform_embeddings": [
+                                str(cuda_dir / f"transform_0_{batch}.f32le") for batch in range(3)
+                            ],
+                            "query_graphs": [
+                                str(cuda_dir / f"query_graph_0_{batch}.i32le") for batch in range(3)
+                            ],
+                            "diagnostic_path": str(
+                                raw_artifacts / f"reverse-{pair}-{mode}-{side}.json"
+                            ),
+                            "graph_width": width,
+                        }
+                        measured = last_json(
+                            run_supervised(
+                                [
+                                    sys.executable,
+                                    str(Path(__file__).resolve()),
+                                    "--suite",
+                                    "stage2",
+                                    "--_stage2_worker",
+                                    json.dumps(quality_payload),
+                                ],
+                                deadline,
+                            ).stdout,
+                            require_fit_seconds=False,
+                        )
+                        per_batch = []
+                        for batch in range(3):
+                            ref_batch = reference["transform"][batch]
+                            score = measured["transform"][batch]["trustworthiness"]
+                            per_batch.append(
+                                {
+                                    "batch": batch,
+                                    "seed": seeds[batch],
+                                    "seconds": float(transform_times[0][batch]),
+                                    "trustworthiness": score,
+                                    "recall": measured["transform"][batch]["recall"],
+                                    "reference_trustworthiness": ref_batch["trustworthiness"],
+                                    "reference_trustworthiness_mean": None,
+                                }
+                            )
+                        output["pairs"].append(
+                            {
+                                "pair": pair,
+                                "mode": mode,
+                                "side": side,
+                                "order": len(output["pairs"]),
+                                "mode_order": list(mode_order),
+                                "side_order": list(side_order),
+                                "seed": seed,
+                                "cuda": result,
+                                "reference": reference,
+                                "fit_trustworthiness": measured["fit"]["trustworthiness"],
+                                "fit_seconds": result["fit_seconds"],
+                                "reference_fit_trustworthiness": reference["fit_trustworthiness"],
+                                "fit_recall": measured["fit"]["recall"],
+                                "transform": per_batch,
+                                "reverse_graph_diagnostics": measured["reverse_graph_diagnostics"],
+                                "transform_total_seconds": sum(row["seconds"] for row in per_batch),
+                            }
+                        )
+                        output["coverage"]["completed_baseline_repetitions"] += 1
+                        output["coverage"]["completed_pairs"] += int(side == side_order[-1])
+                        emit()
+                        deadline.remaining()
+            if args.profile_nsys:
+                output["coverage"]["profiles"] = {"status": "running", "runs": {}}
+                output["resource_evidence"]["nsys_modes"] = {}
+                nsys = shutil.which("nsys")
+                if nsys is None:
+                    output["coverage"]["profiles"] = {
+                        "status": "unavailable",
+                        "reason": "nsys executable not found",
+                    }
+                    for mode in STAGE2_MODES:
+                        output["resource_evidence"]["nsys_modes"][mode] = nsys_memory_incomplete(
+                            STAGE2_GPU_CAP, "nsys executable not found"
+                        )
+                else:
+                    profile_root = Path(args.output).resolve().parent / f"{args.output.stem}-nsys"
+                    profile_root.mkdir(parents=True, exist_ok=True)
+                    for mode in STAGE2_MODES:
+                        profile_out = profile_root / mode
+                        (temp / f"profile-{mode}").mkdir()
+                        profile_command = stage2_cuda_command(
+                            binary,
+                            train_path,
+                            args.rows,
+                            args.features,
+                            args.epochs,
+                            temp / f"profile-{mode}",
+                            mode,
+                            42,
+                            args.warmups,
+                            1,
+                            args.neighbors,
+                            args.init,
+                            queries,
+                        )
+                        trace_path = raw_artifacts / f"host-trace-{mode}.json"
+                        profile_command.extend(["--trace", str(trace_path)])
+                        profile = run_supervised(
+                            [
+                                nsys,
+                                "profile",
+                                "--force-overwrite=true",
+                                "--trace=cuda,nvtx,osrt",
+                                "--cuda-memory-usage=true",
+                                "--output",
+                                str(profile_out),
+                                *profile_command,
+                            ],
+                            deadline,
+                            telemetry=telemetry,
+                        )
+                        output["resource_evidence"]["supplementary_nvidia_smi"] = telemetry.evidence
+                        sqlite_out = Path(str(profile_out) + ".sqlite")
+                        try:
+                            run_supervised(
+                                [
+                                    nsys,
+                                    "export",
+                                    "--type",
+                                    "sqlite",
+                                    "--force-overwrite=true",
+                                    "-o",
+                                    str(sqlite_out),
+                                    str(profile_out) + ".nsys-rep",
+                                ],
+                                deadline,
+                            )
+                            memory_evidence = nsys_cuda_memory_evidence(sqlite_out, STAGE2_GPU_CAP)
+                        except (subprocess.SubprocessError, OSError) as error:
+                            memory_evidence = nsys_memory_incomplete(
+                                STAGE2_GPU_CAP, f"Nsight Systems export failed: {error}"
+                            )
+                        output["resource_evidence"]["nsys_modes"][mode] = memory_evidence
+                        stats = run_supervised(
+                            [
+                                nsys,
+                                "stats",
+                                "--report",
+                                "cuda_gpu_kern_sum,cuda_api_sum",
+                                "--format",
+                                "csv",
+                                "--force-export=true",
+                                str(profile_out) + ".nsys-rep",
+                            ],
+                            deadline,
+                        )
+                        stats_path = raw_artifacts / f"nsys-stats-{mode}.csv"
+                        stats_path.write_text(stats.stdout, encoding="utf-8")
+                        stats_stderr_path = raw_artifacts / f"nsys-stats-{mode}.stderr.txt"
+                        stats_stderr_path.write_text(stats.stderr, encoding="utf-8")
+                        output["coverage"]["profiles"]["runs"][mode] = {
+                            "report": str(profile_out) + ".nsys-rep",
+                            "stdout": profile.stdout[-2000:],
+                            "stderr": profile.stderr[-2000:],
+                            "host_trace": str(trace_path),
+                            "stats_csv": str(stats_path),
+                            "stats_csv_sha256": sha256_file(stats_path),
+                            "stats_stderr": str(stats_stderr_path),
+                            "sqlite": str(sqlite_out),
+                            "memory_evidence": memory_evidence,
+                            "workload": "same fit plus three transforms as measured runs",
+                        }
+                    output["coverage"]["profiles"]["status"] = "captured"
+            aggregate = stage2_aggregate(output["pairs"], reference_scores, args.paired_runs)
+            output.update(
+                {
+                    key: aggregate[key]
+                    for key in ("quality", "timings", "paired_timing_differences", "warnings")
+                }
+            )
+            output["coverage"]["full_baseline_pair_coverage"] = aggregate["full_coverage"]
+            output["coverage"]["speed_gates"] = aggregate["speed_gates"]
+            output["resource_status"] = finalize_resource_evidence(
+                output["resource_evidence"], telemetry
+            )
+            output["complete"] = (
+                output["coverage"]["completed_pairs"] == args.paired_runs * 2
+                and aggregate["full_coverage"]
+                and all(v["all_runs_pass"] for v in output["quality"].values())
+            )
+            if not output["complete"]:
+                output["incomplete_reason"] = "quality failed or required pair coverage missing"
+            elif output["resource_status"] == "fail":
+                output["complete"] = False
+                output["incomplete_reason"] = "Nsight Systems GPU lifetime memory cap exceeded"
+            elif output["resource_status"] != "pass":
+                output["complete"] = False
+                output["incomplete_reason"] = "GPU lifetime memory evidence unavailable"
+            else:
+                output["incomplete_reason"] = None
+    except (
+        DeadlineExceeded,
+        ResourceLimitExceeded,
+        subprocess.CalledProcessError,
+        OSError,
+        ValueError,
+        IndexError,
+        KeyError,
+        TypeError,
+        statistics.StatisticsError,
+    ) as error:
+        output["incomplete_reason"] = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            failure_path = raw_artifacts / f"failure-{len(output.get('failures', [])):03d}.json"
+            failure = {
+                "argv": error.cmd,
+                "returncode": error.returncode,
+                "stdout": error.stdout,
+                "stderr": error.stderr,
+            }
+            failure_path.write_text(json.dumps(failure, indent=2) + "\n", encoding="utf-8")
+            output.setdefault("failures", []).append({"artifact": str(failure_path)})
+        if "telemetry" in locals():
+            output["resource_status"] = finalize_resource_evidence(
+                output["resource_evidence"], telemetry
+            )
+    finally:
+        recovered = []
+        for path in sorted(raw_artifacts.glob("reverse-*.json")):
+            try:
+                diagnostic = json.loads(path.read_text(encoding="utf-8"))
+                recovered.append({"artifact": str(path), "diagnostics": diagnostic})
+            except (OSError, json.JSONDecodeError) as error:
+                recovered.append({"artifact": str(path), "recovery_error": str(error)})
+        output["reverse_graph_diagnostics"] = recovered
+        emit()
+    return 0 if output["complete"] else 1
+
+
+def last_json(text: str, *, require_fit_seconds: bool = True) -> dict[str, Any]:
     for line in reversed(text.splitlines()):
         try:
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and "fit_seconds" in parsed:
+        if isinstance(parsed, dict) and (not require_fit_seconds or "fit_seconds" in parsed):
             return parsed
     raise ValueError("worker did not emit its result JSON")
 
@@ -318,6 +1957,12 @@ def ncu_kernel(binary_args: list[str], regex: str, temp: Path, deadline: Deadlin
 
 
 def _cli() -> int:
+    if (
+        "--suite" in sys.argv
+        and sys.argv.index("--suite") + 1 < len(sys.argv)
+        and sys.argv[sys.argv.index("--suite") + 1] == "stage2"
+    ):
+        return _stage2_cli(sys.argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["stage1"], default="stage1")
     parser.add_argument("--runs", type=int, default=5)
