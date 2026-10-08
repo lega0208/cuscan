@@ -205,12 +205,14 @@ fn standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors() {
         "equal numeric indices are valid in bipartite mode"
     );
     assert!(graph.weights.iter().any(|weight| *weight > 0.0));
-    assert!(graph
-        .heads
-        .iter()
-        .zip(&graph.tails)
-        .zip(&graph.weights)
-        .any(|((&head, &tail), &weight)| head == 0 && tail == 0 && weight > 0.0));
+    assert!(
+        graph
+            .heads
+            .iter()
+            .zip(&graph.tails)
+            .zip(&graph.weights)
+            .any(|((&head, &tail), &weight)| head == 0 && tail == 0 && weight > 0.0)
+    );
     // Bipartite edges stay (query row, reference id) and are emitted once.
     for ((&head, &tail), &weight) in graph.heads.iter().zip(&graph.tails).zip(&graph.weights) {
         if weight > 0.0 {
@@ -400,12 +402,14 @@ fn bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero() {
         ],
         "bipartite directed memberships",
     );
-    assert!(graph
-        .heads
-        .iter()
-        .zip(&graph.tails)
-        .zip(&graph.weights)
-        .any(|((&head, &tail), &weight)| head == 0 && tail == 0 && weight > 0.0));
+    assert!(
+        graph
+            .heads
+            .iter()
+            .zip(&graph.tails)
+            .zip(&graph.weights)
+            .any(|((&head, &tail), &weight)| head == 0 && tail == 0 && weight > 0.0)
+    );
 }
 
 #[test]

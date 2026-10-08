@@ -1,4 +1,3 @@
-
 #![cfg(feature = "parametric")]
 
 use burn::tensor::Device;

@@ -4,8 +4,8 @@ use burn::tensor::DeviceIndex;
 #[cfg(all(feature = "gpu", not(feature = "cuda")))]
 use burn::tensor::DeviceKind;
 use fast_umap::{
-    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
-    ParametricUMAPOptimizationParams,
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    utils::generate_test_data,
 };
 /// Test NN-Descent on a large dataset (50K samples).
 /// This would OOM with the exact pairwise distance approach (10GB matrix).

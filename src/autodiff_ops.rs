@@ -11,14 +11,14 @@
 use std::fmt::Debug;
 
 use burn::backend::{
+    Autodiff,
     autodiff::{
+        NodeId,
         checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
         grads::Gradients,
         ops::{Backward, Ops, OpsKind},
-        NodeId,
     },
     tensor::{FloatTensor, IntTensor},
-    Autodiff,
 };
 
 use crate::backend::UmapOps;

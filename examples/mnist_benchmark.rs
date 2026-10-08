@@ -1,9 +1,9 @@
 use burn::{prelude::*, tensor::DeviceKind};
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{Receiver, unbounded};
 use fast_umap::{
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPLossReduction,
     chart::{self, ChartConfigBuilder},
     utils::convert_vector_to_tensor,
-    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPLossReduction,
 };
 use mnist::*;
 use std::sync::{Arc, Mutex};

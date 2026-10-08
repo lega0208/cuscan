@@ -7,7 +7,7 @@ use burn::{
 };
 use num::{Float, FromPrimitive, ToPrimitive};
 // use prettytable::{row, Table};
-use rand::{distr::uniform::SampleUniform, RngExt};
+use rand::{RngExt, distr::uniform::SampleUniform};
 
 /// Generates random test data with the given number of samples and features.
 ///

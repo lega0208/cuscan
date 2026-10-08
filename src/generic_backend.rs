@@ -4,8 +4,8 @@
 //! and runtime dispatch while avoiding backend-generic conversion bounds.
 
 use burn::backend::{
-    tensor::{FloatTensor, IntTensor},
     Flex,
+    tensor::{FloatTensor, IntTensor},
 };
 use burn::tensor::{DType, Int, Tensor, TensorData};
 

@@ -441,7 +441,7 @@ pub fn validate_search_settings(
             _ => {
                 return Err(UmapError::InvalidConfig(
                     "Auto search requires a resolved Exact or Approximate mode".into(),
-                ))
+                ));
             }
         },
     };
@@ -471,7 +471,9 @@ pub fn validate_backend_choice(choice: BackendChoice) -> Result<()> {
             {
                 let count = crate::cuda_backend::device_count();
                 if device_index >= count {
-                    return Err(UmapError::BackendUnavailable(format!("CUDA device index {device_index} is unavailable; {count} device(s) detected")));
+                    return Err(UmapError::BackendUnavailable(format!(
+                        "CUDA device index {device_index} is unavailable; {count} device(s) detected"
+                    )));
                 }
                 Ok(())
             }

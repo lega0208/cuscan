@@ -81,13 +81,13 @@ pub mod utils;
 pub use graph::{GraphParams, ManifoldParams, Metric};
 #[cfg(feature = "parametric")]
 pub use parametric_umap::{
-    validate_parametric_umap_data, validate_parametric_umap_input, FittedParametricUMAP,
-    ParametricUMAP, ParametricUMAPConfig, ParametricUMAPEpochProgress, ParametricUMAPLossReduction,
-    ParametricUMAPModel, ParametricUMAPModelConfig, ParametricUMAPModelConfigBuilder,
-    ParametricUMAPOptimizationParams,
+    FittedParametricUMAP, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPEpochProgress,
+    ParametricUMAPLossReduction, ParametricUMAPModel, ParametricUMAPModelConfig,
+    ParametricUMAPModelConfigBuilder, ParametricUMAPOptimizationParams,
+    validate_parametric_umap_data, validate_parametric_umap_input,
 };
 pub use standard_umap::{
-    BackendChoice, Embedding, FittedUMAP, Init, NeighborSearch, Result, UMAPConfig, UmapError, UMAP,
+    BackendChoice, Embedding, FittedUMAP, Init, NeighborSearch, Result, UMAP, UMAPConfig, UmapError,
 };
 
 // export for python bindings

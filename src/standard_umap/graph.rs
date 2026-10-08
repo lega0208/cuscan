@@ -1,7 +1,7 @@
 use burn::{
     backend::{
-        tensor::{FloatTensor, IntTensor},
         Backend,
+        tensor::{FloatTensor, IntTensor},
     },
     tensor::{Bool, Int, Tensor},
 };

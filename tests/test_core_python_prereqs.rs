@@ -1,8 +1,8 @@
 #![cfg(feature = "parametric")]
 use burn::tensor::Device;
 use fast_umap::{
-    validate_parametric_umap_data, validate_parametric_umap_input, ParametricUMAP,
-    ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    validate_parametric_umap_data, validate_parametric_umap_input,
 };
 
 // Flex seeding is process-global; seeded training cases must not race each other.
@@ -103,12 +103,14 @@ fn fit_and_transform_keep_unequal_scale_features_raw() {
     let standardized_fitted = fit(321, standardized);
 
     // An automatic scaler would erase this deliberate geometry/input difference.
-    assert!(raw_fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .zip(standardized_fitted.embedding().iter().flatten())
-        .any(|(raw, scaled)| (raw - scaled).abs() > 1e-3));
+    assert!(
+        raw_fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .zip(standardized_fitted.embedding().iter().flatten())
+            .any(|(raw, scaled)| (raw - scaled).abs() > 1e-3)
+    );
 }
 
 #[test]
@@ -239,11 +241,13 @@ fn custom_graph_controls_reach_signal_progress_and_fitted_config() {
         assert_eq!(fitted.config().graph.local_connectivity, 0.5);
         assert_eq!(fitted.config().graph.bandwidth, 0.75);
         assert_eq!(fitted.config().graph.set_op_mix_ratio, 0.5);
-        assert!(fitted
-            .embedding()
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite()));
+        assert!(
+            fitted
+                .embedding()
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
         let input: Vec<Vec<f64>> = data
             .iter()
             .map(|row| row.iter().map(|value| f64::from(*value)).collect())
@@ -277,9 +281,11 @@ fn cancellation_before_first_epoch_keeps_configured_graph_counts_valid() {
     );
     assert!(events.lock().unwrap().is_empty());
     assert_eq!(fitted.config().optimization.n_epochs, 10);
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
 }

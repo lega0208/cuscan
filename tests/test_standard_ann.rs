@@ -173,8 +173,11 @@ fn required_cuda_mode_fails_when_cuda_support_is_not_compiled() {
 fn ann_rejects_invalid_tiny_width_instead_of_exact_fallback() {
     let device = Device::flex();
     let data = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0], [2, 1]), &device);
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = <Dispatch as StandardUmapOps>::approximate_neighbors(data.into_dispatch(), 0, 1, 3);
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                <Dispatch as StandardUmapOps>::approximate_neighbors(data.into_dispatch(), 0, 1, 3);
+        }))
+        .is_err()
+    );
 }

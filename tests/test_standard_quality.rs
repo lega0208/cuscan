@@ -5,7 +5,7 @@ use burn::{
 use fast_umap::{
     backend::StandardUmapOps,
     standard_umap::{
-        approximate_query_budget, BackendChoice, Init, NeighborSearch, UMAPConfig, UMAP,
+        BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, approximate_query_budget,
     },
 };
 use serde_json::Value;
@@ -398,12 +398,14 @@ fn run_recall(device: Device) {
             .to_data()
             .try_to_vec::<i32>()
             .unwrap();
-        assert!(Tensor::<2, Int>::from_dispatch(stats)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap()
-            .iter()
-            .all(|&value| value >= 0));
+        assert!(
+            Tensor::<2, Int>::from_dispatch(stats)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap()
+                .iter()
+                .all(|&value| value >= 0)
+        );
         let recall = tie_aware_recall(&query_ids, heldout, train, 15, false);
         query_weighted_hits += (recall * (heldout.rows * 15) as f64).round() as usize;
         query_weighted_rows += heldout.rows * 15;
@@ -495,11 +497,13 @@ fn fit_without_dense_matrix(backend: BackendChoice, rows: usize) {
         start.elapsed()
     );
     assert_eq!(fitted.embedding().len(), rows);
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
 }
 
 /// A dense N x N f32 matrix at N=20,000 needs 1.6 GB; the sparse pipeline

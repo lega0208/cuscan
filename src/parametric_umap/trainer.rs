@@ -13,15 +13,15 @@
 
 use super::model::ParametricUMAPModel;
 #[cfg(feature = "plotters")]
-use crate::chart::{self, plot_loss, ChartConfigBuilder};
+use crate::chart::{self, ChartConfigBuilder, plot_loss};
 use crate::graph::{
-    directed_memberships, smooth_knn_dist, sparse_inputs, symmetrize, WeightedEdge,
-    NN_DESCENT_THRESHOLD,
+    NN_DESCENT_THRESHOLD, WeightedEdge, directed_memberships, smooth_knn_dist, sparse_inputs,
+    symmetrize,
 };
 use crate::utils::format_duration;
 use burn::{
     module::Module,
-    optim::{decay::WeightDecayConfig, AdamConfig, GradientsParams},
+    optim::{AdamConfig, GradientsParams, decay::WeightDecayConfig},
     tensor::{Device, Int, Tensor, TensorData},
 };
 
@@ -267,7 +267,9 @@ where
 
     if verbose {
         if use_nn_descent {
-            println!("[fast-umap] Computing approximate k-NN graph via NN-Descent (k={k}, n={num_samples}) …");
+            println!(
+                "[fast-umap] Computing approximate k-NN graph via NN-Descent (k={k}, n={num_samples}) …"
+            );
         } else {
             println!("[fast-umap] Computing global k-NN graph (k={k}) …");
         }
@@ -319,10 +321,21 @@ where
         println!(
             "[fast-umap] Fuzzy graph done in {:.2}s — {} directed, {} symmetric, {} positive-count edges; integer mass={}",
             knn_elapsed.as_secs_f64(),
-            directed.len(), weighted_edges.len(), sampler.edges.len(), sampler.total,
+            directed.len(),
+            weighted_edges.len(),
+            sampler.edges.len(),
+            sampler.total,
         );
-        println!("[fast-umap]   local_connectivity={} bandwidth={} set_op_mix_ratio={}; fresh {n_pos} positive + {n_neg} negative draws per epoch", config.local_connectivity, config.bandwidth, config.set_op_mix_ratio);
-        println!("[fast-umap]   coalesced={} symmetric={} retained_after_pruning={retained_edges} positive_count_support={} max_weight={maximum_weight} prune_threshold={prune_threshold}; NN-descent threshold={NN_DESCENT_THRESHOLD}", directed.len(), weighted_edges.len(), sampler.edges.len());
+        println!(
+            "[fast-umap]   local_connectivity={} bandwidth={} set_op_mix_ratio={}; fresh {n_pos} positive + {n_neg} negative draws per epoch",
+            config.local_connectivity, config.bandwidth, config.set_op_mix_ratio
+        );
+        println!(
+            "[fast-umap]   coalesced={} symmetric={} retained_after_pruning={retained_edges} positive_count_support={} max_weight={maximum_weight} prune_threshold={prune_threshold}; NN-descent threshold={NN_DESCENT_THRESHOLD}",
+            directed.len(),
+            weighted_edges.len(),
+            sampler.edges.len()
+        );
         println!("[fast-umap] Training started …");
     }
 
@@ -409,7 +422,9 @@ where
     'main: loop {
         if exit_rx.try_recv().is_ok() {
             if verbose {
-                eprintln!("[fast-umap] Interrupted — restoring best model (epoch {epoch}, loss {best_loss:.6})");
+                eprintln!(
+                    "[fast-umap] Interrupted — restoring best model (epoch {epoch}, loss {best_loss:.6})"
+                );
             }
             break 'main;
         }
@@ -802,9 +817,11 @@ mod tests {
         for (head, tail) in first.0.iter().zip(&first.1) {
             assert_ne!(head, tail);
         }
-        assert!(first.0[..50_000]
-            .iter()
-            .all(|head| *head == 0 || *head == 1));
+        assert!(
+            first.0[..50_000]
+                .iter()
+                .all(|head| *head == 0 || *head == 1)
+        );
         let (heads, tails) = small.sample_batch(100, 0, &mut rng);
         assert_eq!(heads.len(), 12 + 100);
         assert_eq!(heads.len(), tails.len());

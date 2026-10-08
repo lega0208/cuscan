@@ -5,8 +5,8 @@
 use std::time::Instant;
 
 use fast_umap::{
-    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
-    ParametricUMAPOptimizationParams,
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    utils::generate_test_data,
 };
 
 fn device() -> burn::tensor::Device {

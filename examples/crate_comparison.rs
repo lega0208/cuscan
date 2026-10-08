@@ -17,8 +17,8 @@ use ndarray;
 
 // ── fast-umap imports ────────────────────────────────────────────────────────
 use fast_umap::{
-    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
-    ParametricUMAPOptimizationParams,
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    utils::generate_test_data,
 };
 
 // ── umap-rs imports ──────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@
 ///   • normalize_tensor    – 1-D min-max normalisation
 ///   • layer_normalize     – 2-D layer normalisation
 use burn::tensor::{Device, Tensor, TensorData};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fast_umap::{
     normalizer::normalize as layer_normalize,
     parametric_umap::model::{ParametricUMAPModel, ParametricUMAPModelConfigBuilder},

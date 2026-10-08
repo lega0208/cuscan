@@ -1,7 +1,7 @@
 use fast_umap::standard_umap::{
-    approximate_query_budget, fit_curve, fit_neighbor_widths, query_neighbor_width,
-    validate_backend_choice, validate_input, validate_search_settings, BackendChoice, Init,
-    NeighborSearch, UMAPConfig,
+    BackendChoice, Init, NeighborSearch, UMAPConfig, approximate_query_budget, fit_curve,
+    fit_neighbor_widths, query_neighbor_width, validate_backend_choice, validate_input,
+    validate_search_settings,
 };
 
 #[test]
@@ -182,8 +182,10 @@ fn backend_selection_never_falls_back_from_cuda() {
     });
     assert!(error.is_err());
     #[cfg(not(feature = "cuda"))]
-    assert!(error
-        .unwrap_err()
-        .to_string()
-        .contains("requires the `cuda` feature"));
+    assert!(
+        error
+            .unwrap_err()
+            .to_string()
+            .contains("requires the `cuda` feature")
+    );
 }

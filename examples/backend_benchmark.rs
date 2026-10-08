@@ -15,8 +15,8 @@ use std::{io::Write as _, time::Instant};
 #[cfg(feature = "gpu")]
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::{
-    utils::generate_test_data, GraphParams, ParametricUMAP, ParametricUMAPConfig,
-    ParametricUMAPOptimizationParams,
+    GraphParams, ParametricUMAP, ParametricUMAPConfig, ParametricUMAPOptimizationParams,
+    utils::generate_test_data,
 };
 
 // ── Configuration ───────────────────────────────────────────────────────────

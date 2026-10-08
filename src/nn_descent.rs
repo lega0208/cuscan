@@ -8,8 +8,8 @@
 //! Reference: Dong, W., Moses, C., & Li, K. (2011).
 //! "Efficient k-nearest neighbor graph construction for generic similarity measures."
 
-use rand::seq::SliceRandom;
 use rand::RngExt;
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
 
 /// Build an approximate k-NN graph using NN-Descent.

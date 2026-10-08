@@ -13,9 +13,9 @@ pub use estimator::{FittedUMAP, UMAP};
 pub use init::initialize;
 
 pub use config::{
+    BackendChoice, FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig,
     approximate_query_budget, fit_curve, fit_neighbor_widths, query_neighbor_width,
-    validate_backend_choice, validate_input, validate_search_settings, BackendChoice,
-    FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig,
+    validate_backend_choice, validate_input, validate_search_settings,
 };
 
 /// Embedding shape used by the standard UMAP pipeline.

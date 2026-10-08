@@ -1,4 +1,4 @@
-use fast_umap::standard_umap::{initialize, Init, UMAPConfig, UmapError};
+use fast_umap::standard_umap::{Init, UMAPConfig, UmapError, initialize};
 
 fn spectral_config(dimensions: usize) -> UMAPConfig {
     UMAPConfig {
@@ -154,9 +154,11 @@ fn disconnected_components_use_signed_axis_centers_and_seeded_local_layouts() {
     let repeated = initialize(&data, &[0, 1, 3, 4], &[1, 2, 4, 5], &[1.0; 4], &config, 22).unwrap();
     assert_eq!(first, repeated);
     assert_eq!(first.len(), data.len() * 2);
-    assert!(first
-        .iter()
-        .all(|value| value.is_finite() && (0.0..=10.0).contains(value)));
+    assert!(
+        first
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
+    );
     let left_center = (0..3).map(|row| first[row * 2]).sum::<f32>() / 3.0;
     let right_center = (3..6).map(|row| first[row * 2]).sum::<f32>() / 3.0;
     assert!((left_center - right_center).abs() > 1.0);
@@ -185,9 +187,11 @@ fn many_components_use_matrix_free_centroid_affinity_layout() {
     let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(2), 91)
         .expect("matrix-free complete centroid affinity and per-component spectral layouts");
     assert_eq!(embedding.len(), 40);
-    assert!(embedding
-        .iter()
-        .all(|value| value.is_finite() && (0.0..=10.0).contains(value)));
+    assert!(
+        embedding
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
+    );
     for dim in 0..2 {
         let values = (0..20).map(|row| embedding[row * 2 + dim]);
         assert!(values.clone().fold(f32::INFINITY, f32::min).abs() < 1.0e-6);

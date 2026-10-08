@@ -1,4 +1,4 @@
-use fast_umap::{BackendChoice, Init, NeighborSearch, UMAPConfig, UMAP};
+use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 
 fn clustered_data() -> Vec<Vec<f32>> {
     (0..60)
@@ -42,11 +42,13 @@ fn singleton_and_two_row_cases_are_explicit() {
         .fit(&[vec![1.0, 2.0]])
         .unwrap();
     assert_eq!(fitted.embedding(), &[vec![0.0, 0.0, 0.0]]);
-    assert!(fitted
-        .transform(&[vec![1.0, 2.0]])
-        .unwrap_err()
-        .to_string()
-        .contains("only a single data sample"));
+    assert!(
+        fitted
+            .transform(&[vec![1.0, 2.0]])
+            .unwrap_err()
+            .to_string()
+            .contains("only a single data sample")
+    );
     let error = UMAP::new(config(), BackendChoice::Flex, NeighborSearch::Exact)
         .fit(&[vec![0.0], vec![1.0]])
         .unwrap_err();
@@ -78,9 +80,11 @@ fn exact_and_approximate_fit_are_finite_deterministic_and_clustered() {
         assert_eq!(first.embedding(), second.embedding());
         let embedding = first.embedding();
         assert_eq!(embedding.len(), 60);
-        assert!(embedding
-            .iter()
-            .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite())));
+        assert!(
+            embedding
+                .iter()
+                .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite()))
+        );
         let centroids: Vec<[f32; 2]> = (0..3)
             .map(|cluster| {
                 let rows = &embedding[cluster * 20..cluster * 20 + 20];
@@ -168,16 +172,20 @@ fn transform_uses_fitted_embedding_and_search_settings() {
 #[test]
 fn zero_epochs_returns_scaled_initialization() {
     let fitted = fit(NeighborSearch::Exact, config()).unwrap();
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| (0.0..=10.0).contains(value)));
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| (0.0..=10.0).contains(value))
+    );
 }
 
 #[test]
@@ -198,11 +206,13 @@ fn fit_and_transform_run_sgd_epochs() {
     let fitted = UMAP::new(active, BackendChoice::Flex, NeighborSearch::Exact)
         .fit(&data)
         .unwrap();
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
     let transformed = fitted.transform(&[vec![0.1, 0.0], vec![5.1, 0.0]]).unwrap();
     assert!(transformed.iter().flatten().all(|value| value.is_finite()));
 }
@@ -213,9 +223,11 @@ fn fit_transform_returns_reusable_model_and_matching_embedding() {
         .fit_transform(&clustered_data())
         .unwrap();
     assert_eq!(embedding.len(), 60);
-    assert!(embedding
-        .iter()
-        .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite())));
+    assert!(
+        embedding
+            .iter()
+            .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite()))
+    );
     assert_eq!(fitted.embedding(), &embedding);
     let transformed = fitted
         .transform(&[vec![-8.0, 0.0], vec![8.0, 0.0], vec![0.0, 12.0]])
@@ -227,20 +239,22 @@ fn fit_transform_returns_reusable_model_and_matching_embedding() {
 #[test]
 fn auto_search_fits_small_inputs_with_exact_search() {
     let auto = fit(NeighborSearch::Auto, config()).unwrap();
-    assert!(auto
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        auto.embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
     // 60 rows is below AUTO_EXACT_MAX_ROWS, so Auto must reproduce the exact path.
     let exact = fit(NeighborSearch::Exact, config()).unwrap();
     assert_eq!(auto.embedding(), exact.embedding());
-    assert!(auto
-        .transform(&[vec![8.0, 0.0]])
-        .unwrap()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        auto.transform(&[vec![8.0, 0.0]])
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -262,9 +276,11 @@ fn standard_estimator_smoke_runs_on_requested_cuda_device() {
     .fit(&clustered_data())
     .unwrap();
     assert_eq!(fitted.embedding().len(), 60);
-    assert!(fitted
-        .embedding()
-        .iter()
-        .flatten()
-        .all(|value| value.is_finite()));
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
 }

@@ -1,4 +1,4 @@
-use fast_umap::{BackendChoice, Init, NeighborSearch, UMAPConfig, UMAP};
+use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 use std::time::Instant;
 
 const SIZES: [usize; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
