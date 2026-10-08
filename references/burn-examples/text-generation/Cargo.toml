@@ -1,0 +1,38 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+name = "text-generation"
+publish = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["burn/dataset", "burn/sqlite"]
+f16 = []
+flex32 = []
+tch-cpu = ["burn/tch"]
+tch-gpu = ["burn/tch"]
+wgpu = ["burn/wgpu"]
+vulkan = ["burn/vulkan"]
+metal = ["burn/metal"]
+flex = ["burn/flex"]
+remote = ["burn/remote-websocket"]
+cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+
+[dependencies]
+# Burn
+burn = { workspace = true, features = ["default", "train"] }
+
+# Tokenizer
+tokenizers = { version = "0.23.2", default-features = false, features = [
+  "onig",
+  "http",
+] }
+
+# Utils
+derive-new = { workspace = true }
+serde = { workspace = true, features = ["std", "derive"] }

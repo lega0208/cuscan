@@ -1,0 +1,116 @@
+# Burn book findings for fast-umap
+
+## Scope and evidence
+
+This is an independent synthesis of the local Burn book (the table of contents in [`references/burn-book/SUMMARY.md`](burn-book/SUMMARY.md)), not a retelling of the release notes. Advice labeled **Book-backed** follows the cited chapter; **Repository observation** describes inspected source; **Hypothesis** is an experiment to run, not an established speedup. No performance improvement is claimed as measured here.
+
+The manifest declares `burn` and optional `burn-cubecl` version `0.22.0`, and optional `cubecl` `0.11.0` with ordinary Cargo semver requirements (not exact `=` pins); the inspected lockfile resolves Burn-family crates to 0.22.0 and CubeCL crates to 0.11.0. See [`Cargo.toml`](../Cargo.toml) and [`Cargo.lock`](../Cargo.lock). Treat detailed API advice below as specific to the local Burn 0.22 book/current lock resolution, not a promise about later compatible releases or arbitrary dependency resolution without the lockfile. Burn 0.22 requires Rust 1.95 per the [migration guide, Cargo features and toolchain](burn-book/migrating-to-0.22.md#cargo-features-and-toolchain). The user context that called these prerelease pins is stale.
+
+## Prioritized actions
+
+1. **Keep the parametric learning computation sparse and graph-sized; preserve optimizer/autodiff boundaries.** The current trainer already precomputes one KNN graph, samples bounded positive edges, and uses negative sampling; it computes loss/backward/`GradientsParams` and optimizer updates in the training loop ([`src/parametric_umap/trainer.rs`](../src/parametric_umap/trainer.rs), especially `train_sparse`). That is structurally aligned with Burn's custom-loop guidance. Do not replace this with an all-pairs differentiable distance matrix without a separately validated need. **Hypothesis:** profile memory and epoch time for representative `n`, `k`, edge cap and negative-sample settings; check embedding quality and deterministic behavior together. Burn sources explain graph/training semantics but do not validate this algorithm or its quality/performance tradeoff. See [Custom Training Loops, backward and optimizer steps](burn-book/custom-training-loop.md#custom-training-loops), [Autodiff, Gradients with Optimizers](burn-book/building-blocks/autodiff.md#gradients-with-optimizers), and [Data](burn-book/basic-workflow/data.md).
+
+2. **Treat synchronization and host reads as explicit costs.** Burn says most operations may be asynchronous; `into_data`, `into_scalar`, `sync`, and some `to_device` paths synchronize. Use fallible `try_into_*`/`Device::sync` at error boundaries and batch multiple reads through `Transaction` where relevant ([Asynchronous Execution](burn-book/performance/good-practices/asynchronous-execution.md)). **Repository observation:** trainer comments and constants describe periodic loss readback and plotting; keep telemetry out of the per-step critical path and measure its cadence instead of assuming zero cost ([`trainer.rs`](../src/parametric_umap/trainer.rs), module overview/constants). No claim that the current cadence is optimal.
+
+3. **Profile before applying fusion or kernel rewrites.** Use Burn runtime profiling/fusion logs and CubeCL autotuning facilities as diagnostic tools; compare representative workload shapes, warm and cold starts, and synchronized end-to-end time. Runtime settings are loaded on first use; environment changes must precede process startup ([Runtime Configuration](burn-book/advanced/runtime-configuration.md#overview), [Kernel Selection](burn-book/performance/good-practices/kernel-selection.md)). Burn's advice to favor convenient even shapes is a heuristic, not authority to pad data or change UMAP inputs; validate output quality and total work. For standard UMAP, the book's neural-layer/fusion guidance may not apply to custom search kernels.
+
+4. **Write custom CubeCL kernels only for measured compute-bound bottlenecks, and make dispatch metadata/backward rules exact.** The extension chapter states a custom op is opaque to Fusion and doesn't generate gradients; correct output shape/dtype metadata and handwritten backward support are the implementer's responsibility ([Custom CubeCL Kernel, Lazy Fusion registration and Forward Kernel](burn-book/advanced/backend-extension/custom-cubecl-kernel.md#lazy-fusion-registration)). The book's Fusion advice is targeted: reduce needless tensor lifetimes, group view operations, and reason differently about concrete versus virtual tensors ([Kernel Fusion](burn-book/performance/good-practices/kernel-fusion.md#kernel-fusion)). **Repository observation:** `autodiff_ops.rs` explicitly registers custom pairwise distance and k-NN backward behavior; inspect its numerical and shape invariants before modifying it. Test custom forward/backward against reference formulas and across supported backends; never infer correctness from extension registration alone.
+
+5. **Preserve device and autodiff context intentionally across tensor movement.** In 0.22, public tensors are backend-free and runtime-dispatched by device; only enabled Cargo features expose constructors. `to_device` preserves source autodiff/checkpointing context rather than adopting destination defaults; tracked transfers preserve gradients through the transfer. Combining autodiff tensors with differing checkpoint strategies can panic ([Autodiff, tensor movement and checkpointing](burn-book/building-blocks/autodiff.md#autodiff), [Backend and Device, Selecting a Device](burn-book/building-blocks/backend.md#selecting-a-device)). Set up device defaults before first tensor use; they lock on first use ([Tensor, Data types](burn-book/building-blocks/tensor.md#data-types)). These semantics matter when adding CPU preprocessing, GPU training, or validation paths.
+
+6. **Keep model records and architecture identity stable; round-trip across intended devices.** Burn records are backend-independent, and `ModuleRecord` stores module parameters by path; loading applies a record to an initialized module, with parameter allocation lazy ([Record, ModuleRecord](burn-book/building-blocks/record.md#modulerecord), [Saving and Loading Models, Initialization from Recorded Weights](burn-book/saving-and-loading.md#initialization-from-recorded-weights)). **Repository observation:** `ParametricUMAPModel` comments explicitly require stable field names/order for record keys; preserve those keys and test save/load when changing module structure ([`model.rs`](../src/parametric_umap/model.rs)). For precision conversion, the book documents casting the module before saving or casting a record to the module dtype while loading ([Saving and Loading Models](burn-book/saving-and-loading.md)).
+
+7. **Use explicit, reproducible configs and handle 0.22 migration semantics.** Burn `Config` supports serialized settings, useful for reproducible model/training parameters ([Config, Good practices](burn-book/building-blocks/config.md#good-practices)). 0.22 changes include backend-free tensor/module types and runtime device selection; explicit optim feature requirements when defaults are disabled; fallible tensor data conversion; fallible device flushing; and revised learner error reporting ([Migrating to Burn 0.22, Types and devices](burn-book/migrating-to-0.22.md#types-and-devices), [Tensor data and numeric semantics](burn-book/migrating-to-0.22.md#tensor-data-and-numeric-semantics), [Training](burn-book/migrating-to-0.22.md#training)). Keep Cargo features aligned with actual execution paths: current manifest includes Flex by default and CUDA/WGPU are optional feature paths; the physical WSL GPU shown in the workspace reminder is a Microsoft Basic Render Driver, not proof of CUDA availability.
+
+## Engineering guidance by concern
+
+### Training, inference, and autodiff
+
+- **Book-backed:** Burn's learner is appropriate for the conventional train/validation lifecycle and provides metrics, checkpointing, gradient accumulation, gradient checkpointing, early stopping and multi-device strategies; use a custom loop when requirements don't fit its assumptions ([Learner, Usage](burn-book/building-blocks/learner.md#usage)). The custom-loop chapter makes the gradient flow explicit: backward returns a gradient container; map it to module parameters before optimizer step ([Custom Training Loops](burn-book/custom-training-loop.md#custom-training-loops)).
+- **Book-backed:** `require_grad()` is for autodiff leaves that need retained gradients, not a general switch enabling autodiff; `backward()` consumes reachable recorded steps. Combine losses sharing an intermediate or recompute forward before another backward. `without_autodiff()` is appropriate for inference/validation; moving to a non-autodiff device alone does not disable autodiff ([Autodiff](burn-book/building-blocks/autodiff.md#autodiff), [Backward consumes the graph](burn-book/building-blocks/autodiff.md#backward-consumes-the-graph)). These are especially important when adjusting custom UMAP loss or separating validation.
+- **Repository observation:** model forward iterates through linear layers and applies ReLU except at the output layer; trainer currently runs a custom sparse epoch loop and optional PCA warm-start ([`model.rs`](../src/parametric_umap/model.rs), [`trainer.rs`](../src/parametric_umap/trainer.rs)). This establishes current approach, not evidence it is best. Validate any architecture/activation or optimizer change against embedding quality, not loss alone.
+- Burn's learner supports schedule configuration and parameter groups; cosine annealing no longer restarts in 0.22 after the minimum ([Learning Rate Scheduler, Cosine annealing](burn-book/building-blocks/lr-scheduler.md#cosine-annealing)). Do not port an older assumption of cyclic restart unchanged.
+
+### Tensor execution, device movement, fusion
+
+- Tensors carry runtime device and runtime dtype; the Burn 0.22 API decouples user-facing Tensor/Module from a static backend type. Device constructors require matching features ([Backend and Device](burn-book/building-blocks/backend.md#backend-and-device), [Migration, Types and devices](burn-book/migrating-to-0.22.md#types-and-devices)). In this repo, Flex is the portable CPU implementation; CUDA/WGPU availability remains feature-gated in the manifest ([`Cargo.toml`](../Cargo.toml)).
+- Device dtype defaults are per device and lock at first tensor use. Configure before any tensor op; casting later is explicit. Do not assume `f32` constructors mean all future tensors inherit it ([Tensor, Data types](burn-book/building-blocks/tensor.md#data-types)). For distance calculations and optimizer updates, reduced precision is an experiment requiring numerical and quality comparisons.
+- Fusion is not universal: asynchronous graph fusion applies to eligible operations; custom compute-bound ops are boundaries unless specifically integrated. View ops can reduce vectorization and may limit fusion. Reorder views before compute blocks when semantically equivalent; compare both paths where concrete/virtual tensor lifetimes differ ([Kernel Fusion](burn-book/performance/good-practices/kernel-fusion.md#kernel-fusion)). Avoid cloning as a reflex: tensor clones are handles, but may cause materialization/recomputation costs depending on the fused graph.
+- Autotuning selects kernels for hardware/shapes and may incur cold-start tuning; cache reuse can reduce later startup. Avoid inventing shape padding for UMAP: only evaluate padding if a measured kernel bottleneck justifies it and the altered computation preserves exact distance/neighbor semantics ([Kernel Selection](burn-book/performance/good-practices/kernel-selection.md#kernel-selection)).
+
+### Persistence, configuration, and precision
+
+- Burn's ModuleRecord stores model parameters; optimizer and scheduler state have distinct record types. burnpack includes metadata and tensor bytes, and supports file or in-memory bytes ([Record, The burnpack format / three record types](burn-book/building-blocks/record.md#the-burnpack-format)). Repository `ParametricUMAPModel` uses derived Module; module path/key stability is a compatibility concern explicitly noted in source ([`model.rs`](../src/parametric_umap/model.rs)).
+- Separate model configuration, model weights, and training resume state. If a future checkpoint is meant to resume training, persist optimizer and scheduler state as well as parameters; restoring weights alone is inference initialization, not an equivalent training continuation ([Record, The three record types](burn-book/building-blocks/record.md#the-three-record-types)).
+- Burn's quantization chapter says only post-training quantization is implemented, on some backends, and integer execution is not supported (operations dequantize to float); QAT is unavailable there ([Quantization](burn-book/performance/quantization.md#quantization)). This does not establish benefit for small parametric UMAP models. Low-precision float support likewise requires backend capability and quality/throughput tests.
+
+### Profiling and optimization evidence
+
+- Burn's runtime configuration covers autotuning, profiling, fusion and loggers; configuration is first-use loaded, supports environment overrides, and malformed files may be skipped with warnings ([Runtime Configuration, Overview](burn-book/advanced/runtime-configuration.md#overview)). Use this for diagnostics, but separate instrumentation overhead from baseline.
+- Synchronize only where needed, prefer fallible synchronization when errors should be handled, and batch reads via `Transaction` ([Asynchronous Execution](burn-book/performance/good-practices/asynchronous-execution.md)). A CPU-visible scalar read in every iteration can serialize an otherwise asynchronous device loop; test sparse readback periods versus continuous logging.
+- **Suggested experiment, not reported result:** use fixed seeded inputs/configuration, compare reference and candidate over repetitions after warmup, time both isolated operation and synchronized end-to-end fit, report compilation/autotune separately, capture memory/launch behavior where available, and verify downstream embedding quality and exact behavioral tests. For neural training include output/loss stability, parameter gradients, and recorded model load. The Burn book explains profiling and optimization mechanisms but does not supply fast-umap performance results.
+
+### Version/backend and scope caveats
+
+- Local book content describes Burn 0.22. Manifest constraints are semver-compatible, while checked-in lockfile resolves the current workspace versions; applications building without the same lock may resolve newer compatible patch releases. The book's migration advice is a version boundary, not generic guidance for older Burn APIs.
+- `Device::flex()` is CPU pure Rust/eager, while CubeCL CPU (`Device::cpu()`) is a separate backend with JIT/fusion; do not conflate them. The manifest has `flex` enabled in the main Burn feature set, while CUDA/WGPU constructors are optional and feature-gated ([Backend and Device, Selecting a Device](burn-book/building-blocks/backend.md#selecting-a-device), [`Cargo.toml`](../Cargo.toml)).
+- Runtime custom-backend extension, distributed training, ONNX import/export, remote compute and pretrained model facilities are not automatic wins for this repository. Adopt only when a concrete product need exists and feature/backend support is verified. The book chapters are useful API references, not measurements or evidence that a given UMAP path supports every backend.
+
+## Review refinements: first experiments and acceptance criteria
+
+1. **Readback is not just telemetry in the current trainer.** `should_read` also gates progress callbacks and patience accounting, and unread epochs reuse `last_read_loss` (`trainer.rs`, around lines 481–558). Changing `LOSS_READBACK_INTERVAL` can therefore change stopping behavior. First measure its cost without changing cadence; any subsequent experiment must explicitly preserve or evaluate callback/stopping semantics as well as synchronized epoch time. [Asynchronous Execution](burn-book/performance/good-practices/asynchronous-execution.md)
+2. **Separate neural and standard-UMAP optimization tracks.** Profile the parametric forward/loss/backward/optimizer path for eligible fusion and readback stalls; profile standard UMAP by search, graph, and layout stages. Do not interpret fusion improvements in the neural model as evidence for the forward-only standard estimator. Use the [CubeCL findings](cubecl_book_findings.md) for that second track. [Kernel Fusion](burn-book/performance/good-practices/kernel-fusion.md), [Custom CubeCL Kernel](burn-book/advanced/backend-extension/custom-cubecl-kernel.md)
+3. **Make each experiment a decision, not an open-ended rewrite.** Record baseline/candidate features, lockfile, device, shapes, seed, cold-start and warmed synchronized timings, and peak memory when available. Adopt only after focused behavior/gradient/persistence checks and downstream quality comparisons; reject changes that merely move work outside the timed boundary. Start with profiling and existing execution controls before considering architecture changes, quantization, or a new learner. [Runtime Configuration](burn-book/advanced/runtime-configuration.md), [Kernel Selection](burn-book/performance/good-practices/kernel-selection.md)
+
+## Coverage inventory
+
+Every chapter listed by the book TOC was considered. The following inventory records the scope decision (the links lead to the local source chapters).
+
+| TOC chapter | Disposition |
+|---|---|
+| [Overview](burn-book/overview.md) | Considered; used to frame the book's sections. |
+| [Why Burn?](burn-book/motivation.md) | Considered; broad framework rationale, no repository-specific action substantiated. |
+| [Getting started](burn-book/getting-started.md) | Considered; onboarding/build basics, not a runtime optimization source. |
+| [Examples](burn-book/examples.md) | Considered; example execution guidance; not used to infer product behavior. |
+| [Migrating to Burn 0.22](burn-book/migrating-to-0.22.md) | Used for version, dtype, devices and training caveats. |
+| [Basic Workflow README](burn-book/basic-workflow/README.md) | Considered; overview of lifecycle. |
+| [Model](burn-book/basic-workflow/model.md) | Used for module conventions and initialization context. |
+| [Data](burn-book/basic-workflow/data.md) | Used for device-aware batching context. |
+| [Training](burn-book/basic-workflow/training.md) | Used for train/inference gradient distinction and owned tensor semantics. |
+| [Backend](burn-book/basic-workflow/backend.md) | Used for runtime device/backend selection. |
+| [Inference](burn-book/basic-workflow/inference.md) | Used for lazy initialization and inference record loading. |
+| [Building Blocks README](burn-book/building-blocks/README.md) | Considered; navigation only. |
+| [Backend](burn-book/building-blocks/backend.md) | Used for devices/features and backend distinctions. |
+| [Tensor](burn-book/building-blocks/tensor.md) | Used for runtime dtype/device semantics. |
+| [Autodiff](burn-book/building-blocks/autodiff.md) | Used extensively for graph, movement, gradient, and inference behavior. |
+| [Module](burn-book/building-blocks/module.md) | Considered; module traversal/config advice, no custom traversal issue asserted. |
+| [Optimizer](burn-book/building-blocks/optimizer.md) | Considered; optimizer API/configuration, no algorithm recommendation inferred. |
+| [Learner](burn-book/building-blocks/learner.md) | Used to explain built-in learner scope and facilities. |
+| [Learning Rate Scheduler](burn-book/building-blocks/lr-scheduler.md) | Used for 0.22 cosine behavior caveat. |
+| [Metric](burn-book/building-blocks/metric.md) | Considered; metrics adaptors are not directly applicable to custom UMAP objective without implementation. |
+| [Config](burn-book/building-blocks/config.md) | Used for reproducibility guidance. |
+| [Record](burn-book/building-blocks/record.md) | Used for persistence distinctions and burnpack. |
+| [Dataset](burn-book/building-blocks/dataset.md) | Considered; custom sparse trainer does not use Burn Dataset API in inspected entrypoint; API could matter if integrating the learner. |
+| [Performance README](burn-book/performance/README.md) | Considered; section introduction. |
+| [Asynchronous Execution](burn-book/performance/good-practices/asynchronous-execution.md) | Used for sync/readback and multi-device input preparation. |
+| [Kernel Fusion](burn-book/performance/good-practices/kernel-fusion.md) | Used with custom-kernel/fusion boundaries caveat. |
+| [Kernel Selection](burn-book/performance/good-practices/kernel-selection.md) | Used for autotuning and shape heuristic caveat. |
+| [Quantization](burn-book/performance/quantization.md) | Used to describe limited PTQ support and non-claim. |
+| [Distributed Computing](burn-book/performance/distributed-computing.md) | Considered; distributed operation not established as current need. |
+| [Custom Training Loop](burn-book/custom-training-loop.md) | Used for gradients and reason to prefer custom loop where learner assumptions don't fit. |
+| [Saving & Loading Models](burn-book/saving-and-loading.md) | Used for records, precision conversion and lazy init. |
+| [ONNX Import](burn-book/onnx-import.md) | Considered; importing external models is not current code path; no export claim made. |
+| [Models & Pre-Trained Weights](burn-book/models-and-pretrained-weights.md) | Considered; no pretrained model path identified. |
+| [Advanced README](burn-book/advanced/README.md) | Considered; navigation. |
+| [Runtime Configuration](burn-book/advanced/runtime-configuration.md) | Used for profiling/config loading behavior. |
+| [Backend Extension README](burn-book/advanced/backend-extension/README.md) | Considered; extension overview. |
+| [Custom CubeCL Kernel](burn-book/advanced/backend-extension/custom-cubecl-kernel.md) | Used for opaque Fusion boundaries and metadata/backward responsibilities. |
+| [Custom WGPU Kernel](burn-book/advanced/backend-extension/custom-wgpu-kernel.md) | Considered; backend-specific alternative, not presumed enabled or faster here. |
+| [WebAssembly](burn-book/advanced/web-assembly.md) | Considered; not the target runtime in inspected feature context. |
+| [No-Std](burn-book/advanced/no-std.md) | Considered; repository enables std and no no_std target is established. |
+
+## Uncertainties and source gaps
+
+- The task-mentioned `src/parametric_umap/training.rs` does not exist; the active implementation inspected is `src/parametric_umap/trainer.rs`. No code was changed.
+- This synthesis checked the repository's parametric model/trainer, autodiff operation module and manifest/lockfile, but did not audit every backend implementation or every callsite. Recommendations concerning specific CUDA/WGPU runtime behavior remain contingent on enabled features, actual hardware, and those backend implementations.
+- The findings are grounded in the local book text and checked-in source; no benchmarks, tests, quality experiments, runtime profiling session, external package registry state, or full semantic audit of Burn dependencies were run. The book's generic GPU tips cannot establish speedup for this workload.

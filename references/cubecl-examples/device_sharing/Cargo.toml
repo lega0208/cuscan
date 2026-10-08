@@ -1,0 +1,22 @@
+[package]
+authors = []
+edition.workspace = true
+license.workspace = true
+name = "device_sharing"
+publish = false
+version.workspace = true
+
+[features]
+cuda = ["cubecl/cuda"]
+# An example with no runtime linked has nothing to run on, so the
+# portable one is the default. `--no-default-features --features cuda`
+# (or hip, cpu, metal-native) picks another.
+default = ["wgpu"]
+wgpu = ["cubecl/wgpu"]
+
+[dependencies]
+cubecl = { workspace = true, default-features = true }
+half = { workspace = true }
+
+sum_things = { path = "../sum_things" }
+wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }

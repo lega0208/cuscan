@@ -1,0 +1,212 @@
+#![allow(clippy::needless_range_loop)]
+
+use cubecl::{Device, features::Plane, prelude::*, server::Handle};
+use std::marker::PhantomData;
+
+#[cube(launch_unchecked)]
+fn sum_basic<F: Float>(input: &[F], output: &mut [F], #[comptime] end: Option<usize>) {
+    let unroll = end.is_some();
+    let end = end.unwrap_or(input.len());
+
+    let mut sum = F::new(0.0f32);
+
+    #[unroll(unroll)]
+    for i in 0..end {
+        sum += input[i];
+    }
+
+    output[UNIT_POS as usize] = sum;
+}
+
+#[cube(launch_unchecked)]
+fn sum_subgroup<F: Float>(
+    input: &[F],
+    output: &mut [F],
+    #[comptime] subgroup: bool,
+    #[comptime] end: Option<usize>,
+) {
+    if subgroup {
+        output[UNIT_POS as usize] = plane_sum(input[UNIT_POS as usize]);
+    } else {
+        sum_basic(input, output, end);
+    }
+}
+
+#[cube]
+trait SumKind: 'static + Send + Sync {
+    fn sum<F: Float>(input: &[F], #[comptime] end: Option<usize>) -> F;
+}
+
+struct SumBasic;
+struct SumPlane;
+
+#[cube]
+impl SumKind for SumBasic {
+    fn sum<F: Float>(input: &[F], #[comptime] end: Option<usize>) -> F {
+        let unroll = end.is_some();
+        let end = end.unwrap_or(input.len());
+
+        let mut sum = F::new(0.0f32);
+
+        #[unroll(unroll)]
+        for i in 0..end {
+            sum += input[i];
+        }
+
+        sum
+    }
+}
+
+#[cube]
+impl SumKind for SumPlane {
+    fn sum<F: Float>(input: &[F], #[comptime] _end: Option<usize>) -> F {
+        plane_sum(input[UNIT_POS as usize])
+    }
+}
+
+#[cube(launch_unchecked)]
+fn sum_trait<F: Float, K: SumKind>(input: &[F], output: &mut [F], #[comptime] end: Option<usize>) {
+    output[UNIT_POS as usize] = K::sum(input, end);
+}
+
+#[cube]
+trait CreateSeries: 'static + Send + Sync {
+    type SumKind: SumKind;
+
+    fn execute<F: Float>(input: &[F], #[comptime] end: Option<usize>) -> F;
+}
+
+#[cube(launch_unchecked)]
+fn series<F: Float, S: CreateSeries>(
+    input: &[F],
+    output: &mut [F],
+    #[comptime] end: Option<usize>,
+) {
+    output[UNIT_POS as usize] = S::execute(input, end);
+}
+
+struct SumThenMul<K: SumKind> {
+    _p: PhantomData<K>,
+}
+
+#[cube]
+impl<K: SumKind> CreateSeries for SumThenMul<K> {
+    type SumKind = K;
+
+    fn execute<F: Float>(input: &[F], #[comptime] end: Option<usize>) -> F {
+        let val = Self::SumKind::sum(input, end);
+        val * input[UNIT_POS as usize]
+    }
+}
+
+fn launch_basic(client: &Client, input: Handle, output: Handle, len: usize) {
+    unsafe {
+        sum_basic::launch_unchecked::<f32>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(len as u32),
+            BufferArg::from_raw_parts(input, len),
+            BufferArg::from_raw_parts(output, len),
+            Some(len),
+        )
+    }
+}
+
+fn launch_subgroup(client: &Client, input: Handle, output: Handle, len: usize) {
+    unsafe {
+        sum_subgroup::launch_unchecked::<f32>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(len as u32),
+            BufferArg::from_raw_parts(input, len),
+            BufferArg::from_raw_parts(output, len),
+            client.features().plane.contains(Plane::Ops),
+            Some(len),
+        )
+    }
+}
+
+fn launch_trait<K: SumKind>(client: &Client, input: Handle, output: Handle, len: usize) {
+    unsafe {
+        sum_trait::launch_unchecked::<f32, K>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(len as u32),
+            BufferArg::from_raw_parts(input, len),
+            BufferArg::from_raw_parts(output, len),
+            Some(len),
+        )
+    }
+}
+
+fn launch_series<S: CreateSeries>(client: &Client, input: Handle, output: Handle, len: usize) {
+    unsafe {
+        series::launch_unchecked::<f32, S>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(len as u32),
+            BufferArg::from_raw_parts(input, len),
+            BufferArg::from_raw_parts(output, len),
+            Some(len),
+        )
+    }
+}
+
+#[derive(Debug)]
+enum KernelKind {
+    Basic,
+    Plane,
+    TraitSum,
+    SeriesSumThenMul,
+}
+
+pub fn launch(device: &Device) {
+    let client = device.client();
+    let input = &[-1., 10., 1., 5.];
+    let len = input.len();
+
+    let output = client.empty(input.len() * core::mem::size_of::<f32>());
+    let input = client.create_from_slice(f32::as_bytes(input));
+
+    for kind in [
+        KernelKind::Basic,
+        KernelKind::Plane,
+        KernelKind::TraitSum,
+        KernelKind::SeriesSumThenMul,
+    ] {
+        match kind {
+            KernelKind::Basic => launch_basic(&client, input.clone(), output.clone(), len),
+            KernelKind::Plane => launch_subgroup(&client, input.clone(), output.clone(), len),
+            KernelKind::TraitSum => {
+                // When using trait, it's normally a good idea to check if the variation can be
+                // executed.
+                if client.features().plane.contains(Plane::Ops) {
+                    launch_trait::<SumPlane>(&client, input.clone(), output.clone(), len)
+                } else {
+                    launch_trait::<SumBasic>(&client, input.clone(), output.clone(), len)
+                }
+            }
+            KernelKind::SeriesSumThenMul => {
+                if client.features().plane.contains(Plane::Ops) {
+                    launch_series::<SumThenMul<SumPlane>>(
+                        &client,
+                        input.clone(),
+                        output.clone(),
+                        len,
+                    )
+                } else {
+                    launch_series::<SumThenMul<SumBasic>>(
+                        &client,
+                        input.clone(),
+                        output.clone(),
+                        len,
+                    )
+                }
+            }
+        }
+        let bytes = client.read_one(output.clone()).unwrap();
+        let output = f32::from_bytes(&bytes);
+
+        println!("[{:?} - {kind:?}]\n {output:?}", client.name());
+    }
+}
