@@ -284,7 +284,7 @@ impl UMAP {
             self.config.negative_sample_rate,
             true,
             true,
-        );
+        )?;
         #[cfg(feature = "tracing")]
         drop(_optimization_span);
         let embedding = tensor_embedding(&embedding_tensor)?;
@@ -349,6 +349,20 @@ impl FittedUMAP {
     }
     pub fn n_features(&self) -> usize {
         self.n_features
+    }
+
+    /// Diagnostic read-only copy of the fit's non-self neighbor ids, row-major
+    /// `[rows, width]`; reads back from the device. Not part of the stable API.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    pub fn diagnostic_fit_graph(&self) -> Result<(Vec<i32>, usize)> {
+        let width = self.fit_graph.dims()[1];
+        let ids = self
+            .fit_graph
+            .to_data()
+            .try_to_vec::<i32>()
+            .map_err(|error| UmapError::Numerical(format!("could not read fit graph: {error}")))?;
+        Ok((ids, width))
     }
 
     #[cfg_attr(
@@ -561,7 +575,7 @@ impl FittedUMAP {
             self.config.negative_sample_rate,
             false,
             false,
-        );
+        )?;
         #[cfg(feature = "tracing")]
         drop(_optimization_span);
         tensor_embedding(&embedding)
@@ -736,18 +750,27 @@ fn optimize(
     negative_sample_rate: usize,
     move_other: bool,
     shared: bool,
-) -> Tensor<2> {
-    // The device op updates embeddings and clocks in place; give each mutable
-    // operand its own buffer so aliased inputs (shared fit embeddings, clocks
-    // cloned from their intervals) cannot observe each other's writes.
-    tail = tail.add_scalar(0.0);
+) -> Result<Tensor<2>> {
+    // The device op updates clocks and RNG state in place; give each mutable
+    // clock its own buffer so clocks cloned from their intervals cannot
+    // observe each other's writes.
     next_positive = next_positive.add_scalar(0.0);
     next_negative = next_negative.add_scalar(0.0);
+    let device = head.device();
+    let (head_offsets, head_edges) = edge_schedule(
+        &heads,
+        &tails,
+        &weights,
+        head.dims()[0],
+        tail.dims()[0],
+        shared,
+        &device,
+    )?;
     let mut alpha = learning_rate;
     for epoch in 0..n_epochs {
         #[cfg(feature = "tracing")]
         let _epoch_span = tracing::trace_span!("layout_epoch", epoch, alpha).entered();
-        let (new_head, new_tail, new_next_positive, new_next_negative, new_rng, _) =
+        let (new_head, new_tail, new_next_positive, new_next_negative, new_rng) =
             <Dispatch as StandardUmapOps>::optimize_epoch(
                 head.clone().into_dispatch(),
                 tail.clone().into_dispatch(),
@@ -759,6 +782,8 @@ fn optimize(
                 negative.clone().into_dispatch(),
                 next_negative.clone().into_dispatch(),
                 rng.clone().into_dispatch(),
+                head_offsets.clone().into_dispatch(),
+                head_edges.clone().into_dispatch(),
                 epoch,
                 a,
                 b,
@@ -775,7 +800,108 @@ fn optimize(
         rng = Tensor::from_dispatch(new_rng);
         alpha = learning_rate * (1.0 - epoch as f32 / n_epochs.max(1) as f32);
     }
-    head
+    Ok(head)
+}
+
+/// Build stable head CSR for positive-weight edges.
+fn edge_schedule(
+    heads: &Tensor<1, Int>,
+    tails: &Tensor<1, Int>,
+    weights: &Tensor<1>,
+    head_rows: usize,
+    tail_rows: usize,
+    shared: bool,
+    device: &Device,
+) -> Result<(Tensor<1, Int>, Tensor<1, Int>)> {
+    if heads.dims()[0] != weights.dims()[0] || heads.dims()[0] != tails.dims()[0] {
+        return Err(UmapError::Numerical(
+            "layout edge arrays have different lengths".into(),
+        ));
+    }
+    let heads = heads
+        .to_data()
+        .try_to_vec::<i32>()
+        .map_err(|error| UmapError::Numerical(format!("could not read layout edges: {error}")))?;
+    let weights = weights
+        .to_data()
+        .try_to_vec::<f32>()
+        .map_err(|error| UmapError::Numerical(format!("could not read layout weights: {error}")))?;
+    let (offsets, ids) = build_head_csr(&heads, &weights, head_rows)?;
+    if shared {
+        let tails = tails.to_data().try_to_vec::<i32>().map_err(|error| {
+            UmapError::Numerical(format!("could not read layout edges: {error}"))
+        })?;
+        for (&tail, &weight) in tails.iter().zip(&weights) {
+            let tail = usize::try_from(tail)
+                .ok()
+                .filter(|&row| row < tail_rows)
+                .ok_or_else(|| UmapError::Numerical("layout edge endpoint out of range".into()))?;
+            if weight > 0.0 && tail >= head_rows {
+                return Err(UmapError::Numerical(
+                    "shared layout endpoint out of range".into(),
+                ));
+            }
+        }
+    }
+    let len = ids.len();
+    Ok((
+        Tensor::from_data(TensorData::new(offsets, [head_rows + 1]), device),
+        Tensor::from_data(TensorData::new(ids, [len]), device),
+    ))
+}
+
+fn build_head_csr(
+    heads: &[i32],
+    weights: &[f32],
+    head_rows: usize,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    if heads.len() != weights.len() {
+        return Err(UmapError::Numerical(
+            "layout edge arrays have different lengths".into(),
+        ));
+    }
+    let offset_len = head_rows
+        .checked_add(1)
+        .ok_or(UmapError::Overflow("layout head offsets"))?;
+    let mut counts = vec![0usize; head_rows];
+    for (&head, &weight) in heads.iter().zip(weights) {
+        let row = usize::try_from(head)
+            .ok()
+            .filter(|&row| row < head_rows)
+            .ok_or_else(|| UmapError::Numerical("layout edge endpoint out of range".into()))?;
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(UmapError::Numerical(
+                "layout edge has invalid weight".into(),
+            ));
+        }
+        if weight > 0.0 {
+            counts[row] = counts[row]
+                .checked_add(1)
+                .ok_or(UmapError::Overflow("layout edge count"))?;
+        }
+    }
+    let mut offsets = vec![0i32; offset_len];
+    for row in 0..head_rows {
+        let next = (offsets[row] as usize)
+            .checked_add(counts[row])
+            .ok_or(UmapError::Overflow("layout edge count"))?;
+        offsets[row + 1] =
+            i32::try_from(next).map_err(|_| UmapError::Overflow("layout edge count"))?;
+    }
+    let total = offsets[head_rows] as usize;
+    let mut cursor = offsets[..head_rows].to_vec();
+    // Keep the tensor non-empty when there are no positive edges.
+    let mut ids = vec![1i32; total.max(1)];
+    for (edge, (&head, &weight)) in heads.iter().zip(weights).enumerate() {
+        if weight > 0.0 {
+            let edge = i32::try_from(edge).map_err(|_| UmapError::Overflow("layout edge id"))?;
+            let row = head as usize;
+            let slot = &mut cursor[row];
+            ids[*slot as usize] = edge;
+            *slot += 1;
+        }
+    }
+    Ok((offsets, ids))
 }
 
 #[cfg_attr(
@@ -837,5 +963,29 @@ mod tests {
             assert_eq!(estimator.resolve_search(0), mode);
             assert_eq!(estimator.resolve_search(AUTO_EXACT_MAX_ROWS + 1), mode);
         }
+    }
+
+    #[test]
+    fn head_csr_preserves_original_edge_order_within_each_head() {
+        let (offsets, edge_ids) =
+            build_head_csr(&[2, 0, 2, 1, 0, 2], &[1.0, 0.0, 2.0, 1.0, 3.0, 0.0], 4).unwrap();
+        assert_eq!(offsets, vec![0, 1, 2, 4, 4]);
+        assert_eq!(edge_ids, vec![4, 3, 0, 2]);
+    }
+
+    #[test]
+    fn head_csr_keeps_empty_graph_tensor_nonempty() {
+        let (offsets, edge_ids) = build_head_csr(&[0, 1], &[0.0, 0.0], 3).unwrap();
+        assert_eq!(offsets, vec![0, 0, 0, 0]);
+        assert_eq!(edge_ids, vec![1]);
+    }
+
+    #[test]
+    fn head_csr_rejects_invalid_endpoints_weights_and_shapes() {
+        assert!(build_head_csr(&[-1], &[1.0], 1).is_err());
+        assert!(build_head_csr(&[1], &[1.0], 1).is_err());
+        assert!(build_head_csr(&[0], &[f32::NAN], 1).is_err());
+        assert!(build_head_csr(&[0], &[-1.0], 1).is_err());
+        assert!(build_head_csr(&[0], &[], 1).is_err());
     }
 }

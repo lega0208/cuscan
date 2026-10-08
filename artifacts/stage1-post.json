@@ -1,0 +1,232 @@
+{
+  "complete": true,
+  "configuration": {
+    "components": 2,
+    "cuda_seeds": "42+run (warmups 1000+i)",
+    "deadline_seconds": 300.0,
+    "init": "random",
+    "input": "seeded clustered float32 (8 centers), little-endian row-major",
+    "metric": "euclidean",
+    "neighbors": 15,
+    "primary": {
+      "epochs": 10,
+      "features": 32,
+      "rows": 5000
+    },
+    "runs": 5,
+    "small": [
+      {
+        "epochs": 30,
+        "features": 16,
+        "rows": 512
+      },
+      {
+        "epochs": 100,
+        "features": 32,
+        "rows": 1024
+      }
+    ],
+    "warmups": 1
+  },
+  "elapsed_seconds": 95.51169970698538,
+  "gates": {
+    "H-03_pass": true,
+    "H-03_small_ratio_vs_baseline": {
+      "1024x32/100/approximate": 0.17932873806255534,
+      "1024x32/100/exact": 0.022970421514586295,
+      "512x16/30/approximate": 0.4486539005678812,
+      "512x16/30/exact": 0.03598408687896702
+    },
+    "H-04_approximate_cuda_median_le_0.90x_python": false,
+    "H-04_approximate_ratio_cuda_over_python": 25.19720971523904,
+    "H-04_exact_cuda_median_le_0.90x_python": false,
+    "H-04_exact_ratio_cuda_over_python": 18.045787775411412,
+    "primary_cuda_ratio_vs_baseline": {
+      "approximate": 0.5310405147460554,
+      "exact": 0.34337105361903214
+    }
+  },
+  "primary": {
+    "approximate": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          1.584296224,
+          1.5504072930000001,
+          1.5471366450000001,
+          1.5522651920000001,
+          1.5493114000000001
+        ],
+        "search": "Approximate",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 1.5504072930000001,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": false,
+          "force_approximation_algorithm": true,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.06153537699719891,
+          0.06153091197484173,
+          0.06171012498089112,
+          0.06003432199941017,
+          0.0601429529779125
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.06153091197484173
+    },
+    "exact": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          0.756845059,
+          0.712496438,
+          0.720058332,
+          0.71401744,
+          0.725719654
+        ],
+        "search": "Exact",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 0.720058332,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": true,
+          "force_approximation_algorithm": false,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.04118431897950359,
+          0.040850260003935546,
+          0.039901740005007014,
+          0.03543670900398865,
+          0.03524253400973976
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.039901740005007014
+    }
+  },
+  "profiles": {
+    "ncu_approximate": {
+      "reason": "ERR_NVGPUCTRPERM: GPU performance counters denied",
+      "status": "blocked"
+    },
+    "nsys_approximate": {
+      "report": "/tmp/stage1-post-prof/nsys-approximate.nsys-rep",
+      "summary_csv": "Generating SQLite file /tmp/stage1-post-prof/nsys-approximate.sqlite from /tmp/stage1-post-prof/nsys-approximate.nsys-rep\nProcessing [/tmp/stage1-post-prof/nsys-approximate.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_gpu_kern_sum.py]... \nTime (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n56.4,2684157410,26,103236823.5,112534397.5,451700,116848798,30828138.8,ann_step_f_f32_i_i32_b47dcb3c\n17.5,831930240,44,18907505.5,20232844.0,4384,20996812,5110693.8,compute_direct_throughput_i_f32_n_4_d399a4db\n15.8,752887021,39,19304795.4,20174345.0,2240,20906153,4205457.4,memory_direct_throughput_i_f32_n_4_d31d1fd0\n6.2,295703645,16,18481477.8,19654370.5,10091924,20126887,3256560.1,compute_direct_throughput_i_f32_n_1_a0e3cb82\n2.0,95424534,84830,1124.9,1120.0,1088,1728,17.2,launch_overhead_i_i32_n_1_4eb9a74e\n1.6,77586654,5,15517330.8,19817274.0,8350601,20780900,6550976.4,compute_direct_throughput_i_f32_n_2_89213cba\n0.2,7963997,20,398199.8,417682.0,81092,1011756,185346.3,layout_vertex_gather_kernel_f_f32_i_i64_j_i32_m_i32_3bc10ad4\n0.1,5462445,2,2731222.5,2731222.5,2720757,2741688,14800.5,fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78\n0.1,2627539,4,656884.8,579193.5,579129,890023,155425.5,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8\n0.0,2294948,2,1147474.0,1147474.0,1146578,1148370,1267.1,fuzzy_graph_sort_kernel_f_f32_i_i32_8207c9fe\n0.0,1562692,1,1562692.0,1562692.0,1562692,1562692,0.0,prime_buffer_i_f32_n_4_0df454aa\n0.0,870693,8,108836.6,98052.0,98020,184328,30503.1,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_b56870a0\n0.0,307277,2,153638.5,153638.5,112197,195080,58607.1,fuzzy_graph_prefix_kernel_i_i32_30c6e7de\n0.0,288456,18,16025.3,15265.0,15072,26785,2738.4,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_cd4df8c3\n0.0,197096,20,9854.8,10624.0,3456,11425,2226.6,layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\n0.0,120006,2,60003.0,60003.0,59779,60227,316.8,cumulative_kernel_c_i32_da126a79\n0.0,97988,2,48994.0,48994.0,47362,50626,2308.0,fuzzy_graph_scatter_kernel_f_f32_i_i32_0cf0ac83\n0.0,85379,2,42689.5,42689.5,40961,44418,2444.5,ann_init_i_i32_65186f2e\n0.0,70435,2,35217.5,35217.5,35138,35297,112.4,fuzzy_graph_count_kernel_f_f32_i_i32_ee1599bf\n0.0,34594,2,17297.0,17297.0,16961,17633,475.2,elemwise_fuse_6c18e021\n0.0,11906,2,5953.0,5953.0,5921,5985,45.3,ann_output_f_f32_i_i32_227b5ab7\n0.0,11200,2,5600.0,5600.0,3840,7360,2489.0,elemwise_fuse_8b0b0372\n0.0,8576,2,4288.0,4288.0,4160,4416,181.0,fuzzy_graph_zero_kernel_f_f32_i_i32_abafb52b\n0.0,6304,4,1576.0,1424.0,1344,2112,361.4,slice_assign_kernel_e_f32_n_1_197a0642\n0.0,6048,2,3024.0,3024.0,2880,3168,203.6,elemwise_fuse_48b54b1c\n0.0,5568,4,1392.0,1360.0,1248,1600,162.1,copy_kernel_t_f32_n_2_d8924a49\n0.0,3392,2,1696.0,1696.0,1664,1728,45.3,copy_kernel_t_f32_n_1_2ac59715\n0.0,3360,2,1680.0,1680.0,1600,1760,113.1,copy_kernel_t_i64_n_1_c17fc01f\n0.0,2976,2,1488.0,1488.0,1472,1504,22.6,slice_kernel_e_i32_2a989b90\n0.0,2880,2,1440.0,1440.0,1216,1664,316.8,elemwise_fuse_bf8e7554\n0.0,2112,2,1056.0,1056.0,1056,1056,0.0,full_kernel_c_i32_n_4_42fa673b\n0.0,2048,2,1024.0,1024.0,1024,1024,0.0,full_kernel_c_f32_n_1_28ce5594\n0.0,1600,1,1600.0,1600.0,1600,1600,0.0,unary_numeric_t_f32_n_1_c739b437\n\nProcessing [/tmp/stage1-post-prof/nsys-approximate.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_api_sum.py]... \nTime (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n64.1,3480940107,237,14687511.0,5047205.0,371,1343604310,87190886.4,cuEventSynchronize\n25.4,1377555521,33,41744106.7,186297.0,90474,1338983962,232947344.4,cuModuleLoadData\n9.3,503023105,85076,5912.6,2525.0,1993,2078590,77833.3,cuLaunchKernel\n0.5,25150299,85645,293.7,180.0,150,5221579,17868.0,cuCtxSetCurrent\n0.3,15476418,9,1719602.0,417028.0,322900,6707309,2569585.7,cuMemAlloc_v2\n0.2,10720287,2,5360143.5,5360143.5,4983459,5736828,532712.3,cuMemFree_v2\n0.1,7483115,5,1496623.0,1059743.0,952478,2256998,674866.2,cuMemAllocHost_v2\n0.0,2645028,248,10665.4,11286.5,1352,36971,7915.9,cuEventRecord\n0.0,1762512,2,881256.0,881256.0,449713,1312799,610294.0,cuMemFreeHost\n0.0,729718,42,17374.2,10169.0,3918,175066,27815.9,cuMemcpyHtoDAsync_v2\n0.0,310986,15,20732.4,20820.0,14798,32492,4220.8,cuMemcpyDtoHAsync_v2\n0.0,208808,126,1657.2,1273.0,361,42742,3708.1,cuEventDestroy_v2\n0.0,174495,6,29082.5,23825.5,16602,62460,16707.4,cuMemcpy2DAsync_v2\n0.0,150739,138,1092.3,1052.0,220,2595,299.5,cuEventCreate\n0.0,35288,3,11762.7,7625.0,3898,23765,10560.0,cuStreamCreate\n0.0,10440,5,2088.0,2395.0,561,3517,1417.8,cuInit\n\n"
+    },
+    "nsys_exact": {
+      "report": "/tmp/stage1-post-prof/nsys-exact.nsys-rep",
+      "summary_csv": "Generating SQLite file /tmp/stage1-post-prof/nsys-exact.sqlite from /tmp/stage1-post-prof/nsys-exact.nsys-rep\nProcessing [/tmp/stage1-post-prof/nsys-exact.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_gpu_kern_sum.py]... \nTime (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n37.6,1312996699,158,8310105.7,8186779.5,3468725,10250580,836732.7,exact_neighbors_kernel_f_f32_i_i32_632b4cf8\n27.1,945171348,49,19289211.2,20519465.0,5120,21802015,4922842.5,compute_direct_throughput_i_f32_n_4_d399a4db\n20.6,720349909,37,19468916.5,20588620.0,2048,21361292,4367374.2,memory_direct_throughput_i_f32_n_4_d31d1fd0\n8.3,289043783,16,18065236.4,19231378.0,9106499,20090775,3427524.8,compute_direct_throughput_i_f32_n_1_a0e3cb82\n3.6,126401963,113018,1118.4,1120.0,1088,3552,19.1,launch_overhead_i_i32_n_1_4eb9a74e\n2.2,75326404,5,15065280.8,19139022.0,7970131,20243293,6278657.7,compute_direct_throughput_i_f32_n_2_89213cba\n0.2,7361301,20,368065.0,414401.5,82467,452979,116664.7,layout_vertex_gather_kernel_f_f32_i_i64_j_i32_m_i32_3bc10ad4\n0.2,5686322,2,2843161.0,2843161.0,2740085,2946237,145771.5,fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78\n0.1,2627952,4,656988.0,579145.0,579096,890566,155718.7,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8\n0.1,2379621,2,1189810.5,1189810.5,1148305,1231316,58697.6,fuzzy_graph_sort_kernel_f_f32_i_i32_8207c9fe\n0.0,1590756,1,1590756.0,1590756.0,1590756,1590756,0.0,prime_buffer_i_f32_n_4_0df454aa\n0.0,807779,8,100972.4,98036.5,98020,121541,8311.0,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_b56870a0\n0.0,258667,16,16166.7,15425.0,15168,26881,2863.4,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_cd4df8c3\n0.0,232875,2,116437.5,116437.5,112005,120870,6268.5,fuzzy_graph_prefix_kernel_i_i32_30c6e7de\n0.0,197195,20,9859.8,10608.5,3648,10976,2040.3,layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\n0.0,124902,2,62451.0,62451.0,60195,64707,3190.5,cumulative_kernel_c_i32_da126a79\n0.0,102084,2,51042.0,51042.0,47170,54914,5475.8,fuzzy_graph_scatter_kernel_f_f32_i_i32_0cf0ac83\n0.0,76228,2,38114.0,38114.0,35266,40962,4027.7,fuzzy_graph_count_kernel_f_f32_i_i32_ee1599bf\n0.0,34850,2,17425.0,17425.0,16961,17889,656.2,elemwise_fuse_6c18e021\n0.0,22400,2,11200.0,11200.0,10240,12160,1357.6,elemwise_fuse_e1707dff\n0.0,21313,2,10656.5,10656.5,10241,11072,587.6,elemwise_fuse_c0c20b27\n0.0,8608,2,4304.0,4304.0,4160,4448,203.6,fuzzy_graph_zero_kernel_f_f32_i_i32_abafb52b\n0.0,7744,2,3872.0,3872.0,3872,3872,0.0,elemwise_fuse_8b0b0372\n0.0,6624,2,3312.0,3312.0,2880,3744,610.9,elemwise_fuse_7d8dab6a\n0.0,6209,2,3104.5,3104.5,2880,3329,317.5,elemwise_fuse_48b54b1c\n0.0,5632,4,1408.0,1344.0,1216,1728,235.2,copy_kernel_t_f32_n_2_d8924a49\n0.0,3456,2,1728.0,1728.0,1696,1760,45.3,copy_kernel_t_i64_n_1_c17fc01f\n0.0,2848,2,1424.0,1424.0,1312,1536,158.4,slice_kernel_e_i32_2a989b90\n0.0,2592,2,1296.0,1296.0,1248,1344,67.9,elemwise_fuse_bf8e7554\n0.0,2208,2,1104.0,1104.0,1056,1152,67.9,full_kernel_c_i32_n_4_42fa673b\n0.0,1248,1,1248.0,1248.0,1248,1248,0.0,unary_numeric_t_f32_n_1_c739b437\n\nProcessing [/tmp/stage1-post-prof/nsys-exact.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_api_sum.py]... \nTime (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n66.3,2779217759,241,11532023.9,3516327.0,360,632559118,41307128.5,cuEventSynchronize\n17.6,737713021,113391,6505.9,3296.0,1984,2075571,49914.7,cuLaunchKernel\n14.1,591005410,31,19064690.6,203350.0,92547,552684902,99205387.2,cuModuleLoadData\n1.0,42273080,114230,370.1,230.0,140,2432448,7360.3,cuCtxSetCurrent\n0.4,17297685,10,1729768.5,393841.5,308392,8026480,2816384.4,cuMemAlloc_v2\n0.3,10991203,3,3663734.3,4884734.0,549304,5557165,2718050.4,cuMemFree_v2\n0.2,7605805,5,1521161.0,1087086.0,932910,2388812,724502.4,cuMemAllocHost_v2\n0.1,2311846,252,9174.0,5465.5,1342,37813,7602.0,cuEventRecord\n0.0,1579130,2,789565.0,789565.0,448771,1130359,481955.5,cuMemFreeHost\n0.0,1015698,41,24773.1,19507.0,5020,208731,32259.4,cuMemcpyHtoDAsync_v2\n0.0,336186,15,22412.4,22463.0,15619,37512,6025.7,cuMemcpyDtoHAsync_v2\n0.0,208853,6,34808.8,27042.5,16692,84733,24913.3,cuMemcpy2DAsync_v2\n0.0,157174,129,1218.4,1022.0,231,5120,574.0,cuEventDestroy_v2\n0.0,146310,141,1037.7,952.0,161,3106,395.6,cuEventCreate\n0.0,34486,3,11495.3,7324.0,3437,23725,10768.0,cuStreamCreate\n0.0,11181,5,2236.2,2044.0,551,3607,1253.4,cuInit\n\n"
+    }
+  },
+  "quality": {
+    "approximate": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": false,
+      "Q-03_every_run_recall_ge_0.90": true,
+      "cuda_fit_recall_at_14": [
+        0.9976714285714285,
+        0.9976428571428572,
+        0.9976857142857143,
+        0.9976428571428572,
+        0.9977857142857143
+      ],
+      "cuda_trustworthiness": [
+        0.5439705337887617,
+        0.5538877181702498,
+        0.5390940754135691,
+        0.5644523126381354,
+        0.5494885566941263
+      ],
+      "python_fit_recall_at_14": [
+        0.9980571428571429,
+        0.9980714285714286,
+        0.9976714285714285,
+        0.9978428571428571,
+        0.9978571428571429
+      ],
+      "python_trustworthiness": [
+        0.7359189980577323,
+        0.8275241872614024,
+        0.7811458040318799,
+        0.8524591896055187,
+        0.7534585011050834
+      ],
+      "python_trustworthiness_mean": 0.7901013360123234
+    },
+    "exact": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": false,
+      "cuda_trustworthiness": [
+        0.543215883731833,
+        0.5616205237425491,
+        0.5338910588708057,
+        0.5693423695666734,
+        0.5335228665193222
+      ],
+      "python_trustworthiness": [
+        0.8627605331190141,
+        0.8709736682070859,
+        0.8411660304065367,
+        0.8638710360993905,
+        0.8254707360525082
+      ],
+      "python_trustworthiness_mean": 0.8528484007769072
+    }
+  },
+  "small_cuda": {
+    "1024x32/100/approximate": {
+      "fit_seconds": [
+        0.755568769,
+        0.714534451,
+        0.724187068,
+        0.71830449,
+        0.730531582
+      ],
+      "median_seconds": 0.724187068
+    },
+    "1024x32/100/exact": {
+      "fit_seconds": [
+        0.077959873,
+        0.080500393,
+        0.080219274,
+        0.077608078,
+        0.077304327
+      ],
+      "median_seconds": 0.077959873
+    },
+    "512x16/30/approximate": {
+      "fit_seconds": [
+        0.400320831,
+        0.37275438,
+        0.363187161,
+        0.367671478,
+        0.369179839
+      ],
+      "median_seconds": 0.369179839
+    },
+    "512x16/30/exact": {
+      "fit_seconds": [
+        0.015475163,
+        0.018649388,
+        0.016926969,
+        0.016474191,
+        0.016909647
+      ],
+      "median_seconds": 0.016909647
+    }
+  }
+}

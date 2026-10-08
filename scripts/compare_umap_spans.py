@@ -1,30 +1,58 @@
 #!/usr/bin/env -S uv run --script
-"""Compare umap-learn 0.5.12 with the CUDA-only standard UMAP profiler.
+"""Stage-1 benchmark suite: umap-learn 0.5.12 (parallel) vs fast-umap CUDA standard UMAP.
 
 Run from the repository root with ``uv run --no-sync python scripts/compare_umap_spans.py``.
-Build the companion first (not included in the runtime budget):
+Build the companion first (build time is excluded from the runtime budget):
 ``cargo build --release --no-default-features --features cuda,tracing
---example profile_standard_cuda`` (one shell command).
-Defaults are 512 rows, 16 features, 30 epochs, seed 42, 15 exact neighbors, and a
-115-second global deadline covering all worker startup/import/JIT/CUDA warmups.
+--example profile_standard_cuda``.
+
+Primary workload: identical clustered float32 5000x32 input, 20 epochs, Euclidean,
+15 neighbors, 2 components, random init, explicitly forced Exact and Approximate
+search. Each implementation/mode runs one warmup plus N timed fits. Fit durations
+include neighbor generation and host embedding readback and exclude input generation,
+profiler overhead and quality calculation. Python is unseeded and uses all threads.
+Small CUDA regressions: 512x16/30 and 1024x32/100 in both search modes.
+
+Use ``--binary PATH`` to select the benchmark executable. To capture the pre-change
+Rust serial implementation as a tracking reference, run
+Use the suite command with ``--binary /path/to/pre-change/profile_standard_cuda``
+and ``--output artifacts/serial-reference.json``
+and pass the complete suite JSON later with
+``--quality-reference PATH``. It is distinct from ``--baseline``, which only
+provides the existing small/speed comparison gates. Tracking requires at least
+two finite CUDA trustworthiness samples per mode and does not replace Q-02.
+
+One global deadline (default 600 seconds) covers warmups, repetitions,
+quality/recall diagnostics and
+profilers. On expiry the run stops and is reported incomplete (no pass); the
+deadline is never adjusted automatically.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "target" / "release" / "examples" / "profile_standard_cuda"
+PRIMARY = (5000, 32, 20)
+SMALL = ((512, 16, 30), (1024, 32, 100))
+MODES = ("exact", "approximate")
+NEIGHBORS = 15
+FIT_WIDTH = NEIGHBORS - 1
+TRUST_GAP = 0.02
+RECALL_LIMIT = 0.90
+SMALL_RATIO_LIMIT = 1.10
+SPEED_RATIO_LIMIT = 0.90
 
 
 class DeadlineExceeded(TimeoutError):
@@ -44,12 +72,14 @@ class Deadline:
         return value
 
 
-def run_with_deadline(command: list[str], deadline: Deadline) -> subprocess.CompletedProcess[str]:
+def run_with_deadline(
+    command: list[str], deadline: Deadline, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             command,
             cwd=ROOT,
-            check=True,
+            check=check,
             capture_output=True,
             text=True,
             timeout=deadline.remaining(),
@@ -58,129 +88,15 @@ def run_with_deadline(command: list[str], deadline: Deadline) -> subprocess.Comp
         raise DeadlineExceeded("global runtime deadline expired during worker execution") from error
 
 
-def _timed_wrapper(function: Any, label: str, samples: dict[str, list[float]]) -> Any:
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        start = time.perf_counter()
+def last_json(text: str) -> dict[str, Any]:
+    for line in reversed(text.splitlines()):
         try:
-            return function(*args, **kwargs)
-        finally:
-            samples[label].append(time.perf_counter() - start)
-
-    return wrapped
-
-
-@contextmanager
-def instrument_umap(module: Any, samples: dict[str, list[float]]) -> Iterator[None]:
-    """Measure real umap-learn callsites and restore all monkeypatches on exit."""
-    targets = {
-        "pairwise_distances": (module, "pairwise_distances"),
-        "nearest_neighbors": (module, "nearest_neighbors"),
-        "fuzzy_simplicial_set": (module, "fuzzy_simplicial_set"),
-        "simplicial_set_embedding": (module, "simplicial_set_embedding"),
-        "optimize_layout_euclidean": (module, "optimize_layout_euclidean"),
-    }
-    originals: list[tuple[Any, str, Any]] = []
-    try:
-        for label, (owner, attribute) in targets.items():
-            original = getattr(owner, attribute, None)
-            if original is None:
-                continue
-            originals.append((owner, attribute, original))
-            setattr(owner, attribute, _timed_wrapper(original, label, samples))
-        yield
-    finally:
-        for owner, attribute, original in originals:
-            setattr(owner, attribute, original)
-
-
-def _python_worker(input_path: Path, rows: int, features: int, epochs: int) -> dict[str, Any]:
-    import numpy as np
-    import umap
-    import umap.umap_ as umap_module
-
-    if umap.__version__ != "0.5.12":
-        raise ValueError("This callsite mapping requires umap-learn 0.5.12")
-    matrix = np.fromfile(input_path, dtype="<f4").reshape(rows, features)
-    samples: dict[str, list[float]] = defaultdict(list)
-    estimator = umap.UMAP(
-        n_neighbors=15,
-        n_components=2,
-        n_epochs=epochs,
-        init="random",
-        random_state=42,
-        metric="euclidean",
-        force_approximation_algorithm=False,
-        low_memory=True,
-        n_jobs=1,
-        verbose=False,
-    )
-    with instrument_umap(umap_module, samples):
-        estimator.fit(matrix)
-        for durations in samples.values():
-            durations.clear()
-        start = time.perf_counter()
-        estimator.fit(matrix)
-        fit_seconds = time.perf_counter() - start
-
-    stages = {name: sum(durations) for name, durations in samples.items()}
-    simplicial = stages.get("simplicial_set_embedding", 0.0)
-    optimizer = stages.get("optimize_layout_euclidean", 0.0)
-    return {
-        "fit_seconds": fit_seconds,
-        "stages_seconds": stages,
-        "embedding_pre_optimizer_seconds": max(0.0, simplicial - optimizer),
-        "initialization_note": (
-            "Random initialization is inside simplicial_set_embedding and is not exposed as a "
-            "separate umap-learn call; embedding_pre_optimizer_seconds is its inclusive outer "
-            "duration minus the nested optimizer duration, not an initialization-only measurement."
-        ),
-        "umap_learn_version": umap.__version__,
-    }
-
-
-def parse_chrome_trace(trace: dict[str, Any] | list[Any]) -> dict[str, Any]:
-    """Aggregate inclusive durations from Chrome complete and begin/end events."""
-    events = trace if isinstance(trace, list) else trace.get("traceEvents")
-    if not isinstance(events, list):
-        raise ValueError("Chrome trace must contain a traceEvents array")
-    totals: dict[str, float] = defaultdict(float)
-    counts: dict[str, int] = defaultdict(int)
-    stacks: dict[tuple[Any, Any], list[tuple[str, float]]] = defaultdict(list)
-    unmatched_ends = 0
-    for event in events:
-        if not isinstance(event, dict):
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        phase = event.get("ph")
-        name = str(event.get("name", "<unnamed>"))
-        if phase == "X":
-            duration = event.get("dur")
-            if isinstance(duration, (int, float)) and duration >= 0:
-                totals[name] += float(duration) / 1_000_000.0
-                counts[name] += 1
-        elif phase == "B":
-            timestamp = event.get("ts")
-            if isinstance(timestamp, (int, float)):
-                stacks[(event.get("pid"), event.get("tid"))].append((name, float(timestamp)))
-        elif phase == "E":
-            key = (event.get("pid"), event.get("tid"))
-            timestamp = event.get("ts")
-            stack = stacks[key]
-            if not isinstance(timestamp, (int, float)) or not stack:
-                unmatched_ends += 1
-                continue
-            begin_name, begin = stack.pop()
-            if timestamp < begin:
-                raise ValueError(f"Chrome span {begin_name!r} has negative duration")
-            totals[begin_name] += (float(timestamp) - begin) / 1_000_000.0
-            counts[begin_name] += 1
-    unmatched_begins = sum(len(stack) for stack in stacks.values())
-    return {
-        "inclusive_seconds_by_span": dict(sorted(totals.items())),
-        "span_counts": dict(sorted(counts.items())),
-        "unmatched_begin_events": unmatched_begins,
-        "unmatched_end_events": unmatched_ends,
-        "note": "Durations are inclusive; nested spans overlap and must not be summed.",
-    }
+        if isinstance(parsed, dict) and "fit_seconds" in parsed:
+            return parsed
+    raise ValueError("worker did not emit its result JSON")
 
 
 def make_clustered_input(rows: int, features: int, destination: Path) -> None:
@@ -194,185 +110,544 @@ def make_clustered_input(rows: int, features: int, destination: Path) -> None:
     matrix.astype("<f4", copy=False).tofile(destination)
 
 
-def _python_output(text: str) -> dict[str, Any]:
-    for line in reversed(text.splitlines()):
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and "fit_seconds" in parsed:
-            return parsed
-    raise ValueError("Python worker did not emit its result JSON")
+def _python_worker(
+    input_path: Path, rows: int, features: int, epochs: int, mode: str, runs: int, out: Path
+) -> dict[str, Any]:
+    import numba
+    import numpy as np
+    import umap
+    from sklearn.neighbors import NearestNeighbors
+
+    if umap.__version__ != "0.5.12":
+        raise ValueError("This harness requires umap-learn 0.5.12")
+    matrix = np.fromfile(input_path, dtype="<f4").reshape(rows, features)
+
+    def fit_once() -> Any:
+        precomputed = None
+        if mode == "exact":
+            search = NearestNeighbors(n_neighbors=NEIGHBORS, n_jobs=-1).fit(matrix)
+            distances, indices = search.kneighbors(matrix)
+            precomputed = (indices, distances, None)
+        estimator = umap.UMAP(
+            n_neighbors=NEIGHBORS,
+            n_components=2,
+            n_epochs=epochs,
+            init="random",
+            random_state=None,
+            metric="euclidean",
+            force_approximation_algorithm=mode == "approximate",
+            precomputed_knn=precomputed if precomputed is not None else (None, None, None),
+            n_jobs=-1,
+            verbose=False,
+        )
+        estimator.fit(matrix)
+        return estimator
+
+    fit_once()  # warmup (numba JIT)
+    fit_seconds = []
+    for run in range(runs):
+        start = time.perf_counter()
+        estimator = fit_once()
+        fit_seconds.append(time.perf_counter() - start)
+        np.save(out / f"embedding_{run}.npy", np.asarray(estimator.embedding_, dtype=np.float32))
+        np.save(out / f"knn_{run}.npy", np.asarray(estimator._knn_indices))
+    return {
+        "fit_seconds": fit_seconds,
+        "umap_learn_version": umap.__version__,
+        "numba_threads": numba.get_num_threads(),
+        "cpu_count": os.cpu_count(),
+        "config": {
+            "random_state": None,
+            "n_jobs": -1,
+            "force_approximation_algorithm": mode == "approximate",
+            "exact_precomputed_knn_inside_timed_fit": mode == "exact",
+        },
+    }
+
+
+def nonself(indices: Any, width: int) -> Any:
+    import numpy as np
+
+    rows = indices.shape[0]
+    result = np.empty((rows, width), dtype=np.int64)
+    for row in range(rows):
+        ids = [int(i) for i in indices[row] if int(i) != row and int(i) >= 0]
+        if len(ids) < width:
+            raise ValueError(f"row {row} has fewer than {width} non-self neighbors")
+        result[row] = ids[:width]
+    return result
+
+
+def tie_aware_recall(matrix: Any, actual: Any, exact_kth: Any) -> float:
+    """Fraction of actual non-self ids no farther than the exact k-th non-self distance."""
+    import numpy as np
+
+    rows = np.arange(actual.shape[0])[:, None]
+    distances = np.linalg.norm(matrix[actual] - matrix[rows], axis=2)
+    hits = 0
+    for row in range(actual.shape[0]):
+        _, unique_positions = np.unique(actual[row], return_index=True)
+        hits += int(np.sum(distances[row, unique_positions] <= exact_kth[row] * (1 + 1e-6) + 1e-12))
+    return hits / (actual.shape[0] * actual.shape[1])
+
+
+def median(values: list[float]) -> float:
+    return statistics.median(values)
+
+
+def load_quality_reference(path: Path) -> dict[str, Any]:
+    reference = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(reference, dict) or reference.get("complete") is not True:
+        raise ValueError("quality reference must be a complete suite JSON")
+    configuration = reference.get("configuration")
+    if not isinstance(configuration, dict):
+        raise ValueError("quality reference is missing configuration metadata")
+    primary = configuration.get("primary")
+    expected_primary = {"rows": PRIMARY[0], "features": PRIMARY[1], "epochs": PRIMARY[2]}
+    if primary != expected_primary:
+        raise ValueError(f"quality reference primary workload {primary!r} != {expected_primary!r}")
+    expected_metadata = {
+        "neighbors": NEIGHBORS,
+        "components": 2,
+        "init": "random",
+        "metric": "euclidean",
+        "input": "seeded clustered float32 (8 centers), little-endian row-major",
+    }
+    for key, expected in expected_metadata.items():
+        if configuration.get(key) != expected:
+            raise ValueError(
+                f"quality reference {key} metadata {configuration.get(key)!r} != {expected!r}"
+            )
+    quality = reference.get("quality")
+    if not isinstance(quality, dict):
+        raise ValueError("quality reference is missing quality results")
+    for mode in MODES:
+        mode_quality = quality.get(mode)
+        if not isinstance(mode_quality, dict):
+            raise ValueError(f"quality reference is missing {mode} quality results")
+        values = mode_quality.get("cuda_trustworthiness")
+        if not isinstance(values, list) or len(values) < 2:
+            raise ValueError(
+                f"quality reference {mode} requires at least two CUDA trustworthiness samples"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in values
+        ):
+            raise ValueError(
+                f"quality reference {mode} CUDA trustworthiness samples must be finite"
+            )
+    return reference
+
+
+def nsys_kernels(binary_args: list[str], tag: str, temp: Path, deadline: Deadline) -> dict:
+    report = temp / f"nsys-{tag}"
+    run_with_deadline(
+        [
+            "nsys",
+            "profile",
+            "--trace=cuda,osrt",
+            "--sample=none",
+            "--force-overwrite=true",
+            f"--output={report}",
+            *binary_args,
+        ],
+        deadline,
+    )
+    stats = run_with_deadline(
+        [
+            "nsys",
+            "stats",
+            "--report",
+            "cuda_gpu_kern_sum,cuda_api_sum",
+            "--format",
+            "csv",
+            "--force-export=true",
+            str(report) + ".nsys-rep",
+        ],
+        deadline,
+    )
+    return {"report": str(report) + ".nsys-rep", "summary_csv": stats.stdout[-6000:]}
+
+
+def ncu_kernel(binary_args: list[str], regex: str, temp: Path, deadline: Deadline) -> dict:
+    report = temp / "ncu"
+    profiled = run_with_deadline(
+        [
+            "ncu",
+            "--target-processes",
+            "all",
+            "--kernel-name-base",
+            "demangled",
+            "--kernel-name",
+            f"regex:{regex}",
+            # The selected sixteen-batch fit has no fired edges in epoch zero.
+            "--launch-skip",
+            "16",
+            "--launch-count",
+            "1",
+            "--set",
+            "basic",
+            "--force-overwrite",
+            "--export",
+            str(report),
+            *binary_args,
+        ],
+        deadline,
+        check=False,
+    )
+    if "ERR_NVGPUCTRPERM" in profiled.stdout + profiled.stderr:
+        # Driver-level counter access is a host setting only the user can change.
+        return {"status": "blocked", "reason": "ERR_NVGPUCTRPERM: GPU performance counters denied"}
+    if profiled.returncode != 0:
+        raise subprocess.CalledProcessError(
+            profiled.returncode, profiled.args, profiled.stdout, profiled.stderr
+        )
+    details = run_with_deadline(
+        ["ncu", "--import", str(report) + ".ncu-rep", "--csv", "--page", "details"], deadline
+    )
+    if not details.stdout.strip():
+        raise ValueError(f"ncu kernel filter {regex!r} matched no kernel; refine it")
+    return {
+        "report": str(report) + ".ncu-rep",
+        "matching_launches_skipped": 16,
+        "details_csv": details.stdout,
+    }
 
 
 def _cli() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=512)
-    parser.add_argument("--features", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--deadline-seconds", type=float, default=115.0)
+    parser.add_argument("--suite", choices=["stage1"], default="stage1")
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--deadline-seconds", type=float, default=600.0)
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
-    parser.add_argument("--output", type=Path, help="write the full comparison JSON")
-    parser.add_argument("--trace", type=Path, help="copy the Rust Chrome trace here")
+    parser.add_argument("--output", type=Path, help="write the full suite JSON")
+    parser.add_argument("--baseline", type=Path, help="pre-change suite JSON for H-03 ratios")
     parser.add_argument(
-        "--_python-worker", nargs=4, metavar=("INPUT", "ROWS", "FEATURES", "EPOCHS")
+        "--quality-reference",
+        type=Path,
+        help="complete pre-change serial suite JSON for per-mode CUDA quality tracking",
     )
+    parser.add_argument("--profile-nsys", action="store_true")
+    parser.add_argument("--profile-ncu", action="store_true")
+    parser.add_argument("--ncu-kernel", default=".*layout_vertex.*kernel.*")
+    parser.add_argument("--profile-dir", type=Path, help="keep profiler reports here")
+    parser.add_argument("--_python-worker", nargs=7, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args._python_worker:
-        result = _python_worker(Path(args._python_worker[0]), *map(int, args._python_worker[1:]))
+        input_path, rows, features, epochs, mode, runs, out = args._python_worker
+        result = _python_worker(
+            Path(input_path), int(rows), int(features), int(epochs), mode, int(runs), Path(out)
+        )
         print(json.dumps(result))
         return 0
-    if not 15 < args.rows < 4096 or args.features < 1 or args.epochs < 1:
-        parser.error("rows must be 16..4095 (Python exact-search branch); features/epochs positive")
-    if not 0 < args.deadline_seconds <= 115:
-        parser.error("deadline must be positive and at most 115 seconds")
+    if args.runs < 1 or args.warmups < 1:
+        parser.error("runs and warmups must be positive")
+    quality_reference = None
+    if args.quality_reference:
+        try:
+            quality_reference = load_quality_reference(args.quality_reference)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            parser.error(f"invalid --quality-reference: {error}")
     binary = args.binary.resolve()
     if not binary.is_file():
         print(
-            f"CUDA profiler executable not found: {binary}\n"
-            "Build it first (build time is excluded):\n"
+            f"CUDA profiler executable not found: {binary}\nBuild it first:\n"
             "  cargo build --release --no-default-features --features cuda,tracing "
             "--example profile_standard_cuda",
             file=sys.stderr,
         )
         return 2
 
+    import numpy as np
+    from sklearn.manifold import trustworthiness
+    from sklearn.neighbors import NearestNeighbors
+
     deadline = Deadline(args.deadline_seconds)
-    run_start = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="compare-umap-spans-") as temporary:
-        temp = Path(temporary)
-        input_path = temp / "input.f32le"
-        trace_path = temp / "rust-trace.json"
-        make_clustered_input(args.rows, args.features, input_path)
-        python_command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--_python-worker",
-            str(input_path),
-            str(args.rows),
-            str(args.features),
-            str(args.epochs),
-        ]
-        try:
-            python_process = run_with_deadline(python_command, deadline)
-            python = _python_output(python_process.stdout)
-            rust_process = run_with_deadline(
-                [
-                    str(binary),
-                    str(input_path),
-                    str(args.rows),
-                    str(args.features),
-                    str(args.epochs),
-                    str(trace_path),
-                ],
-                deadline,
-            )
-        except (DeadlineExceeded, subprocess.CalledProcessError) as error:
-            detail = getattr(error, "stderr", "")
-            print(f"Comparison failed without fallback: {error}\n{detail}", file=sys.stderr)
-            return 1
-        rust = json.loads(rust_process.stdout.strip().splitlines()[-1])
-        with trace_path.open(encoding="utf-8") as stream:
-            rust_trace = parse_chrome_trace(json.load(stream))
-        cuda_spans = rust_trace["inclusive_seconds_by_span"]
-        python_stages = python["stages_seconds"]
-        embedding_cuda = (
-            cuda_spans.get("initialization", 0.0)
-            + cuda_spans.get("optimization", 0.0)
-            + cuda_spans.get("tensor_embedding", 0.0)
-        )
+    start = time.monotonic()
+    output: dict[str, Any] = {
+        "configuration": {
+            "primary": {"rows": PRIMARY[0], "features": PRIMARY[1], "epochs": PRIMARY[2]},
+            "small": [{"rows": r, "features": f, "epochs": e} for r, f, e in SMALL],
+            "neighbors": NEIGHBORS,
+            "components": 2,
+            "init": "random",
+            "metric": "euclidean",
+            "warmups": args.warmups,
+            "runs": args.runs,
+            "deadline_seconds": args.deadline_seconds,
+            "input": "seeded clustered float32 (8 centers), little-endian row-major",
+            "cuda_seeds": "42+run (warmups 1000+i)",
+        },
+        "complete": False,
+    }
 
-        def stage_ratio(python_seconds: float, cuda_seconds: float) -> float | None:
-            return python_seconds / cuda_seconds if cuda_seconds > 0.0 else None
-
-        output = {
-            "configuration": {
-                "rows": args.rows,
-                "features": args.features,
-                "epochs": args.epochs,
-                "neighbors": 15,
-                "init": "random",
-                "seed": 42,
-                "neighbor_search": "exact",
-                "input": "shared seeded clustered float32, little-endian row-major",
-                "deadline_seconds": args.deadline_seconds,
-            },
-            "elapsed_seconds_including_warmups": time.monotonic() - run_start,
-            "python": python,
-            "rust_cuda": {
-                **rust,
-                "trace": rust_trace,
-                "layout_note": (
-                    "The CUDA layout kernel assigns one serial unit per epoch "
-                    "(src/kernels/standard_umap/layout.rs); epoch spans measure host work, "
-                    "not GPU execution timing."
-                ),
-            },
-            "comparisons": {
-                "fit_wall_ratio_python_over_rust": python["fit_seconds"] / rust["fit_seconds"],
-                "host_span_ratios_python_over_cuda_not_gpu_speedups": {
-                    "exact_neighbor_search": stage_ratio(
-                        python_stages.get("pairwise_distances", 0.0)
-                        + python_stages.get("nearest_neighbors", 0.0),
-                        cuda_spans.get("neighbor_search", 0.0),
-                    ),
-                    "fuzzy_graph": stage_ratio(
-                        max(
-                            0.0,
-                            python_stages.get("fuzzy_simplicial_set", 0.0)
-                            - python_stages.get("nearest_neighbors", 0.0),
-                        ),
-                        cuda_spans.get("fuzzy_graph", 0.0),
-                    ),
-                    "embedding_setup_optimization_and_host_readback": stage_ratio(
-                        python_stages.get("simplicial_set_embedding", 0.0), embedding_cuda
-                    ),
-                },
-                "rust_unmapped_fit_seconds": max(
-                    0.0,
-                    rust["fit_seconds"]
-                    - embedding_cuda
-                    - cuda_spans.get("neighbor_search", 0.0)
-                    - cuda_spans.get("fuzzy_graph", 0.0),
-                ),
-                "python_unmapped_fit_seconds": max(
-                    0.0,
-                    python["fit_seconds"]
-                    - sum(
-                        python_stages.get(stage, 0.0)
-                        for stage in (
-                            "pairwise_distances",
-                            "fuzzy_simplicial_set",
-                            "simplicial_set_embedding",
-                        )
-                    ),
-                ),
-                "note": (
-                    "Python stage timings are inclusive at their actual callsites; fuzzy graph and "
-                    "embedding subtimings nest inside fit, and embedding optimization nests inside "
-                    "simplicial_set_embedding. Python residual is not a separately timed stage. "
-                    "CUDA trace spans are inclusive and may overlap; host enqueue duration "
-                    "is not GPU time. Embedding comparison includes CUDA tensor_embedding "
-                    "to capture queued layout work at host readback, but may include earlier GPU "
-                    "work too. Python neighbor time includes pairwise distances and nested exact "
-                    "nearest_neighbors selection; graph time subtracts that nested selection. "
-                    "No Flex fallback is attempted."
-                ),
-            },
-        }
-        if args.trace:
-            args.trace.resolve().write_bytes(trace_path.read_bytes())
+    def emit() -> None:
+        output["elapsed_seconds"] = time.monotonic() - start
         rendered = json.dumps(output, indent=2, sort_keys=True)
         if args.output:
             args.output.resolve().write_text(rendered + "\n", encoding="utf-8")
         print(rendered)
+
+    with tempfile.TemporaryDirectory(prefix="stage1-") as temporary:
+        temp = Path(temporary)
+        profile_dir = args.profile_dir.resolve() if args.profile_dir else temp
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rows, features, epochs = PRIMARY
+            primary_input = temp / "primary.f32le"
+            make_clustered_input(rows, features, primary_input)
+            matrix = np.fromfile(primary_input, dtype="<f4").reshape(rows, features)
+            primary: dict[str, Any] = {}
+            for mode in MODES:
+                py_dir = temp / f"py-{mode}"
+                py_dir.mkdir()
+                python = last_json(
+                    run_with_deadline(
+                        [
+                            sys.executable,
+                            str(Path(__file__).resolve()),
+                            "--_python-worker",
+                            str(primary_input),
+                            str(rows),
+                            str(features),
+                            str(epochs),
+                            mode,
+                            str(args.runs),
+                            str(py_dir),
+                        ],
+                        deadline,
+                    ).stdout
+                )
+                cuda_dir = temp / f"cuda-{mode}"
+                cuda = last_json(
+                    run_with_deadline(
+                        [
+                            str(binary),
+                            str(primary_input),
+                            str(rows),
+                            str(features),
+                            str(epochs),
+                            str(cuda_dir),
+                            "--search",
+                            mode,
+                            "--warmups",
+                            str(args.warmups),
+                            "--runs",
+                            str(args.runs),
+                        ],
+                        deadline,
+                    ).stdout
+                )
+                if cuda["fit_graph_width"] != FIT_WIDTH:
+                    raise ValueError(f"CUDA fit graph width {cuda['fit_graph_width']} != 14")
+                primary[mode] = {"python": python, "cuda": cuda, "dirs": (py_dir, cuda_dir)}
+            output["primary"] = {
+                mode: {
+                    "python": {k: v for k, v in data["python"].items()},
+                    "cuda": data["cuda"],
+                    "python_median_seconds": median(data["python"]["fit_seconds"]),
+                    "cuda_median_seconds": median(data["cuda"]["fit_seconds"]),
+                }
+                for mode, data in primary.items()
+            }
+
+            small: dict[str, Any] = {}
+            for r, f, e in SMALL:
+                small_input = temp / f"small-{r}.f32le"
+                make_clustered_input(r, f, small_input)
+                for mode in MODES:
+                    result = last_json(
+                        run_with_deadline(
+                            [
+                                str(binary),
+                                str(small_input),
+                                str(r),
+                                str(f),
+                                str(e),
+                                str(temp / f"small-{r}-{mode}"),
+                                "--search",
+                                mode,
+                                "--warmups",
+                                str(args.warmups),
+                                "--runs",
+                                str(args.runs),
+                            ],
+                            deadline,
+                        ).stdout
+                    )
+                    small[f"{r}x{f}/{e}/{mode}"] = {
+                        "fit_seconds": result["fit_seconds"],
+                        "median_seconds": median(result["fit_seconds"]),
+                    }
+            output["small_cuda"] = small
+
+            deadline.remaining()
+            exact = NearestNeighbors(n_neighbors=NEIGHBORS).fit(matrix)
+            exact_dist, exact_idx = exact.kneighbors(matrix)
+            exact_kth = np.array(
+                [
+                    sorted(
+                        d for d, i in zip(exact_dist[row], exact_idx[row], strict=True) if i != row
+                    )[FIT_WIDTH - 1]
+                    for row in range(rows)
+                ]
+            )
+            quality: dict[str, Any] = {}
+            for mode, data in primary.items():
+                py_dir, cuda_dir = data["dirs"]
+                py_trust, cuda_trust, py_recall, cuda_recall = [], [], [], []
+                for run in range(args.runs):
+                    deadline.remaining()
+                    py_emb = np.load(py_dir / f"embedding_{run}.npy")
+                    cuda_emb = np.fromfile(cuda_dir / f"embedding_{run}.f32le", "<f4").reshape(
+                        rows, 2
+                    )
+                    py_trust.append(float(trustworthiness(matrix, py_emb, n_neighbors=NEIGHBORS)))
+                    cuda_trust.append(
+                        float(trustworthiness(matrix, cuda_emb, n_neighbors=NEIGHBORS))
+                    )
+                    if mode == "approximate":
+                        py_graph = nonself(np.load(py_dir / f"knn_{run}.npy"), FIT_WIDTH)
+                        cuda_graph = np.fromfile(cuda_dir / f"graph_{run}.i32le", "<i4").reshape(
+                            rows, FIT_WIDTH
+                        )
+                        py_recall.append(tie_aware_recall(matrix, py_graph, exact_kth))
+                        cuda_recall.append(tie_aware_recall(matrix, cuda_graph, exact_kth))
+                python_mean = statistics.fmean(py_trust)
+                quality[mode] = {
+                    "python_trustworthiness": py_trust,
+                    "python_trustworthiness_mean": python_mean,
+                    "cuda_trustworthiness": cuda_trust,
+                    "Q-02_each_cuda_within_0.02_of_python_mean": all(
+                        abs(t - python_mean) <= TRUST_GAP for t in cuda_trust
+                    ),
+                }
+                if mode == "approximate":
+                    quality[mode].update(
+                        {
+                            "python_fit_recall_at_14": py_recall,
+                            "cuda_fit_recall_at_14": cuda_recall,
+                            "Q-03_every_run_recall_ge_0.90": all(
+                                r >= RECALL_LIMIT for r in py_recall + cuda_recall
+                            ),
+                        }
+                    )
+            output["quality"] = quality
+
+            if quality_reference is not None:
+                reference_quality = quality_reference["quality"]
+                tracking_gates: dict[str, bool] = {}
+                for mode in MODES:
+                    reference_samples = reference_quality[mode]["cuda_trustworthiness"]
+                    candidate_samples = quality[mode]["cuda_trustworthiness"]
+                    if any(not math.isfinite(value) for value in candidate_samples):
+                        raise ValueError(
+                            f"candidate {mode} CUDA trustworthiness samples must be finite"
+                        )
+                    reference_mean = statistics.fmean(reference_samples)
+                    reference_std = statistics.stdev(reference_samples)
+                    threshold = reference_mean - 0.5 * reference_std
+                    candidate_mean = statistics.fmean(candidate_samples)
+                    passed = candidate_mean >= threshold
+                    quality[mode]["tracking_reference"] = {
+                        "sample_count": len(reference_samples),
+                        "mean": reference_mean,
+                        "sample_std": reference_std,
+                        "threshold_mean_minus_0.5_sample_std": threshold,
+                        "candidate_cuda_mean": candidate_mean,
+                        "pass": passed,
+                    }
+                    tracking_gates[f"Rust-reference_{mode}_mean_ge_reference_minus_0.5std"] = passed
+                output["quality_tracking"] = {
+                    "policy": "warning_only",
+                    "checks": tracking_gates,
+                    "warnings": [name for name, passed in tracking_gates.items() if not passed],
+                }
+
+            gates: dict[str, Any] = {
+                f"H-04_{mode}_cuda_median_le_0.90x_python": output["primary"][mode][
+                    "cuda_median_seconds"
+                ]
+                <= SPEED_RATIO_LIMIT * output["primary"][mode]["python_median_seconds"]
+                for mode in MODES
+            }
+            for mode in MODES:
+                gates[f"H-04_{mode}_ratio_cuda_over_python"] = (
+                    output["primary"][mode]["cuda_median_seconds"]
+                    / output["primary"][mode]["python_median_seconds"]
+                )
+            if args.baseline:
+                baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+                ratios = {
+                    key: value["median_seconds"] / baseline["small_cuda"][key]["median_seconds"]
+                    for key, value in small.items()
+                }
+                gates["H-03_small_ratio_vs_baseline"] = ratios
+                gates["H-03_pass"] = all(r <= SMALL_RATIO_LIMIT for r in ratios.values())
+                gates["primary_cuda_ratio_vs_baseline"] = {
+                    mode: output["primary"][mode]["cuda_median_seconds"]
+                    / baseline["primary"][mode]["cuda_median_seconds"]
+                    for mode in MODES
+                }
+            output["gates"] = gates
+
+            profiles: dict[str, Any] = {}
+            primary_args = [str(binary), str(primary_input), *map(str, PRIMARY)]
+            if args.profile_nsys:
+                for mode in MODES:
+                    profiles[f"nsys_{mode}"] = nsys_kernels(
+                        [
+                            *primary_args,
+                            str(temp / f"nsys-{mode}-out"),
+                            "--search",
+                            mode,
+                            "--warmups",
+                            "1",
+                            "--runs",
+                            "1",
+                        ],
+                        mode,
+                        profile_dir,
+                        deadline,
+                    )
+            if args.profile_ncu:
+                profiles["ncu_approximate"] = ncu_kernel(
+                    [
+                        *primary_args,
+                        str(temp / "ncu-out"),
+                        "--search",
+                        "approximate",
+                        "--warmups",
+                        "1",
+                        "--runs",
+                        "1",
+                    ],
+                    args.ncu_kernel,
+                    profile_dir,
+                    deadline,
+                )
+            output["profiles"] = profiles
+            deadline.remaining()
+            output["complete"] = True
+        except DeadlineExceeded as error:
+            output["incomplete_reason"] = (
+                f"{error}; results are incomplete and not a pass. Change parameters or extend "
+                "the timeout (recommended: extend --deadline-seconds) and rerun."
+            )
+            emit()
+            return 1
+        except subprocess.CalledProcessError as error:
+            output["incomplete_reason"] = f"worker failed: {error}\n{error.stderr[-4000:]}"
+            emit()
+            return 1
+    emit()
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(_cli())
-    except DeadlineExceeded as error:
-        print(f"Comparison timed out without fallback: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+    raise SystemExit(_cli())

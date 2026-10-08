@@ -1,0 +1,208 @@
+{
+  "complete": true,
+  "configuration": {
+    "components": 2,
+    "cuda_seeds": "42+run (warmups 1000+i)",
+    "deadline_seconds": 600.0,
+    "init": "random",
+    "input": "seeded clustered float32 (8 centers), little-endian row-major",
+    "metric": "euclidean",
+    "neighbors": 15,
+    "primary": {
+      "epochs": 20,
+      "features": 32,
+      "rows": 5000
+    },
+    "runs": 5,
+    "small": [
+      {
+        "epochs": 30,
+        "features": 16,
+        "rows": 512
+      },
+      {
+        "epochs": 100,
+        "features": 32,
+        "rows": 1024
+      }
+    ],
+    "warmups": 1
+  },
+  "elapsed_seconds": 143.06629211400286,
+  "gates": {
+    "H-04_approximate_cuda_median_le_0.90x_python": false,
+    "H-04_approximate_ratio_cuda_over_python": 61.78260427468432,
+    "H-04_exact_cuda_median_le_0.90x_python": false,
+    "H-04_exact_ratio_cuda_over_python": 71.66523481411252
+  },
+  "primary": {
+    "approximate": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          4.221116279,
+          4.207959707,
+          4.165065837,
+          4.24138515,
+          4.254330279
+        ],
+        "search": "Approximate",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 4.221116279,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": false,
+          "force_approximation_algorithm": true,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.0691920620156452,
+          0.06832208400010131,
+          0.06849555601365864,
+          0.06795549899106845,
+          0.0663729060033802
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.06832208400010131
+    },
+    "exact": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          3.528358658,
+          3.50116391,
+          3.53738799,
+          3.4963053029999998,
+          3.494318623
+        ],
+        "search": "Exact",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 3.50116391,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": true,
+          "force_approximation_algorithm": false,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.0447510750091169,
+          0.04982449900126085,
+          0.043204294983297586,
+          0.0488544259860646,
+          0.049666408012853935
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.0488544259860646
+    }
+  },
+  "profiles": {},
+  "quality": {
+    "approximate": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": true,
+      "Q-03_every_run_recall_ge_0.90": true,
+      "cuda_fit_recall_at_14": [
+        0.9976714285714285,
+        0.9976428571428572,
+        0.9976857142857143,
+        0.9976428571428572,
+        0.9977857142857143
+      ],
+      "cuda_trustworthiness": [
+        0.9423954135690844,
+        0.9424424673498091,
+        0.9417160672426496,
+        0.9424892478735517,
+        0.9425277235282299
+      ],
+      "python_fit_recall_at_14": [
+        0.998,
+        0.9978571428571429,
+        0.9978142857142858,
+        0.9978428571428571,
+        0.9977428571428572
+      ],
+      "python_trustworthiness": [
+        0.9419568655816757,
+        0.9429141410488246,
+        0.9422221338155515,
+        0.9427386538075145,
+        0.9420696912464002
+      ],
+      "python_trustworthiness_mean": 0.9423802970999933
+    },
+    "exact": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": true,
+      "cuda_trustworthiness": [
+        0.9414083664858348,
+        0.9422701895385439,
+        0.9421690014064698,
+        0.9423204313173933,
+        0.9403524827540017
+      ],
+      "python_trustworthiness": [
+        0.9425756211908111,
+        0.9417276806643895,
+        0.9421081669010782,
+        0.9417935597079901,
+        0.9420374335275601
+      ],
+      "python_trustworthiness_mean": 0.9420484923983657
+    }
+  },
+  "small_cuda": {
+    "1024x32/100/approximate": {
+      "fit_seconds": [
+        3.676254741,
+        3.628557047,
+        3.670046678,
+        3.641341236,
+        3.626216515
+      ],
+      "median_seconds": 3.641341236
+    },
+    "1024x32/100/exact": {
+      "fit_seconds": [
+        3.052802861,
+        3.072337137,
+        3.062951532,
+        3.048547777,
+        3.0546318
+      ],
+      "median_seconds": 3.0546318
+    },
+    "512x16/30/approximate": {
+      "fit_seconds": [
+        0.739239353,
+        0.739935381,
+        0.742916759,
+        0.739744188,
+        0.742582916
+      ],
+      "median_seconds": 0.739935381
+    },
+    "512x16/30/exact": {
+      "fit_seconds": [
+        0.413678381,
+        0.423400334,
+        0.424078821,
+        0.41480465,
+        0.421838724
+      ],
+      "median_seconds": 0.421838724
+    }
+  }
+}

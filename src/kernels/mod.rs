@@ -157,6 +157,8 @@ impl crate::backend::StandardUmapOps for CubeBackend {
         epochs_per_negative_sample: FloatTensor<Self>,
         epoch_of_next_negative_sample: FloatTensor<Self>,
         rng_state: IntTensor<Self>,
+        head_offsets: IntTensor<Self>,
+        head_edges: IntTensor<Self>,
         epoch: u32,
         a: f32,
         b: f32,
@@ -171,7 +173,6 @@ impl crate::backend::StandardUmapOps for CubeBackend {
         FloatTensor<Self>,
         FloatTensor<Self>,
         IntTensor<Self>,
-        IntTensor<Self>,
     ) {
         standard_umap::optimize_epoch(
             head_embedding,
@@ -184,6 +185,8 @@ impl crate::backend::StandardUmapOps for CubeBackend {
             epochs_per_negative_sample,
             epoch_of_next_negative_sample,
             rng_state,
+            head_offsets,
+            head_edges,
             epoch,
             a,
             b,

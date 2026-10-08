@@ -1,7 +1,6 @@
 use burn::backend::{
-    backend_extension,
+    Backend, backend_extension,
     tensor::{FloatTensor, IntTensor},
-    Backend,
 };
 
 /// Backend operations used by fast-umap and routed through Burn's dynamic
@@ -202,17 +201,23 @@ pub trait StandardUmapOps: Backend {
         reference: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 
-    #[fusion(meta = |head_embedding, tail_embedding, heads, tails, weights, epochs_per_sample, epoch_of_next_sample, epochs_per_negative_sample, epoch_of_next_negative_sample, rng_state, epoch, a, b, gamma, alpha, negative_sample_rate, move_other, shared_embeddings| {
+    #[fusion(meta = |head_embedding, tail_embedding, heads, tails, weights, epochs_per_sample, epoch_of_next_sample, epochs_per_negative_sample, epoch_of_next_negative_sample, rng_state, head_offsets, head_edges, epoch, a, b, gamma, alpha, negative_sample_rate, move_other, shared_embeddings| {
         (
             burn::backend::fusion::custom::TensorSpec::new(head_embedding.shape.clone(), head_embedding.dtype),
             burn::backend::fusion::custom::TensorSpec::new(tail_embedding.shape.clone(), tail_embedding.dtype),
             burn::backend::fusion::custom::TensorSpec::new(epoch_of_next_sample.shape.clone(), epoch_of_next_sample.dtype),
             burn::backend::fusion::custom::TensorSpec::new(epoch_of_next_negative_sample.shape.clone(), epoch_of_next_negative_sample.dtype),
             burn::backend::fusion::custom::TensorSpec::new(rng_state.shape.clone(), rng_state.dtype),
-            burn::backend::fusion::custom::TensorSpec::new([2].into(), burn::tensor::DType::I32),
         )
     })]
     /// Optimize one standard UMAP epoch using only selected-backend tensors.
+    ///
+    /// `head_offsets`/`head_edges` list, per head row, the original ids of
+    /// positive-weight edges with that head in ascending id order;
+    /// Parallel backends use atomic coordinate updates and exclusive
+    /// per-head RNG ownership; the serial Flex reference walks edges in id
+    /// order and does not need the CSR. Returns the updated head, tail,
+    /// positive clocks, negative clocks and RNG state.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn optimize_epoch(
@@ -226,6 +231,8 @@ pub trait StandardUmapOps: Backend {
         epochs_per_negative_sample: FloatTensor<Self>,
         epoch_of_next_negative_sample: FloatTensor<Self>,
         rng_state: IntTensor<Self>,
+        head_offsets: IntTensor<Self>,
+        head_edges: IntTensor<Self>,
         epoch: u32,
         a: f32,
         b: f32,
@@ -239,7 +246,6 @@ pub trait StandardUmapOps: Backend {
         FloatTensor<Self>,
         FloatTensor<Self>,
         FloatTensor<Self>,
-        IntTensor<Self>,
         IntTensor<Self>,
     );
 }

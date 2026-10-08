@@ -9,8 +9,8 @@ use burn::{
 };
 
 /// Run one reference-ordered Euclidean SGD epoch directly on Flex storage,
-/// mirroring `umap.layouts._optimize_layout_euclidean_single_epoch` (0.5.12)
-/// and the CUDA serial kernel. Mutable operands use Flex copy-on-write, so
+/// mirroring `umap.layouts._optimize_layout_euclidean_single_epoch` (0.5.12).
+/// Mutable operands use Flex copy-on-write, so
 /// aliased inputs are never observed. Schedule tensors are trusted to be the
 /// finite, positive intervals and valid next-event clocks created by
 /// standard-UMAP orchestration.
@@ -44,7 +44,6 @@ pub(crate) fn optimize_epoch(
     FloatTensor<Flex>,
     FloatTensor<Flex>,
     FloatTensor<Flex>,
-    IntTensor<Flex>,
     IntTensor<Flex>,
 ) {
     let mut head_embedding = head_embedding.to_contiguous();
@@ -177,8 +176,6 @@ pub(crate) fn optimize_epoch(
     let rng = rng_state.storage_mut::<i64>();
 
     let epoch_f = f64::from(epoch);
-    let mut positive_events = 0i32;
-    let mut negative_events = 0i32;
     // Clock arithmetic follows numba's float64 promotion; f32 clocks store
     // their float64 updates back at f32 precision after every event.
     let store = |value: f64| {
@@ -192,7 +189,6 @@ pub(crate) fn optimize_epoch(
         if !(edge_weights[edge] > 0.0 && next_positive[edge] <= epoch_f) {
             continue;
         }
-        positive_events += 1;
         let j = edge_heads[edge] as usize;
         let k = edge_tails[edge] as usize;
         assert!(
@@ -233,7 +229,6 @@ pub(crate) fn optimize_epoch(
         }
         let count = ((epoch_f - next_negative[edge]) / negative_intervals[edge]) as i64;
         for _ in 0..count.max(0) {
-            negative_events += 1;
             let state = &mut rng[j * 3..j * 3 + 3];
             state[0] = (((state[0] & 4_294_967_294) << 12) & 0xFFFF_FFFF)
                 ^ ((((state[0] << 13) & 0xFFFF_FFFF) ^ state[0]) >> 19);
@@ -297,16 +292,11 @@ pub(crate) fn optimize_epoch(
                 .for_each(|(out, value)| *out = *value as f32),
         }
     }
-    let stats = IntTensor::<Flex>::from_data(burn::tensor::TensorData::new(
-        vec![positive_events, negative_events],
-        [2],
-    ));
     (
         head_embedding,
         tail_embedding,
         epoch_of_next_sample,
         epoch_of_next_negative_sample,
         rng_state,
-        stats,
     )
 }

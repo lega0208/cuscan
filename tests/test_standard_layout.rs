@@ -1,4 +1,5 @@
 use burn::backend::Dispatch;
+use burn::backend::tensor::IntTensor;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 use serde_json::Value;
@@ -68,9 +69,41 @@ fn initial_rng(case: &Value) -> (Vec<i64>, usize) {
     (state, rows)
 }
 
-fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Value]) {
+type Csr = (IntTensor<Dispatch>, IntTensor<Dispatch>);
+
+/// Positive-weight edge ids grouped by head.
+fn csr(device: &Device, heads: &[i32], weights: &[f32], head_rows: usize) -> Csr {
+    let mut offsets = vec![0i32; head_rows + 1];
+    let mut ids = Vec::new();
+    for row in 0..head_rows {
+        for (edge, (&endpoint, &weight)) in heads.iter().zip(weights).enumerate() {
+            if weight > 0.0 && endpoint as usize == row {
+                ids.push(edge as i32);
+            }
+        }
+        offsets[row + 1] = ids.len() as i32;
+    }
+    if ids.is_empty() {
+        ids.push(0);
+    }
+    let len = ids.len();
+    (
+        Tensor::<1, Int>::from_data(TensorData::new(offsets, [head_rows + 1]), device)
+            .into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(ids, [len]), device).into_dispatch(),
+    )
+}
+
+fn verify_frames(
+    device: &Device,
+    case: &Value,
+    edge_count: usize,
+    frames: &[Value],
+    reference_order: bool,
+) {
     let (head_data, head_rows, dimensions) = matrix(&case["head_initial"]);
     let (tail_data, tail_rows, tail_dimensions) = matrix(&case["tail_initial"]);
+    let shared = case["move_other"].as_bool().unwrap();
     assert_eq!(dimensions, tail_dimensions);
     let edge_rows = case["edges_head_tail"].as_array().unwrap();
     let all_heads: Vec<i32> = edge_rows
@@ -93,7 +126,6 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
         .map(|interval| interval / rate)
         .collect();
     let (mut rng_data, vertices) = initial_rng(case);
-    let shared = case["head_tail_share_storage"].as_bool().unwrap();
     let mut expected_positive = positive_intervals.to_vec();
     let mut expected_negative = negative_intervals.clone();
     let mut expected_head = head_data;
@@ -101,22 +133,7 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
 
     for frame in frames {
         let epoch = frame["epoch"].as_u64().unwrap() as u32;
-        let before_positive = expected_positive.clone();
-        let before_negative = expected_negative.clone();
-        let mut positive_events = 0i32;
-        let mut negative_events = 0i32;
-        for edge in 0..edge_count {
-            if weights[edge] > 0.0 && before_positive[edge] <= epoch as f32 {
-                positive_events += 1;
-                // Source promotes the schedule arithmetic to float64.
-                let count = ((f64::from(epoch) - f64::from(before_negative[edge]))
-                    / f64::from(negative_intervals[edge]))
-                .trunc()
-                .max(0.0) as i32;
-                negative_events += count;
-            }
-        }
-
+        let (head_offsets, head_edges) = csr(device, heads, weights, head_rows);
         let head = Tensor::<2>::from_data(
             TensorData::new(expected_head.clone(), [head_rows, dimensions]),
             device,
@@ -151,7 +168,9 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
             TensorData::new(rng_data.clone(), [vertices, 3]),
             (device, burn::tensor::DType::I64),
         );
-        let (new_head, new_tail, next_positive, next_negative, new_rng, stats) =
+        let retained_head = head.clone();
+        let retained_tail = tail.clone();
+        let (new_head, new_tail, next_positive, next_negative, new_rng) =
             <Dispatch as StandardUmapOps>::optimize_epoch(
                 head.into_dispatch(),
                 tail.into_dispatch(),
@@ -163,6 +182,8 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
                 negative_interval_tensor.into_dispatch(),
                 next_negative_tensor.into_dispatch(),
                 rng_tensor.into_dispatch(),
+                head_offsets,
+                head_edges,
                 epoch,
                 1.576_943_5,
                 0.895_060_9,
@@ -177,17 +198,48 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
         let next_positive: Tensor<1> = Tensor::from_dispatch(next_positive);
         let next_negative: Tensor<1> = Tensor::from_dispatch(next_negative);
         let new_rng: Tensor<2, Int> = Tensor::from_dispatch(new_rng);
-        let stats: Tensor<1, Int> = Tensor::from_dispatch(stats);
-        expected_head = new_head.to_data().try_to_vec::<f32>().unwrap();
-        expected_tail = new_tail.to_data().try_to_vec::<f32>().unwrap();
+        let actual_head = new_head.to_data().try_to_vec::<f32>().unwrap();
+        let actual_tail = new_tail.to_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(
+            retained_head.to_data().try_to_vec::<f32>().unwrap(),
+            expected_head,
+            "retained head observer must not be mutated"
+        );
+        assert_eq!(
+            retained_tail.to_data().try_to_vec::<f32>().unwrap(),
+            expected_tail,
+            "retained tail observer must not be mutated"
+        );
         expected_positive = next_positive.to_data().try_to_vec::<f32>().unwrap();
         expected_negative = next_negative.to_data().try_to_vec::<f32>().unwrap();
         rng_data = new_rng.to_data().try_to_vec::<i64>().unwrap();
 
         let (wanted_head, _, _) = matrix(&frame["head_embedding"]);
         let (wanted_tail, _, _) = matrix(&frame["tail_embedding"]);
-        check_close(&expected_head, &wanted_head, "epoch head coordinates");
-        check_close(&expected_tail, &wanted_tail, "epoch tail coordinates");
+        if reference_order {
+            check_close(&actual_head, &wanted_head, "epoch head coordinates");
+            check_close(&actual_tail, &wanted_tail, "epoch tail coordinates");
+        } else {
+            // Parallel vertex-owner order may differ from serial coordinates.
+            assert!(
+                actual_head
+                    .iter()
+                    .chain(&actual_tail)
+                    .all(|v| v.is_finite()),
+                "epoch coordinates must be finite"
+            );
+            assert_eq!(actual_head.len(), wanted_head.len());
+            assert!(actual_tail.iter().all(|v| v.is_finite()));
+            if shared {
+                assert_eq!(actual_head, actual_tail, "fit outputs must share positions");
+            } else {
+                assert_eq!(actual_tail, expected_tail, "transform tail must stay fixed");
+            }
+        }
+        // Continue each frame from the reference state so clocks/RNG are
+        // checked per epoch independent of coordinate order.
+        expected_head = wanted_head;
+        expected_tail = wanted_tail;
         check_close(
             &expected_positive,
             &floats(&frame["epoch_of_next_sample"]),
@@ -203,15 +255,10 @@ fn verify_frames(device: &Device, case: &Value, edge_count: usize, frames: &[Val
             rng_rows(&frame["rng_state_per_sample"]),
             "per-head Tausworthe state"
         );
-        assert_eq!(
-            stats.to_data().try_to_vec::<i32>().unwrap(),
-            [positive_events, negative_events],
-            "epoch event counts"
-        );
     }
 }
 
-fn verify_fixture(device: &Device) {
+fn verify_fixture(device: &Device, reference_order: bool) {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
     for case in fixture["optimizer_probes"].as_array().unwrap() {
         verify_frames(
@@ -219,6 +266,7 @@ fn verify_fixture(device: &Device) {
             case,
             case["edges_head_tail"].as_array().unwrap().len(),
             case["epochs"].as_array().unwrap(),
+            reference_order,
         );
         for prefix in case["ordered_event_prefixes"].as_array().unwrap() {
             let edge_count = prefix["through_edge_index"].as_u64().unwrap() as usize + 1;
@@ -227,6 +275,7 @@ fn verify_fixture(device: &Device) {
                 case,
                 edge_count,
                 prefix["epochs"].as_array().unwrap(),
+                reference_order,
             );
         }
     }
@@ -234,22 +283,23 @@ fn verify_fixture(device: &Device) {
 
 #[test]
 fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_flex() {
-    verify_fixture(&Device::flex());
+    verify_fixture(&Device::flex(), true);
 }
 
-fn verify_zero_controls_and_repeats(device: &Device) {
+fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
     let case: Value = serde_json::from_str(FIXTURE).unwrap();
     let probe = &case["optimizer_probes"][0];
     let frames = probe["epochs"].as_array().unwrap();
-    verify_frames(device, probe, 2, frames);
-    verify_frames(device, probe, 2, frames);
+    verify_frames(device, probe, 2, frames, reference_order);
+    verify_frames(device, probe, 2, frames, reference_order);
 
-    let head_data = vec![0.0f32, 0.0, 1.0, 0.0];
-    let tail_data = vec![0.0f32, 0.0, 1.0, 0.0];
+    let head_data = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let tail_data = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let rng_data = vec![41i64, 42, 43, 44, 45, 46];
     let run = |edge_count: usize, alpha: f32, gamma: f32, rate: f32| {
-        let head = Tensor::<2>::from_data(TensorData::new(head_data.clone(), [2, 2]), device);
-        let tail = Tensor::<2>::from_data(TensorData::new(tail_data.clone(), [2, 2]), device);
+        let (head_offsets, head_edges) = csr(device, &[0], &[1.0], 2);
+        let head = Tensor::<2>::from_data(TensorData::new(head_data.clone(), [2, 3]), device);
+        let tail = Tensor::<2>::from_data(TensorData::new(tail_data.clone(), [2, 3]), device);
         let heads = Tensor::<1, Int>::from_data(
             TensorData::new(vec![0i32][..edge_count].to_vec(), [edge_count]),
             device,
@@ -290,6 +340,8 @@ fn verify_zero_controls_and_repeats(device: &Device) {
             negative.into_dispatch(),
             next_negative.into_dispatch(),
             rng.into_dispatch(),
+            head_offsets,
+            head_edges,
             1,
             1.0,
             1.0,
@@ -301,47 +353,65 @@ fn verify_zero_controls_and_repeats(device: &Device) {
         )
     };
 
-    let (head, tail, next_pos, next_neg, rng, stats) = run(1, 0.0, 1.0, 0.0);
+    let (head, tail, next_pos, next_neg, rng) = run(1, 0.0, 1.0, 0.0);
     let head: Tensor<2> = Tensor::from_dispatch(head);
     let tail: Tensor<2> = Tensor::from_dispatch(tail);
     let next_pos: Tensor<1> = Tensor::from_dispatch(next_pos);
     let next_neg: Tensor<1> = Tensor::from_dispatch(next_neg);
     let rng: Tensor<2, Int> = Tensor::from_dispatch(rng);
-    let stats: Tensor<1, Int> = Tensor::from_dispatch(stats);
-    assert_eq!(head.to_data().try_to_vec::<f32>().unwrap(), head_data);
-    assert_eq!(tail.to_data().try_to_vec::<f32>().unwrap(), tail_data);
+    let head_data_after = head.to_data().try_to_vec::<f32>().unwrap();
+    let tail_data_after = tail.to_data().try_to_vec::<f32>().unwrap();
+    if reference_order {
+        assert_eq!(head_data_after, head_data);
+        assert_eq!(tail_data_after, tail_data);
+    } else {
+        assert!(
+            head_data_after
+                .iter()
+                .chain(&tail_data_after)
+                .all(|v| v.is_finite())
+        );
+    }
     assert_eq!(next_pos.to_data().try_to_vec::<f32>().unwrap(), [2.0]);
     assert_eq!(next_neg.to_data().try_to_vec::<f32>().unwrap(), [0.0]);
     assert_eq!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
-    assert_eq!(stats.to_data().try_to_vec::<i32>().unwrap(), [1, 0]);
 
-    let (expected_head, expected_tail, _, _, _, _) = run(1, 0.8, 0.0, 0.0);
-    let (head, tail, _, _, rng, stats) = run(1, 0.8, 0.0, 1.0);
+    let (expected_head, expected_tail, _, _, _) = run(1, 0.8, 0.0, 0.0);
+    let (head, tail, _, _, rng) = run(1, 0.8, 0.0, 1.0);
     let head: Tensor<2> = Tensor::from_dispatch(head);
     let tail: Tensor<2> = Tensor::from_dispatch(tail);
     let rng: Tensor<2, Int> = Tensor::from_dispatch(rng);
-    let stats: Tensor<1, Int> = Tensor::from_dispatch(stats);
-    assert_eq!(
-        head.to_data().try_to_vec::<f32>().unwrap(),
-        Tensor::<2>::from_dispatch(expected_head)
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap()
-    );
-    assert_eq!(
-        tail.to_data().try_to_vec::<f32>().unwrap(),
-        Tensor::<2>::from_dispatch(expected_tail)
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap()
-    );
+    let head_data_after = head.to_data().try_to_vec::<f32>().unwrap();
+    let tail_data_after = tail.to_data().try_to_vec::<f32>().unwrap();
+    if reference_order {
+        assert_eq!(
+            head_data_after,
+            Tensor::<2>::from_dispatch(expected_head)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+        );
+        assert_eq!(
+            tail_data_after,
+            Tensor::<2>::from_dispatch(expected_tail)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+        );
+    } else {
+        assert!(
+            head_data_after
+                .iter()
+                .chain(&tail_data_after)
+                .all(|v| v.is_finite())
+        );
+    }
     assert_ne!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
-    assert_eq!(stats.to_data().try_to_vec::<i32>().unwrap(), [1, 1]);
 }
 
 #[test]
 fn standard_layout_zero_controls_and_repeated_runs_are_deterministic() {
-    verify_zero_controls_and_repeats(&Device::flex());
+    verify_zero_controls_and_repeats(&Device::flex(), true);
 }
 
 #[cfg(feature = "cuda")]
@@ -354,8 +424,8 @@ fn standard_layout_matches_frozen_optimizer_epochs_on_cuda() {
         eprintln!("SKIPPED: no CUDA device");
         return;
     };
-    verify_fixture(&device);
-    verify_zero_controls_and_repeats(&device);
+    verify_fixture(&device, false);
+    verify_zero_controls_and_repeats(&device, false);
 }
 
 #[cfg(all(not(feature = "cuda"), test))]

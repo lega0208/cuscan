@@ -1,0 +1,835 @@
+{
+  "complete": true,
+  "configuration": {
+    "rows": 5000,
+    "features": 32,
+    "components": 2,
+    "neighbors": 15,
+    "init": "random",
+    "metric": "euclidean",
+    "epochs": [
+      20,
+      50,
+      100
+    ],
+    "runs": 3,
+    "warmups": 1,
+    "deadline_seconds": 600.0,
+    "cuda_seeds": "42+run",
+    "python": "unseeded parallel n_jobs=-1",
+    "purpose": "screening; not a replacement for five-run20epoch acceptance",
+    "binaries": {
+      "serial": "/tmp/fu-serial-target/release/examples/profile_standard_cuda",
+      "jacobi": "/tmp/fu-layout-jacobi-review/target/profile_standard_cuda",
+      "atomic64": "/tmp/fu-layout-atomic-review/target/profile_standard_cuda",
+      "final_control": "/tmp/fu-layout-final-review/target/profile_standard_cuda"
+    }
+  },
+  "points": [
+    {
+      "epochs": 20,
+      "mode": "exact",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            3.5075201,
+            3.519642234,
+            3.5004656389999997
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9414083664858348,
+            0.9422701895385439,
+            0.9421690014064698
+          ],
+          "trust_mean": 0.9419491858102829,
+          "trust_sample_std": 0.00047108801278579357,
+          "median_fit_seconds": 3.5075201,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.669588331,
+            0.666757778,
+            0.668971021
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.7484806670685151,
+            0.7404361877972004,
+            0.6724696457035697
+          ],
+          "trust_mean": 0.7204621668564284,
+          "trust_sample_std": 0.041756915315218704,
+          "median_fit_seconds": 0.668971021,
+          "each_within_0.02_of_python_mean": false,
+          "speedup_vs_serial": 5.24315701262641,
+          "trust_delta_vs_serial": -0.22148701895385448
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.673467996,
+            0.672543268,
+            0.675451713
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9412118411358917,
+            0.9408644029200991,
+            0.9408977188399973
+          ],
+          "trust_mean": 0.9409913209653293,
+          "trust_sample_std": 0.00019170119156725583,
+          "median_fit_seconds": 0.673467996,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 5.208146668932431,
+          "trust_delta_vs_serial": -0.0009578648449535265
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.811613295,
+            0.814231676,
+            0.814642653
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9415695854262943,
+            0.9420151443305874,
+            0.9421884053311902
+          ],
+          "trust_mean": 0.9419243783626906,
+          "trust_sample_std": 0.0003192387263005743,
+          "median_fit_seconds": 0.814231676,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 4.307766700051595,
+          "trust_delta_vs_serial": -2.4807447592256615e-05
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.04737488098908216,
+          0.03824224101845175,
+          0.039768339978763834
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": false,
+          "exact_precomputed_knn_inside_timed_fit": true
+        },
+        "trustworthiness": [
+          0.9424210729355034,
+          0.9421222449936374,
+          0.9420071823722457
+        ]
+      }
+    },
+    {
+      "epochs": 20,
+      "mode": "approximate",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            4.215457352,
+            4.221158216,
+            4.211317314
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9423954135690844,
+            0.9424424673498091,
+            0.9417160672426496
+          ],
+          "trust_mean": 0.942184649387181,
+          "trust_sample_std": 0.0004064854661613317,
+          "median_fit_seconds": 4.215457352,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.4082606,
+            1.41501134,
+            1.4198432269999999
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.7581467309624271,
+            0.7036083745228049,
+            0.6358017011586632
+          ],
+          "trust_mean": 0.6991856022146318,
+          "trust_sample_std": 0.06129231000368993,
+          "median_fit_seconds": 1.41501134,
+          "each_within_0.02_of_python_mean": false,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 2.9790979286427484,
+          "trust_delta_vs_serial": -0.24299904717254928
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.409680903,
+            1.4106628350000001,
+            1.409969845
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9410771897394682,
+            0.9408778166231331,
+            0.9411385627218538
+          ],
+          "trust_mean": 0.9410311896948184,
+          "trust_sample_std": 0.0001363236409444826,
+          "median_fit_seconds": 1.409969845,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 2.989750005610935,
+          "trust_delta_vs_serial": -0.0011534596923626905
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.548736809,
+            1.5745500639999999,
+            1.568985374
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9421171174067376,
+            0.9426286035764517,
+            0.9424196878976626
+          ],
+          "trust_mean": 0.9423884696269507,
+          "trust_sample_std": 0.00025716815660551583,
+          "median_fit_seconds": 1.568985374,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 2.6867410122842865,
+          "trust_delta_vs_serial": 0.00020382023976961428
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.07408423101878725,
+          0.06763562600826845,
+          0.06795726699056104
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": true,
+          "exact_precomputed_knn_inside_timed_fit": false
+        },
+        "trustworthiness": [
+          0.9423560645636595,
+          0.9432733266358583,
+          0.9421468568749581
+        ],
+        "fit_recall_at14": [
+          0.9975428571428572,
+          0.9977,
+          0.9977285714285714
+        ],
+        "every_run_recall_ge0.90": true
+      }
+    },
+    {
+      "epochs": 50,
+      "mode": "exact",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            8.306362536,
+            8.293150041,
+            8.257081478
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9450655120219678,
+            0.9450426575581006,
+            0.9450953372178689
+          ],
+          "trust_mean": 0.9450678355993124,
+          "trust_sample_std": 2.641658375118261e-05,
+          "median_fit_seconds": 8.293150041,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.689281415,
+            0.67955097,
+            0.679204922
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9361562145871006,
+            0.9303745469158128,
+            0.9332532958274731
+          ],
+          "trust_mean": 0.9332613524434622,
+          "trust_sample_std": 0.0028908422556583164,
+          "median_fit_seconds": 0.67955097,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 12.203867564194635,
+          "trust_delta_vs_serial": -0.0118064831558502
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.694348207,
+            0.697397703,
+            0.687566357
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9444362360190208,
+            0.9442727935168441,
+            0.9444400401848503
+          ],
+          "trust_mean": 0.9443830232402384,
+          "trust_sample_std": 9.548068840922952e-05,
+          "median_fit_seconds": 0.694348207,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 11.94379125256386,
+          "trust_delta_vs_serial": -0.0006848123590740274
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.071440749,
+            1.071299181,
+            1.069595647
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9451064255575647,
+            0.9453248730828477,
+            0.9447390878038979
+          ],
+          "trust_mean": 0.9450567954814368,
+          "trust_sample_std": 0.0002960294860329398,
+          "median_fit_seconds": 1.071299181,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 7.74120823396765,
+          "trust_delta_vs_serial": -1.1040117875560362e-05
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.11918744799913839,
+          0.0993992850126233,
+          0.09344093900290318
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": false,
+          "exact_precomputed_knn_inside_timed_fit": true
+        },
+        "trustworthiness": [
+          0.944475994909919,
+          0.9445722081575246,
+          0.9446095211305338
+        ]
+      }
+    },
+    {
+      "epochs": 50,
+      "mode": "approximate",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            9.049055032,
+            9.052259076,
+            8.999936744
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9448014868394615,
+            0.9449497019623602,
+            0.9449351952313978
+          ],
+          "trust_mean": 0.9448954613444065,
+          "trust_sample_std": 8.170689686643959e-05,
+          "median_fit_seconds": 9.049055032,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.419669703,
+            1.426553296,
+            1.432032185
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9360331819703972,
+            0.9339415337217869,
+            0.9325184461857879
+          ],
+          "trust_mean": 0.9341643872926574,
+          "trust_sample_std": 0.0017679337358737447,
+          "median_fit_seconds": 1.426553296,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 6.343299656152489,
+          "trust_delta_vs_serial": -0.010731074051749112
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.431496576,
+            1.4372853349999999,
+            1.428142934
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9444693510146674,
+            0.9447090643627353,
+            0.9444923394280357
+          ],
+          "trust_mean": 0.9445569182684794,
+          "trust_sample_std": 0.00013226277739889657,
+          "median_fit_seconds": 1.431496576,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 6.321394814150083,
+          "trust_delta_vs_serial": -0.0003385430759270669
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.832851419,
+            1.835295479,
+            1.813746063
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9452211104413636,
+            0.9456350385104816,
+            0.9452066680061617
+          ],
+          "trust_mean": 0.9453542723193357,
+          "trust_sample_std": 0.0002432578602051664,
+          "median_fit_seconds": 1.832851419,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 4.93714598913705,
+          "trust_delta_vs_serial": 0.0004588109749291691
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.08812704202136956,
+          0.09018588598701172,
+          0.08793548902031034
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": true,
+          "exact_precomputed_knn_inside_timed_fit": false
+        },
+        "trustworthiness": [
+          0.944488259326234,
+          0.9447464175205947,
+          0.9450157685352623
+        ],
+        "fit_recall_at14": [
+          0.9977,
+          0.9979857142857143,
+          0.9979857142857143
+        ],
+        "every_run_recall_ge0.90": true
+      }
+    },
+    {
+      "epochs": 100,
+      "mode": "exact",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            16.278404458,
+            16.305364131,
+            16.272678626
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9477593838322952,
+            0.9474513830285982,
+            0.9469996999531177
+          ],
+          "trust_mean": 0.9474034889380037,
+          "trust_sample_std": 0.0003820998325123109,
+          "median_fit_seconds": 16.278404458,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.714905527,
+            0.708365113,
+            0.706140932
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9430816556158328,
+            0.9431956895050566,
+            0.9430567919094501
+          ],
+          "trust_mean": 0.9431113790101132,
+          "trust_sample_std": 7.406581966045987e-05,
+          "median_fit_seconds": 0.708365113,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 22.980245863689223,
+          "trust_delta_vs_serial": -0.004292109927890531
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            0.729444867,
+            0.726454581,
+            0.731676592
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9476764771281228,
+            0.9474928484361396,
+            0.9469576665996919
+          ],
+          "trust_mean": 0.9473756640546515,
+          "trust_sample_std": 0.00037345853637896155,
+          "median_fit_seconds": 0.729444867,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 22.316154646407295,
+          "trust_delta_vs_serial": -2.782488335228983e-05
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.508250624,
+            1.5260060659999999,
+            1.5286010669999999
+          ],
+          "search": "Exact",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9470620454088808,
+            0.946782452615364,
+            0.9475093885205278
+          ],
+          "trust_mean": 0.9471179621815908,
+          "trust_sample_std": 0.00036667965127180647,
+          "median_fit_seconds": 1.5260060659999999,
+          "each_within_0.02_of_python_mean": true,
+          "speedup_vs_serial": 10.667326179553996,
+          "trust_delta_vs_serial": -0.0002855267564129127
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.09965767301036976,
+          0.1095446489925962,
+          0.1057241829985287
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": false,
+          "exact_precomputed_knn_inside_timed_fit": true
+        },
+        "trustworthiness": [
+          0.9472235108164222,
+          0.9471633460585359,
+          0.947364511419195
+        ]
+      }
+    },
+    {
+      "epochs": 100,
+      "mode": "approximate",
+      "layouts": {
+        "serial": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            17.023983458,
+            17.080680381,
+            16.732733977
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9480845274931351,
+            0.9478098238564061,
+            0.9476657799209698
+          ],
+          "trust_mean": 0.9478533770901704,
+          "trust_sample_std": 0.0002127440843527185,
+          "median_fit_seconds": 17.023983458,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 1.0,
+          "trust_delta_vs_serial": 0.0
+        },
+        "jacobi": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.413152378,
+            1.4130543389999999,
+            1.406460016
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9436387248007501,
+            0.943358960551872,
+            0.9437947679324894
+          ],
+          "trust_mean": 0.9435974844283704,
+          "trust_sample_std": 0.00022081121911185392,
+          "median_fit_seconds": 1.4130543389999999,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 12.04764954053193,
+          "trust_delta_vs_serial": -0.0042558926617999315
+        },
+        "atomic64": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            1.428178485,
+            1.4296978519999999,
+            1.444107895
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9475112718505123,
+            0.9470258227848102,
+            0.9470893282432523
+          ],
+          "trust_mean": 0.9472088076261916,
+          "trust_sample_std": 0.0002638592258353575,
+          "median_fit_seconds": 1.4296978519999999,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 11.907399478977466,
+          "trust_delta_vs_serial": -0.000644569463978728
+        },
+        "final_control": {
+          "approximate_iterations": 12,
+          "approximate_iterations_rule": "max(round(log2(n)), 5)",
+          "fit_graph_width": 14,
+          "fit_seconds": [
+            2.099970292,
+            2.102321734,
+            2.097386721
+          ],
+          "search": "Approximate",
+          "warmups": 1,
+          "trustworthiness": [
+            0.9471604072064832,
+            0.9473520166097381,
+            0.9479167503851048
+          ],
+          "trust_mean": 0.947476391400442,
+          "trust_sample_std": 0.00039321186068561677,
+          "median_fit_seconds": 2.099970292,
+          "each_within_0.02_of_python_mean": true,
+          "fit_recall_at14": [
+            0.9976714285714285,
+            0.9976428571428572,
+            0.9976857142857143
+          ],
+          "every_run_recall_ge0.90": true,
+          "speedup_vs_serial": 8.106773473345879,
+          "trust_delta_vs_serial": -0.00037698568972832636
+        }
+      },
+      "python": {
+        "fit_seconds": [
+          0.11753329201019369,
+          0.13234476000070572,
+          0.11989488897961564
+        ],
+        "umap_learn_version": "0.5.12",
+        "numba_threads": 15,
+        "cpu_count": 15,
+        "config": {
+          "random_state": null,
+          "n_jobs": -1,
+          "force_approximation_algorithm": true,
+          "exact_precomputed_knn_inside_timed_fit": false
+        },
+        "trustworthiness": [
+          0.9476613167235952,
+          0.9475307507869534,
+          0.9477674502712478
+        ],
+        "fit_recall_at14": [
+          0.9976714285714285,
+          0.9979714285714286,
+          0.9978
+        ],
+        "every_run_recall_ge0.90": true
+      }
+    }
+  ],
+  "elapsed_seconds": 494.89492813000106
+}

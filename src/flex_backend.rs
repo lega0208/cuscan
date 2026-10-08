@@ -246,6 +246,8 @@ impl StandardUmapOps for burn::backend::Flex {
         epochs_per_negative_sample: FloatTensor<Self>,
         epoch_of_next_negative_sample: FloatTensor<Self>,
         rng_state: IntTensor<Self>,
+        _head_offsets: IntTensor<Self>,
+        _head_edges: IntTensor<Self>,
         epoch: u32,
         a: f32,
         b: f32,
@@ -260,8 +262,9 @@ impl StandardUmapOps for burn::backend::Flex {
         FloatTensor<Self>,
         FloatTensor<Self>,
         IntTensor<Self>,
-        IntTensor<Self>,
     ) {
+        // The serial reference walks edges in id order; the ownership CSR is
+        // only needed by parallel backends.
         crate::standard_umap::layout::optimize_epoch(
             head_embedding,
             tail_embedding,

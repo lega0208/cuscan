@@ -1,0 +1,252 @@
+{
+  "complete": true,
+  "configuration": {
+    "components": 2,
+    "cuda_seeds": "42+run (warmups 1000+i)",
+    "deadline_seconds": 600.0,
+    "init": "random",
+    "input": "seeded clustered float32 (8 centers), little-endian row-major",
+    "metric": "euclidean",
+    "neighbors": 15,
+    "primary": {
+      "epochs": 20,
+      "features": 32,
+      "rows": 5000
+    },
+    "runs": 5,
+    "small": [
+      {
+        "epochs": 30,
+        "features": 16,
+        "rows": 512
+      },
+      {
+        "epochs": 100,
+        "features": 32,
+        "rows": 1024
+      }
+    ],
+    "warmups": 1
+  },
+  "elapsed_seconds": 89.44168332198751,
+  "gates": {
+    "H-03_pass": true,
+    "H-03_small_ratio_vs_baseline": {
+      "1024x32/100/approximate": 0.18604243356883787,
+      "1024x32/100/exact": 0.027497002421044654,
+      "512x16/30/approximate": 0.4570693599526632,
+      "512x16/30/exact": 0.044550755847630526
+    },
+    "H-04_approximate_cuda_median_le_0.90x_python": false,
+    "H-04_approximate_ratio_cuda_over_python": 20.8639642696742,
+    "H-04_exact_cuda_median_le_0.90x_python": false,
+    "H-04_exact_ratio_cuda_over_python": 11.764944904188521,
+    "primary_cuda_ratio_vs_baseline": {
+      "approximate": 0.3339130580250002,
+      "exact": 0.18891080937710228
+    }
+  },
+  "primary": {
+    "approximate": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          1.425002324,
+          1.40735297,
+          1.405943856,
+          1.409485845,
+          1.425813571
+        ],
+        "search": "Approximate",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 1.409485845,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": false,
+          "force_approximation_algorithm": true,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.06943059401237406,
+          0.06826682999962941,
+          0.06755599399912171,
+          0.06753872998524457,
+          0.06700827000895515
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.06755599399912171
+    },
+    "exact": {
+      "cuda": {
+        "approximate_iterations": 12,
+        "approximate_iterations_rule": "max(round(log2(n)), 5)",
+        "fit_graph_width": 14,
+        "fit_seconds": [
+          0.66033552,
+          0.663840629,
+          0.658392427,
+          0.661407708,
+          0.662073595
+        ],
+        "search": "Exact",
+        "warmups": 1
+      },
+      "cuda_median_seconds": 0.661407708,
+      "python": {
+        "config": {
+          "exact_precomputed_knn_inside_timed_fit": true,
+          "force_approximation_algorithm": false,
+          "n_jobs": -1,
+          "random_state": null
+        },
+        "cpu_count": 15,
+        "fit_seconds": [
+          0.0580754260008689,
+          0.05330164000042714,
+          0.05621851299656555,
+          0.057291695004096255,
+          0.05434050798066892
+        ],
+        "numba_threads": 15,
+        "umap_learn_version": "0.5.12"
+      },
+      "python_median_seconds": 0.05621851299656555
+    }
+  },
+  "profiles": {
+    "ncu_approximate": {
+      "details_csv": "figuration Size\",\"Kbyte\",\"16.38\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Driver Shared Memory Per Block\",\"Kbyte/block\",\"1.02\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Dynamic Shared Memory Per Block\",\"byte/block\",\"0\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Static Shared Memory Per Block\",\"byte/block\",\"0\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"# SMs\",\"SM\",\"68\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Stack Size\",\"\",\"1,024\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Threads\",\"thread\",\"150,016\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"# TPCs\",\"\",\"34\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Enabled TPC IDs\",\"\",\"all\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Uses Green Context\",\"\",\"0\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Launch Statistics\",\"Waves Per SM\",\"\",\"2.15\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"LaunchStats\",\"\",\"\",\"\",\"LaunchConfiguration\",\"OPT\",\"A wave of thread blocks is defined as the maximum number of blocks that can be executed in parallel on the target GPU. The number of blocks in a wave depends on the number of multiprocessors and the theoretical occupancy of the kernel. This kernel launch results in 2 full waves and a partial wave of 168 thread blocks. Under the assumption of a uniform execution duration of all thread blocks, this partial wave may account for up to 33.3% of the total runtime of this kernel. Try launching a grid with no partial wave. The overall impact of this tail effect also lessens with the number of full waves executed for a grid. See the Hardware Model (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model) description for more details on launch configurations.\",\"global\",\"33.33\"\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Block Limit SM\",\"block\",\"16\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Block Limit Registers\",\"block\",\"32\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Block Limit Shared Mem\",\"block\",\"16\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Block Limit Warps\",\"block\",\"24\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Theoretical Active Warps per SM\",\"warp\",\"32\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Theoretical Occupancy\",\"%\",\"66.67\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Achieved Occupancy\",\"%\",\"48.24\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"Achieved Active Warps Per SM\",\"warp\",\"23.15\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"\",\"\",\"\",\"AchievedOccupancy\",\"OPT\",\"The difference between calculated theoretical (66.7%) and measured achieved occupancy (48.2%) can be the result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on optimizing occupancy.\",\"local\",\"27.65\"\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"Occupancy\",\"\",\"\",\"\",\"TheoreticalOccupancy\",\"OPT\",\"The 8.00 theoretical warps per scheduler this kernel can issue according to its occupancy are below the hardware maximum of 12. This kernel's theoretical occupancy (66.7%) is limited by the number of blocks that can fit on the SM, and the required amount of shared memory.\",\"local\",\"33.33\"\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Average DRAM Active Cycles\",\"cycle\",\"23,470.40\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Total DRAM Elapsed Cycles\",\"cycle\",\"463,872\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Average L1 Active Cycles\",\"cycle\",\"6,062\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Total L1 Elapsed Cycles\",\"cycle\",\"646,516\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Average L2 Active Cycles\",\"cycle\",\"4,126.27\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Total L2 Elapsed Cycles\",\"cycle\",\"339,280\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Average SM Active Cycles\",\"cycle\",\"6,062\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Total SM Elapsed Cycles\",\"cycle\",\"646,516\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Average SMSP Active Cycles\",\"cycle\",\"5,625.26\",\n\"0\",\"17583\",\"profile_standard_cuda\",\"127.0.0.1\",\"layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\",\"1\",\"14\",\"(64, 1, 1)\",\"(2344, 1, 1)\",\"0\",\"8.6\",\"GPU and Memory Workload Distribution\",\"Total SMSP Elapsed Cycles\",\"cycle\",\"2,586,064\",\n",
+      "report": "/tmp/stage1-atomic-prof/ncu.ncu-rep"
+    },
+    "nsys_approximate": {
+      "report": "/tmp/stage1-atomic-prof/nsys-approximate.nsys-rep",
+      "summary_csv": "Generating SQLite file /tmp/stage1-atomic-prof/nsys-approximate.sqlite from /tmp/stage1-atomic-prof/nsys-approximate.nsys-rep\nProcessing [/tmp/stage1-atomic-prof/nsys-approximate.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_gpu_kern_sum.py]... \nTime (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n65.1,2794199387,26,107469207.2,118325188.0,485341,120310569,32125516.2,ann_step_f_f32_i_i32_b47dcb3c\n12.6,540222430,29,18628359.7,20506829.0,4448,22492356,6426893.3,compute_direct_throughput_i_f32_n_4_d399a4db\n11.3,485255815,25,19410232.6,20897477.0,2208,21992391,5417578.7,memory_direct_throughput_i_f32_n_4_d31d1fd0\n6.7,288630235,15,19242015.7,20348260.0,7990431,22260087,4547350.5,compute_direct_throughput_i_f32_n_1_a0e3cb82\n1.8,75797722,66352,1142.4,1152.0,1120,1665,25.2,launch_overhead_i_i32_n_1_4eb9a74e\n1.7,71067141,5,14213428.2,16831537.0,8189163,19035253,4839063.1,compute_direct_throughput_i_f32_n_2_89213cba\n0.5,22668335,40,566708.4,611445.0,34242,1039902,189587.6,layout_vertex_atomic_kernel_f_f32_i_i64_j_i32_m_i32_89303800\n0.1,5482345,2,2741172.5,2741172.5,2740389,2741956,1108.0,fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78\n0.1,2631551,4,657887.8,579235.0,579171,893910,157348.2,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8\n0.1,2305034,2,1152517.0,1152517.0,1145189,1159845,10363.4,fuzzy_graph_sort_kernel_f_f32_i_i32_8207c9fe\n0.0,1575614,1,1575614.0,1575614.0,1575614,1575614,0.0,prime_buffer_i_f32_n_4_0df454aa\n0.0,872948,8,109118.5,98086.0,98054,186347,31205.0,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_b56870a0\n0.0,494270,2,247135.0,247135.0,112519,381751,190375.8,fuzzy_graph_prefix_kernel_i_i32_30c6e7de\n0.0,372886,40,9322.1,9472.5,3681,12064,1349.5,layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\n0.0,268049,16,16753.1,15169.0,14977,26722,3934.3,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_cd4df8c3\n0.0,156457,2,78228.5,78228.5,60291,96166,25367.5,cumulative_kernel_c_i32_da126a79\n0.0,100934,2,50467.0,50467.0,50403,50531,90.5,fuzzy_graph_scatter_kernel_f_f32_i_i32_0cf0ac83\n0.0,85382,2,42691.0,42691.0,40963,44419,2443.8,ann_init_i_i32_65186f2e\n0.0,73508,2,36754.0,36754.0,35426,38082,1878.1,fuzzy_graph_count_kernel_f_f32_i_i32_ee1599bf\n0.0,64677,40,1616.9,1632.0,1472,1824,87.6,layout_copy_kernel_f_f32_49ea250f\n0.0,33762,2,16881.0,16881.0,16833,16929,67.9,elemwise_fuse_6c18e021\n0.0,15490,2,7745.0,7745.0,7617,7873,181.0,elemwise_fuse_8b0b0372\n0.0,11904,2,5952.0,5952.0,5920,5984,45.3,ann_output_f_f32_i_i32_227b5ab7\n0.0,8353,2,4176.5,4176.5,4161,4192,21.9,fuzzy_graph_zero_kernel_f_f32_i_i32_abafb52b\n0.0,6977,4,1744.3,1648.0,1376,2305,412.3,slice_assign_kernel_e_f32_n_1_197a0642\n0.0,6528,2,3264.0,3264.0,2880,3648,543.1,elemwise_fuse_48b54b1c\n0.0,5600,4,1400.0,1376.0,1248,1600,179.8,copy_kernel_t_f32_n_2_d8924a49\n0.0,3616,2,1808.0,1808.0,1760,1856,67.9,copy_kernel_t_i64_n_1_c17fc01f\n0.0,3392,2,1696.0,1696.0,1504,1888,271.5,slice_kernel_e_i32_2a989b90\n0.0,3360,2,1680.0,1680.0,1664,1696,22.6,copy_kernel_t_f32_n_1_2ac59715\n0.0,2464,2,1232.0,1232.0,1216,1248,22.6,elemwise_fuse_bf8e7554\n0.0,2113,2,1056.5,1056.5,1056,1057,0.7,full_kernel_c_i32_n_4_42fa673b\n0.0,2048,2,1024.0,1024.0,1024,1024,0.0,full_kernel_c_f32_n_1_28ce5594\n0.0,1152,1,1152.0,1152.0,1152,1152,0.0,unary_numeric_t_f32_n_1_c739b437\n\nProcessing [/tmp/stage1-atomic-prof/nsys-approximate.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_api_sum.py]... \nTime (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n58.7,2915012672,181,16105042.4,2333421.0,370,1390017466,103130330.9,cuEventSynchronize\n29.0,1442172347,34,42416833.7,178540.0,81868,1402965524,240471888.8,cuModuleLoadData\n11.0,546647734,66646,8202.3,2505.0,1994,2083758,103555.8,cuLaunchKernel\n0.5,22996486,67161,342.4,181.0,140,6803411,26286.3,cuCtxSetCurrent\n0.3,15374671,9,1708296.8,456460.0,288497,6350986,2539320.8,cuMemAlloc_v2\n0.2,11590595,2,5795297.5,5795297.5,5635324,5955271,226236.7,cuMemFree_v2\n0.2,8213946,5,1642789.2,1142118.0,876603,2991202,904647.1,cuMemAllocHost_v2\n0.0,2338224,192,12178.3,11737.0,1773,70887,9969.9,cuEventRecord\n0.0,1848985,2,924492.5,924492.5,405905,1443080,733393.5,cuMemFreeHost\n0.0,853647,43,19852.3,12184.0,3206,187652,29399.8,cuMemcpyHtoDAsync_v2\n0.0,421847,15,28123.1,24197.0,16913,52001,9913.8,cuMemcpyDtoHAsync_v2\n0.0,159348,6,26558.0,25378.5,16813,35098,7220.9,cuMemcpy2DAsync_v2\n0.0,123913,108,1147.3,1032.0,251,3246,420.8,cuEventCreate\n0.0,121102,96,1261.5,1163.0,241,5611,587.6,cuEventDestroy_v2\n0.0,36471,3,12157.0,6813.0,4088,25570,11695.6,cuStreamCreate\n0.0,10779,5,2155.8,2484.0,571,3977,1536.0,cuInit\n\n"
+    },
+    "nsys_exact": {
+      "report": "/tmp/stage1-atomic-prof/nsys-exact.nsys-rep",
+      "summary_csv": "Generating SQLite file /tmp/stage1-atomic-prof/nsys-exact.sqlite from /tmp/stage1-atomic-prof/nsys-exact.nsys-rep\nProcessing [/tmp/stage1-atomic-prof/nsys-exact.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_gpu_kern_sum.py]... \nTime (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n42.5,1312497635,158,8306947.1,8168816.5,4083584,10334952,696135.7,exact_neighbors_kernel_f_f32_i_i32_632b4cf8\n22.5,694747480,36,19298541.1,20794728.5,4704,22702383,5864432.4,compute_direct_throughput_i_f32_n_4_d399a4db\n20.1,621153021,32,19411031.9,20725380.5,2113,21743060,4708900.4,memory_direct_throughput_i_f32_n_4_d31d1fd0\n9.5,294153786,15,19610252.4,20803449.0,8130526,22828025,4665180.5,compute_direct_throughput_i_f32_n_1_a0e3cb82\n2.3,72065354,5,14413070.8,17120146.0,8538391,19298875,4930688.5,compute_direct_throughput_i_f32_n_2_89213cba\n1.9,57509523,50346,1142.3,1152.0,1120,1792,25.4,launch_overhead_i_i32_n_1_4eb9a74e\n0.7,22258901,40,556472.5,614071.0,34594,828308,167313.7,layout_vertex_atomic_kernel_f_f32_i_i64_j_i32_m_i32_89303800\n0.2,5483032,2,2741516.0,2741516.0,2740748,2742284,1086.1,fuzzy_graph_row_kernel_f_f32_i_i32_cc8e9c78\n0.1,2908375,1,2908375.0,2908375.0,2908375,2908375,0.0,prime_buffer_i_f32_n_4_0df454aa\n0.1,2632453,4,658113.3,579220.0,578757,895256,158095.3,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_78bf2be8\n0.1,2294736,2,1147368.0,1147368.0,1144488,1150248,4072.9,fuzzy_graph_sort_kernel_f_f32_i_i32_8207c9fe\n0.0,956988,8,119623.5,98070.5,98054,185227,39922.0,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_b56870a0\n0.0,376439,40,9411.0,9632.0,3584,11713,1327.4,layout_clock_kernel_f_f32_c_f64_m_i32_c3cebd5a\n0.0,270928,16,16933.0,15585.0,15296,26849,3843.2,reduce_kernel_in_f32_in_size_4_out_f32_out_size_1_acc_f32_cd4df8c3\n0.0,224814,2,112407.0,112407.0,112327,112487,113.1,fuzzy_graph_prefix_kernel_i_i32_30c6e7de\n0.0,120519,2,60259.5,60259.5,60228,60291,44.5,cumulative_kernel_c_i32_da126a79\n0.0,98694,2,49347.0,49347.0,48195,50499,1629.2,fuzzy_graph_scatter_kernel_f_f32_i_i32_0cf0ac83\n0.0,73252,2,36626.0,36626.0,34882,38370,2466.4,fuzzy_graph_count_kernel_f_f32_i_i32_ee1599bf\n0.0,65412,40,1635.3,1632.0,1408,1760,66.7,layout_copy_kernel_f_f32_49ea250f\n0.0,33794,2,16897.0,16897.0,16865,16929,45.3,elemwise_fuse_6c18e021\n0.0,21250,2,10625.0,10625.0,9409,11841,1719.7,elemwise_fuse_e1707dff\n0.0,21121,2,10560.5,10560.5,9952,11169,860.5,elemwise_fuse_c0c20b27\n0.0,10689,2,5344.5,5344.5,4032,6657,1856.2,elemwise_fuse_8b0b0372\n0.0,8321,2,4160.5,4160.5,4160,4161,0.7,fuzzy_graph_zero_kernel_f_f32_i_i32_abafb52b\n0.0,6752,2,3376.0,3376.0,2880,3872,701.4,elemwise_fuse_7d8dab6a\n0.0,6144,2,3072.0,3072.0,2912,3232,226.3,elemwise_fuse_48b54b1c\n0.0,5504,4,1376.0,1344.0,1248,1568,156.8,copy_kernel_t_f32_n_2_d8924a49\n0.0,3616,2,1808.0,1808.0,1760,1856,67.9,copy_kernel_t_i64_n_1_c17fc01f\n0.0,2784,2,1392.0,1392.0,1312,1472,113.1,slice_kernel_e_i32_2a989b90\n0.0,2464,2,1232.0,1232.0,1216,1248,22.6,elemwise_fuse_bf8e7554\n0.0,2336,2,1168.0,1168.0,1056,1280,158.4,full_kernel_c_i32_n_4_42fa673b\n0.0,1152,1,1152.0,1152.0,1152,1152,0.0,unary_numeric_t_f32_n_1_c739b437\n\nProcessing [/tmp/stage1-atomic-prof/nsys-exact.sqlite] with [/usr/lib/nsight-systems/target-linux-x64/reports/cuda_api_sum.py]... \nTime (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name\n71.3,2468519307,189,13060948.7,6515662.0,301,645956026,47299328.0,cuEventSynchronize\n15.8,548104043,32,17128251.3,175359.0,91768,509980366,90116642.9,cuModuleLoadData\n11.4,394839029,50780,7775.5,2555.0,2003,2082057,98569.7,cuLaunchKernel\n0.4,15506931,10,1550693.1,395799.5,306668,6073086,2318352.7,cuMemAlloc_v2\n0.4,12235537,51562,237.3,181.0,150,332623,1505.6,cuCtxSetCurrent\n0.3,10579531,3,3526510.3,5040849.0,383902,5154780,2722174.8,cuMemFree_v2\n0.2,7779868,5,1555973.6,1132992.0,852847,2546949,762017.2,cuMemAllocHost_v2\n0.1,2004265,200,10021.3,11111.0,1423,55968,7847.8,cuEventRecord\n0.1,1894566,2,947283.0,947283.0,516321,1378245,609472.3,cuMemFreeHost\n0.0,845526,42,20131.6,14308.0,4118,185769,29004.9,cuMemcpyHtoDAsync_v2\n0.0,325040,15,21669.3,20429.0,15099,34427,4724.7,cuMemcpyDtoHAsync_v2\n0.0,175596,110,1596.3,1173.0,571,40037,3718.3,cuEventDestroy_v2\n0.0,137435,6,22905.8,23946.0,16402,29367,5314.6,cuMemcpy2DAsync_v2\n0.0,131928,122,1081.4,1062.0,181,2676,364.1,cuEventCreate\n0.0,35108,3,11702.7,7384.0,3647,24077,10878.2,cuStreamCreate\n0.0,11452,5,2290.4,3166.0,581,3637,1560.5,cuInit\n\n"
+    }
+  },
+  "quality": {
+    "approximate": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": true,
+      "Q-03_every_run_recall_ge_0.90": true,
+      "cuda_fit_recall_at_14": [
+        0.9976714285714285,
+        0.9976428571428572,
+        0.9976857142857143,
+        0.9976428571428572,
+        0.9977857142857143
+      ],
+      "cuda_trustworthiness": [
+        0.9408055347933829,
+        0.9403763257651865,
+        0.9412915410890095,
+        0.9414408438818566,
+        0.9409851074944746
+      ],
+      "python_fit_recall_at_14": [
+        0.9977857142857143,
+        0.9978285714285714,
+        0.9978428571428571,
+        0.9976714285714285,
+        0.9977428571428572
+      ],
+      "python_trustworthiness": [
+        0.9419058308217801,
+        0.9421716803964906,
+        0.9417815042528966,
+        0.9417729689906905,
+        0.9420408813877168
+      ],
+      "python_trustworthiness_mean": 0.9419345731699149,
+      "tracking_reference": {
+        "candidate_cuda_mean": 0.9409798706047819,
+        "mean": 0.942314183912665,
+        "pass": false,
+        "sample_count": 5,
+        "sample_std": 0.00033802551904213435,
+        "threshold_mean_minus_0.5_sample_std": 0.9421451711531439
+      }
+    },
+    "exact": {
+      "Q-02_each_cuda_within_0.02_of_python_mean": true,
+      "cuda_trustworthiness": [
+        0.9408769566673364,
+        0.9414898372513563,
+        0.9414333078829281,
+        0.9413010381086331,
+        0.9414076779853995
+      ],
+      "python_trustworthiness": [
+        0.9420522161944946,
+        0.9426882191413837,
+        0.9422978688634385,
+        0.9426481066238028,
+        0.941420901480142
+      ],
+      "python_trustworthiness_mean": 0.9422214624606523,
+      "tracking_reference": {
+        "candidate_cuda_mean": 0.9413017635791305,
+        "mean": 0.9417040943004487,
+        "pass": true,
+        "sample_count": 5,
+        "sample_std": 0.000841246466129896,
+        "threshold_mean_minus_0.5_sample_std": 0.9412834710673837
+      }
+    }
+  },
+  "quality_tracking_gates": {
+    "Q-04_approximate_cuda_mean_ge_reference_mean_minus_0.5std": false,
+    "Q-04_exact_cuda_mean_ge_reference_mean_minus_0.5std": true
+  },
+  "small_cuda": {
+    "1024x32/100/approximate": {
+      "fit_seconds": [
+        0.670047548,
+        0.664806623,
+        0.681266555,
+        0.677443985,
+        0.684822423
+      ],
+      "median_seconds": 0.677443985
+    },
+    "1024x32/100/exact": {
+      "fit_seconds": [
+        0.083302673,
+        0.082303813,
+        0.083993218,
+        0.084997067,
+        0.084235947
+      ],
+      "median_seconds": 0.083993218
+    },
+    "512x16/30/approximate": {
+      "fit_seconds": [
+        0.338603826,
+        0.332848207,
+        0.338703259,
+        0.338201791,
+        0.337487769
+      ],
+      "median_seconds": 0.338201791
+    },
+    "512x16/30/exact": {
+      "fit_seconds": [
+        0.018793234,
+        0.017530523,
+        0.01912698,
+        0.018859421,
+        0.018598768
+      ],
+      "median_seconds": 0.018793234
+    }
+  }
+}
