@@ -1,0 +1,13 @@
+
+running 8 tests
+test standard_fuzzy_graph_marks_invalid_reference_indices ... ok
+test standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors ... ok
+test bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero ... ok
+test bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_flex ... ok
+test standard_fuzzy_graph_matches_reference_fixtures_on_flex ... ok
+test standard_fuzzy_graph_matches_reference_fixtures_on_cuda ... ok
+test bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cuda ... ok
+test standard_fuzzy_graph_cuda_source_tagged_capture_oracle ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+

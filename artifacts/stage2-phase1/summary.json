@@ -1,0 +1,314 @@
+{
+  "baseline": "artifacts/stage2-phase0/phase0-final.json",
+  "candidate": "artifacts/stage2-phase1/phase1-candidate.json",
+  "complete": true,
+  "elapsed_seconds": 547.1621699780226,
+  "deadline_seconds": 900.0,
+  "coverage": {
+    "baseline_repetitions_required_per_mode": 6,
+    "completed_baseline_repetitions": 12,
+    "completed_pairs": 6,
+    "full_baseline_pair_coverage": true,
+    "modes": [
+      "exact",
+      "approximate"
+    ],
+    "pairs_required_per_mode": 3,
+    "quality_runs": 6,
+    "speed_gates": []
+  },
+  "quality": {
+    "exact": {
+      "all_runs_pass": true,
+      "query_recall_warning": false,
+      "reference_fit_trustworthiness_mean": 0.9513744665876605,
+      "reference_transform_trustworthiness_means": [
+        0.9593512173590298,
+        0.9587374431124432,
+        0.9592443147130648
+      ],
+      "fit_recall_min": 1.0
+    },
+    "approximate": {
+      "all_runs_pass": true,
+      "query_recall_warning": true,
+      "reference_fit_trustworthiness_mean": 0.9514279019138075,
+      "reference_transform_trustworthiness_means": [
+        0.9592752733377733,
+        0.9593219063922188,
+        0.9594155844155844
+      ],
+      "fit_recall_min": 0.99285888671875
+    }
+  },
+  "timings": {
+    "exact": {
+      "baseline_fit_median_seconds": 9.798583652,
+      "candidate_fit_median_seconds": 8.684840572999999,
+      "fit_ratio": 0.8863363197626349,
+      "fit_reduction_percent": 11.366368023736506,
+      "baseline_transform_total_median_seconds": 1.811917719,
+      "candidate_transform_total_median_seconds": 1.599064308,
+      "candidate_fit_samples": [
+        8.625015642,
+        8.33447863,
+        8.750881568,
+        8.744665504,
+        8.941334601,
+        8.387171213
+      ],
+      "candidate_transform_total_samples": [
+        1.654584846,
+        1.497767264,
+        1.745087182,
+        1.54354377,
+        1.758504241,
+        1.396895561
+      ]
+    },
+    "approximate": {
+      "baseline_fit_median_seconds": 7.4589041625,
+      "candidate_fit_median_seconds": 5.5548008585,
+      "fit_ratio": 0.744720770971563,
+      "fit_reduction_percent": 25.527922902843702,
+      "exact_drift_normalized_fit_reduction_percent": 15.97763124825995,
+      "normalization_caveat": "Approximate historical ratio divided by unchanged exact-mode historical ratio; illustrative drift adjustment, not a causal matched baseline/candidate experiment.",
+      "baseline_transform_total_median_seconds": 5.0030706955,
+      "candidate_transform_total_median_seconds": 4.122341415,
+      "candidate_fit_samples": [
+        5.137372992,
+        5.478525547,
+        6.537097651,
+        5.531274674,
+        5.578327043,
+        5.607453136
+      ],
+      "candidate_transform_total_samples": [
+        4.121892406000001,
+        4.181646382,
+        4.124008018,
+        4.083106617,
+        4.122790424,
+        3.872833202
+      ]
+    }
+  },
+  "warnings": [
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.8482421875,
+      "seed": 43,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.8501953125,
+      "seed": 44,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.84703125,
+      "seed": 45,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.8482421875,
+      "seed": 43,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.8501953125,
+      "seed": 44,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 0,
+      "recall": 0.84703125,
+      "seed": 45,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.846171875,
+      "seed": 43,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.8514453125,
+      "seed": 44,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.8477734375,
+      "seed": 45,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.846171875,
+      "seed": 43,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.8514453125,
+      "seed": 44,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 1,
+      "recall": 0.8477734375,
+      "seed": 45,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.8454296875,
+      "seed": 43,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.84734375,
+      "seed": 44,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.8483984375,
+      "seed": 45,
+      "side": "B"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.8454296875,
+      "seed": 43,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.84734375,
+      "seed": 44,
+      "side": "A"
+    },
+    {
+      "kind": "query_recall_below_limit",
+      "limit": 0.87,
+      "mode": "approximate",
+      "pair": 2,
+      "recall": 0.8483984375,
+      "seed": 45,
+      "side": "A"
+    }
+  ],
+  "memory": {
+    "authoritative_lifetime_peak_bytes": 2249195520,
+    "cap_bytes": 7516192768,
+    "explanation": "Nsight Systems CUDA allocation tracking is required for an authoritative lifetime peak; nvidia-smi polling is supplementary only.",
+    "method": "nsys --cuda-memory-usage allocation tracking (excludes CUDA context/module overhead)",
+    "nsys_modes": {
+      "approximate": {
+        "allocation_event_count": 28,
+        "cap_bytes": 7516192768,
+        "free_event_count": 23,
+        "method": "nsys --cuda-memory-usage allocation tracking (excludes CUDA context/module overhead)",
+        "nsys_peak_live_allocation_bytes": 2249195520,
+        "pass": true,
+        "per_pid_device_peaks": [
+          {
+            "deviceId": 0,
+            "globalPid": 282603311595520,
+            "peak_live_allocation_bytes": 2249195520
+          }
+        ],
+        "status": "pass",
+        "unknown_event_count": 0
+      },
+      "exact": {
+        "allocation_event_count": 27,
+        "cap_bytes": 7516192768,
+        "free_event_count": 22,
+        "method": "nsys --cuda-memory-usage allocation tracking (excludes CUDA context/module overhead)",
+        "nsys_peak_live_allocation_bytes": 2249195520,
+        "pass": true,
+        "per_pid_device_peaks": [
+          {
+            "deviceId": 0,
+            "globalPid": 282601029894144,
+            "peak_live_allocation_bytes": 2249195520
+          }
+        ],
+        "status": "pass",
+        "unknown_event_count": 0
+      }
+    },
+    "units": "bytes"
+  },
+  "limitations": [
+    "Product benchmark script has a Phase0-only pristine-source guard. Initial exact requested invocation failed. Scratch harness changed only root/provenance/source guard; campaign workload, gates and 900-second deadline unchanged.",
+    "ANN iteration IDs/distances and downstream graph are bit-identical. Embedding bits differ, including baseline vs itself; strict full comparer does not pass.",
+    "Cross-campaign timings are historical comparisons, not simultaneous baseline/candidate pairs; unchanged exact mode also sped up. No causal performance estimate from historical ratios alone."
+  ],
+  "reverse_workspace_bytes": 2293764,
+  "source_snapshots": {
+    "campaign_ann_rs_sha256": "330505ecbfd918c39364e6ea2f16199cf0befbaa3355ffb33a9c31dc647a52d7",
+    "final_ann_rs_sha256": "46eed640a040aafab6d3feb750905bea60f7cfbd0cb1c33408db671880f326a4",
+    "post_campaign_change": "cfg(test) upload helper only: safe TensorData bytes replaced unsafe cast; product prefix unchanged"
+  }
+}

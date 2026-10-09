@@ -1,0 +1,29 @@
+{
+  "kind": "algorithm-package-test-report",
+  "status": "passed-with-plan-limitations",
+  "commands": [
+    "FAST_UMAP_REQUIRE_CUDA=1 cargo test --lib --features cuda cuda_backend -- --nocapture",
+    "FAST_UMAP_REQUIRE_CUDA=1 cargo test --lib --features cuda kernels::standard_umap::ann::tests -- --nocapture",
+    "FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_CUDA_ANN_ORACLE_PATH=artifacts/stage2-phase0/differential/ann.json cargo test --test test_standard_ann -- --nocapture",
+    "FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_CUDA_GRAPH_ORACLE_PATH=artifacts/stage2-phase0/differential/graph.json cargo test --test test_standard_graph -- --nocapture",
+    "FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_CUDA_ERROR_ORACLE_PATH=artifacts/stage2-phase0/differential/errors.json cargo test --release --test test_standard_quality -- --nocapture",
+    "cargo test --no-default-features --test test_standard_ann --test test_standard_graph",
+    "cargo fmt --all -- --check",
+    "git diff --check"
+  ],
+  "test_counts": {"cuda_backend": 6, "reverse_csr_internal": 2, "ann_integration": 7, "graph_integration": 8, "quality_integration_release": 7, "portable_ann": 5, "portable_graph": 5, "capture_and_oracle_integrity_adversarial_scenarios": 9},
+  "logs": ["artifacts/stage2-phase1/cuda-backend-tests.log", "artifacts/stage2-phase1/reverse-csr-tests.log", "artifacts/stage2-phase1/ann-tests.log", "artifacts/stage2-phase1/graph-tests.log", "artifacts/stage2-phase1/quality-release-tests.log"],
+  "quality_debug_attempt": "The full debug quality suite exceeded a 300-second command timeout after six tests passed, with the existing 20,000-row Flex fit still running. Preserved quality-tests.log. Full seven-test suite rerun in release mode passed, including 20,000-row Flex and 60,000-row CUDA fits; no tests ignored or suppressed.",
+  "harness_provenance": "artifacts/stage2-phase1/harness-provenance.json",
+  "adversarial_evidence": "artifacts/stage2-phase1/capture-integrity-rejections.json",
+  "identity_evidence": "artifacts/stage2-phase1/identity.json",
+  "campaign_evidence": "artifacts/stage2-phase1/phase1-candidate.json",
+  "summary": "artifacts/stage2-phase1/summary.json",
+  "warnings": ["Existing burn-cubecl/burn-cubecl-fusion future incompatibility warnings", "18 approximate query recall warnings; deferred beyond Stage2 under approved plan"],
+  "plan_limitations": [
+    "Exact requested unchanged campaign invocation rejected changed source via Phase0-only guard. Initial failed report preserved in phase1.json. Hash-bound throwaway scratch harness used identical workload, quality checks, memory checks and deadline; product script unchanged.",
+    "All 15 iteration IDs and distance bits plus downstream graph are bit-identical. Full comparator fails embedding bit identity; repeated unmodified baseline also fails embedding reproducibility. No layout change made; accepting this gate limitation requires user decision."
+  ],
+  "unchanged_surfaces": ["Flex ANN", "CUDA approximate query/transform", "consider and proposal ordering", "candidate width and iteration policy", "public API and configuration", "product benchmark script"],
+  "documentation": "Public behavior/API unchanged; existing docs and runtime guidance unchanged. Findings and limitations recorded in requested benchmark artifacts."
+}

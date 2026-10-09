@@ -7,6 +7,18 @@ use serde_json::json;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn source_tree_digest(commit: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", &format!("{commit}:src")])
+        .output()
+        .expect("git must be available to identify product source");
+    assert!(
+        output.status.success(),
+        "could not resolve {commit}:src tree digest"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn frozen_source_digest() -> String {
     let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
     for args in [
@@ -22,15 +34,7 @@ fn frozen_source_digest() -> String {
             "working product src differs from frozen source commit"
         );
     }
-    let output = Command::new("git")
-        .args(["rev-parse", "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e:src"])
-        .output()
-        .expect("git must be available to identify frozen product source");
-    assert!(
-        output.status.success(),
-        "could not resolve frozen src tree digest"
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    source_tree_digest(commit)
 }
 
 fn git_blob_digest(bytes: &[u8]) -> String {
@@ -131,6 +135,184 @@ fn recall_score(ids: &[i32]) -> usize {
             .count();
     }
     hits
+}
+
+#[cfg(feature = "cuda")]
+fn old_rescan_oracle(
+    points: &[f32],
+    n: usize,
+    features: usize,
+    k: usize,
+    seed: u64,
+    iterations: u32,
+) -> (Vec<i32>, Vec<u32>) {
+    let width = (k * 4).min(64).min(n - 1);
+    let mut candidates = vec![0i32; n * width];
+    for row in 0..n {
+        let modulus = 2_147_483_647i64;
+        let seed_base = (seed % 2_147_483_646) as i64 + 1;
+        let mut state = (row as i64 + seed_base) % modulus;
+        if state == 0 {
+            state = 1;
+        }
+        for column in 0..width {
+            let hi = state / 127_773;
+            let lo = state - hi * 127_773;
+            let test = lo * 16_807 - hi * 2_836;
+            state = if test <= 0 { test + modulus } else { test };
+            let t = state - 1;
+            let j = n - 1 - width + column;
+            let draw = t % (j + 1) as i64;
+            let collision = (0..column).any(|previous| {
+                let old = candidates[row * width + previous] as usize;
+                let previous_raw = if old > row { old - 1 } else { old };
+                previous_raw as i64 == draw
+            });
+            let chosen = if collision { j as i64 } else { draw };
+            candidates[row * width + column] = if chosen >= row as i64 {
+                (chosen + 1) as i32
+            } else {
+                chosen as i32
+            };
+        }
+    }
+
+    let mut final_ids = vec![n as i32; n * width];
+    let mut final_squared = vec![f32::MAX; n * width];
+    for iteration in 0..=iterations {
+        let mut next_ids = vec![n as i32; n * width];
+        let mut next_squared = vec![f32::MAX; n * width];
+        for row in 0..n {
+            let mut consider_candidate = |candidate: i32| {
+                let candidate = candidate as usize;
+                if candidate >= n || candidate == row {
+                    return;
+                }
+                let mut squared = 0.0f32;
+                for feature in 0..features {
+                    let delta =
+                        points[row * features + feature] - points[candidate * features + feature];
+                    squared += delta * delta;
+                }
+                let base = row * width;
+                let mut position = width;
+                let mut duplicate = false;
+                for slot in 0..width {
+                    let old = next_ids[base + slot];
+                    duplicate |= old == candidate as i32;
+                    if position == width
+                        && (squared < next_squared[base + slot]
+                            || (squared == next_squared[base + slot] && candidate < old as usize))
+                    {
+                        position = slot;
+                    }
+                }
+                if !duplicate && position < width {
+                    for slot in (position + 1..width).rev() {
+                        next_ids[base + slot] = next_ids[base + slot - 1];
+                        next_squared[base + slot] = next_squared[base + slot - 1];
+                    }
+                    next_ids[base + position] = candidate as i32;
+                    next_squared[base + position] = squared;
+                }
+            };
+            for slot in 0..width {
+                consider_candidate(candidates[row * width + slot]);
+            }
+            if iteration > 0 {
+                for slot in 0..width {
+                    let neighbor = candidates[row * width + slot] as usize;
+                    if neighbor < n {
+                        for other in 0..width {
+                            consider_candidate(candidates[neighbor * width + other]);
+                        }
+                    }
+                }
+                for source in 0..n {
+                    if (0..width).any(|slot| candidates[source * width + slot] as usize == row) {
+                        for slot in 0..width {
+                            consider_candidate(candidates[source * width + slot]);
+                        }
+                    }
+                }
+            }
+        }
+        candidates = next_ids.clone();
+        final_ids = next_ids;
+        final_squared = next_squared;
+    }
+    let mut ids = Vec::with_capacity(n * k);
+    let mut distance_bits = Vec::with_capacity(n * k);
+    for row in 0..n {
+        for slot in 0..k {
+            ids.push(final_ids[row * width + slot]);
+            distance_bits.push(final_squared[row * width + slot].sqrt().to_bits());
+        }
+    }
+    (ids, distance_bits)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    let fixtures = [
+        ("hub-ties", 19usize, 2usize),
+        ("duplicate-points", 23usize, 3usize),
+        ("repeated-iterations", 31usize, 4usize),
+    ];
+    for (fixture, n, features) in fixtures {
+        let points = (0..n)
+            .flat_map(|row| {
+                if fixture == "duplicate-points" && row % 5 == 0 {
+                    vec![0.0f32; features]
+                } else if fixture == "hub-ties" {
+                    (0..features)
+                        .map(|column| if column == 0 { (row % 3) as f32 } else { 0.0 })
+                        .collect()
+                } else {
+                    (0..features)
+                        .map(|column| ((row * (column + 3)) % 17) as f32 * 0.125)
+                        .collect()
+                }
+            })
+            .collect::<Vec<_>>();
+        let k = 3usize;
+        let iterations = 5;
+        let data = Tensor::<2>::from_data(TensorData::new(points.clone(), [n, features]), &device);
+        let (actual_ids, actual_distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            data.into_dispatch(),
+            k as u32,
+            0x5179,
+            iterations,
+        );
+        let actual_ids = Tensor::<2, burn::tensor::Int>::from_dispatch(actual_ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let actual_distance_bits = Tensor::<2>::from_dispatch(actual_distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        let expected = old_rescan_oracle(&points, n, features, k, 0x5179, iterations);
+        assert_eq!(
+            actual_ids, expected.0,
+            "old-rescan ids differ for {fixture}"
+        );
+        assert_eq!(
+            actual_distance_bits, expected.1,
+            "distance bits differ for {fixture}"
+        );
+    }
 }
 
 #[test]
@@ -312,9 +494,7 @@ fn cuda_ann_source_tagged_capture_oracle() {
                 .unwrap(),
         );
     }
-    let capture = json!({
-        "source_commit": SOURCE,
-        "product_src_tree_digest": frozen_source_digest(),
+    let semantic_capture = json!({
         "input_git_blob_digest": git_blob_digest(&input_bytes),
         "query_input_git_blob_digest": git_blob_digest(
             &input_bytes[..65 * features * std::mem::size_of::<f32>()],
@@ -337,6 +517,14 @@ fn cuda_ann_source_tagged_capture_oracle() {
         "invalid_sentinel_overflow_and_budget_cases": ann_edge_cases(&device),
     });
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ANN_CAPTURE_PATH") {
+        // Capture export is the frozen-baseline operation; never label candidate
+        // product source as the baseline oracle's source.
+        let mut capture = semantic_capture.as_object().unwrap().clone();
+        capture.insert("source_commit".to_owned(), json!(SOURCE));
+        capture.insert(
+            "product_src_tree_digest".to_owned(),
+            json!(frozen_source_digest()),
+        );
         std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
     }
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ANN_ORACLE_PATH") {
@@ -344,9 +532,32 @@ fn cuda_ann_source_tagged_capture_oracle() {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
         assert_eq!(
-            capture, oracle,
-            "CUDA ANN output differs from frozen-source oracle"
+            oracle["product_src_tree_digest"],
+            source_tree_digest(SOURCE),
+            "oracle product source provenance"
         );
+        let oracle_keys = oracle
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = semantic_capture
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected_oracle_keys = expected_keys.clone();
+        expected_oracle_keys.insert("source_commit".to_owned());
+        expected_oracle_keys.insert("product_src_tree_digest".to_owned());
+        assert_eq!(oracle_keys, expected_oracle_keys, "oracle semantic key set");
+        for (field, value) in semantic_capture.as_object().unwrap() {
+            assert_eq!(
+                oracle[field], *value,
+                "CUDA ANN semantic oracle mismatch in {field}"
+            );
+        }
     }
     assert_eq!(ids, run_odd_dimension_case(&device));
 }

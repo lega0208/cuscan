@@ -105,6 +105,18 @@ fn fixture_cases() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
 }
 
+fn source_tree_digest(commit: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", &format!("{commit}:src")])
+        .output()
+        .expect("git must be available to identify product source");
+    assert!(
+        output.status.success(),
+        "could not resolve {commit}:src tree digest"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn frozen_source_digest() -> String {
     let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
     for args in [
@@ -120,15 +132,7 @@ fn frozen_source_digest() -> String {
             "working product src differs from frozen source commit"
         );
     }
-    let output = Command::new("git")
-        .args(["rev-parse", "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e:src"])
-        .output()
-        .expect("git must be available to identify frozen product source");
-    assert!(
-        output.status.success(),
-        "could not resolve frozen src tree digest"
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    source_tree_digest(commit)
 }
 
 fn git_blob_digest(bytes: &[u8]) -> String {
@@ -617,23 +621,52 @@ fn standard_fuzzy_graph_cuda_source_tagged_capture_oracle() {
         true,
         4,
     ));
-    let capture = json!({
-        "source_commit": SOURCE,
-        "product_src_tree_digest": frozen_source_digest(),
+    let semantic_capture = json!({
         "schema": "fast-umap.cuda-graph-capture.v1",
         "operation": "fuzzy_graph",
         "dtype": "f32/i32",
         "cases": cases,
     });
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_CAPTURE_PATH") {
+        // Capture export is the frozen-baseline operation; candidate runs do not
+        // claim that their product source is the oracle's source.
+        let mut capture = semantic_capture.as_object().unwrap().clone();
+        capture.insert("source_commit".to_owned(), json!(SOURCE));
+        capture.insert(
+            "product_src_tree_digest".to_owned(),
+            json!(frozen_source_digest()),
+        );
         std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
     }
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_ORACLE_PATH") {
         let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
         assert_eq!(
-            capture, oracle,
-            "CUDA graph output differs from frozen-source oracle"
+            oracle["product_src_tree_digest"],
+            source_tree_digest(SOURCE),
+            "oracle product source provenance"
         );
+        let oracle_keys = oracle
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = semantic_capture
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected_oracle_keys = expected_keys.clone();
+        expected_oracle_keys.insert("source_commit".to_owned());
+        expected_oracle_keys.insert("product_src_tree_digest".to_owned());
+        assert_eq!(oracle_keys, expected_oracle_keys, "oracle semantic key set");
+        for (field, value) in semantic_capture.as_object().unwrap() {
+            assert_eq!(
+                oracle[field], *value,
+                "CUDA graph semantic oracle mismatch in {field}"
+            );
+        }
     }
 }

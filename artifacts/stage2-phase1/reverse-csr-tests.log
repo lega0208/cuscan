@@ -1,0 +1,7 @@
+
+running 2 tests
+test kernels::standard_umap::ann::tests::ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates ... ok
+test kernels::standard_umap::ann::tests::reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.28s
+

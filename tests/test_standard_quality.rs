@@ -42,13 +42,18 @@ fn frozen_source_digest() -> String {
             "working product src differs from frozen source commit"
         );
     }
+    source_tree_digest(commit)
+}
+
+#[cfg(feature = "cuda")]
+fn source_tree_digest(commit: &str) -> String {
     let output = Command::new("git")
-        .args(["rev-parse", "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e:src"])
+        .args(["rev-parse", &format!("{commit}:src")])
         .output()
-        .expect("git must be available to identify frozen product source");
+        .expect("git must be available to identify product source");
     assert!(
         output.status.success(),
-        "could not resolve frozen src tree digest"
+        "could not resolve {commit}:src tree digest"
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
@@ -565,9 +570,7 @@ fn cuda_transform_error_source_tagged_capture_oracle() {
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
     input_bytes.extend_from_slice(b"n_neighbors=1;budget=usize::MAX");
-    let capture = serde_json::json!({
-        "source_commit": SOURCE,
-        "product_src_tree_digest": frozen_source_digest(),
+    let semantic_capture = serde_json::json!({
         "schema": "fast-umap.cuda-error-capture.v1",
         "operation": ["single-row-transform", "config-validation", "query-budget-validation", "backend-validation"],
         "dtype": "f32/u64",
@@ -578,15 +581,44 @@ fn cuda_transform_error_source_tagged_capture_oracle() {
         "unavailable_error_coverage": ["Numerical", "SpectralConvergence"],
     });
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ERROR_CAPTURE_PATH") {
+        let mut capture = semantic_capture.as_object().unwrap().clone();
+        capture.insert("source_commit".to_owned(), serde_json::json!(SOURCE));
+        capture.insert(
+            "product_src_tree_digest".to_owned(),
+            serde_json::json!(frozen_source_digest()),
+        );
         std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
     }
     if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ERROR_ORACLE_PATH") {
         let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
         assert_eq!(
-            capture, oracle,
-            "CUDA error contract differs from frozen-source oracle"
+            oracle["product_src_tree_digest"],
+            source_tree_digest(SOURCE),
+            "oracle product source provenance"
         );
+        let oracle_keys = oracle
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = semantic_capture
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected_oracle_keys = expected_keys;
+        expected_oracle_keys.insert("source_commit".to_owned());
+        expected_oracle_keys.insert("product_src_tree_digest".to_owned());
+        assert_eq!(oracle_keys, expected_oracle_keys, "oracle semantic key set");
+        for (field, value) in semantic_capture.as_object().unwrap() {
+            assert_eq!(
+                oracle[field], *value,
+                "CUDA error semantic oracle mismatch in {field}"
+            );
+        }
     }
 }
 

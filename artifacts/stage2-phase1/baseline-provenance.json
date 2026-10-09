@@ -1,0 +1,17 @@
+{
+  "plan": ".gjc/_session-01a11dfb-fd12-7027-94c8-fc276354a7c6/plans/ralplan/01a11dfb-fd12-7027-94c8-fc276354a7c6/stage-03-final.md",
+  "baseline_commit": "84b84ca",
+  "candidate_base_commit": "690ce15",
+  "pristine_src_commit_diff": {"command": "git diff --exit-code 84b84ca HEAD -- src", "exit_code": 0, "output": ""},
+  "baseline_before_dump_patch_status": " M examples/profile_standard_cuda.rs\n",
+  "baseline_driver_restored_from_candidate_head": true,
+  "manifest_delta": "Packaging excludes only: package exclude moved to package table and references excluded from package/workspace; dependency declarations unchanged.",
+  "scratch_baseline": "/tmp/fast-umap-84b84ca-phase1",
+  "scratch_diagnostics": "/tmp/fast-umap-phase1-diagnostics",
+  "train_sha256": "5f22cf600cca9b76dab4f31003e45dc7dd38ba4b2ad6271726dd50b50d6c2179",
+  "training_generation": {"rows": 16384, "features": 16, "seed": 42, "centers": 8, "center_scale": 5.0, "noise": 0.35},
+  "baseline_dump_driver": {"neighbors": 25, "init": "spectral", "seed": 42, "epochs": 100, "warmups": 0, "runs": 1, "search": "approximate", "fit_seconds_diagnostic_only": 6.955272515, "baseline_repeat_fit_seconds_diagnostic_only": 7.336867213, "candidate_fit_seconds_diagnostic_only": 5.618852919},
+  "diagnostic_build_note": "Baseline and candidate share dependency artifacts only. Forced cargo clean --release -p fast-umap before final candidate and repeated-baseline builds to prevent package fingerprint reuse across equal-version scratch worktrees. All compared dump files were produced by these explicit builds.",
+  "baseline_build": {"command": "cargo build --release --no-default-features --features cuda,tracing --example profile_standard_cuda", "exit_code": 0, "warnings": ["burn-cubecl and burn-cubecl-fusion future incompatibility warnings"]},
+  "reverse_workspace": {"n": 16384, "width": 32, "dtype": "i32", "elements": 573441, "bytes": 2293764, "formula": "4 * (N*W + 3*N + 1)"}
+}
