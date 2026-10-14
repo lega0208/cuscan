@@ -1,0 +1,12 @@
+{
+  "method": "fast-spectral",
+  "rows": 50000,
+  "fit_rows": 50000,
+  "fit_seconds": 88.79381916999978,
+  "stages_seconds": {},
+  "random_state": null,
+  "min_dist": 0.0,
+  "n_neighbors": 15,
+  "n_epochs": null,
+  "finite": true
+}

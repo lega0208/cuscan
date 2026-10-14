@@ -1,0 +1,18 @@
+[
+  {
+    "rows": 49923,
+    "distinct_feature_vectors": 41739
+  },
+  {
+    "rows": 22,
+    "distinct_feature_vectors": 2
+  },
+  {
+    "rows": 36,
+    "distinct_feature_vectors": 2
+  },
+  {
+    "rows": 19,
+    "distinct_feature_vectors": 1
+  }
+]

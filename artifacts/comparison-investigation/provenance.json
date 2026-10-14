@@ -1,0 +1,46 @@
+{
+  "commit": "14421bddc174a069e89239910bed6a66ea0f04e1",
+  "packages": {
+    "umap-learn": "0.5.12",
+    "numpy": "2.5.3",
+    "scipy": "1.18.1",
+    "scikit-learn": "1.9.1",
+    "pynndescent": "0.6.0",
+    "polars": "1.44.2"
+  },
+  "results": {
+    "python-unique-15000": {
+      "fit_seconds": 10.97162447200003,
+      "fit_rows": 13312
+    },
+    "python-unique-50000": {
+      "fit_seconds": 12.014400610999928,
+      "fit_rows": 41744
+    },
+    "fast-spectral-15000": {
+      "fit_seconds": 6.707399758000065,
+      "fit_rows": 15000
+    },
+    "fast-spectral-50000": {
+      "fit_seconds": 88.79381916999978,
+      "fit_rows": 50000
+    },
+    "fast-random-50000": {
+      "fit_seconds": 5.844356288999961,
+      "fit_rows": 50000
+    },
+    "fast-unique-50000": {
+      "fit_seconds": 7.738915061999933,
+      "fit_rows": 41744
+    },
+    "python-all-50000": {
+      "fit_seconds": 19.597135265999896,
+      "fit_rows": 50000
+    }
+  },
+  "rebuilt_graph_identical": false,
+  "sample_sha256": {
+    "15000": "d82f22cee962b784835e9087867f5a7d1726860d8a3acb20987c80e0f12335d3",
+    "50000": "33991e60caef8ce5fb0de0c6e2f23287c812b8036f4652c91055668f74313bb5"
+  }
+}

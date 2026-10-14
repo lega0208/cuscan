@@ -1,0 +1,154 @@
+{
+  "15000": {
+    "graph_components": 1,
+    "largest_component": 15000,
+    "component_sizes": [
+      15000
+    ],
+    "duplicate_groups_at_least_15": 10,
+    "rows_in_groups_at_least_15": 265,
+    "ann_queries": 1000,
+    "tie_aware_recall_at_14": 0.9818571428571428,
+    "recall_duplicate_queries": 0.9988385598141696,
+    "recall_nonduplicate_queries": 0.9794754846066135,
+    "embeddings": {
+      "python-unique": {
+        "trustworthiness_2000_unique_at_15": 0.8907457595683697,
+        "neighbor_overlap_2000_unique_at_15": 0.3242333333333334,
+        "radius_quantiles_50_90_95_99_100": [
+          3.743888020515442,
+          6.245986413955689,
+          6.734852337837219,
+          7.038360204696656,
+          8.165092468261719
+        ],
+        "radius_p95_over_max": 0.8248347907897011,
+        "duplicate_displacement_p50_p95_max": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "fast-spectral": {
+        "trustworthiness_2000_unique_at_15": 0.8768918732085652,
+        "neighbor_overlap_2000_unique_at_15": 0.30926666666666663,
+        "radius_quantiles_50_90_95_99_100": [
+          3.8792773485183716,
+          7.977477550506592,
+          10.028281927108765,
+          15.857324266433716,
+          18.57910919189453
+        ],
+        "radius_p95_over_max": 0.5397611814178789,
+        "duplicate_displacement_p50_p95_max": [
+          0.002817039145156741,
+          0.04052045755088329,
+          4.643354892730713
+        ]
+      }
+    }
+  },
+  "50000": {
+    "graph_components": 4,
+    "largest_component": 49923,
+    "component_sizes": [
+      49923,
+      36,
+      22,
+      19
+    ],
+    "duplicate_groups_at_least_15": 114,
+    "rows_in_groups_at_least_15": 3246,
+    "ann_queries": 1000,
+    "tie_aware_recall_at_14": 0.9671428571428571,
+    "recall_duplicate_queries": 0.9966777408637875,
+    "recall_nonduplicate_queries": 0.9590536851683348,
+    "embeddings": {
+      "python-unique": {
+        "trustworthiness_2000_unique_at_15": 0.8684282245827011,
+        "neighbor_overlap_2000_unique_at_15": 0.3038666666666667,
+        "radius_quantiles_50_90_95_99_100": [
+          4.655948877334595,
+          8.544866561889648,
+          9.457769203186036,
+          10.550817365646363,
+          11.291617393493652
+        ],
+        "radius_p95_over_max": 0.8375920714986058,
+        "duplicate_displacement_p50_p95_max": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "fast-spectral": {
+        "trustworthiness_2000_unique_at_15": 0.833348052604957,
+        "neighbor_overlap_2000_unique_at_15": 0.25889999999999996,
+        "radius_quantiles_50_90_95_99_100": [
+          4.810725927352905,
+          10.306555080413817,
+          14.709601068496704,
+          19.554383907318122,
+          20.606420516967773
+        ],
+        "radius_p95_over_max": 0.7138358191023279,
+        "duplicate_displacement_p50_p95_max": [
+          0.0015362889971584082,
+          0.03916751854121684,
+          20.782155990600586
+        ]
+      },
+      "fast-random": {
+        "trustworthiness_2000_unique_at_15": 0.8368295565671894,
+        "neighbor_overlap_2000_unique_at_15": 0.25826666666666664,
+        "radius_quantiles_50_90_95_99_100": [
+          5.04835319519043,
+          10.833366584777826,
+          15.100370502471923,
+          19.824019069671632,
+          21.351966857910156
+        ],
+        "radius_p95_over_max": 0.7072121553466052,
+        "duplicate_displacement_p50_p95_max": [
+          0.00146639090962708,
+          0.04119940903037779,
+          13.770548820495605
+        ]
+      },
+      "fast-unique": {
+        "trustworthiness_2000_unique_at_15": 0.8628021581520823,
+        "neighbor_overlap_2000_unique_at_15": 0.2943333333333334,
+        "radius_quantiles_50_90_95_99_100": [
+          4.574889659881592,
+          7.863253116607666,
+          8.477489280700683,
+          9.582555265426636,
+          11.996382713317871
+        ],
+        "radius_p95_over_max": 0.7066704591951153,
+        "duplicate_displacement_p50_p95_max": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "python-all": {
+        "trustworthiness_2000_unique_at_15": 0.8241325914685551,
+        "neighbor_overlap_2000_unique_at_15": 0.2525666666666667,
+        "radius_quantiles_50_90_95_99_100": [
+          4.843753099441528,
+          10.869323921203613,
+          14.84176082611084,
+          19.148453044891358,
+          20.73309898376465
+        ],
+        "radius_p95_over_max": 0.7158486455755068,
+        "duplicate_displacement_p50_p95_max": [
+          0.000900344894034788,
+          0.04591554459184407,
+          37.128631591796875
+        ]
+      }
+    }
+  }
+}

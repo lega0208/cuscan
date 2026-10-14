@@ -1,0 +1,37 @@
+[
+  [
+    "spectral_embedding",
+    83.8051,
+    null
+  ],
+  [
+    "initialize",
+    84.1364,
+    null
+  ],
+  [
+    "initialization",
+    84.1365,
+    null
+  ],
+  [
+    "optimize",
+    0.0128,
+    null
+  ],
+  [
+    "optimization",
+    0.0128,
+    null
+  ],
+  [
+    "tensor_embedding",
+    0.0656,
+    null
+  ],
+  [
+    "fit",
+    96.5503,
+    null
+  ]
+]

@@ -1,0 +1,20 @@
+{
+  "15000": {
+    "shape": [
+      15000,
+      128
+    ],
+    "unique_rows": 13312,
+    "duplicate_rows": 1688,
+    "max_multiplicity": 71
+  },
+  "50000": {
+    "shape": [
+      50000,
+      128
+    ],
+    "unique_rows": 41744,
+    "duplicate_rows": 8256,
+    "max_multiplicity": 233
+  }
+}

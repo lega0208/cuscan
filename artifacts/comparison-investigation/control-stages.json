@@ -1,0 +1,18 @@
+{
+  "unique-50000": {
+    "spectral_embedding": 2.646639870999999,
+    "initialize": 2.918703056,
+    "initialization": 2.918747137,
+    "optimization": 0.00812814699999988,
+    "tensor_embedding": 0.05872790199999977,
+    "fit": 7.614022017
+  },
+  "50000-rebuilt": {
+    "spectral_embedding": 82.752253266,
+    "initialize": 83.10074262,
+    "initialization": 83.10078852400001,
+    "optimization": 0.013293706000000238,
+    "tensor_embedding": 0.06856620499999821,
+    "fit": 86.38276955799999
+  }
+}
