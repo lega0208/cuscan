@@ -1,0 +1,83 @@
+{
+  "schema": "fast-umap-ann-campaign-quality-v1",
+  "reference": {
+    "distribution": "umap-learn",
+    "version": "0.5.12",
+    "python": "3.14.0 (main, Oct 31 2025, 23:03:06) [Clang 21.1.4 ]",
+    "numpy": "2.5.3",
+    "scipy": "1.18.1",
+    "scikit_learn": "1.9.1",
+    "numba": "0.68.0",
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.44",
+    "machine": "x86_64",
+    "processor": "",
+    "generator_sha256": "db677ff334a907ad8f3323be9f217c3026ef31fd8c959242a0e25b98f95a7e37"
+  },
+  "data": {
+    "input_file": "artifacts/stage2-phase1/phase1-candidate-stage2-48uxsust/train.f32le",
+    "sha256": "5f22cf600cca9b76dab4f31003e45dc7dd38ba4b2ad6271726dd50b50d6c2179",
+    "dtype": "little-endian float32",
+    "shape": [
+      16384,
+      16
+    ]
+  },
+  "controls": {
+    "n_neighbors": 25,
+    "n_components": 2,
+    "seeds": [
+      11,
+      29,
+      47,
+      71,
+      101
+    ],
+    "trustworthiness_k": 15,
+    "fit": {
+      "min_dist": 0.1,
+      "spread": 1.0,
+      "local_connectivity": 1.0,
+      "set_op_mix_ratio": 1.0,
+      "n_epochs": 200,
+      "learning_rate": 1.0,
+      "negative_sample_rate": 5,
+      "repulsion_strength": 1.0,
+      "init": "spectral",
+      "metric": "euclidean",
+      "n_jobs": 1,
+      "low_memory": true
+    },
+    "truth": "Exact Euclidean neighbors, self excluded by row identity; ties at kth distance are inclusive.",
+    "trustworthiness": "Exact Euclidean ranks, self excluded by row identity, ties ordered by row index; row-wise bounded-memory computation.",
+    "freeze": "Freeze campaign reference before evaluating kernel candidates."
+  },
+  "quality": {
+    "cases": [
+      "campaign"
+    ],
+    "scores": {
+      "campaign": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.9526897081537905
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.9527447277105076
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.9526432108622129
+        },
+        {
+          "seed": 71,
+          "fit_trustworthiness_at_15": 0.9530290655126743
+        },
+        {
+          "seed": 101,
+          "fit_trustworthiness_at_15": 0.9527506368656631
+        }
+      ]
+    }
+  }
+}

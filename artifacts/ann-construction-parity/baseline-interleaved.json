@@ -1,0 +1,1462 @@
+{
+  "compile_contamination": {
+    "cubecl": {
+      "delivery": "The source `ServerLogger` sends compilation messages through an async channel; the file sink writes one complete record and flushes on each logger write. This harness waits for five identical file-size/event-count observations 25ms apart after each response; this is a quiet-period barrier, not a synchronous CubeCL acknowledgement.",
+      "logging_level": "Full (CUBECL_DEBUG_LOG path selects CompilationLogLevel::Full and source formatting)",
+      "logs": {
+        "baseline": {
+          "final_bytes": 103977,
+          "final_sha256": "5ce2884086d78576c533f2b47af917c2b918464b87ece5cac5b5fc6a757442d9",
+          "path": "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/baseline-interleaved-cubecl-logs/baseline.log",
+          "sha256_after_warmup": "a166366b645b1cd41c84884db1eccbbcd06d5d7e5090dda97cc26345e1c60e07",
+          "total_compilation_records": 7,
+          "warmup_compile_records": 7
+        },
+        "candidate": {
+          "final_bytes": 103968,
+          "final_sha256": "3cf41a3813006768ec87bfcccc4daa378381d72838202034347afe1b6e3e14ce",
+          "path": "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/baseline-interleaved-cubecl-logs/candidate.log",
+          "sha256_after_warmup": "3d61ee7a3c847690a7e511f85079cbdb49e551a2cf5b6e2c77b8665e115f9164",
+          "total_compilation_records": 7,
+          "warmup_compile_records": 7
+        }
+      },
+      "record_cost": "CubeCL emits records from the compilation/load path only; `CompiledKernel` Full formatting and any C++ source formatting occur only on new compilation. The debug env also enables medium profiling output, so timings are explicitly instrumented.",
+      "record_marker": "[START_KERNEL_COMPILATION]"
+    },
+    "pynndescent": {
+      "method": "live Numba CPUDispatcher identity and public signatures/count snapshots before and after every constructor call, performed outside the constructor timer",
+      "proof_scope": "No newly visible Numba dispatcher/signature in the timed call proves the observed dispatcher set was post-warmup; Numba exposes no general public compilation event counter here, so this is explicitly a dispatcher-snapshot signal, not a claim about transient unseen dispatchers."
+    },
+    "rejected_samples": [],
+    "status": "zero_timed_compile_events_observed",
+    "strategy": "One in-process warmup per implementation. Reject and rerun a CUDA sample if its stabilized per-worker CubeCL log gains compilation markers; reject and rerun PyNNDescent if its live dispatcher count or compiled signatures change. Keep every rejected sample and its evidence in this object."
+  },
+  "complete": true,
+  "configuration": {
+    "cuda_cap": 14,
+    "cuda_device_index": 0,
+    "features": 16,
+    "ipc": "persistent Rust process; stdin/stdout JSONL {op:warmup|build,seed,k,cap}; serial requests",
+    "k_nonself": 24,
+    "metric": "euclidean",
+    "n_neighbors_including_self": 25,
+    "order": "ten trials; baseline/candidate/PyNNDescent rotated one-at-a-time; no overlap",
+    "pynndescent": {
+      "delta": 0.001,
+      "max_candidates": 60,
+      "n_iters": 14,
+      "n_jobs": 15,
+      "n_neighbors": 25,
+      "n_trees": 11,
+      "random_state": 42,
+      "version": "0.6.0"
+    },
+    "rows": 16384,
+    "seed": 42,
+    "timed_builds_per_implementation": 10,
+    "timer": "CUDA host input through upload, construction, sync and materialized host IDs/distances; PyNNDescent constructor including trees plus neighbor_graph read; disk IO excluded",
+    "warmups_per_implementation": 1
+  },
+  "medians_ms": {
+    "baseline": 595.387832,
+    "candidate": 596.397921,
+    "pynndescent": 130.22423448273912
+  },
+  "protocol_admissible": true,
+  "provenance": {
+    "created_utc": "2026-10-09T15:40:57.863400+00:00",
+    "data": {
+      "bytes": 1048576,
+      "path": "/home/marc/projects/fast-umap/artifacts/stage2-phase1/phase1-candidate-stage2-48uxsust/train.f32le",
+      "sha256": "5f22cf600cca9b76dab4f31003e45dc7dd38ba4b2ad6271726dd50b50d6c2179"
+    },
+    "dependencies": {
+      "numba": "0.68.0",
+      "numpy": "2.5.3",
+      "pynndescent": "0.6.0",
+      "scikit-learn": "1.9.1",
+      "scipy": "1.18.1"
+    },
+    "gpu": {
+      "api": "nvidia-smi",
+      "devices": [
+        {
+          "cuda_runtime_explanation": "nvidia-smi does not identify the CUDA runtime loaded by this process.",
+          "cuda_runtime_version": null,
+          "driver_cuda_compatibility_version": null,
+          "driver_version": "617.14",
+          "name": "NVIDIA GeForce RTX 3080",
+          "uuid": "GPU-b8c28142-ff65-2d01-3831-de9654bd006e"
+        }
+      ],
+      "status": "available",
+      "version": "NVIDIA-SMI version  : 615.78.02"
+    },
+    "hardware": {
+      "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.44",
+      "processor": "",
+      "python": "3.14.0 (main, Oct 31 2025, 23:03:06) [Clang 21.1.4 ]"
+    },
+    "harness": {
+      "path": "/home/marc/projects/fast-umap/scripts/compare_umap_spans.py",
+      "sha256": "a0c2623f0c06cedecc1e06b2e35378eb5c4251d4dc8ab070fd0e7b5e5d13e13b"
+    },
+    "source_roots": {
+      "baseline": {
+        "commit": "23080c78435bf2c3beb722c1ef3a2b2a64128b27",
+        "repository": "/tmp/fast-umap-ann-baseline-01a120d9",
+        "source_tree_identity_sha256": "b7ec25583cf08ee79a0c1423d48505cb399a418f86d232fee9e337cd35bf9267",
+        "tracked_patch_sha256": "e3f090c0e6e613f01640a0acab2392da051bbe31527ec1667998d6b6c1730cfc",
+        "untracked_files_sha256": "bc9165a6f28d5da41e083b1a3fdd64d24dfb38418d0a902eb4c20262580b7f48",
+        "working_tree_status": " M Cargo.toml\n?? examples/ann_construction_worker.rs\n",
+        "working_tree_status_sha256": "00607c511e97c1d90d29e8075287f8f1052cc8b38ce65ba598ad39b7e6479145"
+      },
+      "candidate": {
+        "commit": "23080c78435bf2c3beb722c1ef3a2b2a64128b27",
+        "repository": "/home/marc/projects/fast-umap",
+        "source_tree_identity_sha256": "29728035efa87bb9f1e2d1ae228cc3538317f4104ef04cc0344b9e45b7d339e3",
+        "tracked_patch_sha256": "b01a2cfe36a12658a2f4c1b3ab96647f65d3d7a7aab0fc75074a16625432fc56",
+        "untracked_files_sha256": "76dc4402d34e92c964abb084f7152a80ca13a85d5b9fc6b1761bade293ecbbfc",
+        "working_tree_status": " M Cargo.toml\n M scripts/compare_umap_spans.py\n M tests/fixtures/generate_standard_umap.py\n M tests/test_standard_ann.rs\n M tests/test_standard_quality.rs\n?? artifacts/ann-construction-parity/baseline-construction-cubecl-logs/baseline.log\n?? artifacts/ann-construction-parity/baseline-construction-retry-cubecl-logs/baseline.log\n?? artifacts/ann-construction-parity/baseline-construction-retry-cubecl-logs/candidate.log\n?? artifacts/ann-construction-parity/baseline-construction-retry.json\n?? artifacts/ann-construction-parity/baseline-construction.json\n?? artifacts/ann-construction-parity/baseline-e2-trace.json\n?? artifacts/ann-construction-parity/baseline-quality-receipt.json\n?? artifacts/ann-construction-parity/baseline-quality.log\n?? artifacts/ann-construction-parity/input-freeze.json\n?? artifacts/ann-construction-parity/reference-freeze.json\n?? examples/ann_construction_worker.rs\n?? tests/fixtures/ann_campaign_quality.npz\n?? tests/fixtures/ann_campaign_reference.json\n",
+        "working_tree_status_sha256": "52a8a1cbefca72346fe37b3bad36e07c98b0e4ff7068ad3ef2d7ee647184a3ba"
+      }
+    },
+    "workers": {
+      "baseline": {
+        "path": "/home/marc/projects/fast-umap/target/ann-baseline/release/examples/ann_construction_worker",
+        "sha256": "ccbb23d74e7291c56d4f51b4b4782f125100612e4465b21a311d20444d04a719",
+        "source": {
+          "commit": "23080c78435bf2c3beb722c1ef3a2b2a64128b27",
+          "repository": "/tmp/fast-umap-ann-baseline-01a120d9",
+          "source_tree_identity_sha256": "b7ec25583cf08ee79a0c1423d48505cb399a418f86d232fee9e337cd35bf9267",
+          "tracked_patch_sha256": "e3f090c0e6e613f01640a0acab2392da051bbe31527ec1667998d6b6c1730cfc",
+          "untracked_files_sha256": "bc9165a6f28d5da41e083b1a3fdd64d24dfb38418d0a902eb4c20262580b7f48",
+          "working_tree_status": " M Cargo.toml\n?? examples/ann_construction_worker.rs\n",
+          "working_tree_status_sha256": "00607c511e97c1d90d29e8075287f8f1052cc8b38ce65ba598ad39b7e6479145"
+        }
+      },
+      "candidate": {
+        "path": "/home/marc/projects/fast-umap/target/release/examples/ann_construction_worker",
+        "sha256": "ccbb23d74e7291c56d4f51b4b4782f125100612e4465b21a311d20444d04a719",
+        "source": {
+          "commit": "23080c78435bf2c3beb722c1ef3a2b2a64128b27",
+          "repository": "/home/marc/projects/fast-umap",
+          "source_tree_identity_sha256": "29728035efa87bb9f1e2d1ae228cc3538317f4104ef04cc0344b9e45b7d339e3",
+          "tracked_patch_sha256": "b01a2cfe36a12658a2f4c1b3ab96647f65d3d7a7aab0fc75074a16625432fc56",
+          "untracked_files_sha256": "76dc4402d34e92c964abb084f7152a80ca13a85d5b9fc6b1761bade293ecbbfc",
+          "working_tree_status": " M Cargo.toml\n M scripts/compare_umap_spans.py\n M tests/fixtures/generate_standard_umap.py\n M tests/test_standard_ann.rs\n M tests/test_standard_quality.rs\n?? artifacts/ann-construction-parity/baseline-construction-cubecl-logs/baseline.log\n?? artifacts/ann-construction-parity/baseline-construction-retry-cubecl-logs/baseline.log\n?? artifacts/ann-construction-parity/baseline-construction-retry-cubecl-logs/candidate.log\n?? artifacts/ann-construction-parity/baseline-construction-retry.json\n?? artifacts/ann-construction-parity/baseline-construction.json\n?? artifacts/ann-construction-parity/baseline-e2-trace.json\n?? artifacts/ann-construction-parity/baseline-quality-receipt.json\n?? artifacts/ann-construction-parity/baseline-quality.log\n?? artifacts/ann-construction-parity/input-freeze.json\n?? artifacts/ann-construction-parity/reference-freeze.json\n?? examples/ann_construction_worker.rs\n?? tests/fixtures/ann_campaign_quality.npz\n?? tests/fixtures/ann_campaign_reference.json\n",
+          "working_tree_status_sha256": "52a8a1cbefca72346fe37b3bad36e07c98b0e4ff7068ad3ef2d7ee647184a3ba"
+        }
+      }
+    }
+  },
+  "rejections": [],
+  "samples": [
+    {
+      "accepted_index": 0,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 79527,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "2fc14251097fb231c9cb363b95ee17da39f5c7004035b26d5bcc32f5ef50c65c",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 76810,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "a166366b645b1cd41c84884db1eccbbcd06d5d7e5090dda97cc26345e1c60e07",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 803.908455,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 0
+    },
+    {
+      "accepted_index": 0,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 79525,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "ec8c84fa441507b6d5f200322dbea89b2520e4821bf7c87ad795c08b544db597",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 76809,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "3d61ee7a3c847690a7e511f85079cbdb49e551a2cf5b6e2c77b8665e115f9164",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 590.936326,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 0
+    },
+    {
+      "accepted_index": 0,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 133.01092898473144,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 2,
+      "rejected": false,
+      "trial": 0
+    },
+    {
+      "accepted_index": 1,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 82240,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "efef808e5df1e8cc08540ab3593e311e27b4c47c3705a6610b225cb018779d0d",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 79525,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "ec8c84fa441507b6d5f200322dbea89b2520e4821bf7c87ad795c08b544db597",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 589.675351,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 1
+    },
+    {
+      "accepted_index": 1,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 139.63873698958196,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 1,
+      "rejected": false,
+      "trial": 1
+    },
+    {
+      "accepted_index": 1,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 82244,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "f9ae75061727638b1a56e51fd5b7a9eb44d26a72278af0e0d587adab3aaa85b3",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 79527,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "2fc14251097fb231c9cb363b95ee17da39f5c7004035b26d5bcc32f5ef50c65c",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 589.951311,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 1
+    },
+    {
+      "accepted_index": 2,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 129.0240789821837,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 0,
+      "rejected": false,
+      "trial": 2
+    },
+    {
+      "accepted_index": 2,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 84960,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5ec4d4a00020b80e6661d969d59404871559e6c63084f0976690ed5c9a89eeea",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 82244,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "f9ae75061727638b1a56e51fd5b7a9eb44d26a72278af0e0d587adab3aaa85b3",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 591.402466,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 2
+    },
+    {
+      "accepted_index": 2,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 84956,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "cf4fa0c852dacc6c9f0a425a39fc4ac8e83255c535bef130a9ceaf0df4758939",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 82240,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "efef808e5df1e8cc08540ab3593e311e27b4c47c3705a6610b225cb018779d0d",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 599.7748419999999,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 2
+    },
+    {
+      "accepted_index": 3,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 87678,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "48a4e9d1c4a3e41a7e2772d23247349df6d18204434675540c8d41a03eb029bd",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 84960,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5ec4d4a00020b80e6661d969d59404871559e6c63084f0976690ed5c9a89eeea",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 593.98926,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 3
+    },
+    {
+      "accepted_index": 3,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 87673,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "e9d6289cb3f3b29695c19203ce0037340012c50b37dd705642150684ed7b43b3",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 84956,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "cf4fa0c852dacc6c9f0a425a39fc4ac8e83255c535bef130a9ceaf0df4758939",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 601.199122,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 3
+    },
+    {
+      "accepted_index": 3,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 126.66129600256681,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 2,
+      "rejected": false,
+      "trial": 3
+    },
+    {
+      "accepted_index": 4,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 90389,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "fba35d182147e912fc6c59c95ac5334f5987018ec13f8b652e90c34eacda9dab",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 87673,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "e9d6289cb3f3b29695c19203ce0037340012c50b37dd705642150684ed7b43b3",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 596.9146199999999,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 4
+    },
+    {
+      "accepted_index": 4,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 129.97676897794008,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 1,
+      "rejected": false,
+      "trial": 4
+    },
+    {
+      "accepted_index": 4,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 90394,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "49d592962b6291d6d2d4dbad5102cbbb71a0f42ff6792b34c9bcfe1e3d7283cb",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 87678,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "48a4e9d1c4a3e41a7e2772d23247349df6d18204434675540c8d41a03eb029bd",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 600.570563,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 4
+    },
+    {
+      "accepted_index": 5,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 130.47169998753816,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 0,
+      "rejected": false,
+      "trial": 5
+    },
+    {
+      "accepted_index": 5,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 93111,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "95df6793ed01b61fff8a5d0f255a8b1c46a0ed1aa452b6873f8fdb7de5941633",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 90394,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "49d592962b6291d6d2d4dbad5102cbbb71a0f42ff6792b34c9bcfe1e3d7283cb",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 600.522733,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 5
+    },
+    {
+      "accepted_index": 5,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 93105,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5f3b7cd775a3669a7bb3cf5bd4926eafe024aa1c34c75edce3b9ed7fc6abb03a",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 90389,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "fba35d182147e912fc6c59c95ac5334f5987018ec13f8b652e90c34eacda9dab",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 594.0958750000001,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 5
+    },
+    {
+      "accepted_index": 6,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 95828,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "948bcbbf1320cb13539e9bc44da9baa17143eeb11b5e20c3603db1f2e3b726bf",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 93111,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "95df6793ed01b61fff8a5d0f255a8b1c46a0ed1aa452b6873f8fdb7de5941633",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 599.530165,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 6
+    },
+    {
+      "accepted_index": 6,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 95821,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "2bab3eabe5df183882cad39f29f5b966d5118be5f7094ba2d0c89ac56f6b2ad2",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 93105,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5f3b7cd775a3669a7bb3cf5bd4926eafe024aa1c34c75edce3b9ed7fc6abb03a",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 595.8812220000001,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 6
+    },
+    {
+      "accepted_index": 6,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 141.9893120182678,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 2,
+      "rejected": false,
+      "trial": 6
+    },
+    {
+      "accepted_index": 7,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 98535,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "cf4d01299c6566e32acc484d1844ec3ff300ca500f83dfd324a711da4d35f8fa",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 95821,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "2bab3eabe5df183882cad39f29f5b966d5118be5f7094ba2d0c89ac56f6b2ad2",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 592.275211,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 7
+    },
+    {
+      "accepted_index": 7,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 129.00415100739338,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 1,
+      "rejected": false,
+      "trial": 7
+    },
+    {
+      "accepted_index": 7,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 98545,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "a9031e0d159ec3bc56833a4269b961152a6115bdd6e805927852dc8d1adea34e",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 95828,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "948bcbbf1320cb13539e9bc44da9baa17143eeb11b5e20c3603db1f2e3b726bf",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 593.054175,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 7
+    },
+    {
+      "accepted_index": 8,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 129.85118399956264,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 0,
+      "rejected": false,
+      "trial": 8
+    },
+    {
+      "accepted_index": 8,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 101261,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "befdcee2a52977524c88df64a74f3f0186bec48c3d068dc1ba64c91e93771140",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 98545,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "a9031e0d159ec3bc56833a4269b961152a6115bdd6e805927852dc8d1adea34e",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 595.030248,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 8
+    },
+    {
+      "accepted_index": 8,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 101253,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5d69609378b69820982ea098180463094f14c2273007d73748d03825f82c6e1f",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 98535,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "cf4d01299c6566e32acc484d1844ec3ff300ca500f83dfd324a711da4d35f8fa",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 602.073145,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 2,
+      "rejected": false,
+      "trial": 8
+    },
+    {
+      "accepted_index": 9,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 103977,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5ce2884086d78576c533f2b47af917c2b918464b87ece5cac5b5fc6a757442d9",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 101261,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "befdcee2a52977524c88df64a74f3f0186bec48c3d068dc1ba64c91e93771140",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 595.745416,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "baseline",
+      "order_index": 0,
+      "rejected": false,
+      "trial": 9
+    },
+    {
+      "accepted_index": 9,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "cubecl_log_after": {
+        "bytes": 103968,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "3cf41a3813006768ec87bfcccc4daa378381d72838202034347afe1b6e3e14ce",
+        "stable_observations": 5
+      },
+      "cubecl_log_before": {
+        "bytes": 101253,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "5d69609378b69820982ea098180463094f14c2273007d73748d03825f82c6e1f",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 601.1649180000001,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4",
+      "implementation": "candidate",
+      "order_index": 1,
+      "rejected": false,
+      "trial": 9
+    },
+    {
+      "accepted_index": 9,
+      "attempt": 0,
+      "compile_contaminated": false,
+      "compile_event_count": 0,
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 134.54299201839603,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "implementation": "pynndescent",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "compile_contaminated": false,
+        "compile_event_count": 0,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 194,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 350,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [],
+        "new_dispatchers": 0,
+        "vanished_dispatchers": 0
+      },
+      "order_index": 2,
+      "rejected": false,
+      "trial": 9
+    }
+  ],
+  "schema": "fast-umap.ann-construction-campaign.v1",
+  "warmups": {
+    "baseline": {
+      "compile_signal": {
+        "detail": "CubeCL 0.11 CUBECL_DEBUG_LOG path enables full compilation records. The harness counts new marker records after each response; one record is emitted by each compiled kernel.",
+        "log_path": "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/baseline-interleaved-cubecl-logs/baseline.log",
+        "logging_cost": "Full compilation formatting, including source, occurs only on new compilation events; no compilation record is emitted for an already compiled kernel. The debug setting also enables medium profiling output, so timing is explicitly an instrumented run.",
+        "record_marker": "[START_KERNEL_COMPILATION]",
+        "status": "cubecl_debug_log"
+      },
+      "cubecl_compile_records_during_warmup": 7,
+      "cubecl_log_snapshot": {
+        "bytes": 76810,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "a166366b645b1cd41c84884db1eccbbcd06d5d7e5090dda97cc26345e1c60e07",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 788.131743,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4"
+    },
+    "candidate": {
+      "compile_signal": {
+        "detail": "CubeCL 0.11 CUBECL_DEBUG_LOG path enables full compilation records. The harness counts new marker records after each response; one record is emitted by each compiled kernel.",
+        "log_path": "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/baseline-interleaved-cubecl-logs/candidate.log",
+        "logging_cost": "Full compilation formatting, including source, occurs only on new compilation events; no compilation record is emitted for an already compiled kernel. The debug setting also enables medium profiling output, so timing is explicitly an instrumented run.",
+        "record_marker": "[START_KERNEL_COMPILATION]",
+        "status": "cubecl_debug_log"
+      },
+      "cubecl_compile_records_during_warmup": 7,
+      "cubecl_log_snapshot": {
+        "bytes": 76809,
+        "compilation_records": 7,
+        "poll_interval_ms": 25,
+        "sha256": "3d61ee7a3c847690a7e511f85079cbdb49e551a2cf5b6e2c77b8665e115f9164",
+        "stable_observations": 5
+      },
+      "distances_hash_fnv1a64": "fnv1a64:81086b5221c1bdb9",
+      "elapsed_ms": 770.655647,
+      "ids_hash_fnv1a64": "fnv1a64:956f64cc62b104e4"
+    },
+    "pynndescent": {
+      "distances_sha256": "def663c605f9f5448a7c4c3b71d4bd3ec11b827ab83f3069b0b5649f8ce824ee",
+      "elapsed_ms": 8346.17018699646,
+      "ids_sha256": "32bdcb1cf933960efa15b7c21686c328b172cc9151735769b5e86b218511f491",
+      "numba_dispatcher_snapshot": {
+        "after_signature_sha256": "24069b872679c88a8d702354db4257b8a9c6dec8287cdf5c85d090d2becdc120",
+        "before_signature_sha256": "220f5fdca01d4ccaec8f3934418ce6a1066544ade25786d0ba87ed97ff564450",
+        "compile_contaminated": true,
+        "compile_event_count": 108,
+        "compiled_signature_count_after": 194,
+        "compiled_signature_count_before": 86,
+        "dispatcher_count_after": 350,
+        "dispatcher_count_before": 257,
+        "method": "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots before and after each constructor; snapshots run outside timed interval",
+        "new_compiled_signatures": [
+          {
+            "dispatcher_id": 123473145818128,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), Array(int64, 1, 'C', False, aligned=True), int32, bool, int64)"
+          },
+          {
+            "dispatcher_id": 123473140083728,
+            "signature": "(typeref[array(int32, 1d, C)], int64)"
+          },
+          {
+            "dispatcher_id": 123473137806352,
+            "signature": "(UniTuple(int64, 2), int64, class(int32))"
+          },
+          {
+            "dispatcher_id": 123473145677856,
+            "signature": "(int64, Array(float32, 2, 'C', False, aligned=True), Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), Array(int64, 1, 'C', False, aligned=True))"
+          },
+          {
+            "dispatcher_id": 123473064986656,
+            "signature": "(int32, class(int32))"
+          },
+          {
+            "dispatcher_id": 123473145816128,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), ListType(Array(float32, 1, 'C', False, aligned=True)), ListType(float64), ListType(UniTuple(int32, 2)), ListType(Array(int32, 1, 'C', False, aligned=True)), Array(int64, 1, 'C', False, aligned=True), int32, int64)"
+          },
+          {
+            "dispatcher_id": 123473156236352,
+            "signature": "(unicode_type, Literal[str](__str__))"
+          },
+          {
+            "dispatcher_id": 123473064984656,
+            "signature": "(ListType(Array(int32, 1, 'C', False, aligned=True)), int64)"
+          },
+          {
+            "dispatcher_id": 123472262938704,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473161542768,
+            "signature": "(Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), Array(float32, 3, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), int32)"
+          },
+          {
+            "dispatcher_id": 123473064991856,
+            "signature": "(Array(int32, 1, 'C', False, aligned=True),)"
+          },
+          {
+            "dispatcher_id": 123473155045520,
+            "signature": "(int64, class(int32))"
+          },
+          {
+            "dispatcher_id": 123473130076304,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473145362576,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473161540768,
+            "signature": "(Array(float32, 1, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), Literal[int](0))"
+          },
+          {
+            "dispatcher_id": 123473136243872,
+            "signature": "(ListType(Array(int32, 1, 'C', False, aligned=True)), Array(int32, 1, 'C', False, aligned=True))"
+          },
+          {
+            "dispatcher_id": 123473156227552,
+            "signature": "(unicode_type, Literal[str](__str__))"
+          },
+          {
+            "dispatcher_id": 123473064997056,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473145679056,
+            "signature": "(Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), Array(float32, 2, 'C', False, aligned=True), int64, Array(int64, 1, 'C', False, aligned=True), int64, type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), int64, float64, bool)"
+          },
+          {
+            "dispatcher_id": 123473136241872,
+            "signature": "(ListType(UniTuple(int32, 2)), UniTuple(int32, 2))"
+          },
+          {
+            "dispatcher_id": 123473064987856,
+            "signature": "(int64, Literal[str](__str__))"
+          },
+          {
+            "dispatcher_id": 123472262941904,
+            "signature": "(int64, Literal[str](__repr__))"
+          },
+          {
+            "dispatcher_id": 123473064995056,
+            "signature": "(int32, int64, uint32)"
+          },
+          {
+            "dispatcher_id": 123473145677056,
+            "signature": "(Array(float32, 3, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), Array(int32, 2, 'C', False, aligned=True), Array(float32, 1, 'A', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), Literal[int](8))"
+          },
+          {
+            "dispatcher_id": 123473140073728,
+            "signature": "(typeref[UniTuple(int32 x 2)], int64)"
+          },
+          {
+            "dispatcher_id": 123472262945904,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473137810752,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[array(float32, 1d, C)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473140088128,
+            "signature": "(ListType(float64), float64)"
+          },
+          {
+            "dispatcher_id": 123473136254272,
+            "signature": "(int64, class(int64))"
+          },
+          {
+            "dispatcher_id": 123473140078928,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], class(float64), omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123472262945104,
+            "signature": "(unicode_type, int64, int64)"
+          },
+          {
+            "dispatcher_id": 123473159288176,
+            "signature": "(Array(bool, 1, 'C', False, aligned=True), omitted(default=None), omitted(default=None))"
+          },
+          {
+            "dispatcher_id": 123473130062304,
+            "signature": "(Array(float32, 3, 'C', False, aligned=True),)"
+          },
+          {
+            "dispatcher_id": 123473136252272,
+            "signature": "(int64, dtype(int32))"
+          },
+          {
+            "dispatcher_id": 123473137808752,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473155044720,
+            "signature": "(float64,)"
+          },
+          {
+            "dispatcher_id": 123472262944704,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473130066304,
+            "signature": "(Array(int32, 1, 'C', False, aligned=True),)"
+          },
+          {
+            "dispatcher_id": 123473064989056,
+            "signature": "(UniTuple(int64, 2), class(int32))"
+          },
+          {
+            "dispatcher_id": 123473137799552,
+            "signature": "(ListType(UniTuple(int32, 2)), int64)"
+          },
+          {
+            "dispatcher_id": 123473064996256,
+            "signature": "(ListType(Array(int32, 1, 'C', False, aligned=True)),)"
+          },
+          {
+            "dispatcher_id": 123473145359776,
+            "signature": "(int64, omitted(default=None), omitted(default=None), omitted(default=None))"
+          },
+          {
+            "dispatcher_id": 123473140074928,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[UniTuple(int32 x 2)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473136241072,
+            "signature": "(List(float64, False), class(float32))"
+          },
+          {
+            "dispatcher_id": 123473156229552,
+            "signature": "(unicode_type, int64, uint32)"
+          },
+          {
+            "dispatcher_id": 123473136248272,
+            "signature": "(int64, dtype(float32))"
+          },
+          {
+            "dispatcher_id": 123473140082128,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473064985056,
+            "signature": "(UniTuple(int64, 2), int64, class(int32))"
+          },
+          {
+            "dispatcher_id": 123472262943504,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473140076928,
+            "signature": "(ListType(Array(int32, 1, 'C', False, aligned=True)),)"
+          },
+          {
+            "dispatcher_id": 123473130312064,
+            "signature": "(int32, class(int32))"
+          },
+          {
+            "dispatcher_id": 123473136253472,
+            "signature": "(UniTuple(int64, 2), class(float32))"
+          },
+          {
+            "dispatcher_id": 123473156241952,
+            "signature": "(unicode_type, Literal[str](__repr__))"
+          },
+          {
+            "dispatcher_id": 123472262954304,
+            "signature": "(uint32, uint32)"
+          },
+          {
+            "dispatcher_id": 123473161541168,
+            "signature": "(Array(float32, 3, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), Array(int32, 2, 'C', False, aligned=True), Array(int32, 2, 'C', False, aligned=True), Array(float32, 1, 'A', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), int32)"
+          },
+          {
+            "dispatcher_id": 123472262951504,
+            "signature": "(unicode_type, unicode_type)"
+          },
+          {
+            "dispatcher_id": 123473145679456,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), int64, Array(int64, 1, 'C', False, aligned=True), int64, type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), int64, float64, Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), bool, Array(int32, 2, 'C', False, aligned=True), bool, bool)"
+          },
+          {
+            "dispatcher_id": 123472262942304,
+            "signature": "(Array(bool, 1, 'C', False, aligned=True), none)"
+          },
+          {
+            "dispatcher_id": 123473130065504,
+            "signature": "(int64, class(int32))"
+          },
+          {
+            "dispatcher_id": 123473145358976,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[UniTuple(int32 x 2)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473159285376,
+            "signature": "(Tuple((int32, int64, int64)), class(float32))"
+          },
+          {
+            "dispatcher_id": 123473156237952,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473145677456,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), Array(int32, 2, 'C', False, aligned=True), omitted(default=8))"
+          },
+          {
+            "dispatcher_id": 123473064986256,
+            "signature": "(ListType(UniTuple(int32, 2)), int64)"
+          },
+          {
+            "dispatcher_id": 123473137796752,
+            "signature": "(UniTuple(int64, 2), float64, class(float32))"
+          },
+          {
+            "dispatcher_id": 123472262940304,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473155032720,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473145815728,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True), ListType(Array(float32, 1, 'C', False, aligned=True)), ListType(float64), ListType(UniTuple(int32, 2)), ListType(Array(int32, 1, 'C', False, aligned=True)), Array(int64, 1, 'C', False, aligned=True), int32, int64)"
+          },
+          {
+            "dispatcher_id": 123473136245472,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473137801952,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[array(int32, 1d, C)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473137809152,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], class(float64), omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473155045120,
+            "signature": "(UniTuple(int64, 3), class(float32))"
+          },
+          {
+            "dispatcher_id": 123473145362176,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473161540368,
+            "signature": "(Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True))"
+          },
+          {
+            "dispatcher_id": 123473140077328,
+            "signature": "(typeref[array(float32, 1d, C)], int64)"
+          },
+          {
+            "dispatcher_id": 123473145360176,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[array(float32, 1d, C)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473130073904,
+            "signature": "(UniTuple(float32, 2),)"
+          },
+          {
+            "dispatcher_id": 123473064991456,
+            "signature": "(ListType(Array(int32, 1, 'C', False, aligned=True)), int64)"
+          },
+          {
+            "dispatcher_id": 123473130068704,
+            "signature": "(UniTuple(int64, 3), class(float32))"
+          },
+          {
+            "dispatcher_id": 123473145678656,
+            "signature": "(Array(float32, 2, 'C', False, aligned=True), type(CPUDispatcher(<function squared_euclidean at 0x704c55cda980>)), Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), Array(int32, 2, 'C', False, aligned=True), Array(int32, 2, 'C', False, aligned=True), int64, Literal[int](16384), int32, Array(float32, 3, 'C', False, aligned=True), Array(int32, 1, 'C', False, aligned=True))"
+          },
+          {
+            "dispatcher_id": 123473136241472,
+            "signature": "(List(int64, False), class(int32))"
+          },
+          {
+            "dispatcher_id": 123473156229952,
+            "signature": "(int32,)"
+          },
+          {
+            "dispatcher_id": 123473130310464,
+            "signature": "(unicode_type, int64)"
+          },
+          {
+            "dispatcher_id": 123472262941504,
+            "signature": "()"
+          },
+          {
+            "dispatcher_id": 123473130064704,
+            "signature": "(UniTuple(int64, 2),)"
+          },
+          {
+            "dispatcher_id": 123473140082528,
+            "signature": "(typeref[<class 'numba.core.types.containers.ListType'>], typeref[array(int32, 1d, C)], omitted(default=0))"
+          },
+          {
+            "dispatcher_id": 123473156237152,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473130317664,
+            "signature": "(int64, Literal[str](__repr__))"
+          },
+          {
+            "dispatcher_id": 123473155031920,
+            "signature": "(unicode_type, Literal[str](__repr__))"
+          },
+          {
+            "dispatcher_id": 123473140073328,
+            "signature": "(class(float64), int64)"
+          },
+          {
+            "dispatcher_id": 123473136239072,
+            "signature": "(int64, class(int64))"
+          },
+          {
+            "dispatcher_id": 123473137801152,
+            "signature": "(int64, Literal[str](__str__))"
+          },
+          {
+            "dispatcher_id": 123473134264208,
+            "signature": "(int64,)"
+          },
+          {
+            "dispatcher_id": 123473130069904,
+            "signature": "(UniTuple(float32, 2),)"
+          },
+          {
+            "dispatcher_id": 123473145822128,
+            "signature": "(FlatTree(ListType[array(float32, 1d, C)], ListType[float64], ListType[UniTuple(int32 x 2)], ListType[array(int32, 1d, C)], int64), int64)"
+          },
+          {
+            "dispatcher_id": 123473145363376,
+            "signature": "(int64, class(int64))"
+          },
+          {
+            "dispatcher_id": 123473130077104,
+            "signature": "(int64, class(int32))"
+          },
+          {
+            "dispatcher_id": 123472262953904,
+            "signature": "(int32, int32)"
+          },
+          {
+            "dispatcher_id": 123473159289776,
+            "signature": "(float64,)"
+          },
+          {
+            "dispatcher_id": 123473161541568,
+            "signature": "(Tuple((Array(int32, 2, 'C', False, aligned=True), Array(float32, 2, 'C', False, aligned=True), Array(uint8, 2, 'C', False, aligned=True))), int64, Array(int64, 1, 'C', False, aligned=True), int32)"
+          },
+          {
+            "dispatcher_id": 123473130313664,
+            "signature": "()"
+          },
+          {
+            "dispatcher_id": 123473137800352,
+            "signature": "(ListType(UniTuple(int32, 2)),)"
+          },
+          {
+            "dispatcher_id": 123473151169696,
+            "signature": "(UniTuple(int64, 1), UniTuple(int64, 1))"
+          },
+          {
+            "dispatcher_id": 123473140085728,
+            "signature": "(ListType(Array(float32, 1, 'C', False, aligned=True)), Array(float32, 1, 'C', False, aligned=True))"
+          },
+          {
+            "dispatcher_id": 123473155044320,
+            "signature": "(UniTuple(int64, 3), class(float32))"
+          },
+          {
+            "dispatcher_id": 123472262951904,
+            "signature": "(unicode_type,)"
+          },
+          {
+            "dispatcher_id": 123473064989456,
+            "signature": "(ListType(UniTuple(int32, 2)),)"
+          },
+          {
+            "dispatcher_id": 123472262942704,
+            "signature": "(float64,)"
+          }
+        ],
+        "new_dispatchers": 93,
+        "vanished_dispatchers": 0
+      }
+    }
+  }
+}

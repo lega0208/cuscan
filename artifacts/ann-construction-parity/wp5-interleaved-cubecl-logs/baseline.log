@@ -1,0 +1,1772 @@
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::ann_init::AnnInit
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::ann_init::AnnInit,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: AnnInitInfo {
+        dtype: Int(
+            I32,
+        ),
+        indices: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        n: (),
+        width: (),
+        seed_base: (),
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @ann_init_i_i32_26b902ef(ptr addrspace(1) noalias %0, ptr addrspace(1) noalias readonly %1, ptr noalias readonly byval([40 x i8]) align 8 %2) #0 {
+entry_block2v1:
+  %v103 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v104 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v105 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v106 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v107 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v108 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v109 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v110 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v111 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v112 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v186 = mul i32 %v106, 32
+  %v187 = add i32 %v186, %v103
+  %v191 = getelementptr inbounds nuw i32, ptr %2, i64 2
+  %v192 = load i32, ptr %v191, align 4
+  %v195 = getelementptr inbounds nuw i32, ptr %2, i64 3
+  %v196 = load i32, ptr %v195, align 4
+  %v199 = getelementptr inbounds nuw i32, ptr %2, i64 4
+  %v200 = load i32, ptr %v199, align 4
+  %v201 = icmp ult i32 %v187, %v192
+  br i1 %v201, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  %v203 = sub i32 2147483647, %v200
+  %v204 = icmp sge i32 %v187, %v203
+  br i1 %v204, label %then_block5v1, label %else_block6v1
+
+then_block5v1:                                    ; preds = %then_block3v1
+  %v207 = sub i32 %v187, %v203
+  br label %if_merge_block22v1
+
+else_block6v1:                                    ; preds = %then_block3v1
+  %v208 = add i32 %v187, %v200
+  br label %if_merge_block22v1
+
+if_merge_block22v1:                               ; preds = %else_block6v1, %then_block5v1
+  %v284 = phi i32 [ %v208, %else_block6v1 ], [ %v207, %then_block5v1 ]
+  %v214 = icmp eq i32 %v284, 0
+  br i1 %v214, label %then_block7v1, label %else_block8v1
+
+then_block7v1:                                    ; preds = %if_merge_block22v1
+  br label %if_merge_block23v1
+
+else_block8v1:                                    ; preds = %if_merge_block22v1
+  br label %if_merge_block23v1
+
+if_merge_block23v1:                               ; preds = %else_block8v1, %then_block7v1
+  %v283 = phi i32 [ %v284, %else_block8v1 ], [ 1, %then_block7v1 ]
+  br label %for_header_block25v1
+
+for_header_block25v1:                             ; preds = %if_merge_block32v1, %if_merge_block23v1
+  %v165 = phi i32 [ 0, %if_merge_block23v1 ], [ %v275, %if_merge_block32v1 ]
+  %v282 = phi i32 [ %v283, %if_merge_block23v1 ], [ %v281, %if_merge_block32v1 ]
+  %v217 = icmp ult i32 %v165, %v196
+  br i1 %v217, label %body_block9v1, label %for_exit_block24v1
+
+body_block9v1:                                    ; preds = %for_header_block25v1
+  %v32 = phi i32 [ %v165, %for_header_block25v1 ]
+  %v220 = sdiv i32 %v282, 127773
+  %v221 = mul i32 %v220, 127773
+  %v222 = sub i32 %v282, %v221
+  %v224 = mul i32 %v222, 16807
+  %v226 = mul i32 %v220, 2836
+  %v227 = sub i32 %v224, %v226
+  %v228 = icmp sle i32 %v227, 0
+  br i1 %v228, label %then_block10v1, label %else_block11v1
+
+then_block10v1:                                   ; preds = %body_block9v1
+  %v231 = add i32 %v227, 2147483647
+  br label %if_merge_block26v1
+
+else_block11v1:                                   ; preds = %body_block9v1
+  br label %if_merge_block26v1
+
+if_merge_block26v1:                               ; preds = %else_block11v1, %then_block10v1
+  %v281 = phi i32 [ %v227, %else_block11v1 ], [ %v231, %then_block10v1 ]
+  %v235 = sub i32 %v281, 1
+  %v236 = sub i32 %v192, 1
+  %v237 = sub i32 %v236, %v196
+  %v238 = add i32 %v237, %v32
+  %v239 = add i32 %v238, 1
+  %v240 = sdiv i32 %v235, %v239
+  %v241 = mul i32 %v240, %v239
+  %v242 = sub i32 %v235, %v241
+  br label %for_header_block28v1
+
+for_header_block28v1:                             ; preds = %if_merge_block30v1, %if_merge_block26v1
+  %v168 = phi i32 [ 0, %if_merge_block26v1 ], [ %v259, %if_merge_block30v1 ]
+  %v280 = phi i1 [ false, %if_merge_block26v1 ], [ %v279, %if_merge_block30v1 ]
+  %v246 = icmp ult i32 %v168, %v32
+  br i1 %v246, label %body_block12v1, label %for_exit_block27v1
+
+body_block12v1:                                   ; preds = %for_header_block28v1
+  %v70 = phi i32 [ %v168, %for_header_block28v1 ]
+  %v247 = mul i32 %v187, %v196
+  %v248 = add i32 %v247, %v70
+  %v249 = zext i32 %v248 to i64
+  %v250 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v249
+  %v251 = load i32, ptr addrspace(1) %v250, align 4
+  %v252 = icmp sgt i32 %v251, %v187
+  br i1 %v252, label %then_block13v1, label %else_block14v1
+
+then_block13v1:                                   ; preds = %body_block12v1
+  %v255 = sub i32 %v251, 1
+  br label %if_merge_block29v1
+
+else_block14v1:                                   ; preds = %body_block12v1
+  br label %if_merge_block29v1
+
+if_merge_block29v1:                               ; preds = %else_block14v1, %then_block13v1
+  %v278 = phi i32 [ %v251, %else_block14v1 ], [ %v255, %then_block13v1 ]
+  %v257 = icmp eq i32 %v278, %v242
+  br i1 %v257, label %then_block15v1, label %else_block16v1
+
+then_block15v1:                                   ; preds = %if_merge_block29v1
+  br label %if_merge_block30v1
+
+else_block16v1:                                   ; preds = %if_merge_block29v1
+  br label %if_merge_block30v1
+
+if_merge_block30v1:                               ; preds = %else_block16v1, %then_block15v1
+  %v279 = phi i1 [ %v280, %else_block16v1 ], [ true, %then_block15v1 ]
+  %v259 = add i32 %v70, 1
+  br label %for_header_block28v1
+
+for_exit_block27v1:                               ; preds = %for_header_block28v1
+  br i1 %v280, label %then_block17v1, label %else_block18v1
+
+then_block17v1:                                   ; preds = %for_exit_block27v1
+  br label %if_merge_block31v1
+
+else_block18v1:                                   ; preds = %for_exit_block27v1
+  br label %if_merge_block31v1
+
+if_merge_block31v1:                               ; preds = %else_block18v1, %then_block17v1
+  %v277 = phi i32 [ %v242, %else_block18v1 ], [ %v238, %then_block17v1 ]
+  %v264 = icmp sge i32 %v277, %v187
+  br i1 %v264, label %then_block19v1, label %else_block20v1
+
+then_block19v1:                                   ; preds = %if_merge_block31v1
+  %v268 = add i32 %v277, 1
+  br label %if_merge_block32v1
+
+else_block20v1:                                   ; preds = %if_merge_block31v1
+  br label %if_merge_block32v1
+
+if_merge_block32v1:                               ; preds = %else_block20v1, %then_block19v1
+  %v276 = phi i32 [ %v277, %else_block20v1 ], [ %v268, %then_block19v1 ]
+  %v270 = mul i32 %v187, %v196
+  %v271 = add i32 %v270, %v32
+  %v272 = zext i32 %v271 to i64
+  %v273 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v272
+  store i32 %v276, ptr addrspace(1) %v273, align 4
+  %v275 = add i32 %v32, 1
+  br label %for_header_block25v1
+
+for_exit_block24v1:                               ; preds = %for_header_block25v1
+  br label %if_merge_block21v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block21v1
+
+if_merge_block21v1:                               ; preds = %else_block4v1, %for_exit_block24v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::ann_step::AnnStep
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::ann_step::AnnStep,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: AnnStepInfo {
+        dtypes: [
+            Float(
+                F32,
+            ),
+            Int(
+                I32,
+            ),
+        ],
+        data: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        candidates: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        reverse_offsets: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        reverse_sources: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        output_indices: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        output_distances: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        width: (),
+        do_expand: (),
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @ann_step_f_f32_i_i32_0937ac6f(ptr addrspace(1) noalias readonly %0, ptr addrspace(1) noalias readonly %1, ptr addrspace(1) noalias readonly %2, ptr addrspace(1) noalias readonly %3, ptr addrspace(1) noalias %4, ptr addrspace(1) noalias %5, ptr addrspace(1) noalias readonly %6, ptr noalias readonly byval([128 x i8]) align 8 %7) #0 {
+entry_block2v1:
+  %v509 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v510 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v511 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v512 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v513 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v514 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v515 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v516 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v517 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v518 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v642 = mul i32 %v512, 32
+  %v643 = add i32 %v642, %v509
+  %v647 = getelementptr inbounds nuw i32, ptr %7, i64 12
+  %v648 = load i32, ptr %v647, align 4
+  %v651 = getelementptr inbounds nuw i32, ptr %7, i64 13
+  %v652 = load i32, ptr %v651, align 4
+  %v655 = getelementptr inbounds nuw i32, ptr %7, i64 20
+  %v656 = load i32, ptr %v655, align 4
+  %v657 = add i32 %v656, 0
+  %v659 = add i32 %v657, 0
+  %v660 = zext i32 %v659 to i64
+  %v661 = getelementptr inbounds nuw i32, ptr addrspace(1) %6, i64 %v660
+  %v662 = load i32, ptr addrspace(1) %v661, align 4
+  %v666 = getelementptr inbounds nuw i32, ptr %7, i64 20
+  %v667 = load i32, ptr %v666, align 4
+  %v668 = add i32 %v667, 1
+  %v670 = add i32 %v668, 0
+  %v671 = zext i32 %v670 to i64
+  %v672 = getelementptr inbounds nuw i32, ptr addrspace(1) %6, i64 %v671
+  %v673 = load i32, ptr addrspace(1) %v672, align 4
+  %v674 = icmp ult i32 %v643, %v662
+  br i1 %v674, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  %v675 = mul i32 %v643, %v648
+  br label %for_header_block59v1
+
+for_header_block59v1:                             ; preds = %body_block5v1, %then_block3v1
+  %v571 = phi i32 [ 0, %then_block3v1 ], [ %v683, %body_block5v1 ]
+  %v676 = icmp ult i32 %v571, %v648
+  br i1 %v676, label %body_block5v1, label %for_exit_block58v1
+
+body_block5v1:                                    ; preds = %for_header_block59v1
+  %v52 = phi i32 [ %v571, %for_header_block59v1 ]
+  %v677 = add i32 %v675, %v52
+  %v678 = zext i32 %v677 to i64
+  %v679 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v678
+  store i32 %v662, ptr addrspace(1) %v679, align 4
+  %v680 = zext i32 %v677 to i64
+  %v681 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v680
+  store float f0x7F7FFFFF, ptr addrspace(1) %v681, align 4
+  %v683 = add i32 %v52, 1
+  br label %for_header_block59v1
+
+for_exit_block58v1:                               ; preds = %for_header_block59v1
+  br label %for_header_block61v1
+
+for_header_block61v1:                             ; preds = %if_merge_block62v1, %for_exit_block58v1
+  %v574 = phi i32 [ 0, %for_exit_block58v1 ], [ %v767, %if_merge_block62v1 ]
+  %v684 = icmp ult i32 %v574, %v648
+  br i1 %v684, label %body_block6v1, label %for_exit_block60v1
+
+body_block6v1:                                    ; preds = %for_header_block61v1
+  %v69 = phi i32 [ %v574, %for_header_block61v1 ]
+  %v685 = add i32 %v675, %v69
+  %v686 = zext i32 %v685 to i64
+  %v687 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v686
+  %v688 = load i32, ptr addrspace(1) %v687, align 4
+  %v689 = icmp ult i32 %v688, %v662
+  %v690 = icmp ne i32 %v688, %v643
+  %v691 = and i1 %v689, %v690
+  br i1 %v691, label %then_block7v1, label %else_block8v1
+
+then_block7v1:                                    ; preds = %body_block6v1
+  br label %for_header_block64v1
+
+for_header_block64v1:                             ; preds = %body_block9v1, %then_block7v1
+  %v577 = phi i32 [ 0, %then_block7v1 ], [ %v709, %body_block9v1 ]
+  %v979 = phi float [ 0.000000e+00, %then_block7v1 ], [ %v708, %body_block9v1 ]
+  %v695 = icmp ult i32 %v577, %v673
+  br i1 %v695, label %body_block9v1, label %for_exit_block63v1
+
+body_block9v1:                                    ; preds = %for_header_block64v1
+  %v87 = phi i32 [ %v577, %for_header_block64v1 ]
+  %v696 = mul i32 %v643, %v673
+  %v697 = add i32 %v696, %v87
+  %v698 = zext i32 %v697 to i64
+  %v699 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v698
+  %v700 = load float, ptr addrspace(1) %v699, align 4
+  %v701 = mul i32 %v688, %v673
+  %v702 = add i32 %v701, %v87
+  %v703 = zext i32 %v702 to i64
+  %v704 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v703
+  %v705 = load float, ptr addrspace(1) %v704, align 4
+  %v706 = fsub contract float %v700, %v705
+  %v708 = call float @llvm.fmuladd.f32(float %v706, float %v706, float %v979)
+  %v709 = add i32 %v87, 1
+  br label %for_header_block64v1
+
+for_exit_block63v1:                               ; preds = %for_header_block64v1
+  br label %for_header_block66v1
+
+for_header_block66v1:                             ; preds = %if_merge_block68v1, %for_exit_block63v1
+  %v580 = phi i32 [ 0, %for_exit_block63v1 ], [ %v733, %if_merge_block68v1 ]
+  %v975 = phi i1 [ false, %for_exit_block63v1 ], [ %v974, %if_merge_block68v1 ]
+  %v978 = phi i32 [ %v648, %for_exit_block63v1 ], [ %v977, %if_merge_block68v1 ]
+  %v715 = icmp ult i32 %v580, %v648
+  br i1 %v715, label %body_block10v1, label %for_exit_block65v1
+
+body_block10v1:                                   ; preds = %for_header_block66v1
+  %v114 = phi i32 [ %v580, %for_header_block66v1 ]
+  %v716 = add i32 %v675, %v114
+  %v717 = zext i32 %v716 to i64
+  %v718 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v717
+  %v719 = load i32, ptr addrspace(1) %v718, align 4
+  %v720 = icmp eq i32 %v719, %v688
+  br i1 %v720, label %then_block11v1, label %else_block12v1
+
+then_block11v1:                                   ; preds = %body_block10v1
+  br label %if_merge_block67v1
+
+else_block12v1:                                   ; preds = %body_block10v1
+  br label %if_merge_block67v1
+
+if_merge_block67v1:                               ; preds = %else_block12v1, %then_block11v1
+  %v974 = phi i1 [ %v975, %else_block12v1 ], [ true, %then_block11v1 ]
+  %v723 = icmp eq i32 %v978, %v648
+  br i1 %v723, label %then_block13v1, label %else_block14v1
+
+then_block13v1:                                   ; preds = %if_merge_block67v1
+  %v724 = zext i32 %v716 to i64
+  %v725 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v724
+  %v726 = load float, ptr addrspace(1) %v725, align 4
+  %v728 = fcmp olt float %v979, %v726
+  %v729 = fcmp oeq float %v979, %v726
+  %v730 = icmp ult i32 %v688, %v719
+  %v731 = and i1 %v729, %v730
+  %v732 = or i1 %v728, %v731
+  br i1 %v732, label %then_block15v1, label %else_block16v1
+
+then_block15v1:                                   ; preds = %then_block13v1
+  br label %if_merge_block69v1
+
+else_block16v1:                                   ; preds = %then_block13v1
+  br label %if_merge_block69v1
+
+if_merge_block69v1:                               ; preds = %else_block16v1, %then_block15v1
+  %v976 = phi i32 [ %v978, %else_block16v1 ], [ %v114, %then_block15v1 ]
+  br label %if_merge_block68v1
+
+else_block14v1:                                   ; preds = %if_merge_block67v1
+  br label %if_merge_block68v1
+
+if_merge_block68v1:                               ; preds = %else_block14v1, %if_merge_block69v1
+  %v977 = phi i32 [ %v978, %else_block14v1 ], [ %v976, %if_merge_block69v1 ]
+  %v733 = add i32 %v114, 1
+  br label %for_header_block66v1
+
+for_exit_block65v1:                               ; preds = %for_header_block66v1
+  %v736 = xor i1 %v975, true
+  %v738 = icmp ult i32 %v978, %v648
+  %v739 = and i1 %v736, %v738
+  br i1 %v739, label %then_block17v1, label %else_block18v1
+
+then_block17v1:                                   ; preds = %for_exit_block65v1
+  %v740 = sub i32 %v648, 1
+  br label %before_block19v1
+
+before_block19v1:                                 ; preds = %after_block20v1, %then_block17v1
+  %v973 = phi i32 [ %v740, %then_block17v1 ], [ %v759, %after_block20v1 ]
+  %v745 = icmp ugt i32 %v973, %v978
+  br i1 %v745, label %after_block20v1, label %while_exit_block71v1
+
+after_block20v1:                                  ; preds = %before_block19v1
+  %v747 = add i32 %v675, %v973
+  %v748 = sub i32 %v747, 1
+  %v749 = zext i32 %v748 to i64
+  %v750 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v749
+  %v751 = load i32, ptr addrspace(1) %v750, align 4
+  %v752 = zext i32 %v747 to i64
+  %v753 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v752
+  store i32 %v751, ptr addrspace(1) %v753, align 4
+  %v754 = zext i32 %v748 to i64
+  %v755 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v754
+  %v756 = load float, ptr addrspace(1) %v755, align 4
+  %v757 = zext i32 %v747 to i64
+  %v758 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v757
+  store float %v756, ptr addrspace(1) %v758, align 4
+  %v759 = sub i32 %v973, 1
+  br label %before_block19v1
+
+while_exit_block71v1:                             ; preds = %before_block19v1
+  %v761 = add i32 %v675, %v978
+  %v762 = zext i32 %v761 to i64
+  %v763 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v762
+  store i32 %v688, ptr addrspace(1) %v763, align 4
+  %v764 = zext i32 %v761 to i64
+  %v765 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v764
+  store float %v979, ptr addrspace(1) %v765, align 4
+  br label %if_merge_block70v1
+
+else_block18v1:                                   ; preds = %for_exit_block65v1
+  br label %if_merge_block70v1
+
+if_merge_block70v1:                               ; preds = %else_block18v1, %while_exit_block71v1
+  br label %if_merge_block62v1
+
+else_block8v1:                                    ; preds = %body_block6v1
+  br label %if_merge_block62v1
+
+if_merge_block62v1:                               ; preds = %else_block8v1, %if_merge_block70v1
+  %v767 = add i32 %v69, 1
+  br label %for_header_block61v1
+
+for_exit_block60v1:                               ; preds = %for_header_block61v1
+  %v769 = icmp ne i32 %v652, 0
+  br i1 %v769, label %then_block21v1, label %else_block22v1
+
+then_block21v1:                                   ; preds = %for_exit_block60v1
+  br label %for_header_block74v1
+
+for_header_block74v1:                             ; preds = %if_merge_block75v1, %then_block21v1
+  %v583 = phi i32 [ 0, %then_block21v1 ], [ %v861, %if_merge_block75v1 ]
+  %v770 = icmp ult i32 %v583, %v648
+  br i1 %v770, label %body_block23v1, label %for_exit_block73v1
+
+body_block23v1:                                   ; preds = %for_header_block74v1
+  %v203 = phi i32 [ %v583, %for_header_block74v1 ]
+  %v771 = add i32 %v675, %v203
+  %v772 = zext i32 %v771 to i64
+  %v773 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v772
+  %v774 = load i32, ptr addrspace(1) %v773, align 4
+  %v775 = icmp ult i32 %v774, %v662
+  br i1 %v775, label %then_block24v1, label %else_block25v1
+
+then_block24v1:                                   ; preds = %body_block23v1
+  br label %for_header_block77v1
+
+for_header_block77v1:                             ; preds = %if_merge_block78v1, %then_block24v1
+  %v586 = phi i32 [ 0, %then_block24v1 ], [ %v860, %if_merge_block78v1 ]
+  %v776 = icmp ult i32 %v586, %v648
+  br i1 %v776, label %body_block26v1, label %for_exit_block76v1
+
+body_block26v1:                                   ; preds = %for_header_block77v1
+  %v216 = phi i32 [ %v586, %for_header_block77v1 ]
+  %v777 = mul i32 %v774, %v648
+  %v778 = add i32 %v777, %v216
+  %v779 = zext i32 %v778 to i64
+  %v780 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v779
+  %v781 = load i32, ptr addrspace(1) %v780, align 4
+  %v782 = icmp ult i32 %v781, %v662
+  %v783 = icmp ne i32 %v781, %v643
+  %v784 = and i1 %v782, %v783
+  br i1 %v784, label %then_block27v1, label %else_block28v1
+
+then_block27v1:                                   ; preds = %body_block26v1
+  br label %for_header_block80v1
+
+for_header_block80v1:                             ; preds = %body_block29v1, %then_block27v1
+  %v589 = phi i32 [ 0, %then_block27v1 ], [ %v802, %body_block29v1 ]
+  %v972 = phi float [ 0.000000e+00, %then_block27v1 ], [ %v801, %body_block29v1 ]
+  %v788 = icmp ult i32 %v589, %v673
+  br i1 %v788, label %body_block29v1, label %for_exit_block79v1
+
+body_block29v1:                                   ; preds = %for_header_block80v1
+  %v235 = phi i32 [ %v589, %for_header_block80v1 ]
+  %v789 = mul i32 %v643, %v673
+  %v790 = add i32 %v789, %v235
+  %v791 = zext i32 %v790 to i64
+  %v792 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v791
+  %v793 = load float, ptr addrspace(1) %v792, align 4
+  %v794 = mul i32 %v781, %v673
+  %v795 = add i32 %v794, %v235
+  %v796 = zext i32 %v795 to i64
+  %v797 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v796
+  %v798 = load float, ptr addrspace(1) %v797, align 4
+  %v799 = fsub contract float %v793, %v798
+  %v801 = call float @llvm.fmuladd.f32(float %v799, float %v799, float %v972)
+  %v802 = add i32 %v235, 1
+  br label %for_header_block80v1
+
+for_exit_block79v1:                               ; preds = %for_header_block80v1
+  br label %for_header_block82v1
+
+for_header_block82v1:                             ; preds = %if_merge_block84v1, %for_exit_block79v1
+  %v592 = phi i32 [ 0, %for_exit_block79v1 ], [ %v826, %if_merge_block84v1 ]
+  %v968 = phi i1 [ false, %for_exit_block79v1 ], [ %v967, %if_merge_block84v1 ]
+  %v971 = phi i32 [ %v648, %for_exit_block79v1 ], [ %v970, %if_merge_block84v1 ]
+  %v808 = icmp ult i32 %v592, %v648
+  br i1 %v808, label %body_block30v1, label %for_exit_block81v1
+
+body_block30v1:                                   ; preds = %for_header_block82v1
+  %v262 = phi i32 [ %v592, %for_header_block82v1 ]
+  %v809 = add i32 %v675, %v262
+  %v810 = zext i32 %v809 to i64
+  %v811 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v810
+  %v812 = load i32, ptr addrspace(1) %v811, align 4
+  %v813 = icmp eq i32 %v812, %v781
+  br i1 %v813, label %then_block31v1, label %else_block32v1
+
+then_block31v1:                                   ; preds = %body_block30v1
+  br label %if_merge_block83v1
+
+else_block32v1:                                   ; preds = %body_block30v1
+  br label %if_merge_block83v1
+
+if_merge_block83v1:                               ; preds = %else_block32v1, %then_block31v1
+  %v967 = phi i1 [ %v968, %else_block32v1 ], [ true, %then_block31v1 ]
+  %v816 = icmp eq i32 %v971, %v648
+  br i1 %v816, label %then_block33v1, label %else_block34v1
+
+then_block33v1:                                   ; preds = %if_merge_block83v1
+  %v817 = zext i32 %v809 to i64
+  %v818 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v817
+  %v819 = load float, ptr addrspace(1) %v818, align 4
+  %v821 = fcmp olt float %v972, %v819
+  %v822 = fcmp oeq float %v972, %v819
+  %v823 = icmp ult i32 %v781, %v812
+  %v824 = and i1 %v822, %v823
+  %v825 = or i1 %v821, %v824
+  br i1 %v825, label %then_block35v1, label %else_block36v1
+
+then_block35v1:                                   ; preds = %then_block33v1
+  br label %if_merge_block85v1
+
+else_block36v1:                                   ; preds = %then_block33v1
+  br label %if_merge_block85v1
+
+if_merge_block85v1:                               ; preds = %else_block36v1, %then_block35v1
+  %v969 = phi i32 [ %v971, %else_block36v1 ], [ %v262, %then_block35v1 ]
+  br label %if_merge_block84v1
+
+else_block34v1:                                   ; preds = %if_merge_block83v1
+  br label %if_merge_block84v1
+
+if_merge_block84v1:                               ; preds = %else_block34v1, %if_merge_block85v1
+  %v970 = phi i32 [ %v971, %else_block34v1 ], [ %v969, %if_merge_block85v1 ]
+  %v826 = add i32 %v262, 1
+  br label %for_header_block82v1
+
+for_exit_block81v1:                               ; preds = %for_header_block82v1
+  %v829 = xor i1 %v968, true
+  %v831 = icmp ult i32 %v971, %v648
+  %v832 = and i1 %v829, %v831
+  br i1 %v832, label %then_block37v1, label %else_block38v1
+
+then_block37v1:                                   ; preds = %for_exit_block81v1
+  %v833 = sub i32 %v648, 1
+  br label %before_block39v1
+
+before_block39v1:                                 ; preds = %after_block40v1, %then_block37v1
+  %v966 = phi i32 [ %v833, %then_block37v1 ], [ %v852, %after_block40v1 ]
+  %v838 = icmp ugt i32 %v966, %v971
+  br i1 %v838, label %after_block40v1, label %while_exit_block87v1
+
+after_block40v1:                                  ; preds = %before_block39v1
+  %v840 = add i32 %v675, %v966
+  %v841 = sub i32 %v840, 1
+  %v842 = zext i32 %v841 to i64
+  %v843 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v842
+  %v844 = load i32, ptr addrspace(1) %v843, align 4
+  %v845 = zext i32 %v840 to i64
+  %v846 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v845
+  store i32 %v844, ptr addrspace(1) %v846, align 4
+  %v847 = zext i32 %v841 to i64
+  %v848 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v847
+  %v849 = load float, ptr addrspace(1) %v848, align 4
+  %v850 = zext i32 %v840 to i64
+  %v851 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v850
+  store float %v849, ptr addrspace(1) %v851, align 4
+  %v852 = sub i32 %v966, 1
+  br label %before_block39v1
+
+while_exit_block87v1:                             ; preds = %before_block39v1
+  %v854 = add i32 %v675, %v971
+  %v855 = zext i32 %v854 to i64
+  %v856 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v855
+  store i32 %v781, ptr addrspace(1) %v856, align 4
+  %v857 = zext i32 %v854 to i64
+  %v858 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v857
+  store float %v972, ptr addrspace(1) %v858, align 4
+  br label %if_merge_block86v1
+
+else_block38v1:                                   ; preds = %for_exit_block81v1
+  br label %if_merge_block86v1
+
+if_merge_block86v1:                               ; preds = %else_block38v1, %while_exit_block87v1
+  br label %if_merge_block78v1
+
+else_block28v1:                                   ; preds = %body_block26v1
+  br label %if_merge_block78v1
+
+if_merge_block78v1:                               ; preds = %else_block28v1, %if_merge_block86v1
+  %v860 = add i32 %v216, 1
+  br label %for_header_block77v1
+
+for_exit_block76v1:                               ; preds = %for_header_block77v1
+  br label %if_merge_block75v1
+
+else_block25v1:                                   ; preds = %body_block23v1
+  br label %if_merge_block75v1
+
+if_merge_block75v1:                               ; preds = %else_block25v1, %for_exit_block76v1
+  %v861 = add i32 %v203, 1
+  br label %for_header_block74v1
+
+for_exit_block73v1:                               ; preds = %for_header_block74v1
+  %v862 = zext i32 %v643 to i64
+  %v863 = getelementptr inbounds nuw i32, ptr addrspace(1) %2, i64 %v862
+  %v864 = load i32, ptr addrspace(1) %v863, align 4
+  %v865 = add i32 %v643, 1
+  %v866 = zext i32 %v865 to i64
+  %v867 = getelementptr inbounds nuw i32, ptr addrspace(1) %2, i64 %v866
+  %v868 = load i32, ptr addrspace(1) %v867, align 4
+  br label %for_header_block89v1
+
+for_header_block89v1:                             ; preds = %for_exit_block90v1, %for_exit_block73v1
+  %v595 = phi i32 [ %v864, %for_exit_block73v1 ], [ %v958, %for_exit_block90v1 ]
+  %v869 = icmp ult i32 %v595, %v868
+  br i1 %v869, label %body_block41v1, label %for_exit_block88v1
+
+body_block41v1:                                   ; preds = %for_header_block89v1
+  %v364 = phi i32 [ %v595, %for_header_block89v1 ]
+  %v870 = zext i32 %v364 to i64
+  %v871 = getelementptr inbounds nuw i32, ptr addrspace(1) %3, i64 %v870
+  %v872 = load i32, ptr addrspace(1) %v871, align 4
+  br label %for_header_block91v1
+
+for_header_block91v1:                             ; preds = %if_merge_block92v1, %body_block41v1
+  %v598 = phi i32 [ 0, %body_block41v1 ], [ %v957, %if_merge_block92v1 ]
+  %v873 = icmp ult i32 %v598, %v648
+  br i1 %v873, label %body_block42v1, label %for_exit_block90v1
+
+body_block42v1:                                   ; preds = %for_header_block91v1
+  %v375 = phi i32 [ %v598, %for_header_block91v1 ]
+  %v874 = mul i32 %v872, %v648
+  %v875 = add i32 %v874, %v375
+  %v876 = zext i32 %v875 to i64
+  %v877 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v876
+  %v878 = load i32, ptr addrspace(1) %v877, align 4
+  %v879 = icmp ult i32 %v878, %v662
+  %v880 = icmp ne i32 %v878, %v643
+  %v881 = and i1 %v879, %v880
+  br i1 %v881, label %then_block43v1, label %else_block44v1
+
+then_block43v1:                                   ; preds = %body_block42v1
+  br label %for_header_block94v1
+
+for_header_block94v1:                             ; preds = %body_block45v1, %then_block43v1
+  %v601 = phi i32 [ 0, %then_block43v1 ], [ %v899, %body_block45v1 ]
+  %v965 = phi float [ 0.000000e+00, %then_block43v1 ], [ %v898, %body_block45v1 ]
+  %v885 = icmp ult i32 %v601, %v673
+  br i1 %v885, label %body_block45v1, label %for_exit_block93v1
+
+body_block45v1:                                   ; preds = %for_header_block94v1
+  %v394 = phi i32 [ %v601, %for_header_block94v1 ]
+  %v886 = mul i32 %v643, %v673
+  %v887 = add i32 %v886, %v394
+  %v888 = zext i32 %v887 to i64
+  %v889 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v888
+  %v890 = load float, ptr addrspace(1) %v889, align 4
+  %v891 = mul i32 %v878, %v673
+  %v892 = add i32 %v891, %v394
+  %v893 = zext i32 %v892 to i64
+  %v894 = getelementptr inbounds nuw float, ptr addrspace(1) %0, i64 %v893
+  %v895 = load float, ptr addrspace(1) %v894, align 4
+  %v896 = fsub contract float %v890, %v895
+  %v898 = call float @llvm.fmuladd.f32(float %v896, float %v896, float %v965)
+  %v899 = add i32 %v394, 1
+  br label %for_header_block94v1
+
+for_exit_block93v1:                               ; preds = %for_header_block94v1
+  br label %for_header_block96v1
+
+for_header_block96v1:                             ; preds = %if_merge_block98v1, %for_exit_block93v1
+  %v604 = phi i32 [ 0, %for_exit_block93v1 ], [ %v923, %if_merge_block98v1 ]
+  %v961 = phi i1 [ false, %for_exit_block93v1 ], [ %v960, %if_merge_block98v1 ]
+  %v964 = phi i32 [ %v648, %for_exit_block93v1 ], [ %v963, %if_merge_block98v1 ]
+  %v905 = icmp ult i32 %v604, %v648
+  br i1 %v905, label %body_block46v1, label %for_exit_block95v1
+
+body_block46v1:                                   ; preds = %for_header_block96v1
+  %v421 = phi i32 [ %v604, %for_header_block96v1 ]
+  %v906 = add i32 %v675, %v421
+  %v907 = zext i32 %v906 to i64
+  %v908 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v907
+  %v909 = load i32, ptr addrspace(1) %v908, align 4
+  %v910 = icmp eq i32 %v909, %v878
+  br i1 %v910, label %then_block47v1, label %else_block48v1
+
+then_block47v1:                                   ; preds = %body_block46v1
+  br label %if_merge_block97v1
+
+else_block48v1:                                   ; preds = %body_block46v1
+  br label %if_merge_block97v1
+
+if_merge_block97v1:                               ; preds = %else_block48v1, %then_block47v1
+  %v960 = phi i1 [ %v961, %else_block48v1 ], [ true, %then_block47v1 ]
+  %v913 = icmp eq i32 %v964, %v648
+  br i1 %v913, label %then_block49v1, label %else_block50v1
+
+then_block49v1:                                   ; preds = %if_merge_block97v1
+  %v914 = zext i32 %v906 to i64
+  %v915 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v914
+  %v916 = load float, ptr addrspace(1) %v915, align 4
+  %v918 = fcmp olt float %v965, %v916
+  %v919 = fcmp oeq float %v965, %v916
+  %v920 = icmp ult i32 %v878, %v909
+  %v921 = and i1 %v919, %v920
+  %v922 = or i1 %v918, %v921
+  br i1 %v922, label %then_block51v1, label %else_block52v1
+
+then_block51v1:                                   ; preds = %then_block49v1
+  br label %if_merge_block99v1
+
+else_block52v1:                                   ; preds = %then_block49v1
+  br label %if_merge_block99v1
+
+if_merge_block99v1:                               ; preds = %else_block52v1, %then_block51v1
+  %v962 = phi i32 [ %v964, %else_block52v1 ], [ %v421, %then_block51v1 ]
+  br label %if_merge_block98v1
+
+else_block50v1:                                   ; preds = %if_merge_block97v1
+  br label %if_merge_block98v1
+
+if_merge_block98v1:                               ; preds = %else_block50v1, %if_merge_block99v1
+  %v963 = phi i32 [ %v964, %else_block50v1 ], [ %v962, %if_merge_block99v1 ]
+  %v923 = add i32 %v421, 1
+  br label %for_header_block96v1
+
+for_exit_block95v1:                               ; preds = %for_header_block96v1
+  %v926 = xor i1 %v961, true
+  %v928 = icmp ult i32 %v964, %v648
+  %v929 = and i1 %v926, %v928
+  br i1 %v929, label %then_block53v1, label %else_block54v1
+
+then_block53v1:                                   ; preds = %for_exit_block95v1
+  %v930 = sub i32 %v648, 1
+  br label %before_block55v1
+
+before_block55v1:                                 ; preds = %after_block56v1, %then_block53v1
+  %v959 = phi i32 [ %v930, %then_block53v1 ], [ %v949, %after_block56v1 ]
+  %v935 = icmp ugt i32 %v959, %v964
+  br i1 %v935, label %after_block56v1, label %while_exit_block101v1
+
+after_block56v1:                                  ; preds = %before_block55v1
+  %v937 = add i32 %v675, %v959
+  %v938 = sub i32 %v937, 1
+  %v939 = zext i32 %v938 to i64
+  %v940 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v939
+  %v941 = load i32, ptr addrspace(1) %v940, align 4
+  %v942 = zext i32 %v937 to i64
+  %v943 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v942
+  store i32 %v941, ptr addrspace(1) %v943, align 4
+  %v944 = zext i32 %v938 to i64
+  %v945 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v944
+  %v946 = load float, ptr addrspace(1) %v945, align 4
+  %v947 = zext i32 %v937 to i64
+  %v948 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v947
+  store float %v946, ptr addrspace(1) %v948, align 4
+  %v949 = sub i32 %v959, 1
+  br label %before_block55v1
+
+while_exit_block101v1:                            ; preds = %before_block55v1
+  %v951 = add i32 %v675, %v964
+  %v952 = zext i32 %v951 to i64
+  %v953 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v952
+  store i32 %v878, ptr addrspace(1) %v953, align 4
+  %v954 = zext i32 %v951 to i64
+  %v955 = getelementptr inbounds nuw float, ptr addrspace(1) %5, i64 %v954
+  store float %v965, ptr addrspace(1) %v955, align 4
+  br label %if_merge_block100v1
+
+else_block54v1:                                   ; preds = %for_exit_block95v1
+  br label %if_merge_block100v1
+
+if_merge_block100v1:                              ; preds = %else_block54v1, %while_exit_block101v1
+  br label %if_merge_block92v1
+
+else_block44v1:                                   ; preds = %body_block42v1
+  br label %if_merge_block92v1
+
+if_merge_block92v1:                               ; preds = %else_block44v1, %if_merge_block100v1
+  %v957 = add i32 %v375, 1
+  br label %for_header_block91v1
+
+for_exit_block90v1:                               ; preds = %for_header_block91v1
+  %v958 = add i32 %v364, 1
+  br label %for_header_block89v1
+
+for_exit_block88v1:                               ; preds = %for_header_block89v1
+  br label %if_merge_block72v1
+
+else_block22v1:                                   ; preds = %for_exit_block60v1
+  br label %if_merge_block72v1
+
+if_merge_block72v1:                               ; preds = %else_block22v1, %for_exit_block88v1
+  br label %if_merge_block57v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block57v1
+
+if_merge_block57v1:                               ; preds = %else_block4v1, %if_merge_block72v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fmuladd.f32(float, float, float) #2
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::reverse_zero::ReverseZero
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::reverse_zero::ReverseZero,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: ReverseZeroInfo {
+        dtype: Int(
+            I32,
+        ),
+        counts: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @reverse_zero_i_i32_a0560214(ptr addrspace(1) noalias %0, ptr addrspace(1) noalias readonly %1, ptr noalias readonly byval([24 x i8]) align 8 %2) #0 {
+entry_block2v1:
+  %v18 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v19 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v20 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v21 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v22 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v23 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v24 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v25 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v26 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v27 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v95 = mul i32 %v21, 32
+  %v96 = add i32 %v95, %v18
+  %v100 = getelementptr inbounds nuw i32, ptr %2, i64 3
+  %v101 = load i32, ptr %v100, align 4
+  %v102 = add i32 %v101, 0
+  %v104 = add i32 %v102, 0
+  %v105 = zext i32 %v104 to i64
+  %v106 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v105
+  %v107 = load i32, ptr addrspace(1) %v106, align 4
+  %v108 = icmp ult i32 %v96, %v107
+  br i1 %v108, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  %v110 = zext i32 %v96 to i64
+  %v111 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v110
+  store i32 0, ptr addrspace(1) %v111, align 4
+  br label %if_merge_block5v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block5v1
+
+if_merge_block5v1:                                ; preds = %else_block4v1, %then_block3v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::reverse_count::ReverseCount
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::reverse_count::ReverseCount,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: ReverseCountInfo {
+        dtype: Int(
+            I32,
+        ),
+        candidates: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        counts: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        n: (),
+        width: (),
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @reverse_count_i_i32_f45ca152(ptr addrspace(1) noalias readonly %0, ptr addrspace(1) noalias %1, ptr addrspace(1) noalias readonly %2, ptr noalias readonly byval([48 x i8]) align 8 %3) #0 {
+entry_block2v1:
+  %v72 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v73 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v74 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v75 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v76 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v77 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v78 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v79 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v80 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v81 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v151 = mul i32 %v75, 32
+  %v152 = add i32 %v151, %v72
+  %v156 = getelementptr inbounds nuw i32, ptr %3, i64 4
+  %v157 = load i32, ptr %v156, align 4
+  %v160 = getelementptr inbounds nuw i32, ptr %3, i64 5
+  %v161 = load i32, ptr %v160, align 4
+  %v162 = icmp ult i32 %v152, %v157
+  br i1 %v162, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  br label %for_header_block15v1
+
+for_header_block15v1:                             ; preds = %if_merge_block20v1, %then_block3v1
+  %v134 = phi i32 [ 0, %then_block3v1 ], [ %v189, %if_merge_block20v1 ]
+  %v164 = icmp ult i32 %v134, %v161
+  br i1 %v164, label %body_block5v1, label %for_exit_block14v1
+
+body_block5v1:                                    ; preds = %for_header_block15v1
+  %v22 = phi i32 [ %v134, %for_header_block15v1 ]
+  %v165 = mul i32 %v152, %v161
+  %v166 = add i32 %v165, %v22
+  %v167 = zext i32 %v166 to i64
+  %v168 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v167
+  %v169 = load i32, ptr addrspace(1) %v168, align 4
+  %v170 = icmp ult i32 %v169, %v157
+  br i1 %v170, label %then_block6v1, label %else_block7v1
+
+then_block6v1:                                    ; preds = %body_block5v1
+  br label %for_header_block18v1
+
+for_header_block18v1:                             ; preds = %if_merge_block19v1, %then_block6v1
+  %v137 = phi i32 [ 0, %then_block6v1 ], [ %v182, %if_merge_block19v1 ]
+  %v191 = phi i1 [ %v170, %then_block6v1 ], [ %v190, %if_merge_block19v1 ]
+  %v174 = icmp ult i32 %v137, %v22
+  br i1 %v174, label %body_block8v1, label %for_exit_block17v1
+
+body_block8v1:                                    ; preds = %for_header_block18v1
+  %v38 = phi i32 [ %v137, %for_header_block18v1 ]
+  %v175 = add i32 %v165, %v38
+  %v176 = zext i32 %v175 to i64
+  %v177 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v176
+  %v178 = load i32, ptr addrspace(1) %v177, align 4
+  %v179 = load i32, ptr addrspace(1) %v168, align 4
+  %v180 = icmp eq i32 %v178, %v179
+  br i1 %v180, label %then_block9v1, label %else_block10v1
+
+then_block9v1:                                    ; preds = %body_block8v1
+  br label %if_merge_block19v1
+
+else_block10v1:                                   ; preds = %body_block8v1
+  br label %if_merge_block19v1
+
+if_merge_block19v1:                               ; preds = %else_block10v1, %then_block9v1
+  %v190 = phi i1 [ %v191, %else_block10v1 ], [ false, %then_block9v1 ]
+  %v182 = add i32 %v38, 1
+  br label %for_header_block18v1
+
+for_exit_block17v1:                               ; preds = %for_header_block18v1
+  br label %if_merge_block16v1
+
+else_block7v1:                                    ; preds = %body_block5v1
+  br label %if_merge_block16v1
+
+if_merge_block16v1:                               ; preds = %else_block7v1, %for_exit_block17v1
+  %v192 = phi i1 [ %v170, %else_block7v1 ], [ %v191, %for_exit_block17v1 ]
+  br i1 %v192, label %then_block11v1, label %else_block12v1
+
+then_block11v1:                                   ; preds = %if_merge_block16v1
+  %v184 = load i32, ptr addrspace(1) %v168, align 4
+  %v185 = zext i32 %v184 to i64
+  %v186 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v185
+  %4 = atomicrmw add ptr addrspace(1) %v186, i32 1 syncscope("device") monotonic, align 4
+  br label %if_merge_block20v1
+
+else_block12v1:                                   ; preds = %if_merge_block16v1
+  br label %if_merge_block20v1
+
+if_merge_block20v1:                               ; preds = %else_block12v1, %then_block11v1
+  %v189 = add i32 %v22, 1
+  br label %for_header_block15v1
+
+for_exit_block14v1:                               ; preds = %for_header_block15v1
+  br label %if_merge_block13v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block13v1
+
+if_merge_block13v1:                               ; preds = %else_block4v1, %for_exit_block14v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::reverse_prefix::ReversePrefix
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::reverse_prefix::ReversePrefix,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 1,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: ReversePrefixInfo {
+        dtype: Int(
+            I32,
+        ),
+        counts: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        offsets: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        cursors: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @reverse_prefix_i_i32_0786c15d(ptr addrspace(1) noalias readonly %0, ptr addrspace(1) noalias %1, ptr addrspace(1) noalias %2, ptr addrspace(1) noalias readonly %3, ptr noalias readonly byval([64 x i8]) align 8 %4) #0 {
+entry_block2v1:
+  %v57 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v58 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v59 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v60 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v61 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v62 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v63 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v64 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v65 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v66 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v137 = mul i32 %v60, 1
+  %v138 = add i32 %v137, %v57
+  %v141 = icmp eq i32 %v138, 0
+  br i1 %v141, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  %v144 = getelementptr inbounds nuw i32, ptr %4, i64 9
+  %v145 = load i32, ptr %v144, align 4
+  %v146 = add i32 %v145, 0
+  %v148 = add i32 %v146, 0
+  %v149 = zext i32 %v148 to i64
+  %v150 = getelementptr inbounds nuw i32, ptr addrspace(1) %3, i64 %v149
+  %v151 = load i32, ptr addrspace(1) %v150, align 4
+  %v156 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 0
+  store i32 0, ptr addrspace(1) %v156, align 4
+  br label %for_header_block8v1
+
+for_header_block8v1:                              ; preds = %body_block5v1, %then_block3v1
+  %v119 = phi i32 [ 0, %then_block3v1 ], [ %v171, %body_block5v1 ]
+  %v172 = phi i32 [ 0, %then_block3v1 ], [ %v166, %body_block5v1 ]
+  %v159 = icmp ult i32 %v119, %v151
+  br i1 %v159, label %body_block5v1, label %for_exit_block7v1
+
+body_block5v1:                                    ; preds = %for_header_block8v1
+  %v35 = phi i32 [ %v119, %for_header_block8v1 ]
+  %v160 = zext i32 %v35 to i64
+  %v161 = getelementptr inbounds nuw i32, ptr addrspace(1) %2, i64 %v160
+  store atomic i32 %v172, ptr addrspace(1) %v161 syncscope("device") monotonic, align 4
+  %v163 = zext i32 %v35 to i64
+  %v164 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v163
+  %v165 = load i32, ptr addrspace(1) %v164, align 4
+  %v166 = add i32 %v172, %v165
+  %v167 = add i32 %v35, 1
+  %v168 = zext i32 %v167 to i64
+  %v169 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v168
+  store i32 %v166, ptr addrspace(1) %v169, align 4
+  %v171 = add i32 %v35, 1
+  br label %for_header_block8v1
+
+for_exit_block7v1:                                ; preds = %for_header_block8v1
+  br label %if_merge_block6v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block6v1
+
+if_merge_block6v1:                                ; preds = %else_block4v1, %for_exit_block7v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+attributes #0 = { "nvvm.reqntid"="1,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::reverse_scatter::ReverseScatter
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::reverse_scatter::ReverseScatter,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: ReverseScatterInfo {
+        dtype: Int(
+            I32,
+        ),
+        candidates: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        cursors: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        sources: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        n: (),
+        width: (),
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @reverse_scatter_i_i32_7979e044(ptr addrspace(1) noalias readonly %0, ptr addrspace(1) %1, ptr addrspace(1) %2, ptr addrspace(1) noalias readonly %3, ptr noalias readonly byval([72 x i8]) align 8 %4) #0 {
+entry_block2v1:
+  %v85 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v86 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v87 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v88 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v89 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v90 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v91 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v92 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v93 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v94 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v164 = mul i32 %v88, 32
+  %v165 = add i32 %v164, %v85
+  %v169 = getelementptr inbounds nuw i32, ptr %4, i64 6
+  %v170 = load i32, ptr %v169, align 4
+  %v173 = getelementptr inbounds nuw i32, ptr %4, i64 7
+  %v174 = load i32, ptr %v173, align 4
+  %v175 = icmp ult i32 %v165, %v170
+  br i1 %v175, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  br label %for_header_block15v1
+
+for_header_block15v1:                             ; preds = %if_merge_block20v1, %then_block3v1
+  %v147 = phi i32 [ 0, %then_block3v1 ], [ %v204, %if_merge_block20v1 ]
+  %v177 = icmp ult i32 %v147, %v174
+  br i1 %v177, label %body_block5v1, label %for_exit_block14v1
+
+body_block5v1:                                    ; preds = %for_header_block15v1
+  %v28 = phi i32 [ %v147, %for_header_block15v1 ]
+  %v178 = mul i32 %v165, %v174
+  %v179 = add i32 %v178, %v28
+  %v180 = zext i32 %v179 to i64
+  %v181 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v180
+  %v182 = load i32, ptr addrspace(1) %v181, align 4
+  %v183 = icmp ult i32 %v182, %v170
+  br i1 %v183, label %then_block6v1, label %else_block7v1
+
+then_block6v1:                                    ; preds = %body_block5v1
+  br label %for_header_block18v1
+
+for_header_block18v1:                             ; preds = %if_merge_block19v1, %then_block6v1
+  %v150 = phi i32 [ 0, %then_block6v1 ], [ %v195, %if_merge_block19v1 ]
+  %v206 = phi i1 [ %v183, %then_block6v1 ], [ %v205, %if_merge_block19v1 ]
+  %v187 = icmp ult i32 %v150, %v28
+  br i1 %v187, label %body_block8v1, label %for_exit_block17v1
+
+body_block8v1:                                    ; preds = %for_header_block18v1
+  %v44 = phi i32 [ %v150, %for_header_block18v1 ]
+  %v188 = add i32 %v178, %v44
+  %v189 = zext i32 %v188 to i64
+  %v190 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v189
+  %v191 = load i32, ptr addrspace(1) %v190, align 4
+  %v192 = load i32, ptr addrspace(1) %v181, align 4
+  %v193 = icmp eq i32 %v191, %v192
+  br i1 %v193, label %then_block9v1, label %else_block10v1
+
+then_block9v1:                                    ; preds = %body_block8v1
+  br label %if_merge_block19v1
+
+else_block10v1:                                   ; preds = %body_block8v1
+  br label %if_merge_block19v1
+
+if_merge_block19v1:                               ; preds = %else_block10v1, %then_block9v1
+  %v205 = phi i1 [ %v206, %else_block10v1 ], [ false, %then_block9v1 ]
+  %v195 = add i32 %v44, 1
+  br label %for_header_block18v1
+
+for_exit_block17v1:                               ; preds = %for_header_block18v1
+  br label %if_merge_block16v1
+
+else_block7v1:                                    ; preds = %body_block5v1
+  br label %if_merge_block16v1
+
+if_merge_block16v1:                               ; preds = %else_block7v1, %for_exit_block17v1
+  %v207 = phi i1 [ %v183, %else_block7v1 ], [ %v206, %for_exit_block17v1 ]
+  br i1 %v207, label %then_block11v1, label %else_block12v1
+
+then_block11v1:                                   ; preds = %if_merge_block16v1
+  %v197 = load i32, ptr addrspace(1) %v181, align 4
+  %v198 = zext i32 %v197 to i64
+  %v199 = getelementptr inbounds nuw i32, ptr addrspace(1) %1, i64 %v198
+  %5 = atomicrmw add ptr addrspace(1) %v199, i32 1 syncscope("device") monotonic, align 4
+  %v202 = zext i32 %5 to i64
+  %v203 = getelementptr inbounds nuw i32, ptr addrspace(1) %2, i64 %v202
+  store i32 %v165, ptr addrspace(1) %v203, align 4
+  br label %if_merge_block20v1
+
+else_block12v1:                                   ; preds = %if_merge_block16v1
+  br label %if_merge_block20v1
+
+if_merge_block20v1:                               ; preds = %else_block12v1, %then_block11v1
+  %v204 = add i32 %v28, 1
+  br label %for_header_block15v1
+
+for_exit_block14v1:                               ; preds = %for_header_block15v1
+  br label %if_merge_block13v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block13v1
+
+if_merge_block13v1:                               ; preds = %else_block4v1, %for_exit_block14v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+
+[START_KERNEL_COMPILATION]
+name: fast_umap::kernels::standard_umap::ann::ann_output::AnnOutput
+id: KernelId {
+    type: fast_umap::kernels::standard_umap::ann::ann_output::AnnOutput,
+    address_type: U32,
+    cube_dim: Dim3 {
+        x: 32,
+        y: 1,
+        z: 1,
+    },
+    mode: Checked,
+    info: AnnOutputInfo {
+        dtypes: [
+            Float(
+                F32,
+            ),
+            Int(
+                I32,
+            ),
+        ],
+        indices: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        squared_distances: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        output_indices: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        output_distances: TensorCompilationArg {
+            meta: TensorMeta {
+                len: (),
+                rank: (),
+            },
+            buffer: BufferCompilationArg {
+                inplace: None,
+            },
+        },
+        width: (),
+        k: (),
+    },
+}
+source:
+```ll
+; ModuleID = 'kernel'
+source_filename = "kernel"
+target triple = "nvptx64-nvidia-cuda"
+
+define ptx_kernel void @ann_output_f_f32_i_i32_2f120087(ptr addrspace(1) noalias readonly %0, ptr addrspace(1) noalias readonly %1, ptr addrspace(1) noalias %2, ptr addrspace(1) noalias %3, ptr addrspace(1) noalias readonly %4, ptr noalias readonly byval([88 x i8]) align 8 %5) #0 {
+entry_block2v1:
+  %v62 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %v63 = call i32 @llvm.nvvm.read.ptx.sreg.tid.y()
+  %v64 = call i32 @llvm.nvvm.read.ptx.sreg.tid.z()
+  %v65 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %v66 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()
+  %v67 = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()
+  %v68 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+  %v69 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+  %v70 = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+  %v71 = call i32 @llvm.nvvm.read.ptx.sreg.laneid()
+  %v150 = mul i32 %v65, 32
+  %v151 = add i32 %v150, %v62
+  %v155 = getelementptr inbounds nuw i32, ptr %5, i64 8
+  %v156 = load i32, ptr %v155, align 4
+  %v159 = getelementptr inbounds nuw i32, ptr %5, i64 9
+  %v160 = load i32, ptr %v159, align 4
+  %v163 = getelementptr inbounds nuw i32, ptr %5, i64 14
+  %v164 = load i32, ptr %v163, align 4
+  %v165 = add i32 %v164, 0
+  %v167 = add i32 %v165, 0
+  %v168 = zext i32 %v167 to i64
+  %v169 = getelementptr inbounds nuw i32, ptr addrspace(1) %4, i64 %v168
+  %v170 = load i32, ptr addrspace(1) %v169, align 4
+  %v171 = icmp ult i32 %v151, %v170
+  br i1 %v171, label %then_block3v1, label %else_block4v1
+
+then_block3v1:                                    ; preds = %entry_block2v1
+  br label %for_header_block8v1
+
+for_header_block8v1:                              ; preds = %body_block5v1, %then_block3v1
+  %v124 = phi i32 [ 0, %then_block3v1 ], [ %v189, %body_block5v1 ]
+  %v173 = icmp ult i32 %v124, %v160
+  br i1 %v173, label %body_block5v1, label %for_exit_block7v1
+
+body_block5v1:                                    ; preds = %for_header_block8v1
+  %v37 = phi i32 [ %v124, %for_header_block8v1 ]
+  %v174 = mul i32 %v151, %v156
+  %v175 = add i32 %v174, %v37
+  %v176 = mul i32 %v151, %v160
+  %v177 = add i32 %v176, %v37
+  %v178 = zext i32 %v175 to i64
+  %v179 = getelementptr inbounds nuw i32, ptr addrspace(1) %0, i64 %v178
+  %v180 = load i32, ptr addrspace(1) %v179, align 4
+  %v181 = zext i32 %v177 to i64
+  %v182 = getelementptr inbounds nuw i32, ptr addrspace(1) %2, i64 %v181
+  store i32 %v180, ptr addrspace(1) %v182, align 4
+  %v183 = zext i32 %v175 to i64
+  %v184 = getelementptr inbounds nuw float, ptr addrspace(1) %1, i64 %v183
+  %v185 = load float, ptr addrspace(1) %v184, align 4
+  %v186 = call float @llvm.sqrt.f32(float %v185)
+  %v187 = zext i32 %v177 to i64
+  %v188 = getelementptr inbounds nuw float, ptr addrspace(1) %3, i64 %v187
+  store float %v186, ptr addrspace(1) %v188, align 4
+  %v189 = add i32 %v37, 1
+  br label %for_header_block8v1
+
+for_exit_block7v1:                                ; preds = %for_header_block8v1
+  br label %if_merge_block6v1
+
+else_block4v1:                                    ; preds = %entry_block2v1
+  br label %if_merge_block6v1
+
+if_merge_block6v1:                                ; preds = %else_block4v1, %for_exit_block7v1
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 64) i32 @llvm.nvvm.read.ptx.sreg.tid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 65535) i32 @llvm.nvvm.read.ptx.sreg.ctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, -2147483648) i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 65536) i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 32) i32 @llvm.nvvm.read.ptx.sreg.laneid() #1
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.sqrt.f32(float) #2
+
+attributes #0 = { "nvvm.reqntid"="32,1,1" "target-cpu"="sm_86" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+
+```
+[END_KERNEL_COMPILATION]
+

@@ -1,0 +1,105 @@
+Parent executed command:
+FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_ANN_CAMPAIGN=1 FAST_UMAP_CUDA_ANN_ORACLE_PATH=artifacts/stage2-phase0/differential/ann.json FAST_UMAP_CUDA_ANN_E2_TRACE_PATH=/tmp/ann-generation2-e2-trace.json cargo test --release --no-default-features --features cuda --lib --test test_standard_ann --test test_standard_quality --test test_standard_estimator --test test_standard_graph --test test_standard_umap -- --nocapture --test-threads=1
+No product code or frozen reference change in generation2; test-only CUDA counter boundary coverage and removal of literal-array tautology.
+
+running 24 tests
+test cuda_backend::tests::cuda_custom_kernels_match_expected_values_when_available ... ok
+test cuda_backend::tests::cuda_euclidean_pairwise_backward_matches_analytic_gradient_when_available ... ok
+test cuda_backend::tests::cuda_knn_backward_k1_matches_expected_gradient_when_available ... ok
+test cuda_backend::tests::cuda_knn_backward_k2_matches_expected_gradient_when_available ... ok
+test cuda_backend::tests::cuda_knn_k3_returns_ordered_neighbors_when_available ... ok
+test cuda_backend::tests::out_of_range_device_is_none ... ok
+test graph::get_distance_by_metric::tests::knn_handles_zero_neighbors_and_rejects_out_of_range_k ... ok
+test graph::get_distance_by_metric::tests::knn_partial_selection_preserves_pre_move_cutoff_ties ... ok
+test graph::get_distance_by_metric::tests::knn_short_pairwise_storage_panics_when_row_is_indexed ... ok
+test graph::get_distance_by_metric::tests::knn_sorts_exact_distance_ties_by_candidate_order ... ok
+test kernels::standard_umap::ann::tests::ann_step_device_counter_locks_inclusive_stop_boundary ... ANN boundary n=16384 width=32 actualNEW=524 stop=true
+ANN boundary n=16384 width=32 actualNEW=525 stop=false
+ok
+test kernels::standard_umap::ann::tests::ann_step_evaluates_both_mixed_retention_forward_pairs ... ok
+test kernels::standard_umap::ann::tests::ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates ... ok
+test kernels::standard_umap::ann::tests::ann_stop_threshold_uses_inclusive_integer_equivalent ... ok
+test kernels::standard_umap::ann::tests::reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers ... ok
+test standard_umap::estimator::tests::head_csr_keeps_empty_graph_tensor_nonempty ... ok
+test standard_umap::estimator::tests::head_csr_preserves_original_edge_order_within_each_head ... ok
+test standard_umap::estimator::tests::head_csr_rejects_invalid_endpoints_weights_and_shapes ... ok
+test standard_umap::estimator::tests::resolve_search_passes_explicit_modes_through ... ok
+test standard_umap::estimator::tests::resolve_search_uses_approximate_above_the_auto_cutoff ... ok
+test standard_umap::estimator::tests::resolve_search_uses_exact_up_to_the_auto_cutoff ... ok
+test standard_umap::init::solver_tests::bounded_lanczos_returns_analytic_path_and_repeated_cycle_modes ... ok
+test standard_umap::init::solver_tests::forced_solver_budget_failure_warns_and_uses_deterministic_random_modes ... ok
+test standard_umap::init::solver_tests::zero_coordinate_span_is_an_explicit_numerical_error ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+
+running 9 tests
+test ann_rejects_invalid_tiny_width_instead_of_exact_fallback ... ok
+test cuda_ann_matches_generalized_full_join_e2_grid ... ok
+test cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures ... ok
+test cuda_ann_runs_on_cuda_and_obeys_required_device_mode ... ok
+test cuda_ann_source_tagged_capture_oracle ... ok
+test flex_ann_is_deterministic_unique_and_sorted ... ok
+test flex_ann_refines_seed_candidates_with_more_neighbor_joins ... ok
+test flex_ann_resolves_equal_distances_by_neighbor_index ... ok
+test generalized_full_join_host_oracle_is_reverse_order_independent_and_rejects_overflow ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+
+
+running 9 tests
+test auto_search_fits_small_inputs_with_exact_search ... ok
+test exact_and_approximate_fit_are_finite_deterministic_and_clustered ... ok
+test fit_and_transform_run_sgd_epochs ... ok
+test fit_transform_returns_reusable_model_and_matching_embedding ... ok
+test invalid_config_and_input_are_reported_as_errors ... ok
+test singleton_and_two_row_cases_are_explicit ... ok
+test standard_estimator_smoke_runs_on_requested_cuda_device ... ok
+test transform_uses_fitted_embedding_and_search_settings ... ok
+test zero_epochs_returns_scaled_initialization ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.80s
+
+
+running 8 tests
+test bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cuda ... ok
+test bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_flex ... ok
+test bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero ... ok
+test standard_fuzzy_graph_cuda_source_tagged_capture_oracle ... ok
+test standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors ... ok
+test standard_fuzzy_graph_marks_invalid_reference_indices ... ok
+test standard_fuzzy_graph_matches_reference_fixtures_on_cuda ... ok
+test standard_fuzzy_graph_matches_reference_fixtures_on_flex ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+
+running 9 tests
+test cuda_approximate_fit_quality_campaign ... ok
+test cuda_approximate_fit_quality_per_frozen_fixture_case ... ok
+test cuda_fit_larger_than_device_dense_memory_completes ... ok
+test cuda_transform_error_source_tagged_capture_oracle ... ok
+test flex_fit_larger_than_dense_memory_budget_completes ... ok
+test standard_ann_recall_on_cuda ... ok
+test standard_ann_recall_on_flex ... ok
+test standard_quality_trustworthiness_on_cuda ... ok
+test standard_quality_trustworthiness_on_flex ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 185.43s
+
+
+running 11 tests
+test approximate_queue_budgets_are_checked_and_capped ... ok
+test backend_selection_never_falls_back_from_cuda ... ok
+test config_rejects_invalid_control_values ... ok
+test fit_and_query_widths_keep_their_distinct_self_semantics ... ok
+test fit_curve_matches_pinned_umap_0512_coefficients ... ok
+test fit_curve_rejects_invalid_controls ... ok
+test input_validation_checks_shape_finiteness_and_feature_matching ... ok
+test optimizer_controls_reject_negative_or_nonfinite_floats ... ok
+test queue_control_is_exact_compatible_only_at_its_default ... ok
+test reference_permits_zero_epochs_and_optimizer_controls ... ok
+test standard_config_defaults_match_the_reference_controls ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

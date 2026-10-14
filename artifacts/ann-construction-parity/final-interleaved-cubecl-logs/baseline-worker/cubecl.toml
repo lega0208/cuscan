@@ -1,0 +1,6 @@
+[profiling.logger]
+level = "disabled"
+
+[compilation.logger]
+level = "full"
+file = "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/final-interleaved-cubecl-logs/baseline.log"

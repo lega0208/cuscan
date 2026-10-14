@@ -253,6 +253,371 @@ fn old_rescan_oracle(
 }
 
 #[cfg(feature = "cuda")]
+struct FullJoinTrace {
+    ids: Vec<i32>,
+    distance_bits: Vec<u32>,
+    new_ids_per_expansion: Vec<usize>,
+    stop_reason: &'static str,
+}
+
+#[cfg(feature = "cuda")]
+fn generalized_full_join_oracle(
+    points: &[f32],
+    n: usize,
+    features: usize,
+    k: usize,
+    seed: u64,
+    max_iterations: u32,
+) -> FullJoinTrace {
+    let width = k.max(k.saturating_mul(4).min(32)).min(n - 1);
+    let mut candidates = vec![0i32; n * width];
+    const MODULUS: i64 = 2_147_483_647;
+    let seed_base = (seed % (MODULUS as u64 - 1)) as i64 + 1;
+    for row in 0..n {
+        let mut state = (row as i64 + seed_base) % MODULUS;
+        if state == 0 {
+            state = 1;
+        }
+        for column in 0..width {
+            let hi = state / 127_773;
+            let lo = state - hi * 127_773;
+            let test = lo * 16_807 - hi * 2_836;
+            state = if test <= 0 { test + MODULUS } else { test };
+            let draw = (state - 1) % (n - 1 - width + column + 1) as i64;
+            let collision = (0..column).any(|previous| {
+                let old = candidates[row * width + previous] as usize;
+                let old_raw = if old > row { old - 1 } else { old };
+                old_raw as i64 == draw
+            });
+            let chosen = if collision {
+                (n - 1 - width + column) as i64
+            } else {
+                draw
+            };
+            candidates[row * width + column] = if chosen >= row as i64 {
+                (chosen + 1) as i32
+            } else {
+                chosen as i32
+            };
+        }
+    }
+
+    let mut new_ids_per_expansion = Vec::new();
+    let mut stop_reason = "cap";
+    for expansion in 0..=max_iterations {
+        let previous = candidates.clone();
+        let mut next = vec![n as i32; n * width];
+        let mut next_squared = vec![f32::MAX; n * width];
+        for row in 0..n {
+            let mut proposals = Vec::with_capacity(width * (width + 2));
+            proposals.extend_from_slice(&previous[row * width..(row + 1) * width]);
+            if expansion > 0 {
+                for slot in 0..width {
+                    let neighbor = previous[row * width + slot] as usize;
+                    if neighbor < n {
+                        proposals
+                            .extend_from_slice(&previous[neighbor * width..(neighbor + 1) * width]);
+                    }
+                }
+                for source in 0..n {
+                    if previous[source * width..(source + 1) * width]
+                        .iter()
+                        .any(|&candidate| candidate as usize == row)
+                    {
+                        proposals
+                            .extend_from_slice(&previous[source * width..(source + 1) * width]);
+                    }
+                }
+            }
+            let base = row * width;
+            for candidate in proposals {
+                let candidate = candidate as usize;
+                if candidate >= n || candidate == row {
+                    continue;
+                }
+                let mut squared = 0.0f32;
+                for feature in 0..features {
+                    let delta =
+                        points[row * features + feature] - points[candidate * features + feature];
+                    squared += delta * delta;
+                }
+                if !squared.is_finite() {
+                    continue;
+                }
+                let mut duplicate = false;
+                let mut position = width;
+                for slot in 0..width {
+                    let old = next[base + slot];
+                    duplicate |= old == candidate as i32;
+                    if position == width
+                        && (squared < next_squared[base + slot]
+                            || (squared == next_squared[base + slot] && candidate < old as usize))
+                    {
+                        position = slot;
+                    }
+                }
+                if !duplicate && position < width {
+                    for slot in (position + 1..width).rev() {
+                        next[base + slot] = next[base + slot - 1];
+                        next_squared[base + slot] = next_squared[base + slot - 1];
+                    }
+                    next[base + position] = candidate as i32;
+                    next_squared[base + position] = squared;
+                }
+            }
+        }
+        candidates = next;
+        if expansion > 0 {
+            let mut newly_admitted = 0;
+            for row in 0..n {
+                let old = &previous[row * width..(row + 1) * width];
+                newly_admitted += candidates[row * width..(row + 1) * width]
+                    .iter()
+                    .filter(|&&id| id < n as i32 && !old.contains(&id))
+                    .count();
+            }
+            new_ids_per_expansion.push(newly_admitted);
+            if newly_admitted == 0 {
+                stop_reason = "zero";
+                break;
+            }
+        }
+        if expansion == max_iterations {
+            stop_reason = "cap";
+            break;
+        }
+    }
+
+    let mut ids = Vec::with_capacity(n * k);
+    let mut distance_bits = Vec::with_capacity(n * k);
+    for row in 0..n {
+        for slot in 0..k {
+            ids.push(candidates[row * width + slot]);
+            let id = candidates[row * width + slot];
+            let squared = if id >= 0 && (id as usize) < n {
+                let mut squared = 0.0f32;
+                for feature in 0..features {
+                    let delta =
+                        points[row * features + feature] - points[id as usize * features + feature];
+                    squared += delta * delta;
+                }
+                squared
+            } else {
+                f32::MAX
+            };
+            distance_bits.push(squared.sqrt().to_bits());
+        }
+    }
+    FullJoinTrace {
+        ids,
+        distance_bits,
+        new_ids_per_expansion,
+        stop_reason,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn e2_points(shape_index: usize, n: usize, features: usize) -> Vec<f32> {
+    (0..n)
+        .flat_map(|row| {
+            (0..features).map(move |feature| match shape_index % 3 {
+                0 => (row % 4) as f32 + ((row / 4 + feature) % 3) as f32 * 0.25,
+                1 => {
+                    if row % 3 == 0 {
+                        0.0
+                    } else {
+                        ((row * (feature + 3) + feature * 7) % 11) as f32 * 0.125
+                    }
+                }
+                _ => {
+                    if row == 0 {
+                        0.0
+                    } else {
+                        (((row * (feature + 2)) % 11 + 1) as f32 * 0.125) + feature as f32 * 0.0625
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+fn ordered_host_proposals(
+    points: &[f32],
+    n: usize,
+    features: usize,
+    row: usize,
+    width: usize,
+    proposals: &[i32],
+) -> (Vec<i32>, Vec<u32>) {
+    let mut ranked = Vec::new();
+    for &id in proposals {
+        if id < 0 || id as usize >= n || id as usize == row {
+            continue;
+        }
+        let id = id as usize;
+        let mut squared = 0.0f32;
+        for feature in 0..features {
+            let delta = points[row * features + feature] - points[id * features + feature];
+            squared += delta * delta;
+        }
+        if squared.is_finite() && !ranked.iter().any(|&(old, _): &(usize, f32)| old == id) {
+            ranked.push((id, squared));
+        }
+    }
+    ranked.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+    let mut ids = vec![n as i32; width];
+    let mut bits = vec![f32::MAX.to_bits(); width];
+    for (slot, (id, squared)) in ranked.into_iter().take(width).enumerate() {
+        ids[slot] = id as i32;
+        bits[slot] = squared.to_bits();
+    }
+    (ids, bits)
+}
+
+#[test]
+fn generalized_full_join_host_oracle_is_reverse_order_independent_and_rejects_overflow() {
+    let points = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0];
+    let proposals = [3, 1, 2, 3, -1, 4];
+    let forward = ordered_host_proposals(&points, 4, 2, 0, 3, &proposals);
+    let reverse = ordered_host_proposals(
+        &points,
+        4,
+        2,
+        0,
+        3,
+        &proposals.iter().rev().copied().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        forward, reverse,
+        "reverse proposal permutation changed top-W"
+    );
+
+    let huge = [0.0f32, f32::MAX, -f32::MAX, 1.0];
+    let overflow = ordered_host_proposals(&huge, 4, 1, 0, 2, &[1, 2, 3, 4]);
+    assert_eq!(overflow.0, [3, 4]);
+    assert_eq!(overflow.1, [1.0f32.to_bits(), f32::MAX.to_bits()]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_ann_matches_generalized_full_join_e2_grid() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    let shapes = [
+        (2usize, 1usize, 1usize),
+        (5, 2, 2),
+        (19, 2, 3),
+        (23, 3, 3),
+        (31, 4, 3),
+        (48, 2, 8),
+        (67, 3, 33),
+        (120, 5, 24),
+    ];
+    let seeds = [0x5179u64, 29, 0x5eed, 1, 47];
+    let caps = [0u32, 1, 2, 5, 8, 14];
+    let configurations = shapes
+        .iter()
+        .map(|&(n, features, k)| json!([n, features, k]))
+        .collect::<Vec<_>>();
+    let configuration_bytes = serde_json::to_vec(&json!({
+        "shapes": configurations,
+        "seeds": seeds,
+        "caps": caps,
+        "generator": "lattice/duplicate-heavy/hub-heavy-v1",
+    }))
+    .unwrap();
+    let configuration_hash = git_blob_digest(&configuration_bytes);
+    let configuration = serde_json::from_slice::<serde_json::Value>(&configuration_bytes).unwrap();
+    let mut traces = Vec::with_capacity(shapes.len() * seeds.len() * caps.len());
+
+    for (shape_index, &(n, features, k)) in shapes.iter().enumerate() {
+        let points = e2_points(shape_index, n, features);
+        for &seed in &seeds {
+            for &cap in &caps {
+                let data =
+                    Tensor::<2>::from_data(TensorData::new(points.clone(), [n, features]), &device);
+                let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+                    data.into_dispatch(),
+                    k as u32,
+                    seed,
+                    cap,
+                );
+                let ids = Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
+                    .to_data()
+                    .try_to_vec::<i32>()
+                    .unwrap();
+                let distance_bits = Tensor::<2>::from_dispatch(distances)
+                    .to_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                let expected = generalized_full_join_oracle(&points, n, features, k, seed, cap);
+                assert_eq!(
+                    ids, expected.ids,
+                    "ids mismatch n={n}, features={features}, k={k}, seed={seed}, cap={cap}"
+                );
+                assert_eq!(
+                    distance_bits, expected.distance_bits,
+                    "distance bits mismatch n={n}, features={features}, k={k}, seed={seed}, cap={cap}"
+                );
+                if expected.stop_reason == "zero" {
+                    assert_eq!(expected.new_ids_per_expansion.last(), Some(&0));
+                    let capped = generalized_full_join_oracle(
+                        &points,
+                        n,
+                        features,
+                        k,
+                        seed,
+                        caps[caps.len() - 1],
+                    );
+                    assert_eq!(
+                        expected.ids, capped.ids,
+                        "zero-stop ids differ from capped run"
+                    );
+                    assert_eq!(
+                        expected.distance_bits, capped.distance_bits,
+                        "zero-stop distances differ from capped run"
+                    );
+                } else if let Some(last_new_ids) = expected.new_ids_per_expansion.last() {
+                    assert_ne!(
+                        *last_new_ids, 0,
+                        "zero NEW count must use the zero stop reason"
+                    );
+                }
+                traces.push(json!({
+                    "n": n,
+                    "features": features,
+                    "k": k,
+                    "seed": seed,
+                    "cap": cap,
+                    "new_ids_per_expansion": expected.new_ids_per_expansion,
+                    "stop_reason": expected.stop_reason,
+                }));
+            }
+        }
+    }
+    assert_eq!(traces.len(), 240, "frozen E2 grid comparison count");
+
+    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_ANN_E2_TRACE_PATH") {
+        let artifact = json!({
+            "schema": "fast-umap.cuda-ann-e2-grid-trace.v1",
+            "configuration_hash": configuration_hash,
+            "configuration_hash_algorithm": "git-sha1-blob",
+            "configuration": configuration,
+            "comparisons": traces,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {

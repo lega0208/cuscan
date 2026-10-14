@@ -160,6 +160,12 @@ fn matrix_from_npz(archive: &mut ZipArchive<File>, name: &str) -> Matrix {
     npy_matrix(&bytes)
 }
 
+fn matrix_from_npz_path(path: &std::path::Path, name: &str) -> Matrix {
+    let mut archive = ZipArchive::new(File::open(path).unwrap())
+        .unwrap_or_else(|error| panic!("could not open {}: {error}", path.display()));
+    matrix_from_npz(&mut archive, name)
+}
+
 fn fixture() -> (Value, Vec<(String, Matrix, Matrix)>) {
     let reference: Value = serde_json::from_str(REFERENCE).unwrap();
     let mut archive = ZipArchive::new(File::open(QUALITY).unwrap()).unwrap();
@@ -315,6 +321,191 @@ fn matrix_from_embedding(embedding: &[Vec<f32>]) -> Matrix {
         cols: embedding[0].len(),
         values: embedding.iter().flatten().copied().collect(),
     }
+}
+
+fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f64 {
+    let n = original.rows;
+    assert_eq!(embedded.rows, n, "trustworthiness row shape");
+    assert!(k > 0 && k < n / 2, "invalid trustworthiness k={k}, n={n}");
+    let mut penalty = 0usize;
+    let mut original_order = Vec::with_capacity(n - 1);
+    let mut embedded_order = Vec::with_capacity(n - 1);
+    let mut ranks = vec![0usize; n];
+    for row in 0..n {
+        original_order.clear();
+        embedded_order.clear();
+        for other in 0..n {
+            if other == row {
+                continue;
+            }
+            original_order.push((
+                distances(
+                    &original.values[row * original.cols..(row + 1) * original.cols],
+                    &original.values[other * original.cols..(other + 1) * original.cols],
+                    original.cols,
+                ),
+                other,
+            ));
+            embedded_order.push((
+                distances(
+                    &embedded.values[row * embedded.cols..(row + 1) * embedded.cols],
+                    &embedded.values[other * embedded.cols..(other + 1) * embedded.cols],
+                    embedded.cols,
+                ),
+                other,
+            ));
+        }
+        original_order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        embedded_order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (rank, &(_, id)) in original_order.iter().enumerate() {
+            ranks[id] = rank + 1;
+        }
+        penalty += embedded_order[..k]
+            .iter()
+            .map(|&(_, id)| ranks[id].saturating_sub(k))
+            .sum::<usize>();
+    }
+    let normalizer = n as f64 * k as f64 * (2 * n - 3 * k - 1) as f64;
+    1.0 - 2.0 * penalty as f64 / normalizer
+}
+
+fn assert_approximate_fit_quality(
+    device: &Device,
+    name: &str,
+    train: &Matrix,
+    seeds: &[u64],
+    n_neighbors: usize,
+    trust_k: usize,
+    reference_trust: &[f64],
+) {
+    assert_eq!(
+        reference_trust.len(),
+        seeds.len(),
+        "{name}: reference seed count"
+    );
+    assert_eq!(
+        train.values.len(),
+        train.rows * train.cols,
+        "{name}: input shape"
+    );
+    assert!(
+        train.rows > n_neighbors && train.cols > 0,
+        "{name}: invalid training shape"
+    );
+    assert!(
+        train.values.iter().all(|value| value.is_finite()),
+        "{name}: non-finite input"
+    );
+    assert!(
+        reference_trust.iter().all(|value| value.is_finite()),
+        "{name}: non-finite reference score"
+    );
+    let train_rows = train.rows_as_vec();
+    let mut recall_scores = Vec::with_capacity(seeds.len());
+    let mut trust_scores = Vec::with_capacity(seeds.len());
+    for (seed_index, &seed) in seeds.iter().enumerate() {
+        let k = n_neighbors - 1;
+        let train_tensor = Tensor::<2>::from_data(
+            TensorData::new(train.values.clone(), [train.rows, train.cols]),
+            device,
+        );
+        let (ids, _) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            train_tensor.clone().into_dispatch(),
+            k as u32,
+            seed,
+            (train.rows as f64).log2().round().max(5.0) as u32,
+        );
+        let ids = Tensor::<2, Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        assert_eq!(ids.len(), train.rows * k, "{name} seed {seed}: ANN shape");
+        assert!(
+            ids.iter().all(|&id| id >= 0 && (id as usize) < train.rows),
+            "{name} seed {seed}: invalid ANN id"
+        );
+        for row in 0..train.rows {
+            let neighbors = &ids[row * k..(row + 1) * k];
+            let unique = neighbors.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(
+                unique.len(),
+                k,
+                "{name} seed {seed} row {row}: duplicate ANN id"
+            );
+            assert!(
+                !unique.contains(&(row as i32)),
+                "{name} seed {seed} row {row}: self neighbor was not removed by identity"
+            );
+        }
+        let recall = tie_aware_recall(&ids, train, train, k, true);
+        assert!(recall.is_finite(), "{name} seed {seed}: non-finite recall");
+
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors,
+                n_components: 2,
+                min_dist: 0.1,
+                spread: 1.0,
+                local_connectivity: 1.0,
+                set_op_mix_ratio: 1.0,
+                n_epochs: Some(200),
+                learning_rate: 1.0,
+                negative_sample_rate: 5,
+                repulsion_strength: 1.0,
+                init: Init::Spectral,
+                random_state: Some(seed),
+                transform_seed: seed,
+                ..UMAPConfig::default()
+            },
+            backend(device),
+            NeighborSearch::Approximate,
+        )
+        .fit(&train_rows)
+        .unwrap_or_else(|error| panic!("{name} seed {seed}: approximate fit failed: {error}"));
+        let embedding = matrix_from_embedding(fitted.embedding());
+        assert_eq!(
+            (embedding.rows, embedding.cols),
+            (train.rows, 2),
+            "{name} seed {seed}: embedding shape"
+        );
+        assert!(
+            embedding.values.iter().all(|value| value.is_finite()),
+            "{name} seed {seed}: non-finite embedding"
+        );
+        let trust = bounded_trustworthiness(train, &embedding, trust_k);
+        assert!(
+            trust.is_finite(),
+            "{name} seed {seed}: non-finite trustworthiness"
+        );
+        let gap = reference_trust[seed_index] - trust;
+        recall_scores.push(recall);
+        trust_scores.push(trust);
+        eprintln!(
+            "QUALITY_OBSERVATION {{\"case\":\"{name}\",\"seed\":{seed},\"recall_at_{}\":{recall:.9},\"reference_fit_trustworthiness_at_{trust_k}\":{:.9},\"candidate_fit_trustworthiness_at_{trust_k}\":{trust:.9},\"reference_minus_candidate_trustworthiness\":{gap:.9}}}",
+            n_neighbors - 1,
+            reference_trust[seed_index],
+        );
+    }
+    let recall_mean = recall_scores.iter().sum::<f64>() / seeds.len() as f64;
+    let trust_loss_mean = reference_trust
+        .iter()
+        .zip(&trust_scores)
+        .map(|(reference, candidate)| reference - candidate)
+        .sum::<f64>()
+        / seeds.len() as f64;
+    assert!(
+        recall_mean >= RECALL_LIMIT,
+        "{name}: five-seed mean recall@{} {recall_mean:.6} below {RECALL_LIMIT}",
+        n_neighbors - 1
+    );
+    assert!(
+        trust_loss_mean <= TRUST_GAP_LIMIT,
+        "{name}: one-sided five-seed reference-minus-candidate trustworthiness@{trust_k} {trust_loss_mean:.6} exceeds {TRUST_GAP_LIMIT}"
+    );
+    eprintln!(
+        "QUALITY_CASE_MEAN {{\"case\":\"{name}\",\"mean_recall_at_{}\":{recall_mean:.9},\"mean_reference_minus_candidate_trustworthiness_at_{trust_k}\":{trust_loss_mean:.9}}}",
+        n_neighbors - 1
+    );
 }
 
 fn run_quality(device: Device) {
@@ -511,6 +702,114 @@ fn standard_quality_trustworthiness_on_cuda() {
         return;
     };
     run_quality(device);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
+    let Some(device) = device_for_cuda() else {
+        return;
+    };
+    let (reference, cases) = fixture();
+    let seeds: Vec<u64> = reference["controls"]["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seed| seed.as_u64().unwrap())
+        .collect();
+    let n_neighbors = reference["controls"]["n_neighbors"].as_u64().unwrap() as usize;
+    let trust_k = reference["controls"]["trustworthiness_k"].as_u64().unwrap() as usize;
+    for (name, train, _) in cases {
+        let seed_scores = reference["quality"]["scores"][name.as_str()]
+            .as_array()
+            .unwrap();
+        assert_eq!(seed_scores.len(), seeds.len(), "{name}: frozen score count");
+        let reference_trust = seed_scores
+            .iter()
+            .map(|score| score["fit_trustworthiness_at_15"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        assert_approximate_fit_quality(
+            &device,
+            &name,
+            &train,
+            &seeds,
+            n_neighbors,
+            trust_k,
+            &reference_trust,
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_approximate_fit_quality_campaign() {
+    if std::env::var_os("FAST_UMAP_RUN_ANN_CAMPAIGN").is_none() {
+        eprintln!("SKIPPED: set FAST_UMAP_RUN_ANN_CAMPAIGN=1 to run the frozen large ANN campaign");
+        return;
+    }
+    let Some(device) = device_for_cuda() else {
+        return;
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let reference_path = root.join("ann_campaign_reference.json");
+    let quality_path = root.join("ann_campaign_quality.npz");
+    let reference: Value =
+        serde_json::from_reader(File::open(&reference_path).unwrap_or_else(|error| {
+            panic!(
+                "campaign reference {} unavailable: {error}",
+                reference_path.display()
+            )
+        }))
+        .unwrap();
+    assert_eq!(reference["schema"], "fast-umap-ann-campaign-quality-v1");
+    assert_eq!(reference["data"]["shape"], serde_json::json!([16384, 16]));
+    assert_eq!(reference["controls"]["n_neighbors"], 25);
+    assert_eq!(
+        reference["controls"]["seeds"],
+        serde_json::json!([11, 29, 47, 71, 101])
+    );
+    let seeds = reference["controls"]["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seed| seed.as_u64().unwrap())
+        .collect::<Vec<_>>();
+    let train = matrix_from_npz_path(&quality_path, "campaign__train");
+    assert_eq!(
+        (train.rows, train.cols),
+        (16384, 16),
+        "campaign training shape"
+    );
+    let scores = reference["quality"]["scores"]["campaign"]
+        .as_array()
+        .unwrap();
+    assert_eq!(scores.len(), seeds.len(), "campaign frozen score count");
+    let reference_trust = scores
+        .iter()
+        .map(|score| {
+            assert!(
+                score["seed"].as_u64().is_some(),
+                "campaign score missing seed"
+            );
+            score["fit_trustworthiness_at_15"].as_f64().unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (score, &seed) in scores.iter().zip(&seeds) {
+        assert_eq!(
+            score["seed"].as_u64(),
+            Some(seed),
+            "campaign score seed order"
+        );
+    }
+    assert_approximate_fit_quality(
+        &device,
+        "campaign",
+        &train,
+        &seeds,
+        25,
+        15,
+        &reference_trust,
+    );
 }
 
 #[cfg(feature = "cuda")]

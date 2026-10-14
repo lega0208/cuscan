@@ -12,14 +12,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "feedback_clustered.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "umap_comparison.html"
 SAMPLE_SEED = 42
-N_NEIGHBORS = 5
+N_NEIGHBORS = 15
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare umap-learn and fast_umap on one reproducible data sample."
     )
-    parser.add_argument("--sample-size", type=int, default=5_000)
+    parser.add_argument("--sample-size", type=int, default=50_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--device", choices=("cuda", "cpu", "wgpu"), default="cuda")

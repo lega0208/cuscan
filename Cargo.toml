@@ -204,6 +204,10 @@ required-features = ["cuda", "parametric"]
 name = "profile_standard_cuda"
 required-features = ["cuda", "tracing"]
 
+[[example]]
+name = "ann_construction_worker"
+required-features = ["cuda"]
+
 [[bin]]
 name = "bench_report"
 required-features = ["gpu"]

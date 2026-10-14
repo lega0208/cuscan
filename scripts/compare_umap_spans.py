@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
 from pathlib import Path
 from typing import Any
 
@@ -1956,6 +1957,661 @@ def ncu_kernel(binary_args: list[str], regex: str, temp: Path, deadline: Deadlin
     }
 
 
+def _source_identity(source_root: Path) -> dict[str, Any]:
+    source_root = source_root.resolve()
+    if not source_root.is_dir():
+        raise ValueError(f"source root is not a directory: {source_root}")
+    root = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if Path(root).resolve() != source_root:
+        raise ValueError(
+            f"source root must be a git worktree root: {source_root} (detected {root})"
+        )
+    commit = subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", root, "status", "--porcelain=v1", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    patch = subprocess.run(
+        ["git", "-C", root, "diff", "HEAD", "--binary"], capture_output=True, check=True
+    ).stdout
+    untracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    untracked_digest = hashlib.sha256()
+    for relative in untracked.split(b"\0"):
+        if relative:
+            path = Path(root) / os.fsdecode(relative)
+            untracked_digest.update(relative + b"\0" + path.read_bytes())
+    identity = hashlib.sha256(
+        commit.encode()
+        + b"\0"
+        + status.encode()
+        + b"\0"
+        + patch
+        + b"\0"
+        + untracked_digest.digest()
+    ).hexdigest()
+    return {
+        "repository": root,
+        "commit": commit,
+        "working_tree_status": status,
+        "working_tree_status_sha256": hashlib.sha256(status.encode()).hexdigest(),
+        "tracked_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "untracked_files_sha256": untracked_digest.hexdigest(),
+        "source_tree_identity_sha256": identity,
+    }
+
+
+def _ann_worker_identity(binary: Path) -> dict[str, Any]:
+    binary = binary.resolve()
+    return {"path": str(binary), "sha256": sha256_file(binary)}
+
+
+class AnnConstructionWorker:
+    def __init__(
+        self,
+        binary: Path,
+        data: Path,
+        rows: int,
+        features: int,
+        device_index: int,
+        compile_log: Path,
+    ):
+        compile_log.parent.mkdir(parents=True, exist_ok=True)
+        compile_log.unlink(missing_ok=True)
+        self.compile_log = compile_log.resolve()
+        self.config_dir = self.compile_log.parent / f"{self.compile_log.stem}-worker"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = self.config_dir / "cubecl.toml"
+        config_path.write_text(
+            "[profiling.logger]\n"
+            'level = "disabled"\n'
+            "\n"
+            "[compilation.logger]\n"
+            'level = "full"\n'
+            f"file = {json.dumps(str(self.compile_log))}\n",
+            encoding="utf-8",
+        )
+        child_env = os.environ.copy()
+        child_env.pop("CUBECL_DEBUG_LOG", None)
+        child_env.pop("CUBECL_DEBUG_OPTION", None)
+        self.process = subprocess.Popen(
+            [
+                str(binary.resolve()),
+                str(data.resolve()),
+                str(rows),
+                str(features),
+                str(device_index),
+            ],
+            cwd=self.config_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=child_env,
+        )
+
+    def _stable_log_snapshot(self) -> dict[str, Any]:
+        stable_observations = 0
+        previous: tuple[int, int] | None = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                content = self.compile_log.read_bytes()
+            except FileNotFoundError:
+                content = b""
+            current = (
+                len(content),
+                sum(line == b"[START_KERNEL_COMPILATION]" for line in content.splitlines()),
+            )
+            if current == previous:
+                stable_observations += 1
+            else:
+                stable_observations = 0
+            if stable_observations >= 4:
+                return {
+                    "bytes": current[0],
+                    "compilation_records": current[1],
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "stable_observations": stable_observations + 1,
+                    "poll_interval_ms": 25,
+                }
+            previous = current
+            time.sleep(0.025)
+        raise TimeoutError(f"CubeCL compile log did not stabilize: {self.compile_log}")
+
+    def request(
+        self, op: str, seed: int, k: int, cap: int
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        assert self.process.stdin is not None and self.process.stdout is not None
+        before = self._stable_log_snapshot()
+        self.process.stdin.write(json.dumps({"op": op, "seed": seed, "k": k, "cap": cap}) + "\n")
+        self.process.stdin.flush()
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError("ANN worker closed stdout before replying")
+        value = json.loads(line)
+        if value.get("ok") is not True:
+            raise RuntimeError(f"ANN worker error: {value}")
+        after = self._stable_log_snapshot()
+        return value, before, after
+
+    def close(self) -> None:
+        if self.process.stdin:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        if self.process.returncode:
+            error = self.process.stderr.read() if self.process.stderr else ""
+            raise RuntimeError(f"ANN worker exit {self.process.returncode}: {error[-4000:]}")
+
+
+def _validate_ann_graph(ids: Any, distances: Any, rows: int, k: int) -> tuple[Any, Any]:
+    import numpy as np
+
+    ids, distances = np.asarray(ids), np.asarray(distances)
+    if ids.ndim != 2 or distances.shape != ids.shape or ids.shape[0] != rows:
+        raise ValueError(f"invalid neighbor graph shapes: {ids.shape}, {distances.shape}")
+    clean_ids = np.empty((rows, k), dtype="<i4")
+    clean_distances = np.empty((rows, k), dtype="<f4")
+    for row in range(rows):
+        keep = ids[row] != row
+        row_ids, row_distances = ids[row][keep], distances[row][keep]
+        if (
+            row_ids.size != k
+            or np.any(row_ids < 0)
+            or np.any(row_ids >= rows)
+            or np.unique(row_ids).size != k
+            or np.any(row_ids == row)
+        ):
+            raise ValueError(
+                f"row {row} does not contain exactly {k} unique valid nonself neighbors"
+            )
+        if not np.all(np.isfinite(row_distances)) or np.any(row_distances < 0):
+            raise ValueError(f"row {row} contains invalid distances")
+        if np.any(row_distances[1:] < row_distances[:-1]):
+            raise ValueError(f"row {row} contains descending materialized distances")
+        clean_ids[row], clean_distances[row] = row_ids, row_distances
+    return clean_ids, clean_distances
+
+
+class AnnGraphValidationTests(unittest.TestCase):
+    def test_equal_rounded_sqrt_distances_do_not_require_id_tie_break(self) -> None:
+        import numpy as np
+
+        squared = np.array(
+            [1.0, np.nextafter(np.float32(1.0), np.float32(np.inf))], dtype=np.float32
+        )
+        distances = np.sqrt(squared, dtype=np.float32)
+        self.assertNotEqual(squared[0], squared[1])
+        self.assertEqual(distances[0], distances[1])
+        graph_ids = [[2, 1], [2, 0], [1, 0]]
+        graph_distances = np.tile(distances, (3, 1))
+        ids, validated_distances = _validate_ann_graph(graph_ids, graph_distances, rows=3, k=2)
+        np.testing.assert_array_equal(ids, graph_ids)
+        np.testing.assert_array_equal(validated_distances, graph_distances)
+
+    def test_descending_materialized_distances_are_rejected(self) -> None:
+        import numpy as np
+
+        with self.assertRaisesRegex(ValueError, "descending materialized distances"):
+            _validate_ann_graph(
+                [[1, 2], [0, 2], [0, 1]],
+                [[1.0, np.nextafter(np.float32(1.0), np.float32(0.0))], [1.0, 2.0], [1.0, 2.0]],
+                rows=3,
+                k=2,
+            )
+
+
+def _numba_dispatcher_snapshot(numba: Any) -> dict[str, Any]:
+    """Snapshot all currently-live Numba dispatchers without entering build timing."""
+    import gc
+
+    from numba.core.registry import CPUDispatcher
+
+    dispatchers: dict[int, tuple[str, ...]] = {}
+    dispatcher_refs: dict[int, Any] = {}
+    for value in gc.get_objects():
+        try:
+            if isinstance(value, CPUDispatcher):
+                dispatchers[id(value)] = tuple(
+                    sorted(repr(signature) for signature in value.signatures)
+                )
+                dispatcher_refs[id(value)] = value
+        except (ReferenceError, RuntimeError):
+            continue
+    flattened = [
+        f"{identity}:{signature}"
+        for identity, signatures in dispatchers.items()
+        for signature in signatures
+    ]
+    flattened.sort()
+    signature_bytes = "\n".join(flattened).encode()
+    return {
+        "live_dispatcher_count": len(dispatchers),
+        "compiled_signature_count": sum(len(signatures) for signatures in dispatchers.values()),
+        "dispatcher_ids": dispatchers,
+        "dispatcher_refs": dispatcher_refs,
+        "signature_sha256": hashlib.sha256(signature_bytes).hexdigest(),
+    }
+
+
+def _numba_compile_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    old, new = before["dispatcher_ids"], after["dispatcher_ids"]
+    new_dispatchers = sorted(set(new) - set(old))
+    lost_dispatchers = sorted(set(old) - set(new))
+    added_signatures = [
+        {"dispatcher_id": identity, "signature": signature}
+        for identity in set(old) | set(new)
+        for signature in sorted(set(new.get(identity, ())) - set(old.get(identity, ())))
+    ]
+    return {
+        "dispatcher_count_before": before["live_dispatcher_count"],
+        "dispatcher_count_after": after["live_dispatcher_count"],
+        "new_dispatchers": len(new_dispatchers),
+        "vanished_dispatchers": len(lost_dispatchers),
+        "compiled_signature_count_before": before["compiled_signature_count"],
+        "compiled_signature_count_after": after["compiled_signature_count"],
+        "new_compiled_signatures": added_signatures,
+        "compile_event_count": len(added_signatures),
+        "compile_contaminated": bool(added_signatures or new_dispatchers or lost_dispatchers),
+        "before_signature_sha256": before["signature_sha256"],
+        "after_signature_sha256": after["signature_sha256"],
+        "method": (
+            "live numba.core.registry.CPUDispatcher identities plus public signatures snapshots "
+            "before and after each constructor; snapshots run outside timed interval"
+        ),
+    }
+
+
+def _ann_construction_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Interleaved CUDA ANN construction campaign")
+    parser.add_argument("--suite", choices=["ann-construction"], required=True)
+    parser.add_argument("--baseline-worker", type=Path, required=True)
+    parser.add_argument("--candidate-worker", type=Path, required=True)
+    parser.add_argument("--baseline-source-root", type=Path, required=True)
+    parser.add_argument("--candidate-source-root", type=Path, required=True)
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--rows", type=int, required=True)
+    parser.add_argument("--features", type=int, required=True)
+    parser.add_argument("--k", type=int, required=True, help="nonself neighbor count")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device-index", type=int, default=0)
+    args = parser.parse_args(argv)
+    if (
+        args.rows <= 25
+        or args.features < 1
+        or args.k != 24
+        or args.k >= args.rows
+        or args.device_index < 0
+    ):
+        parser.error("campaign requires rows > 25, features > 0 and k=24")
+    try:
+        source_identities = {
+            "baseline": _source_identity(args.baseline_source_root),
+            "candidate": _source_identity(args.candidate_source_root),
+        }
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        parser.error(f"invalid source root: {error}")
+    data = args.data.resolve()
+    if data.stat().st_size != args.rows * args.features * 4:
+        parser.error("f32le input length does not match rows * features * 4")
+
+    for name in (
+        "NUMBA_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = "15"
+    import numpy as np
+    import pynndescent
+    from pynndescent import NNDescent
+
+    numba = __import__("numba")
+    numba.set_num_threads(15)
+    matrix = np.fromfile(data, dtype="<f4").reshape(args.rows, args.features)
+    if pynndescent.__version__ != "0.6.0":
+        parser.error(f"requires PyNNDescent 0.6.0, found {pynndescent.__version__}")
+    configuration = {
+        "rows": args.rows,
+        "features": args.features,
+        "metric": "euclidean",
+        "k_nonself": 24,
+        "n_neighbors_including_self": 25,
+        "seed": 42,
+        "cuda_cap": 14,
+        "cuda_device_index": args.device_index,
+        "pynndescent": {
+            "version": pynndescent.__version__,
+            "n_jobs": 15,
+            "n_trees": 11,
+            "max_candidates": 60,
+            "n_iters": 14,
+            "n_neighbors": 25,
+            "random_state": 42,
+            "delta": 0.001,
+        },
+        "warmups_per_implementation": 1,
+        "timed_builds_per_implementation": 10,
+        "timer": (
+            "CUDA host input through upload, construction, sync and materialized host "
+            "IDs/distances; PyNNDescent constructor including trees plus neighbor_graph read; "
+            "disk IO excluded"
+        ),
+        "ipc": (
+            "persistent Rust process; stdin/stdout JSONL {op:warmup|build,seed,k,cap}; "
+            "serial requests"
+        ),
+        "order": "ten trials; baseline/candidate/PyNNDescent rotated one-at-a-time; no overlap",
+    }
+    output: dict[str, Any] = {
+        "schema": "fast-umap.ann-construction-campaign.v1",
+        "complete": False,
+        "protocol_admissible": False,
+        "configuration": configuration,
+        "provenance": {
+            "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "data": {"path": str(data), "sha256": sha256_file(data), "bytes": data.stat().st_size},
+            "harness": {
+                "path": str(Path(__file__).resolve()),
+                "sha256": sha256_file(Path(__file__).resolve()),
+            },
+            "workers": {
+                "baseline": {
+                    **_ann_worker_identity(args.baseline_worker),
+                    "source": source_identities["baseline"],
+                },
+                "candidate": {
+                    **_ann_worker_identity(args.candidate_worker),
+                    "source": source_identities["candidate"],
+                },
+            },
+            "source_roots": source_identities,
+            "hardware": {
+                "platform": platform.platform(),
+                "processor": platform.processor(),
+                "python": sys.version,
+            },
+            "dependencies": {
+                name: __import__("importlib.metadata", fromlist=["version"]).version(name)
+                for name in ("numpy", "pynndescent", "numba", "scipy", "scikit-learn")
+            },
+            "gpu": gpu_device_provenance(),
+        },
+        "compile_contamination": {
+            "status": "cubecl_log_and_numba_dispatcher_snapshots",
+            "cubecl": {
+                "record_marker": "[START_KERNEL_COMPILATION]",
+                "configuration": (
+                    "Each worker runs from an isolated per-worker cwd containing cubecl.toml with "
+                    "[compilation.logger] level='full' file=<dedicated log> and "
+                    "[profiling.logger] level='disabled'. CUBECL_DEBUG_LOG and "
+                    "CUBECL_DEBUG_OPTION are removed from child environment."
+                ),
+                "record_cost": (
+                    "CubeCL emits records from the compilation/load path only; "
+                    "`CompiledKernel` Full formatting and any C++ source formatting occur only "
+                    "on new compilation. "
+                    "Profiling is independently disabled, so no kernel profiling/synchronization "
+                    "instrumentation is enabled."
+                ),
+                "delivery": (
+                    "The source `ServerLogger` sends compilation messages through an async "
+                    "channel; "
+                    "the file sink writes one complete record and flushes on each logger write. "
+                    "This harness waits for five identical file-size/event-count observations "
+                    "25ms apart after each response; this is a quiet-period barrier, not a "
+                    "synchronous CubeCL acknowledgement."
+                ),
+                "logs": {},
+            },
+            "pynndescent": {
+                "method": (
+                    "live Numba CPUDispatcher identity and public signatures/count snapshots "
+                    "before and after every constructor call, performed outside "
+                    "the constructor timer"
+                ),
+                "proof_scope": (
+                    "No newly visible Numba dispatcher/signature in the timed call proves the "
+                    "observed dispatcher set was post-warmup; Numba exposes no general public "
+                    "compilation event counter here, so this is explicitly a dispatcher-snapshot "
+                    "signal, not a claim about transient unseen dispatchers."
+                ),
+            },
+            "rejected_samples": [],
+            "strategy": (
+                "One in-process warmup per implementation. Reject and rerun a CUDA sample if its "
+                "stabilized per-worker CubeCL log gains compilation markers; reject and rerun "
+                "PyNNDescent if its live dispatcher count or compiled signatures change. Keep "
+                "every rejected sample and its evidence in this object."
+            ),
+        },
+        "warmups": {},
+        "samples": [],
+        "medians_ms": {},
+        "rejections": [],
+    }
+
+    def persist() -> None:
+        out = args.output.resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    workers: dict[str, AnnConstructionWorker] = {}
+    try:
+        log_dir = args.output.resolve().with_suffix("").with_name(args.output.stem + "-cubecl-logs")
+        workers["baseline"] = AnnConstructionWorker(
+            args.baseline_worker,
+            data,
+            args.rows,
+            args.features,
+            args.device_index,
+            log_dir / "baseline.log",
+        )
+        workers["candidate"] = AnnConstructionWorker(
+            args.candidate_worker,
+            data,
+            args.rows,
+            args.features,
+            args.device_index,
+            log_dir / "candidate.log",
+        )
+        for name in ("baseline", "candidate"):
+            result, before_log, after_log = workers[name].request("warmup", 42, 24, 14)
+            output["warmups"][name] = {
+                **{
+                    key: result[key]
+                    for key in (
+                        "elapsed_ms",
+                        "ids_hash_fnv1a64",
+                        "distances_hash_fnv1a64",
+                        "compile_signal",
+                    )
+                },
+                "cubecl_compile_records_during_warmup": after_log["compilation_records"]
+                - before_log["compilation_records"],
+                "cubecl_log_snapshot": after_log,
+            }
+            output["compile_contamination"]["cubecl"]["logs"][name] = {
+                "path": str(workers[name].compile_log),
+                "configuration_path": str(workers[name].config_dir / "cubecl.toml"),
+                "configuration_sha256": sha256_file(workers[name].config_dir / "cubecl.toml"),
+                "profiling_level": "disabled",
+                "compilation_level": "full",
+                "sha256_after_warmup": after_log["sha256"],
+                "warmup_compile_records": after_log["compilation_records"]
+                - before_log["compilation_records"],
+            }
+
+        def py_build() -> tuple[float, Any, Any]:
+            start = time.perf_counter()
+            index = NNDescent(
+                matrix,
+                n_neighbors=25,
+                n_trees=11,
+                max_candidates=60,
+                n_iters=14,
+                random_state=42,
+                n_jobs=15,
+                delta=0.001,
+                metric="euclidean",
+            )
+            graph = index.neighbor_graph
+            elapsed = (time.perf_counter() - start) * 1000.0
+            ids, distances = _validate_ann_graph(graph[0], graph[1], args.rows, 24)
+            return elapsed, ids, distances
+
+        py_before = _numba_dispatcher_snapshot(numba)
+        py_ms, py_ids, py_distances = py_build()
+        py_after = _numba_dispatcher_snapshot(numba)
+        py_warm_compile = _numba_compile_delta(py_before, py_after)
+        output["warmups"]["pynndescent"] = {
+            "elapsed_ms": py_ms,
+            "ids_sha256": hashlib.sha256(py_ids.tobytes()).hexdigest(),
+            "distances_sha256": hashlib.sha256(py_distances.tobytes()).hexdigest(),
+            "numba_dispatcher_snapshot": py_warm_compile,
+        }
+        accepted = {"baseline": 0, "candidate": 0, "pynndescent": 0}
+        for trial in range(10):
+            labels = ["baseline", "candidate", "pynndescent"]
+            order = labels[trial % 3 :] + labels[: trial % 3]
+            for order_index, name in enumerate(order):
+                attempts = 0
+                while accepted[name] <= trial:
+                    attempts += 1
+                    if attempts > 20:
+                        raise RuntimeError(
+                            f"{name} continued compiling after warmup for 20 consecutive attempts"
+                        )
+                    sample: dict[str, Any] = {
+                        "trial": trial,
+                        "order_index": order_index,
+                        "attempt": attempts - 1,
+                        "accepted_index": accepted[name],
+                        "implementation": name,
+                    }
+                    if name == "pynndescent":
+                        before = _numba_dispatcher_snapshot(numba)
+                        elapsed, ids, distances = py_build()
+                        after = _numba_dispatcher_snapshot(numba)
+                        compile_delta = _numba_compile_delta(before, after)
+                        sample.update(
+                            {
+                                "elapsed_ms": elapsed,
+                                "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+                                "distances_sha256": hashlib.sha256(distances.tobytes()).hexdigest(),
+                                "numba_dispatcher_snapshot": compile_delta,
+                                "compile_event_count": compile_delta["compile_event_count"],
+                                "compile_contaminated": compile_delta["compile_contaminated"],
+                            }
+                        )
+                    else:
+                        result, before_log, after_log = workers[name].request("build", 42, 24, 14)
+                        event_delta = (
+                            after_log["compilation_records"] - before_log["compilation_records"]
+                        )
+                        sample.update(
+                            {
+                                "elapsed_ms": result["elapsed_ms"],
+                                "ids_hash_fnv1a64": result["ids_hash_fnv1a64"],
+                                "distances_hash_fnv1a64": result["distances_hash_fnv1a64"],
+                                "cubecl_log_before": before_log,
+                                "cubecl_log_after": after_log,
+                                "compile_event_count": event_delta,
+                                "compile_contaminated": event_delta > 0,
+                            }
+                        )
+                    if sample["compile_contaminated"]:
+                        sample["rejected"] = True
+                        output["compile_contamination"]["rejected_samples"].append(sample)
+                        output["rejections"].append(
+                            {
+                                "trial": trial,
+                                "implementation": name,
+                                "attempt": attempts - 1,
+                                "elapsed_ms": sample["elapsed_ms"],
+                                "compile_event_count": sample["compile_event_count"],
+                                "evidence": sample.get(
+                                    "cubecl_log_after", sample.get("numba_dispatcher_snapshot")
+                                ),
+                            }
+                        )
+                    else:
+                        sample["rejected"] = False
+                        output["samples"].append(sample)
+                        accepted[name] += 1
+                    persist()
+        for name, worker in workers.items():
+            final_log = worker._stable_log_snapshot()
+            output["compile_contamination"]["cubecl"]["logs"][name].update(
+                {
+                    "final_sha256": final_log["sha256"],
+                    "final_bytes": final_log["bytes"],
+                    "total_compilation_records": final_log["compilation_records"],
+                }
+            )
+        output["medians_ms"] = {
+            name: statistics.median(
+                sample["elapsed_ms"]
+                for sample in output["samples"]
+                if sample["implementation"] == name
+            )
+            for name in ("baseline", "candidate", "pynndescent")
+        }
+        output["complete"] = True
+        output["protocol_admissible"] = all(
+            len([sample for sample in output["samples"] if sample["implementation"] == name]) == 10
+            and all(
+                sample["compile_event_count"] == 0
+                for sample in output["samples"]
+                if sample["implementation"] == name
+            )
+            for name in ("baseline", "candidate", "pynndescent")
+        )
+        expected_order = []
+        labels = ["baseline", "candidate", "pynndescent"]
+        for trial in range(10):
+            order = labels[trial % 3 :] + labels[: trial % 3]
+            expected_order.extend((trial, name) for name in order)
+        actual_order = [(sample["trial"], sample["implementation"]) for sample in output["samples"]]
+        if actual_order != expected_order:
+            raise RuntimeError(
+                "accepted construction samples do not match the interleaved schedule"
+            )
+        output["compile_contamination"]["status"] = (
+            "zero_timed_compile_events_observed"
+            if output["protocol_admissible"]
+            else "compile_exclusion_not_established"
+        )
+        persist()
+    except BaseException as error:
+        output["error"] = f"{type(error).__name__}: {error}"
+        persist()
+        raise
+    finally:
+        for worker in workers.values():
+            worker.close()
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0
+
+
 def _cli() -> int:
     if (
         "--suite" in sys.argv
@@ -1963,6 +2619,12 @@ def _cli() -> int:
         and sys.argv[sys.argv.index("--suite") + 1] == "stage2"
     ):
         return _stage2_cli(sys.argv[1:])
+    if (
+        "--suite" in sys.argv
+        and sys.argv.index("--suite") + 1 < len(sys.argv)
+        and sys.argv[sys.argv.index("--suite") + 1] == "ann-construction"
+    ):
+        return _ann_construction_cli(sys.argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["stage1"], default="stage1")
     parser.add_argument("--runs", type=int, default=5)

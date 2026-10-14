@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import platform
@@ -26,6 +27,9 @@ SEEDS = [11, 29, 47, 71, 101]
 N_NEIGHBORS = 15
 N_COMPONENTS = 2
 TRUST_K = 15
+CAMPAIGN_SEEDS = [11, 29, 47, 71, 101]
+CAMPAIGN_N_NEIGHBORS = 25
+CAMPAIGN_TRUST_K = 15
 
 # Explicit fixed rows isolate the reference graph math from neighbor search.
 GRAPH_CASES = [
@@ -294,7 +298,163 @@ def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray]]:
     return scores, arrays
 
 
+def exact_trustworthiness_bounded(original: np.ndarray, embedded: np.ndarray, k: int) -> float:
+    """Exact sklearn-style trustworthiness using O(n + n*k) working memory."""
+    n = len(original)
+    if embedded.shape[0] != n or not 0 < k < n / 2:
+        raise ValueError("trustworthiness requires equal rows and 0 < k < n/2")
+    penalty = 0
+    original64 = np.asarray(original, dtype=np.float64)
+    embedded64 = np.asarray(embedded, dtype=np.float64)
+    for row in range(n):
+        original_dist = np.sum((original64 - original64[row]) ** 2, axis=1)
+        embedded_dist = np.sum((embedded64 - embedded64[row]) ** 2, axis=1)
+        original_dist[row] = np.inf
+        embedded_dist[row] = np.inf
+        # Stable row-index tie breaks are used consistently by Rust candidate scoring.
+        original_order = np.lexsort((np.arange(n), original_dist))
+        embedded_order = np.lexsort((np.arange(n), embedded_dist))[:k]
+        ranks = np.empty(n, dtype=np.int32)
+        ranks[original_order] = np.arange(1, n + 1, dtype=np.int32)
+        penalty += int(np.maximum(ranks[embedded_order] - k, 0).sum())
+    normalizer = n * k * (2 * n - 3 * k - 1)
+    return 1.0 - 2.0 * penalty / normalizer
+
+
+def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> None:
+    import umap
+
+    actual_version = version("umap-learn")
+    if actual_version != REFERENCE_VERSION:
+        raise RuntimeError(f"expected umap-learn {REFERENCE_VERSION}, found {actual_version}")
+    expected_values = 16384 * 16
+    raw = input_path.read_bytes()
+    if len(raw) != expected_values * 4:
+        raise ValueError(f"expected {expected_values * 4} input bytes, found {len(raw)}")
+    train = np.frombuffer(raw, dtype="<f4").reshape(16384, 16).copy()
+    if not np.isfinite(train).all():
+        raise ValueError("campaign training data contains non-finite values")
+
+    arrays: dict[str, np.ndarray] = {"campaign__train": train}
+    scores: list[dict[str, object]] = []
+    for seed in CAMPAIGN_SEEDS:
+        reducer = umap.UMAP(
+            n_neighbors=CAMPAIGN_N_NEIGHBORS,
+            n_components=N_COMPONENTS,
+            min_dist=0.1,
+            spread=1.0,
+            local_connectivity=1.0,
+            set_op_mix_ratio=1.0,
+            n_epochs=200,
+            learning_rate=1.0,
+            negative_sample_rate=5,
+            repulsion_strength=1.0,
+            init="spectral",
+            random_state=seed,
+            transform_seed=seed,
+            metric="euclidean",
+            low_memory=True,
+            n_jobs=1,
+            verbose=False,
+        )
+        reducer.fit(train)
+        embedding = reducer.embedding_.astype(np.float32)
+        if embedding.shape != (len(train), N_COMPONENTS) or not np.isfinite(embedding).all():
+            raise ValueError(f"invalid campaign reference embedding for seed {seed}")
+        arrays[f"campaign__seed{seed}__fit"] = embedding
+        scores.append(
+            {
+                "seed": seed,
+                "fit_trustworthiness_at_15": exact_trustworthiness_bounded(
+                    train, embedding, CAMPAIGN_TRUST_K
+                ),
+            }
+        )
+
+    result = {
+        "schema": "fast-umap-ann-campaign-quality-v1",
+        "reference": {
+            "distribution": "umap-learn",
+            "version": actual_version,
+            "python": sys.version,
+            "numpy": np.__version__,
+            "scipy": scipy.__version__,
+            "scikit_learn": version("scikit-learn"),
+            "numba": version("numba"),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        },
+        "data": {
+            "input_file": str(input_path),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "dtype": "little-endian float32",
+            "shape": [16384, 16],
+        },
+        "controls": {
+            "n_neighbors": CAMPAIGN_N_NEIGHBORS,
+            "n_components": N_COMPONENTS,
+            "seeds": CAMPAIGN_SEEDS,
+            "trustworthiness_k": CAMPAIGN_TRUST_K,
+            "fit": {
+                "min_dist": 0.1,
+                "spread": 1.0,
+                "local_connectivity": 1.0,
+                "set_op_mix_ratio": 1.0,
+                "n_epochs": 200,
+                "learning_rate": 1.0,
+                "negative_sample_rate": 5,
+                "repulsion_strength": 1.0,
+                "init": "spectral",
+                "metric": "euclidean",
+                "n_jobs": 1,
+                "low_memory": True,
+            },
+            "truth": (
+                "Exact Euclidean neighbors, self excluded by row identity; "
+                "ties at kth distance are inclusive."
+            ),
+            "trustworthiness": (
+                "Exact Euclidean ranks, self excluded by row identity, ties ordered by row index; "
+                "row-wise bounded-memory computation."
+            ),
+            "freeze": "Freeze campaign reference before evaluating kernel candidates.",
+        },
+        "quality": {"cases": ["campaign"], "scores": {"campaign": scores}},
+    }
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    quality_path.parent.mkdir(parents=True, exist_ok=True)
+    reference_path.write_text(
+        json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    np.savez_compressed(quality_path, **arrays)
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--campaign",
+        action="store_true",
+        help="generate only the isolated large campaign reference",
+    )
+    parser.add_argument("--input", type=Path, help="campaign raw little-endian float32 input")
+    parser.add_argument("--output-reference", type=Path, help="campaign reference JSON output")
+    parser.add_argument("--output-quality", type=Path, help="campaign quality NPZ output")
+    args = parser.parse_args()
+    if args.campaign:
+        if not all((args.input, args.output_reference, args.output_quality)):
+            parser.error("--campaign requires --input, --output-reference, and --output-quality")
+        outputs = {args.output_reference.resolve(), args.output_quality.resolve()}
+        protected = {REFERENCE_JSON.resolve(), QUALITY_NPZ.resolve()}
+        if len(outputs) != 2 or outputs & protected:
+            parser.error(
+                "campaign outputs must be distinct and may not overwrite standard frozen fixtures"
+            )
+        run_campaign(args.input, args.output_reference, args.output_quality)
+        return
+    if any((args.input, args.output_reference, args.output_quality)):
+        parser.error("campaign input/output controls require --campaign")
     actual_version = version("umap-learn")
     if actual_version != REFERENCE_VERSION:
         raise RuntimeError(f"expected umap-learn {REFERENCE_VERSION}, found {actual_version}")

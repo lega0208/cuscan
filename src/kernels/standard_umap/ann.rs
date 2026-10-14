@@ -11,6 +11,18 @@ use crate::standard_umap::ann::candidate_width;
 
 const ANN_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 
+fn ann_should_stop(new_count: i32, n: usize, width: usize) -> bool {
+    let capacity = n
+        .checked_mul(width)
+        .expect("ANN candidate elements overflow usize");
+    assert!(capacity <= i32::MAX as usize, "ANN count exceeds i32");
+    assert!(
+        new_count >= 0 && (new_count as usize) <= capacity,
+        "ANN new-membership count is outside candidate capacity"
+    );
+    (new_count as u64) * 1000 <= capacity as u64
+}
+
 #[cube]
 fn reverse_first_hit<I: Int>(
     candidates: &Tensor<I>,
@@ -103,55 +115,6 @@ fn reverse_scatter<I: Int>(
     }
 }
 
-#[cube]
-fn consider<F: Float, I: Int>(
-    data: &Tensor<F>,
-    row: usize,
-    candidate: I,
-    features: usize,
-    n: usize,
-    width: usize,
-    indices: &mut Tensor<I>,
-    distances: &mut Tensor<F>,
-) {
-    let candidate_index = u32::cast_from(candidate) as usize;
-    if candidate_index < n && candidate_index != row {
-        let mut squared = F::new(0.0f32);
-        for feature in 0..features {
-            let delta = data[row * features + feature] - data[candidate_index * features + feature];
-            squared += delta * delta;
-        }
-        let base = row * width;
-        let mut position = width;
-        let mut duplicate = false;
-        for slot in 0..width {
-            let old = indices[base + slot];
-            if old == candidate {
-                duplicate = true;
-            }
-            if position == width {
-                let old_distance = distances[base + slot];
-                let old_index = u32::cast_from(old) as usize;
-                if squared < old_distance
-                    || (squared == old_distance && candidate_index < old_index)
-                {
-                    position = slot;
-                }
-            }
-        }
-        if !duplicate && position < width {
-            let mut slot = width - 1;
-            while slot > position {
-                indices[base + slot] = indices[base + slot - 1];
-                distances[base + slot] = distances[base + slot - 1];
-                slot -= 1;
-            }
-            indices[base + position] = candidate;
-            distances[base + position] = squared;
-        }
-    }
-}
-
 #[cube(launch)]
 fn ann_init<I: Int>(
     indices: &mut Tensor<I>,
@@ -215,76 +178,385 @@ fn ann_init<I: Int>(
     }
 }
 
+#[cube]
+fn cooperative_merge_tile<F: Float, I: Int>(
+    n: usize,
+    row: usize,
+    width: usize,
+    proposal: I,
+    proposal_squared: F,
+    proposal_valid: u32,
+    toggle: u32,
+    ids_a: &mut Tensor<I>,
+    distances_a: &mut Tensor<F>,
+    ids_b: &mut Tensor<I>,
+    distances_b: &mut Tensor<F>,
+    proposal_ids: &mut Shared<[I]>,
+    proposal_distances: &mut Shared<[F]>,
+    proposal_valids: &mut Shared<[I]>,
+    row_base: usize,
+) -> u32 {
+    let lane = UNIT_POS_X as usize;
+    proposal_ids[lane] = proposal;
+    proposal_distances[lane] = proposal_squared;
+    proposal_valids[lane] = I::cast_from(proposal_valid as i32);
+    sync_cube();
+
+    let sentinel = I::cast_from(n as i32);
+    let max_distance = F::new(3.402_823_5e38_f32);
+    let proposal_id = proposal_ids[lane];
+    let proposal_index = u32::cast_from(proposal_id) as usize;
+    let mut proposal_novel: bool = proposal_valids[lane] != I::cast_from(0i32)
+        && proposal_index < n
+        && proposal_index != row
+        && proposal_distances[lane] <= max_distance;
+    let mut old_slot = 0usize;
+    while proposal_novel && old_slot < width {
+        let old_id = if toggle == 0 {
+            ids_a[row_base + old_slot]
+        } else {
+            ids_b[row_base + old_slot]
+        };
+        if old_id == proposal_id {
+            proposal_novel = false;
+        }
+        old_slot += 1;
+    }
+    let mut previous_lane = 0usize;
+    while proposal_novel && previous_lane < lane {
+        if proposal_valids[previous_lane] != I::cast_from(0i32)
+            && proposal_ids[previous_lane] == proposal_id
+        {
+            proposal_novel = false;
+        }
+        previous_lane += 1;
+    }
+    sync_cube();
+    proposal_valids[lane] = I::cast_from(if proposal_novel { 1i32 } else { 0i32 });
+    sync_cube();
+
+    let any_novel: bool = plane_any(proposal_novel);
+    if any_novel {
+        let mut position = lane;
+        while position < width {
+            if toggle == 0 {
+                ids_b[row_base + position] = sentinel;
+                distances_b[row_base + position] = max_distance;
+            } else {
+                ids_a[row_base + position] = sentinel;
+                distances_a[row_base + position] = max_distance;
+            }
+            position += 32;
+        }
+        sync_cube();
+
+        // Existing candidates are already unique and lex-sorted. A candidate's
+        // merged rank is its old rank plus the number of novel tile entries before it.
+        position = lane;
+        while position < width {
+            let id = if toggle == 0 {
+                ids_a[row_base + position]
+            } else {
+                ids_b[row_base + position]
+            };
+            let distance = if toggle == 0 {
+                distances_a[row_base + position]
+            } else {
+                distances_b[row_base + position]
+            };
+            let id_index = u32::cast_from(id) as usize;
+            if id_index < n && distance <= max_distance {
+                let mut rank = position;
+                for other_lane in 0..32 {
+                    if proposal_valids[other_lane] != I::cast_from(0i32) {
+                        let other_id = proposal_ids[other_lane];
+                        let other_distance = proposal_distances[other_lane];
+                        let other_index = u32::cast_from(other_id) as usize;
+                        if other_distance < distance
+                            || (other_distance == distance && other_index < id_index)
+                        {
+                            rank += 1;
+                        }
+                    }
+                }
+                if rank < width {
+                    if toggle == 0 {
+                        ids_b[row_base + rank] = id;
+                        distances_b[row_base + rank] = distance;
+                    } else {
+                        ids_a[row_base + rank] = id;
+                        distances_a[row_base + rank] = distance;
+                    }
+                }
+            }
+            position += 32;
+        }
+
+        // Each lane contributes at most one unique proposal; duplicate ids are
+        // owned by their lowest lane and proposals already present in the list vanish.
+        let id = proposal_ids[lane];
+        let distance = proposal_distances[lane];
+        let id_index = u32::cast_from(id) as usize;
+        if proposal_valids[lane] != I::cast_from(0i32) {
+            let mut rank = 0usize;
+            let mut old_slot = 0usize;
+            while old_slot < width {
+                let old_id = if toggle == 0 {
+                    ids_a[row_base + old_slot]
+                } else {
+                    ids_b[row_base + old_slot]
+                };
+                let old_distance = if toggle == 0 {
+                    distances_a[row_base + old_slot]
+                } else {
+                    distances_b[row_base + old_slot]
+                };
+                let old_index = u32::cast_from(old_id) as usize;
+                if old_index < n
+                    && (old_distance < distance
+                        || (old_distance == distance && old_index < id_index))
+                {
+                    rank += 1;
+                }
+                old_slot += 1;
+            }
+            for other_lane in 0..32 {
+                if proposal_valids[other_lane] != I::cast_from(0i32) {
+                    let other_id = proposal_ids[other_lane];
+                    let other_distance = proposal_distances[other_lane];
+                    let other_index = u32::cast_from(other_id) as usize;
+                    if other_distance < distance
+                        || (other_distance == distance && other_index < id_index)
+                    {
+                        rank += 1;
+                    }
+                }
+            }
+            if rank < width {
+                if toggle == 0 {
+                    ids_b[row_base + rank] = id;
+                    distances_b[row_base + rank] = distance;
+                } else {
+                    ids_a[row_base + rank] = id;
+                    distances_a[row_base + rank] = distance;
+                }
+            }
+        }
+        sync_cube();
+        toggle ^ 1u32
+    } else {
+        toggle
+    }
+}
+
 #[cube(launch)]
 fn ann_step<F: Float, I: Int>(
     data: &Tensor<F>,
     candidates: &Tensor<I>,
+    candidate_distances: &Tensor<F>,
+    candidate_retained: &Tensor<I>,
     reverse_offsets: &Tensor<I>,
     reverse_sources: &Tensor<I>,
     output_indices: &mut Tensor<I>,
     output_distances: &mut Tensor<F>,
+    workspace_indices: &mut Tensor<I>,
+    workspace_distances: &mut Tensor<F>,
+    output_retained: &mut Tensor<I>,
+    new_count: &mut Tensor<Atomic<I>>,
     width: u32,
     do_expand: u32,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
-    let row = ABSOLUTE_POS_X as usize;
+    let row = CUBE_POS_X as usize;
+    let lane = UNIT_POS_X as usize;
     let n = data.shape(0);
     let features = data.shape(1);
     let width = width as usize;
     if row < n {
         let base = row * width;
-        for slot in 0..width {
-            output_indices[base + slot] = I::cast_from(n as u32);
+        let mut proposal_ids = Shared::<[I]>::new_slice(32usize);
+        let mut proposal_distances = Shared::<[F]>::new_slice(32usize);
+        let mut proposal_valids = Shared::<[I]>::new_slice(32usize);
+        let mut reverse_skip = Shared::<[I]>::new_slice(1usize);
+        let mut toggle = 0u32;
+        let mut slot = lane;
+        while slot < width {
+            output_indices[base + slot] = I::cast_from(n as i32);
             output_distances[base + slot] = F::new(3.402_823_5e38_f32);
+            slot += 32;
         }
-        for slot in 0..width {
-            consider(
-                data,
-                row,
-                candidates[base + slot],
-                features,
-                n,
-                width,
-                output_indices,
-                output_distances,
-            );
-        }
-        if do_expand != 0 {
-            // Join each current neighbor's list (neighbor-of-neighbor proposals).
-            for slot in 0..width {
-                let neighbor = u32::cast_from(candidates[base + slot]) as usize;
+        sync_cube();
+
+        // Own plus forward proposals form a rectangular, lane-parallel stream.
+        let own_and_forward = if do_expand != 0 {
+            width + width * width
+        } else {
+            width
+        };
+        let mut tile = 0usize;
+        while tile * 32 < own_and_forward {
+            let proposal_position = tile * 32 + lane;
+            let mut proposal = I::cast_from(n as i32);
+            let mut proposal_squared = F::new(3.402_823_5e38_f32);
+            let mut valid = false;
+            let mut reuse = false;
+            if proposal_position < width {
+                proposal = candidates[base + proposal_position];
+                valid = true;
+                reuse = do_expand != 0;
+                if reuse {
+                    proposal_squared = candidate_distances[base + proposal_position];
+                }
+            } else if proposal_position < own_and_forward {
+                let forward_position = proposal_position - width;
+                let outer = forward_position / width;
+                let inner = forward_position - outer * width;
+                let neighbor = u32::cast_from(candidates[base + outer]) as usize;
                 if neighbor < n {
-                    for other in 0..width {
-                        consider(
-                            data,
-                            row,
-                            candidates[neighbor * width + other],
-                            features,
-                            n,
-                            width,
-                            output_indices,
-                            output_distances,
-                        );
+                    let neighbor_retained = candidate_retained[base + outer] != I::cast_from(0i32);
+                    let inner_retained =
+                        candidate_retained[neighbor * width + inner] != I::cast_from(0i32);
+                    if !neighbor_retained || !inner_retained {
+                        proposal = candidates[neighbor * width + inner];
+                        valid = true;
                     }
                 }
             }
-            // Reverse joins traverse the complete CSR segment for this row.
+            if valid && !reuse {
+                let candidate_index = u32::cast_from(proposal) as usize;
+                if candidate_index < n && candidate_index != row {
+                    proposal_squared = F::new(0.0f32);
+                    for feature in 0..features {
+                        let delta = data[row * features + feature]
+                            - data[candidate_index * features + feature];
+                        proposal_squared += delta * delta;
+                    }
+                }
+            }
+            toggle = cooperative_merge_tile::<F, I>(
+                n,
+                row,
+                width,
+                proposal,
+                proposal_squared,
+                if valid { 1u32 } else { 0u32 },
+                toggle,
+                output_indices,
+                output_distances,
+                workspace_indices,
+                workspace_distances,
+                &mut proposal_ids,
+                &mut proposal_distances,
+                &mut proposal_valids,
+                base,
+            );
+            tile += 1;
+        }
+
+        if do_expand != 0 {
             let start = u32::cast_from(reverse_offsets[row]) as usize;
             let end = u32::cast_from(reverse_offsets[row + 1]) as usize;
             for position in start..end {
                 let source = u32::cast_from(reverse_sources[position]) as usize;
-                for slot in 0..width {
-                    consider(
-                        data,
-                        row,
-                        candidates[source * width + slot],
-                        features,
-                        n,
-                        width,
-                        output_indices,
-                        output_distances,
+                let source_base = source * width;
+                if lane == 0 {
+                    let mut row_slot = width;
+                    for source_slot in 0..width {
+                        if row_slot == width
+                            && candidates[source_base + source_slot] == I::cast_from(row as i32)
+                        {
+                            row_slot = source_slot;
+                        }
+                    }
+                    reverse_skip[0] = I::cast_from(
+                        if row_slot < width
+                            && candidate_retained[source_base + row_slot] != I::cast_from(0i32)
+                        {
+                            1i32
+                        } else {
+                            0i32
+                        },
                     );
                 }
+                sync_cube();
+                let row_retained = reverse_skip[0] != I::cast_from(0i32);
+                let mut reverse_tile = 0usize;
+                while reverse_tile * 32 < width {
+                    let reverse_slot = reverse_tile * 32 + lane;
+                    let mut proposal = I::cast_from(n as i32);
+                    let mut valid = false;
+                    if reverse_slot < width
+                        && (!row_retained
+                            || candidate_retained[source_base + reverse_slot] == I::cast_from(0i32))
+                    {
+                        proposal = candidates[source_base + reverse_slot];
+                        valid = true;
+                    }
+                    let mut proposal_squared = F::new(3.402_823_5e38_f32);
+                    if valid {
+                        let candidate_index = u32::cast_from(proposal) as usize;
+                        if candidate_index < n && candidate_index != row {
+                            proposal_squared = F::new(0.0f32);
+                            for feature in 0..features {
+                                let delta = data[row * features + feature]
+                                    - data[candidate_index * features + feature];
+                                proposal_squared += delta * delta;
+                            }
+                        }
+                    }
+                    toggle = cooperative_merge_tile::<F, I>(
+                        n,
+                        row,
+                        width,
+                        proposal,
+                        proposal_squared,
+                        if valid { 1u32 } else { 0u32 },
+                        toggle,
+                        output_indices,
+                        output_distances,
+                        workspace_indices,
+                        workspace_distances,
+                        &mut proposal_ids,
+                        &mut proposal_distances,
+                        &mut proposal_valids,
+                        base,
+                    );
+                    reverse_tile += 1;
+                }
+            }
+        }
+
+        sync_cube();
+        if toggle != 0 {
+            slot = lane;
+            while slot < width {
+                output_indices[base + slot] = workspace_indices[base + slot];
+                output_distances[base + slot] = workspace_distances[base + slot];
+                slot += 32;
+            }
+            sync_cube();
+        }
+        if lane == 0 {
+            let mut row_new = I::cast_from(0i32);
+            for output_slot in 0..width {
+                let output_id = output_indices[base + output_slot];
+                let output_index = u32::cast_from(output_id) as usize;
+                let mut retained = false;
+                if do_expand != 0 && output_index < n {
+                    for previous_slot in 0..width {
+                        if candidates[base + previous_slot] == output_id {
+                            retained = true;
+                        }
+                    }
+                }
+                output_retained[base + output_slot] =
+                    I::cast_from(if retained { 1i32 } else { 0i32 });
+                if do_expand != 0 && output_index < n && !retained {
+                    row_new += I::cast_from(1i32);
+                }
+            }
+            if row_new > I::cast_from(0i32) {
+                new_count[0].fetch_add(row_new);
             }
         }
     }
@@ -416,25 +688,67 @@ pub(crate) fn approximate_neighbors(
         data.client.clone(),
         data.device.clone(),
         Shape::new([n, width]),
+        client.empty(distance_bytes),
+        DType::F32,
+    );
+    let mut next_candidates = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
+        data.client.empty(index_bytes),
+        DType::I32,
+    );
+    let mut next_distances = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
         data.client.empty(distance_bytes),
         DType::F32,
     );
+    let workspace_indices = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
+        data.client.empty(index_bytes),
+        DType::I32,
+    );
+    let workspace_distances = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
+        data.client.empty(distance_bytes),
+        DType::F32,
+    );
+    let mut candidate_retained = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
+        data.client.empty(index_bytes),
+        DType::I32,
+    );
+    let mut next_retained = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([n, width]),
+        data.client.empty(index_bytes),
+        DType::I32,
+    );
+    let new_count = CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([1]),
+        data.client.empty(DType::I32.size()),
+        DType::I32,
+    );
     for iteration in 0..=max_iterations {
-        let next_ids = CubeTensor::new_contiguous(
-            data.client.clone(),
-            data.device.clone(),
-            Shape::new([n, width]),
-            data.client.empty(index_bytes),
-            DType::I32,
-        );
-        let next_distances = CubeTensor::new_contiguous(
-            data.client.clone(),
-            data.device.clone(),
-            Shape::new([n, width]),
-            data.client.empty(distance_bytes),
-            DType::F32,
-        );
         if iteration > 0 {
+            reverse_zero::launch(
+                &data.client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                new_count.clone().into_tensor_arg(),
+                dtype_to_storage_type(DType::I32),
+            );
             reverse_zero::launch(
                 &data.client,
                 CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
@@ -475,14 +789,20 @@ pub(crate) fn approximate_neighbors(
         }
         ann_step::launch(
             &data.client,
-            CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
+            CubeCount::Static(n_u32, 1, 1),
             ANN_CUBE_DIM,
             data.clone().into_tensor_arg(),
-            candidates.into_tensor_arg(),
+            candidates.clone().into_tensor_arg(),
+            candidate_distances.clone().into_tensor_arg(),
+            candidate_retained.clone().into_tensor_arg(),
             reverse_offsets.clone().into_tensor_arg(),
             reverse_sources.clone().into_tensor_arg(),
-            next_ids.clone().into_tensor_arg(),
+            next_candidates.clone().into_tensor_arg(),
             next_distances.clone().into_tensor_arg(),
+            workspace_indices.clone().into_tensor_arg(),
+            workspace_distances.clone().into_tensor_arg(),
+            next_retained.clone().into_tensor_arg(),
+            new_count.clone().into_tensor_arg(),
             width_u32,
             u32::from(iteration > 0),
             [
@@ -490,8 +810,16 @@ pub(crate) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             ],
         );
-        candidates = next_ids;
-        candidate_distances = next_distances;
+        std::mem::swap(&mut candidates, &mut next_candidates);
+        std::mem::swap(&mut candidate_distances, &mut next_distances);
+        std::mem::swap(&mut candidate_retained, &mut next_retained);
+        if iteration > 0 {
+            let bytes = data.client.read_one_unchecked(new_count.handle.clone());
+            let new_ids = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+            if ann_should_stop(new_ids, n, width) {
+                break;
+            }
+        }
     }
     let output_elements = n
         .checked_mul(k)
@@ -540,6 +868,18 @@ pub(crate) fn approximate_neighbors(
 mod tests {
     use super::*;
     use burn_cubecl::CubeDevice;
+
+    #[test]
+    fn ann_stop_threshold_uses_inclusive_integer_equivalent() {
+        assert!(ann_should_stop(0, 1, 1));
+        assert!(!ann_should_stop(1, 1, 999));
+        assert!(ann_should_stop(1, 1, 1000));
+        assert!(!ann_should_stop(2, 1, 1000));
+        assert!(ann_should_stop(1, 1, 1999));
+        assert!(!ann_should_stop(2, 1, 1999));
+        assert!(ann_should_stop(524, 16_384, 32));
+        assert!(!ann_should_stop(525, 16_384, 32));
+    }
 
     fn raw_tensor<T: burn::tensor::Element>(
         data: &[T],
@@ -862,6 +1202,37 @@ mod tests {
             &raw_device,
             &client,
         );
+        let candidate_squared = candidates
+            .iter()
+            .enumerate()
+            .map(|(position, &candidate)| {
+                let row = position / width;
+                if candidate < 0 || candidate as usize >= n || candidate as usize == row {
+                    return f32::MAX;
+                }
+                let mut squared = 0.0f32;
+                for feature in 0..features {
+                    let delta = points[row * features + feature]
+                        - points[candidate as usize * features + feature];
+                    squared += delta * delta;
+                }
+                squared
+            })
+            .collect::<Vec<_>>();
+        let candidate_distance_tensor = raw_tensor(
+            &candidate_squared,
+            Shape::new([n, width]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let candidate_retained_tensor = raw_tensor(
+            &vec![0i32; n * width],
+            Shape::new([n, width]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
         let elements = n * width;
         let count_bytes = n * DType::I32.size();
         let counts = CubeTensor::new_contiguous(
@@ -946,22 +1317,84 @@ mod tests {
             client.empty(elements * DType::F32.size()),
             DType::F32,
         );
+        let workspace_ids = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(elements * DType::I32.size()),
+            DType::I32,
+        );
+        let workspace_distances = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(elements * DType::F32.size()),
+            DType::F32,
+        );
+        let output_retained = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(elements * DType::I32.size()),
+            DType::I32,
+        );
+        let new_count = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([1]),
+            client.empty(DType::I32.size()),
+            DType::I32,
+        );
+        reverse_zero::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            new_count.clone().into_tensor_arg(),
+            dtype,
+        );
         ann_step::launch(
             &client,
-            CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
+            CubeCount::Static(n_u32, 1, 1),
             ANN_CUBE_DIM,
             data.clone().into_tensor_arg(),
             candidate_tensor.into_tensor_arg(),
+            candidate_distance_tensor.into_tensor_arg(),
+            candidate_retained_tensor.into_tensor_arg(),
             offsets.into_tensor_arg(),
             sources.into_tensor_arg(),
             output_ids.clone().into_tensor_arg(),
             output_distances.clone().into_tensor_arg(),
+            workspace_ids.into_tensor_arg(),
+            workspace_distances.into_tensor_arg(),
+            output_retained.clone().into_tensor_arg(),
+            new_count.clone().into_tensor_arg(),
             width_u32,
             1,
             [dtype_to_storage_type(DType::F32), dtype],
         );
         let actual_ids = read_i32(&output_ids);
         let actual_distances = read_f32(&output_distances);
+        let mut expected_new_count = 0i32;
+        let mut expected_retained = vec![0i32; elements];
+        for row in 0..n {
+            let input = &candidates[row * width..(row + 1) * width];
+            for slot in 0..width {
+                let output = actual_ids[row * width + slot];
+                if output >= 0 && (output as usize) < n {
+                    if input.contains(&output) {
+                        expected_retained[row * width + slot] = 1;
+                    } else {
+                        expected_new_count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            read_i32(&new_count),
+            [expected_new_count],
+            "expansion count is valid output membership absent from the input row"
+        );
+        assert_eq!(read_i32(&output_retained), expected_retained);
         let expected = old_rescan_step(&points, &candidates, n, features, width);
         assert_eq!(actual_ids, expected.0);
         assert_eq!(
@@ -975,5 +1408,388 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ann_step_evaluates_both_mixed_retention_forward_pairs() {
+        let Some(_device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+        let n = 7usize;
+        let width = 2usize;
+        let features = 1usize;
+        let points = [0.0f32, 10.0, 11.0, 0.1, 50.0, -0.1, 60.0];
+        let mut candidates = vec![n as i32; n * width];
+        candidates[0..2].copy_from_slice(&[1, 2]);
+        candidates[2..4].copy_from_slice(&[3, 4]);
+        candidates[4..6].copy_from_slice(&[5, 6]);
+        let mut retained = vec![0i32; n * width];
+        retained[0..2].copy_from_slice(&[1, 0]); // retained s=1, new s=2
+        retained[2..4].copy_from_slice(&[0, 1]); // new c=3, retained c=4
+        retained[4..6].copy_from_slice(&[1, 0]); // retained c=5, new c=6
+
+        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
+        let client = raw_device.client();
+        let data = raw_tensor(
+            &points,
+            Shape::new([n, features]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let candidate_tensor = raw_tensor(
+            &candidates,
+            Shape::new([n, width]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
+        let candidate_squared = candidates
+            .iter()
+            .enumerate()
+            .map(|(position, &candidate)| {
+                let row = position / width;
+                if candidate < 0 || candidate as usize >= n || candidate as usize == row {
+                    return f32::MAX;
+                }
+                let delta = points[row] - points[candidate as usize];
+                delta * delta
+            })
+            .collect::<Vec<_>>();
+        let candidate_distances = raw_tensor(
+            &candidate_squared,
+            Shape::new([n, width]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let retained_tensor = raw_tensor(
+            &retained,
+            Shape::new([n, width]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
+        let offsets = raw_tensor(
+            &vec![0i32; n + 1],
+            Shape::new([n + 1]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
+        let sources = raw_tensor(
+            &vec![0i32; n * width],
+            Shape::new([n * width]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
+        let output_ids = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(n * width * DType::I32.size()),
+            DType::I32,
+        );
+        let output_distances = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(n * width * DType::F32.size()),
+            DType::F32,
+        );
+        let workspace_ids = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(n * width * DType::I32.size()),
+            DType::I32,
+        );
+        let workspace_distances = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(n * width * DType::F32.size()),
+            DType::F32,
+        );
+        let output_retained = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([n, width]),
+            client.empty(n * width * DType::I32.size()),
+            DType::I32,
+        );
+        let new_count = CubeTensor::new_contiguous(
+            client.clone(),
+            raw_device.clone(),
+            Shape::new([1]),
+            client.empty(DType::I32.size()),
+            DType::I32,
+        );
+        let dtype = dtype_to_storage_type(DType::I32);
+        reverse_zero::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            new_count.clone().into_tensor_arg(),
+            dtype,
+        );
+        ann_step::launch(
+            &client,
+            CubeCount::Static(u32::try_from(n).unwrap(), 1, 1),
+            ANN_CUBE_DIM,
+            data.into_tensor_arg(),
+            candidate_tensor.into_tensor_arg(),
+            candidate_distances.into_tensor_arg(),
+            retained_tensor.into_tensor_arg(),
+            offsets.into_tensor_arg(),
+            sources.into_tensor_arg(),
+            output_ids.clone().into_tensor_arg(),
+            output_distances.clone().into_tensor_arg(),
+            workspace_ids.into_tensor_arg(),
+            workspace_distances.into_tensor_arg(),
+            output_retained.clone().into_tensor_arg(),
+            new_count.clone().into_tensor_arg(),
+            u32::try_from(width).unwrap(),
+            1,
+            [dtype_to_storage_type(DType::F32), dtype],
+        );
+
+        // Full own-list-first join for row zero: [1,2] plus row 1's [3,4]
+        // and row 2's [5,6]. Both mixed retained/new directions are needed
+        // to produce the two closest results, 3 and 5.
+        let mut proposals = candidates[..width].to_vec();
+        for neighbor in [1usize, 2] {
+            proposals.extend_from_slice(&candidates[neighbor * width..(neighbor + 1) * width]);
+        }
+        let mut expected = proposals
+            .into_iter()
+            .map(|candidate| {
+                let delta = points[0] - points[candidate as usize];
+                (delta * delta, candidate)
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+        let actual_ids = read_i32(&output_ids);
+        let actual_distances = read_f32(&output_distances);
+        assert_eq!(
+            &actual_ids[..width],
+            &expected
+                .iter()
+                .take(width)
+                .map(|entry| entry.1)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual_distances[..width]
+                .iter()
+                .map(|distance| distance.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .take(width)
+                .map(|entry| entry.0.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(read_i32(&new_count), [2]);
+        assert_eq!(&read_i32(&output_retained)[..width], &[0, 0]);
+    }
+
+    #[test]
+    fn ann_step_device_counter_locks_inclusive_stop_boundary() {
+        let Some(_device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+
+        let n = 16_384usize;
+        let width = 32usize;
+        let elements = n * width;
+        let affected_ids = (0..width as i32).collect::<Vec<_>>();
+        let mut affected_retained = vec![1i32; width];
+        affected_retained[0] = 0;
+        let points = vec![0.0f32; n];
+        let mut candidates = vec![0i32; elements];
+        let mut retained = vec![1i32; elements];
+        for row in 0..n {
+            let base = row * width;
+            let mut slot = 0;
+            for id in 0..=width {
+                if id != row {
+                    candidates[base + slot] = id as i32;
+                    slot += 1;
+                    if slot == width {
+                        break;
+                    }
+                }
+            }
+        }
+        // The forward source proposes zero to each affected row. The newly
+        // inserted zero displaces the largest old ID, 32, from the full row.
+        candidates[width..2 * width].copy_from_slice(&[
+            0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ]);
+
+        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
+        let client = raw_device.client();
+        let data = raw_tensor(
+            &points,
+            Shape::new([n, 1]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let candidate_distances = raw_tensor(
+            &vec![0.0f32; elements],
+            Shape::new([n, width]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let offsets = raw_tensor(
+            &vec![0i32; n + 1],
+            Shape::new([n + 1]),
+            DType::I32,
+            &raw_device,
+            &client,
+        );
+        let reverse_sources =
+            raw_tensor(&[0i32], Shape::new([1]), DType::I32, &raw_device, &client);
+        let dtype = dtype_to_storage_type(DType::I32);
+        let n_u32 = u32::try_from(n).unwrap();
+        let width_u32 = u32::try_from(width).unwrap();
+        for target_new in [524usize, 525] {
+            let affected_start = 64usize;
+            let affected_end = affected_start + target_new;
+            for row in affected_start..affected_end {
+                let base = row * width;
+                candidates[base..base + width]
+                    .copy_from_slice(&(1..=width as i32).collect::<Vec<_>>());
+                retained[base] = 0;
+            }
+            let candidate_tensor = raw_tensor(
+                &candidates,
+                Shape::new([n, width]),
+                DType::I32,
+                &raw_device,
+                &client,
+            );
+            let candidate_retained = raw_tensor(
+                &retained,
+                Shape::new([n, width]),
+                DType::I32,
+                &raw_device,
+                &client,
+            );
+            let output_ids = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([n, width]),
+                client.empty(elements * DType::I32.size()),
+                DType::I32,
+            );
+            let output_distances = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([n, width]),
+                client.empty(elements * DType::F32.size()),
+                DType::F32,
+            );
+            let workspace_ids = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([n, width]),
+                client.empty(elements * DType::I32.size()),
+                DType::I32,
+            );
+            let workspace_distances = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([n, width]),
+                client.empty(elements * DType::F32.size()),
+                DType::F32,
+            );
+            let output_retained = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([n, width]),
+                client.empty(elements * DType::I32.size()),
+                DType::I32,
+            );
+            let new_count = CubeTensor::new_contiguous(
+                client.clone(),
+                raw_device.clone(),
+                Shape::new([1]),
+                client.empty(DType::I32.size()),
+                DType::I32,
+            );
+
+            reverse_zero::launch(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                new_count.clone().into_tensor_arg(),
+                dtype,
+            );
+            ann_step::launch(
+                &client,
+                CubeCount::Static(n_u32, 1, 1),
+                ANN_CUBE_DIM,
+                data.clone().into_tensor_arg(),
+                candidate_tensor.into_tensor_arg(),
+                candidate_distances.clone().into_tensor_arg(),
+                candidate_retained.into_tensor_arg(),
+                offsets.clone().into_tensor_arg(),
+                reverse_sources.clone().into_tensor_arg(),
+                output_ids.clone().into_tensor_arg(),
+                output_distances.into_tensor_arg(),
+                workspace_ids.into_tensor_arg(),
+                workspace_distances.into_tensor_arg(),
+                output_retained.clone().into_tensor_arg(),
+                new_count.clone().into_tensor_arg(),
+                width_u32,
+                1,
+                [dtype_to_storage_type(DType::F32), dtype],
+            );
+
+            let actual_new = read_i32(&new_count)[0];
+            let stop = ann_should_stop(actual_new, n, width);
+            println!("ANN boundary n={n} width={width} actualNEW={actual_new} stop={stop}");
+            assert_eq!(actual_new, target_new as i32);
+            assert_eq!(stop, target_new == 524);
+
+            let actual_ids = read_i32(&output_ids);
+            let actual_retained = read_i32(&output_retained);
+            for row in 0..n {
+                let base = row * width;
+                if (affected_start..affected_end).contains(&row) {
+                    assert_eq!(&actual_ids[base..base + width], affected_ids.as_slice());
+                    assert_eq!(
+                        &actual_retained[base..base + width],
+                        affected_retained.as_slice()
+                    );
+                } else {
+                    assert_eq!(
+                        &actual_ids[base..base + width],
+                        &candidates[base..base + width],
+                        "unaffected row {row} must retain its lexicographically smallest neighbors"
+                    );
+                    assert!(
+                        actual_retained[base..base + width]
+                            .iter()
+                            .all(|&flag| flag == 1)
+                    );
+                }
+            }
+            assert!(actual_retained.iter().all(|&flag| flag == 0 || flag == 1));
+        }
     }
 }

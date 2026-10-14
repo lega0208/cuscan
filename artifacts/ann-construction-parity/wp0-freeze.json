@@ -1,0 +1,24 @@
+{
+  "status": "WP0 frozen before candidate kernel edits",
+  "hashes": {
+    "Cargo.toml": "77a0f34261f284f2516074cd8d05fe7558ca92ec3c11b09eac2c98e3d6f4ca68",
+    "examples/ann_construction_worker.rs": "a45a85e64cf25b5408ab11502ac2b996e0f52a8e00401660ee805425e614196a",
+    "scripts/compare_umap_spans.py": "a0c2623f0c06cedecc1e06b2e35378eb5c4251d4dc8ab070fd0e7b5e5d13e13b",
+    "tests/test_standard_ann.rs": "cc4b06de833ab917b49e7bce8a8bc11696b94b86a3a214824cd99197ed1c2369",
+    "tests/test_standard_quality.rs": "2fa7419d611934fdf771b6894d41b67d1993d8bc137d4065da39ffa07c4149b7",
+    "tests/fixtures/generate_standard_umap.py": "db677ff334a907ad8f3323be9f217c3026ef31fd8c959242a0e25b98f95a7e37",
+    "tests/fixtures/ann_campaign_reference.json": "108f1837e5a66b392baf47ad00db78d4edf93e158754f6fe8317fc5647c9d775",
+    "tests/fixtures/ann_campaign_quality.npz": "77dd7eccca3ef72414c586eb6292dff3425b66099b1d9130874ae247fe37a52d"
+  },
+  "benchmark": "baseline-interleaved.json",
+  "medians_ms": {
+    "baseline": 595.387832,
+    "candidate": 596.397921,
+    "pynndescent": 130.22423448273912
+  },
+  "invalid_attempts": {
+    "baseline-construction.json": "worker sqrt tie validator failure/interruption",
+    "baseline-construction-retry.json": "all samples trial0 grouped, rejected by leader; not accepted timing evidence"
+  },
+  "kernel_diff": ""
+}
