@@ -353,6 +353,8 @@ def stage2_cuda_command(
         str(runs),
         "--neighbors",
         str(neighbors),
+        "--min-dist",
+        "0.0",
         "--init",
         init,
         "--seed",
@@ -931,6 +933,7 @@ def _stage2_reference_fit(matrix: Any, mode: str, seed: int, epochs: int, neighb
         n_components=2,
         n_epochs=epochs,
         init="spectral",
+        min_dist=0.0,
         random_state=seed,
         transform_seed=seed,
         metric="euclidean",
@@ -945,6 +948,7 @@ def _stage2_reference_fit(matrix: Any, mode: str, seed: int, epochs: int, neighb
     if (
         estimator.n_neighbors != n_neighbors
         or estimator.init != "spectral"
+        or estimator.min_dist != 0.0
         or estimator.metric != "euclidean"
         or estimator.random_state != seed
         or estimator.transform_seed != seed
@@ -1122,6 +1126,7 @@ def _stage2_worker(payload: dict[str, Any]) -> dict[str, Any]:
             "n_components": 2,
             "n_epochs": payload["epochs"],
             "init": "spectral",
+            "min_dist": 0.0,
             "metric": "euclidean",
             "n_jobs": -1,
             "requested_force_approximation_algorithm": mode == "approximate",
@@ -1773,6 +1778,7 @@ def _python_worker(
             n_components=2,
             n_epochs=epochs,
             init="random",
+            min_dist=0.0,
             random_state=None,
             metric="euclidean",
             force_approximation_algorithm=mode == "approximate",
@@ -1799,6 +1805,7 @@ def _python_worker(
         "config": {
             "random_state": None,
             "n_jobs": -1,
+            "min_dist": 0.0,
             "force_approximation_algorithm": mode == "approximate",
             "exact_precomputed_knn_inside_timed_fit": mode == "exact",
         },
@@ -2683,6 +2690,7 @@ def _cli() -> int:
             "neighbors": NEIGHBORS,
             "components": 2,
             "init": "random",
+            "min_dist": 0.0,
             "metric": "euclidean",
             "warmups": args.warmups,
             "runs": args.runs,
@@ -2742,6 +2750,8 @@ def _cli() -> int:
                             str(cuda_dir),
                             "--search",
                             mode,
+                            "--min-dist",
+                            "0.0",
                             "--warmups",
                             str(args.warmups),
                             "--runs",
@@ -2779,6 +2789,8 @@ def _cli() -> int:
                                 str(temp / f"small-{r}-{mode}"),
                                 "--search",
                                 mode,
+                                "--min-dist",
+                                "0.0",
                                 "--warmups",
                                 str(args.warmups),
                                 "--runs",
@@ -2913,6 +2925,8 @@ def _cli() -> int:
                             str(temp / f"nsys-{mode}-out"),
                             "--search",
                             mode,
+                            "--min-dist",
+                            "0.0",
                             "--warmups",
                             "1",
                             "--runs",
@@ -2929,6 +2943,8 @@ def _cli() -> int:
                         str(temp / "ncu-out"),
                         "--search",
                         "approximate",
+                        "--min-dist",
+                        "0.0",
                         "--warmups",
                         "1",
                         "--runs",

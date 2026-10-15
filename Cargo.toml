@@ -82,6 +82,16 @@ chrono = "0.4.45"
 zip = "=0.6.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = "0.7"
+cubecl-environment = { version = "=0.11.0", default-features = false, features = [
+  "std",
+  "persistence",
+] }
+cubecl-server = { version = "=0.11.0", default-features = false, features = [
+  "std",
+  "persistence",
+] }
+ciborium = "0.2.2"
+log = "0.4"
 
 [features]
 default = ["cuda", "cpu", "verbose"]
@@ -207,6 +217,7 @@ required-features = ["cuda", "tracing"]
 [[example]]
 name = "ann_construction_worker"
 required-features = ["cuda"]
+
 
 [[bin]]
 name = "bench_report"

@@ -40,6 +40,60 @@ def test_random_state_determinism() -> None:
     np.testing.assert_array_equal(first, second)
 
 
+def test_unique_defaults_to_raw_training_behavior() -> None:
+    x, _ = blobs(12)
+    rows = np.vstack((x, x[0], x[3]))
+    default = estimator().fit_transform(rows)
+    explicit_raw = estimator(unique=False).fit_transform(rows)
+    assert default.shape == (len(rows), 2)
+    np.testing.assert_array_equal(default, explicit_raw)
+
+
+def test_unique_expands_first_occurrence_embedding_and_transforms() -> None:
+    x, _ = blobs(12)
+    x[0, 0] = 0.0
+    signed_zero_duplicate = x[0].copy()
+    signed_zero_duplicate[0] = -0.0
+    rows = np.vstack((x, x[5], signed_zero_duplicate, x[2], x[5]))
+
+    first_occurrences: list[np.ndarray] = []
+    row_to_unique: list[int] = []
+    for row in rows:
+        for index, distinct in enumerate(first_occurrences):
+            if np.array_equal(row, distinct):
+                row_to_unique.append(index)
+                break
+        else:
+            row_to_unique.append(len(first_occurrences))
+            first_occurrences.append(row)
+    distinct_rows = np.stack(first_occurrences)
+
+    unique_model = estimator(unique=True, init="random").fit(rows)
+    reference_embedding = estimator(init="random").fit_transform(distinct_rows)
+    np.testing.assert_array_equal(unique_model.embedding_, reference_embedding[row_to_unique])
+    np.testing.assert_array_equal(unique_model.embedding_[-3], unique_model.embedding_[0])
+    np.testing.assert_array_equal(unique_model.embedding_[-1], unique_model.embedding_[5])
+    assert unique_model.embedding_.shape == (len(rows), 2)
+
+    transformed = unique_model.transform(np.vstack((rows[1], rows[-2])))
+    assert transformed.shape == (2, 2)
+    assert np.isfinite(transformed).all()
+
+
+def test_unique_requires_two_distinct_rows_and_validates_before_deduplication() -> None:
+    repeated = np.repeat(np.array([[1.0, 2.0]], dtype=np.float32), 4, axis=0)
+    with pytest.raises(ValueError, match=r"distinct|unique|at least"):
+        estimator(unique=True).fit(repeated)
+
+    two_distinct = np.array([[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    with pytest.raises(ValueError):
+        estimator(unique=True).fit(two_distinct)
+
+    nonfinite = np.array([[1.0, 2.0], [1.0, 2.0], [np.nan, 3.0]], dtype=np.float32)
+    with pytest.raises(ValueError, match="finite"):
+        estimator(unique=True).fit(nonfinite)
+
+
 def test_blob_clusters_are_separated() -> None:
     x, labels = blobs()
     embedding = estimator().fit_transform(x)

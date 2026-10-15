@@ -128,6 +128,8 @@ def test_stage2_cuda_command_matches_rust_positional_contract(tmp_path: Path) ->
         "1",
         "--neighbors",
         "25",
+        "--min-dist",
+        "0.1",
         "--init",
         "spectral",
         "--seed",
@@ -965,6 +967,7 @@ def test_pinned_umap_exact_reference_index_transforms_and_missing_index_fails() 
     estimator = module._stage2_reference_fit(training, "exact", seed=5, epochs=20, neighbors=25)
     assert estimator.n_neighbors == 25
     assert estimator.init == "spectral"
+    assert estimator.min_dist == 0.1
     assert estimator.metric == "euclidean"
     assert estimator.random_state == 5
     assert estimator.transform_seed == 5

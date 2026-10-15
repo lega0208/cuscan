@@ -8,7 +8,7 @@
 //! 3. `layout_vertex_atomic_kernel` — one lane per head vertex processes its
 //!    outgoing CSR edges, consuming its own per-head RNG and atomically
 //!    applying attraction to both endpoints and repulsion to the head only.
-//!    Shared fit processes sixteen ascending contiguous head batches, while
+//!    Shared fit processes four ascending contiguous head batches, while
 //!    transform uses one unpartitioned launch. Every concurrent coordinate
 //!    access is atomic.
 //!
@@ -417,8 +417,8 @@ pub(crate) fn optimize_epoch(
         );
     };
     if shared_embeddings {
-        let batch_size = head_u32.div_ceil(16);
-        for batch in 0..16 {
+        let batch_size = head_u32.div_ceil(4);
+        for batch in 0..4 {
             let start = batch * batch_size;
             let end = start.saturating_add(batch_size).min(head_u32);
             if start < end {

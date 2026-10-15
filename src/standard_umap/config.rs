@@ -17,6 +17,9 @@ pub struct UMAPConfig {
     pub random_state: Option<u64>,
     pub transform_seed: u64,
     pub transform_queue_size: f64,
+    /// Fit on exact distinct rows and return embeddings in original row order.
+    /// Positive and negative zero are considered equal. Defaults to false.
+    pub unique: bool,
 }
 
 impl Default for UMAPConfig {
@@ -36,6 +39,7 @@ impl Default for UMAPConfig {
             random_state: None,
             transform_seed: 42,
             transform_queue_size: 4.0,
+            unique: false,
         }
     }
 }

@@ -37,13 +37,13 @@ cache-keys = [
 
 [tool.ruff]
 line-length = 100
-src = ["python"]
+src = ["python", "comparison"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "NPY", "RUF"]
 
 [tool.ty.src]
-include = ["python"]
+include = ["python", "comparison/metrics.py", "comparison/evaluate.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]

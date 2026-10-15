@@ -1,1 +1,0 @@
-{"approximate_iterations":14,"approximate_iterations_rule":"max(round(log2(n)), 5)","fit_graph_width":14,"fit_seconds":[6.148951064],"init":"Spectral","neighbors":15,"query_batches":0,"query_graph_width":15,"search":"Approximate","seed":42,"transform_seconds":[[]],"warmups":0}

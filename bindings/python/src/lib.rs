@@ -83,7 +83,7 @@ fn map_umap_error(error: UmapError) -> PyErr {
   learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0,
   init="spectral", random_state=None, transform_seed=42,
   transform_queue_size=4.0, backend="flex", device_index=0,
-  neighbor_search="auto"))]
+  neighbor_search="auto", unique=false))]
 #[allow(clippy::too_many_arguments)]
 fn fit_umap(
     py: Python<'_>,
@@ -105,6 +105,7 @@ fn fit_umap(
     backend: &str,
     device_index: usize,
     neighbor_search: &str,
+    unique: bool,
 ) -> PyResult<FittedUMAP> {
     let init = match init {
         "spectral" => Init::Spectral,
@@ -141,6 +142,7 @@ fn fit_umap(
         random_state,
         transform_seed,
         transform_queue_size,
+        unique,
     };
     let data: Vec<Vec<f32>> = x
         .as_array()

@@ -7,17 +7,11 @@ use rand::{RngExt, SeedableRng};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::MaybeUninit;
 
-// Bound basis storage and projected EVD size independently of operator size.
-const MAX_KRYLOV_BASIS: usize = 64;
-const MAX_LANCZOS_OPERATOR_APPLICATIONS_PER_VERTEX: usize = 5;
-const MAX_REORTHOGONALIZATION_PASSES: usize = 2;
-const LANCZOS_BREAKDOWN_TOLERANCE: f64 = 1.0e-13;
-const RESIDUAL_TOLERANCE: f64 = 1.0e-7;
-const ORTHOGONALITY_TOLERANCE: f64 = 1.0e-7;
+const RESIDUAL_TOLERANCE: f64 = 1.0e-6;
+const ORTHOGONALITY_TOLERANCE: f64 = 1.0e-8;
 
-// faer 0.24.4's partial self-adjoint solver can loop without a bound on exact
-// Lanczos breakdown. The matrix-free restarted driver below instead bounds
-// operator applications and uses faer only for its <=64-dimensional projection.
+#[path = "block_spectral.rs"]
+mod block_spectral;
 
 /// Construct the initialization embedding in row-major order.
 ///
@@ -77,10 +71,67 @@ pub fn initialize(
 struct SparseGraph {
     rows: Vec<Vec<(usize, f64)>>,
     degrees: Vec<f64>,
+    normalized: NormalizedCsr,
+}
+
+#[derive(Debug)]
+struct NormalizedCsr {
+    row_offsets: Vec<usize>,
+    columns: Vec<usize>,
+    values: Vec<f64>,
+}
+
+impl NormalizedCsr {
+    fn from_rows(rows: &[Vec<(usize, f64)>], degrees: &[f64]) -> Result<Self> {
+        let mut row_offsets = Vec::with_capacity(rows.len() + 1);
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        row_offsets.push(0);
+        for (i, row) in rows.iter().enumerate() {
+            if !degrees[i].is_finite() || (degrees[i] <= 0.0 && !row.is_empty()) {
+                return Err(numerical("spectral graph has a zero or non-finite degree"));
+            }
+            for &(j, weight) in row {
+                let normalized = weight / (degrees[i].sqrt() * degrees[j].sqrt());
+                if !weight.is_finite()
+                    || weight <= 0.0
+                    || !normalized.is_finite()
+                    || normalized <= 0.0
+                {
+                    return Err(numerical(
+                        "spectral graph has an invalid normalized edge weight",
+                    ));
+                }
+                columns.push(j);
+                values.push(normalized);
+            }
+            row_offsets.push(columns.len());
+        }
+        Ok(Self {
+            row_offsets,
+            columns,
+            values,
+        })
+    }
+
+    fn shifted_apply(&self, x: &[f64], out: &mut [f64]) {
+        for i in 0..x.len() {
+            let mut value = x[i];
+            for edge in self.row_offsets[i]..self.row_offsets[i + 1] {
+                value += self.values[edge] * x[self.columns[edge]];
+            }
+            out[i] = value;
+        }
+    }
 }
 
 impl SparseGraph {
     fn from_edges(n: usize, heads: &[usize], tails: &[usize], weights: &[f32]) -> Result<Self> {
+        if heads.len() != tails.len() || heads.len() != weights.len() {
+            return Err(UmapError::InvalidInput(
+                "spectral graph COO arrays have different lengths".into(),
+            ));
+        }
         let mut directed = BTreeMap::<(usize, usize), f64>::new();
         for (edge, ((&head, &tail), &weight)) in heads.iter().zip(tails).zip(weights).enumerate() {
             if head >= n || tail >= n || head == tail {
@@ -88,14 +139,12 @@ impl SparseGraph {
                     "spectral graph edge {edge} has invalid endpoints ({head}, {tail}) for {n} rows"
                 )));
             }
-            if !weight.is_finite() || weight < 0.0 {
+            if !weight.is_finite() || weight <= 0.0 {
                 return Err(UmapError::InvalidInput(format!(
                     "spectral graph edge {edge} has invalid weight {weight}"
                 )));
             }
-            if weight > 0.0 {
-                *directed.entry((head, tail)).or_default() += f64::from(weight);
-            }
+            *directed.entry((head, tail)).or_default() += f64::from(weight);
         }
 
         let mut undirected = BTreeMap::<(usize, usize), f64>::new();
@@ -123,7 +172,12 @@ impl SparseGraph {
         if degrees.iter().any(|degree| !degree.is_finite()) {
             return Err(numerical("spectral graph degree overflowed"));
         }
-        Ok(Self { rows, degrees })
+        let normalized = NormalizedCsr::from_rows(&rows, &degrees)?;
+        Ok(Self {
+            rows,
+            degrees,
+            normalized,
+        })
     }
 
     fn n(&self) -> usize {
@@ -131,17 +185,7 @@ impl SparseGraph {
     }
 
     fn shifted_apply(&self, x: &[f64], out: &mut [f64]) {
-        for i in 0..self.n() {
-            if self.degrees[i] == 0.0 {
-                out[i] = 2.0 * x[i];
-                continue;
-            }
-            let mut value = x[i];
-            for &(j, weight) in &self.rows[i] {
-                value += weight * x[j] / (self.degrees[i] * self.degrees[j]).sqrt();
-            }
-            out[i] = value;
-        }
+        self.normalized.shifted_apply(x, out);
     }
 
     fn components(&self) -> Vec<Vec<usize>> {
@@ -191,7 +235,12 @@ impl SparseGraph {
         if degrees.iter().any(|degree| !degree.is_finite()) {
             return Err(numerical("induced graph degree overflowed"));
         }
-        Ok(Self { rows, degrees })
+        let normalized = NormalizedCsr::from_rows(&rows, &degrees)?;
+        Ok(Self {
+            rows,
+            degrees,
+            normalized,
+        })
     }
 }
 
@@ -199,6 +248,7 @@ impl SparseGraph {
 struct CentroidGraph {
     centroids: Vec<Vec<f64>>,
     degrees: Vec<f64>,
+    normalized: NormalizedCsr,
 }
 
 impl CentroidGraph {
@@ -240,7 +290,40 @@ impl CentroidGraph {
                 ));
             }
         }
-        Ok(Self { centroids, degrees })
+        let n = components.len();
+        let capacity = n
+            .checked_mul(n)
+            .ok_or(UmapError::Overflow("centroid affinity matrix"))?;
+        let mut row_offsets = Vec::with_capacity(n + 1);
+        let mut columns = Vec::with_capacity(capacity);
+        let mut values = Vec::with_capacity(capacity);
+        row_offsets.push(0);
+        for i in 0..n {
+            for j in 0..n {
+                let value = centroid_affinity(&centroids[i], &centroids[j])
+                    / (degrees[i].sqrt() * degrees[j].sqrt());
+                if !value.is_finite() || value < 0.0 {
+                    return Err(numerical(
+                        "component-centroid affinity has invalid normalized weight",
+                    ));
+                }
+                if value == 0.0 {
+                    continue;
+                }
+                columns.push(j);
+                values.push(value);
+            }
+            row_offsets.push(columns.len());
+        }
+        Ok(Self {
+            centroids,
+            degrees,
+            normalized: NormalizedCsr {
+                row_offsets,
+                columns,
+                values,
+            },
+        })
     }
 
     fn n(&self) -> usize {
@@ -248,14 +331,7 @@ impl CentroidGraph {
     }
 
     fn shifted_apply(&self, x: &[f64], out: &mut [f64]) {
-        for i in 0..self.n() {
-            let mut value = x[i];
-            for (j, &x_j) in x.iter().enumerate().take(self.n()) {
-                let weight = centroid_affinity(&self.centroids[i], &self.centroids[j]);
-                value += weight * x_j / (self.degrees[i] * self.degrees[j]).sqrt();
-            }
-            out[i] = value;
-        }
+        self.normalized.shifted_apply(x, out);
     }
 }
 
@@ -293,28 +369,6 @@ impl BaseOperator<'_> {
         match self {
             Self::Sparse(graph) => &graph.degrees,
             Self::Centroids(graph) => &graph.degrees,
-        }
-    }
-}
-
-/// Matrix-free rank-one deflation around either
-/// sparse graph or complete centroid-affinity normalized adjacency.
-#[derive(Debug)]
-struct SolverOperator<'a> {
-    base: BaseOperator<'a>,
-    deflated: Vec<(f64, Vec<f64>)>,
-}
-
-impl SolverOperator<'_> {
-    fn apply_vector(&self, input: &[f64], output: &mut [f64]) {
-        assert_eq!(input.len(), self.base.n());
-        assert_eq!(output.len(), self.base.n());
-        self.base.shifted_apply(input, output);
-        for (eigenvalue, vector) in &self.deflated {
-            let projection = dot(vector, input);
-            for (value, &basis) in output.iter_mut().zip(vector) {
-                *value -= eigenvalue * basis * projection;
-            }
         }
     }
 }
@@ -497,23 +551,47 @@ fn top_nontrivial_modes(
     dimensions: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<Vec<f64>>> {
-    let budget = base
-        .n()
-        .checked_mul(MAX_LANCZOS_OPERATOR_APPLICATIONS_PER_VERTEX)
-        .ok_or(UmapError::Overflow("Lanczos application budget"))?;
-    top_nontrivial_modes_with_budget(base, dimensions, rng, budget)
+    solve_spectral(base, dimensions, rng).map(|solution| solution.modes)
 }
 
-fn top_nontrivial_modes_with_budget(
+struct SpectralSolution {
+    modes: Vec<Vec<f64>>,
+    #[cfg(all(test, feature = "tracing"))]
+    diagnostics: Option<block_spectral::Diagnostics>,
+    #[cfg(all(test, feature = "tracing"))]
+    eigenvalues: Vec<f64>,
+    #[cfg(all(test, feature = "tracing"))]
+    eigenvectors: Vec<Vec<f64>>,
+    #[cfg(all(test, feature = "tracing"))]
+    raw_eigenvalues: Vec<f64>,
+    #[cfg(all(test, feature = "tracing"))]
+    raw_eigenvectors: Vec<Vec<f64>>,
+    #[cfg(all(test, feature = "tracing"))]
+    n_converged: usize,
+    #[cfg(all(test, feature = "tracing"))]
+    max_dim: usize,
+    #[cfg(all(test, feature = "tracing"))]
+    max_residual: f64,
+    #[cfg(all(test, feature = "tracing"))]
+    orthogonality: f64,
+    #[cfg(all(test, feature = "tracing"))]
+    dense: bool,
+    #[cfg(all(test, feature = "tracing"))]
+    requested: usize,
+}
+
+fn solve_spectral(
     base: BaseOperator<'_>,
     dimensions: usize,
     rng: &mut StdRng,
-    application_budget: usize,
-) -> Result<Vec<Vec<f64>>> {
-    let base_n = base.n();
-    if dimensions == 0 || dimensions >= base_n {
+) -> Result<SpectralSolution> {
+    let n = base.n();
+    let k = dimensions
+        .checked_add(1)
+        .ok_or(UmapError::Overflow("spectral mode count"))?;
+    if n < 2 || k > n - 1 {
         return Err(numerical(format!(
-            "spectral graph with {base_n} vertices cannot supply {dimensions} nontrivial modes"
+            "spectral graph with {n} vertices cannot provide {k} requested eigenpairs"
         )));
     }
     if base
@@ -523,99 +601,431 @@ fn top_nontrivial_modes_with_budget(
     {
         return Err(numerical("spectral graph has a zero or non-finite degree"));
     }
-
-    let dimension = base_n;
-    let deflated_capacity = dimensions
-        .checked_add(1)
-        .ok_or(UmapError::Overflow("deflated eigenspace count"))?;
-    let mut deflated = Vec::with_capacity(deflated_capacity);
-    let mut trivial = vec![0.0; dimension];
-    let norm = base.degrees().iter().sum::<f64>().sqrt();
-    if !norm.is_finite() || norm == 0.0 {
-        return Err(numerical(
-            "normalized-Laplacian trivial mode has invalid norm",
-        ));
-    }
-    for (i, slot) in trivial.iter_mut().enumerate().take(base_n) {
-        *slot = base.degrees()[i].sqrt() / norm;
-    }
-    deflated.push((2.0, trivial));
-
-    let mut modes = Vec::with_capacity(dimensions);
-
-    for mode_index in 0..dimensions {
-        let mut start = vec![0.0; dimension];
-        for value in &mut start {
-            *value = gaussian(rng);
-        }
-        orthogonalize(
-            &mut start,
-            deflated.iter().map(|(_, vector)| vector.as_slice()),
-        );
-        let start_norm = l2_norm(&start);
-        if !start_norm.is_finite() || start_norm <= 1.0e-12 {
-            return Err(numerical(format!(
-                "spectral mode {mode_index} has no independent deterministic start vector"
-            )));
-        }
-        for value in &mut start {
-            *value /= start_norm;
-        }
-        let operator = SolverOperator {
-            base,
-            deflated: deflated.clone(),
-        };
-        let (eigenvalue, mut vector) =
-            bounded_lanczos_largest(&operator, start, application_budget)?;
-        if !eigenvalue.is_finite() {
-            return Err(numerical(format!(
-                "spectral mode {mode_index} eigenvalue is non-finite"
-            )));
-        }
-        let vector_norm = l2_norm(&vector);
-        if !vector_norm.is_finite() || (vector_norm - 1.0).abs() > ORTHOGONALITY_TOLERANCE {
-            return Err(numerical(format!(
-                "spectral mode {mode_index} eigenvector norm is {vector_norm}"
-            )));
-        }
-        orthogonalize(
-            &mut vector,
-            deflated.iter().map(|(_, previous)| previous.as_slice()),
-        );
-        let vector_norm = l2_norm(&vector);
-        if !vector_norm.is_finite() || vector_norm <= 1.0e-12 {
-            return Err(numerical(format!(
-                "spectral mode {mode_index} collapsed against an existing eigenspace"
-            )));
-        }
-        for value in &mut vector {
-            *value /= vector_norm;
-        }
-        let mut applied = vec![0.0; base_n];
-        base.shifted_apply(&vector, &mut applied);
-        let residual = applied
-            .iter()
-            .zip(&vector)
-            .map(|(&actual, &value)| (actual - eigenvalue * value).powi(2))
-            .sum::<f64>();
-        let residual = residual.sqrt();
-        if !residual.is_finite() || residual > RESIDUAL_TOLERANCE {
-            return Err(UmapError::SpectralConvergence(format!(
-                "spectral mode {mode_index} residual {residual} exceeds {RESIDUAL_TOLERANCE} after reorthogonalization"
-            )));
-        }
-        for (previous_index, (_, previous)) in deflated.iter().enumerate() {
-            let overlap = dot(&vector, previous).abs();
-            if overlap > ORTHOGONALITY_TOLERANCE {
-                return Err(numerical(format!(
-                    "spectral mode {mode_index} overlaps mode {previous_index} by {overlap}"
-                )));
+    let m = 64_usize.max(
+        k.checked_mul(2)
+            .ok_or(UmapError::Overflow("spectral max dimension"))?,
+    );
+    let cutoff = 64_usize.max(k * 2).max(m);
+    let dense = n <= cutoff;
+    let max_dim = m;
+    let solve_count = if dense { n } else { k };
+    let mut values = vec![0.0; if dense { n } else { solve_count }];
+    let mut vectors = Mat::zeros(n, values.len());
+    let par = Par::Seq;
+    #[cfg(all(test, feature = "tracing"))]
+    let mut diagnostics = None;
+    let n_converged = if dense {
+        let mut matrix = Mat::zeros(n, n);
+        for col in 0..n {
+            let mut basis = vec![0.0; n];
+            basis[col] = 1.0;
+            let mut applied = vec![0.0; n];
+            base.shifted_apply(&basis, &mut applied);
+            for row in 0..n {
+                matrix[(row, col)] = applied[row];
             }
         }
-        deflated.push((eigenvalue, vector.clone()));
-        modes.push(vector[..base_n].to_vec());
+        let params = Spec::<evd::SelfAdjointEvdParams, f64>::default();
+        let req = self_adjoint_evd_scratch::<f64>(n, ComputeEigenvectors::Yes, par, params);
+        let size = req
+            .size_bytes()
+            .checked_add(req.align_bytes())
+            .ok_or_else(|| numerical("dense EVD scratch size overflow"))?;
+        let mut scratch = vec![MaybeUninit::<u8>::uninit(); size];
+        let mut eigenvalue_matrix = Mat::zeros(n, n);
+        self_adjoint_evd(
+            matrix.as_ref(),
+            eigenvalue_matrix.as_mut().diagonal_mut(),
+            Some(vectors.as_mut()),
+            par,
+            MemStack::new(&mut scratch),
+            params,
+        )
+        .map_err(|error| {
+            UmapError::Numerical(format!("dense self-adjoint EVD failed: {error:?}"))
+        })?;
+        for i in 0..n {
+            values[i] = eigenvalue_matrix[(i, i)];
+        }
+        n
+    } else {
+        if max_dim >= n {
+            return Err(numerical(
+                "sparse spectral block dimension must be smaller than n",
+            ));
+        }
+        let solution = block_spectral::solve(base, k, max_dim, rng)?;
+        convergence_status(solution.pairs.len(), k)?;
+        #[cfg(all(test, feature = "tracing"))]
+        {
+            diagnostics = Some(solution.diagnostics);
+        }
+        for (col, (value, vector)) in solution.pairs.into_iter().enumerate() {
+            values[col] = value;
+            vectors.col_as_slice_mut(col).copy_from_slice(&vector);
+        }
+        k
+    };
+    let count = n_converged.min(values.len());
+    let mut pairs = (0..count)
+        .map(|i| {
+            (
+                values[i],
+                (0..n).map(|j| vectors[(j, i)]).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    validate_raw_eigenpairs(base, &pairs)?;
+    #[cfg(all(test, feature = "tracing"))]
+    let raw_eigenvalues = pairs.iter().map(|pair| pair.0).collect::<Vec<_>>();
+    #[cfg(all(test, feature = "tracing"))]
+    let raw_eigenvectors = pairs.iter().map(|pair| pair.1.clone()).collect::<Vec<_>>();
+    let trivial = base.degrees().iter().map(|d| d.sqrt()).collect::<Vec<_>>();
+    let trivial_norm = l2_norm(&trivial);
+    if !trivial_norm.is_finite() || trivial_norm == 0.0 {
+        return Err(numerical(
+            "locked trivial eigenvector has zero or non-finite norm",
+        ));
     }
-    Ok(modes)
+    let mut retained = Vec::new();
+    for (value, vector) in pairs {
+        let overlap = dot(&vector, &trivial).abs() / trivial_norm;
+        if !overlap.is_finite() {
+            return Err(numerical(
+                "non-finite overlap with locked trivial eigenvector",
+            ));
+        }
+        if overlap > 1.0 - 1.0e-6 {
+            continue;
+        }
+        retained.push((value, vector));
+    }
+    if retained.len() < dimensions {
+        return Err(UmapError::SpectralConvergence(format!(
+            "only {} nontrivial eigenpairs available; requested {dimensions}",
+            retained.len()
+        )));
+    }
+    let mut max_residual: f64 = 0.0;
+    let mut orthogonality: f64 = 0.0;
+    for (i, (value, vector)) in retained.iter().enumerate() {
+        let mut applied = vec![0.0; n];
+        base.shifted_apply(vector, &mut applied);
+        let residual = l2_norm(
+            &applied
+                .iter()
+                .zip(vector)
+                .map(|(a, v)| a - value * v)
+                .collect::<Vec<_>>(),
+        ) / (2.0 - value).abs().max(1.0);
+        max_residual = max_residual.max(residual);
+        for (j, (_, other)) in retained.iter().enumerate() {
+            let error = dot(vector, other) - if i == j { 1.0 } else { 0.0 };
+            orthogonality = orthogonality.max(error.abs());
+        }
+    }
+    if !max_residual.is_finite() {
+        return Err(numerical(format!(
+            "independent spectral residual is non-finite: {max_residual}"
+        )));
+    }
+    if max_residual > RESIDUAL_TOLERANCE {
+        return Err(UmapError::SpectralConvergence(format!(
+            "independent residual {max_residual} exceeds {RESIDUAL_TOLERANCE}"
+        )));
+    }
+    if !orthogonality.is_finite() {
+        return Err(numerical(format!(
+            "independent spectral orthogonality error is non-finite: {orthogonality}"
+        )));
+    }
+    if orthogonality > ORTHOGONALITY_TOLERANCE {
+        return Err(UmapError::SpectralConvergence(format!(
+            "orthogonality error {orthogonality} exceeds {ORTHOGONALITY_TOLERANCE}"
+        )));
+    }
+    #[cfg(all(test, feature = "tracing"))]
+    let sorted_nontrivial = retained.iter().map(|pair| pair.0).collect::<Vec<_>>();
+    let modes = retained
+        .iter()
+        .take(dimensions)
+        .map(|pair| pair.1.clone())
+        .collect();
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        n_converged,
+        requested = k,
+        max_dim,
+        max_residual,
+        orthogonality,
+        dense,
+        "spectral solver diagnostics"
+    );
+    Ok(SpectralSolution {
+        modes,
+        #[cfg(all(test, feature = "tracing"))]
+        diagnostics,
+        #[cfg(all(test, feature = "tracing"))]
+        eigenvalues: sorted_nontrivial,
+        #[cfg(all(test, feature = "tracing"))]
+        eigenvectors: retained.into_iter().map(|pair| pair.1).collect(),
+        #[cfg(all(test, feature = "tracing"))]
+        raw_eigenvalues,
+        #[cfg(all(test, feature = "tracing"))]
+        raw_eigenvectors,
+        #[cfg(all(test, feature = "tracing"))]
+        n_converged,
+        #[cfg(all(test, feature = "tracing"))]
+        max_dim,
+        #[cfg(all(test, feature = "tracing"))]
+        max_residual,
+        #[cfg(all(test, feature = "tracing"))]
+        orthogonality,
+        #[cfg(all(test, feature = "tracing"))]
+        dense,
+        #[cfg(all(test, feature = "tracing"))]
+        requested: k,
+    })
+}
+
+fn validate_raw_eigenpairs(base: BaseOperator<'_>, pairs: &[(f64, Vec<f64>)]) -> Result<()> {
+    let n = base.n();
+    if pairs.is_empty() {
+        return Err(numerical("spectral eigensolver returned no eigenpairs"));
+    }
+    let mut norms = Vec::with_capacity(pairs.len());
+    let mut max_residual = (0.0_f64, 0_usize);
+    let mut max_diagonal = (0.0_f64, 0_usize);
+    let mut max_offdiagonal = (0.0_f64, 0_usize, 0_usize);
+    for (i, (eigenvalue, vector)) in pairs.iter().enumerate() {
+        if !eigenvalue.is_finite() {
+            return Err(numerical(format!(
+                "raw eigenpair {i} has non-finite eigenvalue {eigenvalue}"
+            )));
+        }
+        if *eigenvalue < -1.0e-12 || *eigenvalue > 2.0 + 1.0e-12 {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue {eigenvalue} is outside the shifted [0,2] spectrum"
+            )));
+        }
+        if vector.len() != n {
+            return Err(numerical(format!(
+                "raw eigenpair {i} has vector length {}, expected {n}",
+                vector.len()
+            )));
+        }
+        if let Some((coordinate, value)) = vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} has non-finite coordinate {coordinate}={value}"
+            )));
+        }
+        let norm = l2_norm(vector);
+        if !norm.is_finite() {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} has non-finite norm {norm}"
+            )));
+        }
+        if norm == 0.0 {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} has zero norm"
+            )));
+        }
+        norms.push(norm);
+        let mut applied = vec![0.0; n];
+        base.shifted_apply(vector, &mut applied);
+        if let Some((coordinate, value)) = applied
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} operator result at coordinate {coordinate} is non-finite: {value}"
+            )));
+        }
+        let residual = l2_norm(
+            &applied
+                .iter()
+                .zip(vector)
+                .map(|(actual, value)| actual - eigenvalue * value)
+                .collect::<Vec<_>>(),
+        ) / (2.0 - eigenvalue).abs().max(1.0);
+        if !residual.is_finite() {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} has non-finite residual {residual}"
+            )));
+        }
+        if residual > max_residual.0 {
+            max_residual = (residual, i);
+        }
+        let diagonal_error = (dot(vector, vector) - 1.0).abs();
+        if !diagonal_error.is_finite() {
+            return Err(numerical(format!(
+                "raw eigenpair {i} eigenvalue={eigenvalue} has non-finite diagonal Gram error {diagonal_error}"
+            )));
+        }
+        if diagonal_error > max_diagonal.0 {
+            max_diagonal = (diagonal_error, i);
+        }
+        for (j, (other_eigenvalue, other_vector)) in pairs.iter().take(i).enumerate() {
+            let gram = dot(vector, other_vector);
+            if !gram.is_finite() {
+                return Err(numerical(format!(
+                    "raw Gram entry ({j},{i}) for eigenvalues ({},{eigenvalue}) is non-finite: {gram}",
+                    other_eigenvalue
+                )));
+            }
+            if gram.abs() > max_offdiagonal.0 {
+                max_offdiagonal = (gram.abs(), j, i);
+            }
+        }
+    }
+    let min_norm = norms.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_norm = norms.iter().copied().fold(0.0_f64, f64::max);
+    if max_residual.0 > RESIDUAL_TOLERANCE
+        || max_diagonal.0 > ORTHOGONALITY_TOLERANCE
+        || max_offdiagonal.0 > ORTHOGONALITY_TOLERANCE
+    {
+        let (r, ri) = max_residual;
+        let (d, di) = max_diagonal;
+        let (o, oi, oj) = max_offdiagonal;
+        return Err(UmapError::SpectralConvergence(format!(
+            "raw eigenpair validation failed across {} pairs: max_residual={r} at pair {ri} eigenvalue={} (limit {RESIDUAL_TOLERANCE}); min_norm={min_norm}; max_norm={max_norm}; max_diagonal_gram_error={d} at pair {di} eigenvalue={} (limit {ORTHOGONALITY_TOLERANCE}); max_offdiagonal_dot_abs={o} at pair indices i={oi},j={oj} with shifted eigenvalues lambda_i={},lambda_j={} (limit {ORTHOGONALITY_TOLERANCE})",
+            pairs.len(),
+            pairs[ri].0,
+            pairs[di].0,
+            pairs[oi].0,
+            pairs[oj].0
+        )));
+    }
+    Ok(())
+}
+
+/// Private transport used only by the ignored spectral spike test.
+#[cfg(all(test, feature = "tracing"))]
+#[derive(serde::Serialize)]
+struct SpectralProbeResult {
+    production_eigenvalues: Vec<f64>,
+    production_eigenvectors: Vec<Vec<f64>>,
+    eigenvalues: Vec<f64>,
+    eigenvectors: Vec<Vec<f64>>,
+    n_converged: usize,
+    diagnostic_n_converged: usize,
+    requested: usize,
+    diagnostic_requested: usize,
+    max_dim: usize,
+    production_dense: bool,
+    diagnostic_dense: bool,
+    max_residual: f64,
+    orthogonality: f64,
+    eigengap: Option<f64>,
+    cluster_start: usize,
+    cluster_end: usize,
+    fallback: bool,
+    production_diagnostics: Option<block_spectral::Diagnostics>,
+    diagnostic_diagnostics: Option<block_spectral::Diagnostics>,
+}
+
+#[cfg(all(test, feature = "tracing"))]
+fn spectral_probe(
+    n: usize,
+    heads: &[usize],
+    tails: &[usize],
+    weights: &[f32],
+    dimensions: usize,
+    seed: u64,
+) -> Result<SpectralProbeResult> {
+    if dimensions == 0 || dimensions >= n.saturating_sub(1) {
+        return Err(numerical(
+            "spectral probe dimensions must be positive and less than n-1",
+        ));
+    }
+    let graph = SparseGraph::from_edges(n, heads, tails, weights)?;
+    // First solve the exact production request. Preserve its routing diagnostics:
+    // in particular dims=40,n=83 stays sparse with k=41 and M=82.
+    let production = solve_spectral(
+        BaseOperator::Sparse(&graph),
+        dimensions,
+        &mut StdRng::seed_from_u64(seed),
+    )?;
+    let production_dense = production.dense;
+    let production_max_dim = production.max_dim;
+    let production_requested = production.requested;
+    let production_n_converged = production.n_converged;
+    let production_diagnostics = production.diagnostics;
+    let production_eigenvalues = production.raw_eigenvalues;
+    let production_eigenvectors = production.raw_eigenvectors;
+
+    // Supplement only the diagnostic subspace. An increased request can cross
+    // the dense cutoff; that route is reported separately and is not production.
+    let mut diagnostic_modes = dimensions.saturating_add(1).min(n.saturating_sub(2));
+    let solution = loop {
+        let solution = solve_spectral(
+            BaseOperator::Sparse(&graph),
+            diagnostic_modes,
+            &mut StdRng::seed_from_u64(seed),
+        )?;
+        let boundary_index = dimensions - 1;
+        let boundary = solution.eigenvalues[boundary_index];
+        let last = solution.eigenvalues.len() - 1;
+        let separated = last > boundary_index
+            && (boundary - solution.eigenvalues[last]).abs() / boundary.abs().max(1.0) > 1.0e-6;
+        if separated || solution.eigenvalues.len() == n - 1 || diagnostic_modes >= n - 2 {
+            break solution;
+        }
+        diagnostic_modes = (diagnostic_modes + 8).min(n - 2);
+    };
+    let boundary_index = dimensions - 1;
+    let boundary = solution.eigenvalues[boundary_index];
+    let cluster_start = (0..=boundary_index)
+        .rev()
+        .find(|&index| {
+            (solution.eigenvalues[index] - boundary).abs() / boundary.abs().max(1.0) > 1.0e-6
+        })
+        .map_or(0, |index| index + 1);
+    let cluster_end = (boundary_index + 1..solution.eigenvalues.len())
+        .find(|&index| {
+            (solution.eigenvalues[index] - boundary).abs() / boundary.abs().max(1.0) > 1.0e-6
+        })
+        .unwrap_or(solution.eigenvalues.len());
+    let gap = if dimensions < solution.eigenvalues.len() {
+        Some(
+            (solution.eigenvalues[dimensions - 1] - solution.eigenvalues[dimensions]).abs()
+                / solution.eigenvalues[dimensions - 1].abs().max(1.0),
+        )
+    } else {
+        None
+    };
+    let mut eigenvalues = solution.eigenvalues[..dimensions].to_vec();
+    eigenvalues.extend_from_slice(&solution.eigenvalues[dimensions..cluster_end]);
+    let mut eigenvectors = solution.eigenvectors[..dimensions].to_vec();
+    eigenvectors.extend_from_slice(&solution.eigenvectors[dimensions..cluster_end]);
+    let diagnostic_diagnostics = solution.diagnostics;
+    Ok(SpectralProbeResult {
+        production_eigenvalues,
+        production_eigenvectors,
+        eigenvalues,
+        eigenvectors,
+        n_converged: production_n_converged,
+        diagnostic_n_converged: solution.n_converged,
+        requested: production_requested,
+        diagnostic_requested: solution.requested,
+        max_dim: production_max_dim,
+        production_dense,
+        diagnostic_dense: solution.dense,
+        max_residual: solution.max_residual,
+        orthogonality: solution.orthogonality,
+        eigengap: gap,
+        cluster_start,
+        cluster_end,
+        fallback: false,
+        production_diagnostics,
+        diagnostic_diagnostics,
+    })
 }
 
 fn modes_with_source_fallback(
@@ -640,19 +1050,6 @@ fn modes_with_source_fallback_and_warning(
     fallback_on_spectral_convergence(result, base.n(), dimensions, rng, context, &mut warn)
 }
 
-#[cfg(test)]
-fn modes_with_source_fallback_and_budget_and_warning(
-    base: BaseOperator<'_>,
-    dimensions: usize,
-    rng: &mut StdRng,
-    budget: usize,
-    context: &str,
-    mut warn: impl FnMut(&str),
-) -> Result<Vec<Vec<f64>>> {
-    let result = top_nontrivial_modes_with_budget(base, dimensions, rng, budget);
-    fallback_on_spectral_convergence(result, base.n(), dimensions, rng, context, &mut warn)
-}
-
 fn fallback_on_spectral_convergence(
     result: Result<Vec<Vec<f64>>>,
     row_count: usize,
@@ -664,6 +1061,8 @@ fn fallback_on_spectral_convergence(
     match result {
         Ok(modes) => Ok(modes),
         Err(UmapError::SpectralConvergence(reason)) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(spectral_fallback = true, context = %context, reason = %reason, "spectral solver used seeded random modes");
             warn(&format!(
                 "spectral initialization did not converge for {context} ({reason}); using seeded uniform initialization"
             ));
@@ -683,178 +1082,18 @@ fn random_modes(rows: usize, dimensions: usize, rng: &mut StdRng) -> Vec<Vec<f64
         .collect()
 }
 
-/// Bounded, fully reorthogonalized matrix-free Lanczos followed by faer's dense
-/// EVD only on the small symmetric projected matrix. Work/storage are
-/// O(N*k + k²), with fixed iteration/reorthogonalization bounds; breakdown
-/// terminates the Krylov sequence instead of entering an unbounded solver loop.
-fn bounded_lanczos_largest(
-    operator: &SolverOperator<'_>,
-    start: Vec<f64>,
-    total_budget: usize,
-) -> Result<(f64, Vec<f64>)> {
-    let n = operator.base.n();
-    if n == 0 {
-        return Err(numerical("Lanczos operator has zero dimension"));
-    }
-    let mut remaining_budget = total_budget;
-    let mut start = start;
-    let mut last_residual = f64::INFINITY;
-    let mut last_breakdown = false;
-
-    while remaining_budget > 0 {
-        let cycle_limit = MAX_KRYLOV_BASIS.min(n).min(remaining_budget);
-        let (eigenvalue, vector, residual, breakdown) =
-            lanczos_ritz_cycle(operator, start, cycle_limit)?;
-        remaining_budget -= cycle_limit;
-        if !eigenvalue.is_finite() {
-            return Err(numerical("Lanczos Ritz value is non-finite"));
-        }
-        if residual <= RESIDUAL_TOLERANCE {
-            return Ok((eigenvalue, vector));
-        }
-        last_residual = residual;
-        last_breakdown = breakdown;
-        if breakdown {
-            break;
-        }
-        start = vector;
-    }
-    let status = if last_breakdown {
-        "invariant Krylov subspace exhausted"
-    } else {
-        "bounded restarted-Lanczos application budget exhausted"
-    };
-    Err(UmapError::SpectralConvergence(format!(
-        "largest Ritz pair residual {last_residual} after {status}; budget {total_budget} operator applications"
-    )))
-}
-
-fn lanczos_ritz_cycle(
-    operator: &SolverOperator<'_>,
-    start: Vec<f64>,
-    max_iterations: usize,
-) -> Result<(f64, Vec<f64>, f64, bool)> {
-    let n = operator.base.n();
-    let mut basis = Vec::<Vec<f64>>::with_capacity(max_iterations);
-    let mut diagonal = Vec::<f64>::with_capacity(max_iterations);
-    let mut off_diagonal = Vec::<f64>::with_capacity(max_iterations.saturating_sub(1));
-    basis.push(start);
-    let mut applied = vec![0.0; n];
-    let mut breakdown = false;
-
-    for iteration in 0..max_iterations {
-        operator.apply_vector(&basis[iteration], &mut applied);
-        if iteration > 0 {
-            let beta = off_diagonal[iteration - 1];
-            for (value, &previous) in applied.iter_mut().zip(&basis[iteration - 1]) {
-                *value -= beta * previous;
-            }
-        }
-        let alpha = dot(&basis[iteration], &applied);
-        if !alpha.is_finite() {
-            return Err(numerical(format!(
-                "Lanczos alpha {iteration} is non-finite"
-            )));
-        }
-        diagonal.push(alpha);
-        for (value, &current) in applied.iter_mut().zip(&basis[iteration]) {
-            *value -= alpha * current;
-        }
-        for _ in 0..MAX_REORTHOGONALIZATION_PASSES {
-            for previous in &basis {
-                let projection = dot(&applied, previous);
-                for (value, &basis_value) in applied.iter_mut().zip(previous) {
-                    *value -= projection * basis_value;
-                }
-            }
-        }
-        let beta = l2_norm(&applied);
-        if !beta.is_finite() {
-            return Err(numerical(format!("Lanczos beta {iteration} is non-finite")));
-        }
-        if beta <= LANCZOS_BREAKDOWN_TOLERANCE {
-            breakdown = true;
-            break;
-        }
-        if iteration + 1 == max_iterations {
-            break;
-        }
-        off_diagonal.push(beta);
-        for value in &mut applied {
-            *value /= beta;
-        }
-        basis.push(applied.clone());
-    }
-
-    let projected_n = diagonal.len();
-    if projected_n == 0 {
-        return Err(numerical("Lanczos produced an empty projected operator"));
-    }
-    let mut projected = Mat::zeros(projected_n, projected_n);
-    for i in 0..projected_n {
-        projected[(i, i)] = diagonal[i];
-        if i + 1 < projected_n {
-            let beta = off_diagonal[i];
-            projected[(i, i + 1)] = beta;
-            projected[(i + 1, i)] = beta;
-        }
-    }
-
-    let params = Spec::<evd::SelfAdjointEvdParams, f64>::default();
-    let par = Par::Seq;
-    let scratch_req =
-        self_adjoint_evd_scratch::<f64>(projected_n, ComputeEigenvectors::Yes, par, params);
-    let scratch_size = scratch_req
-        .size_bytes()
-        .checked_add(scratch_req.align_bytes())
-        .ok_or_else(|| numerical("projected EVD scratch size overflowed"))?;
-    let mut scratch = vec![MaybeUninit::<u8>::uninit(); scratch_size];
-    let mut eigenvalues = Mat::zeros(projected_n, projected_n);
-    let mut eigenvectors = Mat::zeros(projected_n, projected_n);
-    self_adjoint_evd(
-        projected.as_ref(),
-        eigenvalues.as_mut().diagonal_mut(),
-        Some(eigenvectors.as_mut()),
-        par,
-        MemStack::new(&mut scratch),
-        params,
-    )
-    .map_err(|error| {
-        UmapError::SpectralConvergence(format!("projected self-adjoint EVD failed: {error:?}"))
-    })?;
-
-    let top = projected_n - 1;
-    let eigenvalue = eigenvalues[(top, top)];
-    let mut vector = vec![0.0; n];
-    for column in 0..projected_n {
-        let coefficient = eigenvectors[(column, top)];
-        for row in 0..n {
-            vector[row] += coefficient * basis[column][row];
-        }
-    }
-    let mut exact = vec![0.0; n];
-    operator.apply_vector(&vector, &mut exact);
-    let residual = l2_norm(
-        &exact
-            .iter()
-            .zip(&vector)
-            .map(|(&actual, &value)| actual - eigenvalue * value)
-            .collect::<Vec<_>>(),
-    );
-    Ok((eigenvalue, vector, residual, breakdown))
-}
-
-fn orthogonalize<'a>(vector: &mut [f64], against: impl Iterator<Item = &'a [f64]>) {
-    for basis in against {
-        let projection = dot(vector, basis);
-        for (value, &basis_value) in vector.iter_mut().zip(basis) {
-            *value -= projection * basis_value;
-        }
-    }
-}
-
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     left.iter().zip(right).map(|(&a, &b)| a * b).sum()
+}
+
+fn convergence_status(actual: usize, requested: usize) -> Result<()> {
+    if actual < requested {
+        Err(UmapError::SpectralConvergence(format!(
+            "spectral solver converged {actual} of {requested} requested eigenpairs"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn l2_norm(vector: &[f64]) -> f64 {
@@ -951,52 +1190,25 @@ mod solver_tests {
     use super::*;
 
     #[test]
-    fn bounded_lanczos_returns_analytic_path_and_repeated_cycle_modes() {
-        let path = SparseGraph::from_edges(3, &[0, 1], &[1, 2], &[1.0, 1.0]).unwrap();
-        let path_modes = top_nontrivial_modes(
-            BaseOperator::Sparse(&path),
+    fn dense_solver_returns_the_analytic_path_mode() {
+        let graph = SparseGraph::from_edges(3, &[0, 1], &[1, 2], &[1.0, 1.0]).unwrap();
+        let modes = top_nontrivial_modes(
+            BaseOperator::Sparse(&graph),
             1,
             &mut StdRng::seed_from_u64(17),
         )
         .unwrap();
-        let mut path_applied = vec![0.0; 3];
-        path.shifted_apply(&path_modes[0], &mut path_applied);
-        let path_residual = path_applied
-            .iter()
-            .zip(&path_modes[0])
-            .map(|(&actual, &value)| (actual - value).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(path_residual < RESIDUAL_TOLERANCE);
-        assert!((dot(&path_modes[0], &path_modes[0]) - 1.0).abs() < ORTHOGONALITY_TOLERANCE);
-
-        let n = 12;
-        let heads = (0..n).collect::<Vec<_>>();
-        let tails = (0..n).map(|i| (i + 1) % n).collect::<Vec<_>>();
-        let weights = vec![1.0; n];
-        let cycle = SparseGraph::from_edges(n, &heads, &tails, &weights).unwrap();
-        let modes = top_nontrivial_modes(
-            BaseOperator::Sparse(&cycle),
-            2,
-            &mut StdRng::seed_from_u64(73),
-        )
-        .unwrap();
-        let expected = 1.0 + (2.0 * std::f64::consts::PI / n as f64).cos();
-        let mut applied = vec![0.0; n];
-        for mode in &modes {
-            cycle.shifted_apply(mode, &mut applied);
-            let residual = applied
+        let mut applied = vec![0.0; 3];
+        graph.shifted_apply(&modes[0], &mut applied);
+        let residual = l2_norm(
+            &applied
                 .iter()
-                .zip(mode)
-                .map(|(&actual, &value)| (actual - expected * value).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            assert!(
-                residual < RESIDUAL_TOLERANCE,
-                "cycle mode residual {residual}"
-            );
-        }
-        assert!(dot(&modes[0], &modes[1]).abs() < ORTHOGONALITY_TOLERANCE);
+                .zip(&modes[0])
+                .map(|(a, v)| a - v)
+                .collect::<Vec<_>>(),
+        );
+        assert!(residual < RESIDUAL_TOLERANCE);
+        assert!((dot(&modes[0], &modes[0]) - 1.0).abs() < ORTHOGONALITY_TOLERANCE);
     }
 
     #[test]
@@ -1008,70 +1220,198 @@ mod solver_tests {
     }
 
     #[test]
-    fn forced_solver_budget_failure_warns_and_uses_deterministic_random_modes() {
-        let n = 12;
-        let heads = (0..n).collect::<Vec<_>>();
-        let tails = (0..n).map(|i| (i + 1) % n).collect::<Vec<_>>();
-        let weights = vec![1.0; n];
-        let graph = SparseGraph::from_edges(n, &heads, &tails, &weights).unwrap();
+    fn fewer_converged_eigenpairs_is_spectral_convergence() {
         assert!(matches!(
-            top_nontrivial_modes_with_budget(
-                BaseOperator::Sparse(&graph),
-                2,
-                &mut StdRng::seed_from_u64(916),
-                0,
-            ),
+            convergence_status(2, 3),
             Err(UmapError::SpectralConvergence(_))
         ));
-        let mut first_rng = StdRng::seed_from_u64(917);
+    }
+
+    #[test]
+    fn only_spectral_convergence_uses_seeded_random_fallback() {
         let mut first_warning = String::new();
-        let first = modes_with_source_fallback_and_budget_and_warning(
-            BaseOperator::Sparse(&graph),
+        let first = fallback_on_spectral_convergence(
+            Err(UmapError::SpectralConvergence(
+                "injected short convergence".into(),
+            )),
+            8,
             2,
-            &mut first_rng,
-            0,
-            "forced solver-budget test",
+            &mut StdRng::seed_from_u64(917),
+            "injected test",
             |message| first_warning = message.to_owned(),
         )
         .unwrap();
         assert!(first_warning.contains("did not converge"));
-        assert!(first_warning.contains("seeded uniform initialization"));
-
-        let mut repeated_rng = StdRng::seed_from_u64(917);
-        let mut repeated_warning = String::new();
-        let repeated = modes_with_source_fallback_and_budget_and_warning(
-            BaseOperator::Sparse(&graph),
+        let mut repeat_warning = String::new();
+        let repeat = fallback_on_spectral_convergence(
+            Err(UmapError::SpectralConvergence(
+                "injected short convergence".into(),
+            )),
+            8,
             2,
-            &mut repeated_rng,
-            0,
-            "forced solver-budget test",
-            |message| repeated_warning = message.to_owned(),
+            &mut StdRng::seed_from_u64(917),
+            "injected test",
+            |message| repeat_warning = message.to_owned(),
         )
         .unwrap();
-        assert_eq!(first, repeated);
-        assert_eq!(first_warning, repeated_warning);
-        assert!(
-            first
-                .iter()
-                .flatten()
-                .all(|value| (-10.0..10.0).contains(value))
-        );
+        assert_eq!(first, repeat);
+        assert_eq!(first_warning, repeat_warning);
 
         let mut warned = false;
         assert!(matches!(
             fallback_on_spectral_convergence(
                 Err(UmapError::Numerical("invalid operator".into())),
-                n,
+                8,
                 2,
                 &mut StdRng::seed_from_u64(918),
-                "error classification test",
+                "error classification",
                 |_| warned = true,
             ),
             Err(UmapError::Numerical(_))
         ));
-        assert!(
-            !warned,
-            "non-convergence fallback must not catch numerical errors"
+        assert!(!warned);
+    }
+
+    #[test]
+    fn invariant_error_propagates_without_random_fallback() {
+        let error = UmapError::Numerical("non-finite spectral Ritz value".into());
+        let mut rng = StdRng::seed_from_u64(919);
+        let mut untouched_rng = StdRng::seed_from_u64(919);
+        let mut warned = false;
+
+        let result = fallback_on_spectral_convergence(
+            Err(error.clone()),
+            8,
+            2,
+            &mut rng,
+            "invariant error regression",
+            |_| warned = true,
         );
+
+        assert_eq!(result, Err(error));
+        assert!(!warned);
+        assert_eq!(rng.random::<u64>(), untouched_rng.random::<u64>());
+    }
+
+    #[test]
+    fn nonfinite_weight_is_rejected_before_solver() {
+        assert!(matches!(
+            SparseGraph::from_edges(3, &[0], &[1], &[f32::NAN]),
+            Err(UmapError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            SparseGraph::from_edges(3, &[0], &[1], &[f32::INFINITY]),
+            Err(UmapError::InvalidInput(_))
+        ));
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    #[ignore = "external spectral probe; request and response paths supplied by harness"]
+    fn external_spectral_probe() {
+        use std::time::Instant;
+
+        let request_path = std::env::var_os("FAST_UMAP_SPECTRAL_REQUEST")
+            .expect("FAST_UMAP_SPECTRAL_REQUEST must name a graph JSON file");
+        let response_path = std::env::var_os("FAST_UMAP_SPECTRAL_RESPONSE")
+            .expect("FAST_UMAP_SPECTRAL_RESPONSE must name a result JSON file");
+        let input: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(request_path).expect("read spectral graph request"),
+        )
+        .expect("parse spectral graph request JSON");
+        let n = input["n"].as_u64().expect("request n") as usize;
+        let dimensions = input["dimensions"].as_u64().expect("request dimensions") as usize;
+        let seed = input["seed"].as_u64().expect("request seed");
+        let heads = input["heads"]
+            .as_array()
+            .expect("request heads")
+            .iter()
+            .map(|value| value.as_u64().expect("COO head") as usize)
+            .collect::<Vec<_>>();
+        let tails = input["tails"]
+            .as_array()
+            .expect("request tails")
+            .iter()
+            .map(|value| value.as_u64().expect("COO tail") as usize)
+            .collect::<Vec<_>>();
+        let weights = input["weights"]
+            .as_array()
+            .expect("request weights")
+            .iter()
+            .map(|value| {
+                value
+                    .as_f64()
+                    .map(|value| value as f32)
+                    .or_else(|| value.as_str().and_then(|value| value.parse::<f32>().ok()))
+                    .expect("COO weight")
+            })
+            .collect::<Vec<_>>();
+        if input["runtime"].as_bool() == Some(true) {
+            let graph =
+                SparseGraph::from_edges(n, &heads, &tails, &weights).expect("valid runtime graph");
+            assert_eq!(
+                graph.components().len(),
+                1,
+                "runtime spectral graph must be connected"
+            );
+            let mut warmup_seconds = 0.0;
+            let mut seconds = Vec::new();
+            let mut diagnostics = Vec::with_capacity(6);
+            for run in 0..6 {
+                // Unseeded runtime is distinct from the paired-seed quality
+                // protocol. Entropy acquisition is outside the solver clock.
+                let mut rng = StdRng::seed_from_u64(rand::rng().random());
+                let started = Instant::now();
+                let solution = solve_spectral(BaseOperator::Sparse(&graph), dimensions, &mut rng)
+                    .expect("runtime spectral solver must not fail or fall back");
+                let elapsed = started.elapsed().as_secs_f64();
+                diagnostics.push(solution.diagnostics);
+                std::hint::black_box(solution.modes);
+                if run == 0 {
+                    warmup_seconds = elapsed;
+                } else {
+                    seconds.push(elapsed);
+                }
+            }
+            std::fs::write(
+                response_path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "runtime": true, "fallback": false, "warmups": 1, "runs": 5,
+                    "warmup_seconds": warmup_seconds, "seconds": seconds,
+                    "diagnostics": diagnostics,
+                    "n": n, "dimensions": dimensions, "unseeded": true,
+                }))
+                .expect("serialize runtime spectral result"),
+            )
+            .expect("write runtime spectral result");
+            return;
+        }
+        let started = Instant::now();
+        let output = match spectral_probe(n, &heads, &tails, &weights, dimensions, seed) {
+            Ok(result) => {
+                let mut output = serde_json::to_value(result).expect("serialize spectral result");
+                output["n"] = n.into();
+                output["dimensions"] = dimensions.into();
+                output["seed"] = seed.into();
+                output["elapsed_seconds"] = started.elapsed().as_secs_f64().into();
+                output["fallback"] = false.into();
+                output
+            }
+            Err(UmapError::InvalidInput(reason)) => serde_json::json!({
+                "n": n,
+                "dimensions": dimensions,
+                "seed": seed,
+                "expected_rejection": true,
+                "error": reason,
+                "fallback": false,
+                "elapsed_seconds": started.elapsed().as_secs_f64(),
+            }),
+            Err(error) => panic!("strict spectral probe failed: {error}"),
+        };
+        std::fs::write(
+            response_path,
+            serde_json::to_vec_pretty(&output).expect("serialize spectral result JSON"),
+        )
+        .expect("write spectral result JSON");
     }
 }

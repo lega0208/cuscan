@@ -39,6 +39,7 @@ def fit_umap(
     backend: Literal["flex", "cuda"] = "flex",
     device_index: int = 0,
     neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
+    unique: bool = False,
 ) -> FittedUMAP: ...
 def fit_parametric_umap(
     x: NDArray[np.float32],

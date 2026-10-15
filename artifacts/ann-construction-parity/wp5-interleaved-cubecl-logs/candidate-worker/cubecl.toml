@@ -1,6 +1,0 @@
-[profiling.logger]
-level = "disabled"
-
-[compilation.logger]
-level = "full"
-file = "/home/marc/projects/fast-umap/artifacts/ann-construction-parity/wp5-interleaved-cubecl-logs/candidate.log"

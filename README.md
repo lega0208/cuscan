@@ -390,8 +390,23 @@ projected = model.transform(X_new)
   `ValueError` (input/config) or `RuntimeError` (backend/numerical). As in
   umap-learn, a one-row fit yields a zero embedding and cannot transform, and a
   graph with no edges (for example two rows) is an error.
+- **Exact unique fitting:** set `UMAPConfig { unique: true, ..Default::default() }`
+  or Python `UMAP(unique=True)` to fit first-occurrence distinct input rows.
+  The default remains false. Signed zeros compare equal; nonfinite inputs are
+  rejected before deduplication. Returned training embeddings retain original
+  row order, with identical coordinates for identical rows, while transform
+  uses the distinct training graph. Unique fits need at least two distinct rows;
+  the existing empty-graph error still applies to a two-row training graph.
 - **Quality:** five-seed trustworthiness@15 against frozen umap-learn 0.5.12
   references is within 0.02 on Flex and CUDA (`tests/test_standard_quality.rs`).
+- **Spectral solver:** small components use faer 0.24.4 dense self-adjoint EVD;
+  larger components use locked-trivial block thick-restart Krylov iteration
+  with cached operator images and faer Rayleigh–Ritz EVD. The sparse iteration has a fixed numerical budget,
+  not a wall-clock guarantee. The failed single-start faer matrix-free path is
+  removed. Numerical regression harnesses use child-process timeouts and fail
+  on timeout or fallback; there is no production watchdog. Reference-relative
+  runtime and separately approved quality margins remain acceptance gates;
+  passing numerical or older quality tests alone does not establish acceptance.
 
 ### Profiling standard UMAP
 
@@ -415,7 +430,8 @@ FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench \
 ```
 
 CUDA requires a working NVIDIA runtime and never falls back to Flex. Traces are
-host-side spans, not GPU kernel timings; enabling detailed backend tracing adds
+host-side spans, not GPU kernel timings. Fit stage boundaries explicitly synchronize
+the selected device when `tracing` is enabled; enabling detailed tracing adds
 overhead. The benches measure complete fit and transform calls, including host
 embedding readback, with deterministic inputs prepared outside the timed loop.
 
@@ -427,12 +443,32 @@ uv run --no-sync python scripts/compare_umap_spans.py --output comparison.json -
 ```
 
 The build is separate from the 115-second run deadline. Defaults are 512 samples,
-16 features, 30 epochs, 15 exact neighbors, random initialization and seed 42.
+16 features, 30 epochs, 15 exact neighbors, `min_dist=0.0`, random initialization
+and seed 42.
 Both implementations consume identical float32 inputs and warm up before timing.
 Python timings wrap actual reference callsites without copying its implementation.
 Initialization cannot be isolated from embedding setup; nested neighbor selection
-is subtracted from Python fuzzy-graph time. CUDA spans measure host enqueue work;
-`tensor_embedding` captures synchronization of queued work, **not just transfer**.
+is subtracted from Python fuzzy-graph time. Fit CUDA spans include device barriers,
+so queued GPU work is not charged to the host spectral solver or graph export.
+Transform spans remain host-side dispatch spans.
+
+The maintained evaluator emits provenance, fixed-representative quality metrics,
+uncertainty, explicit gate results, and full-range/robust-percentile HTML plots:
+
+```sh
+uv run --no-sync python comparison/evaluate.py --input samples.f32le \
+  --rows 15000 --features 128 --device cuda --seeds 42,43,44,45,46 \
+  --output comparison-results.json
+```
+
+Quality gates without explicitly supplied thresholds remain unevaluated. Native
+spectral fallback warnings and subprocess timeouts fail the comparison. The CUDA
+profiler persists synchronized stage times and separate warmup wall times in
+`result.json`. Its compilation duration sums CubeCL's observed artifact-acquisition
+records, which include compilation/cache/persistence/device load and exclude kernel
+execution; it overlaps rather than subtracts from independent full warmup wall times.
+Per-phase outcome counts and coverage evidence are reported. Missing, corrupt, or
+uncertain retained records make compilation timing unavailable, never a measured zero.
 The JSON reports inclusive spans, counts, residual time and explicitly labeled
 host-span ratios, not per-kernel GPU speedups. Rows are limited to 16–4095 to keep
 the reference on its exact-search branch. Missing CUDA fails without CPU fallback.

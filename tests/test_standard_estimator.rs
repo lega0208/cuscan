@@ -1,5 +1,113 @@
 use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 
+#[test]
+fn unique_fit_expands_original_order_and_preserves_transform_state() {
+    let distinct = clustered_data();
+    let order: Vec<usize> = (0..120).map(|i| (i * 17) % distinct.len()).collect();
+    let rows: Vec<Vec<f32>> = order.iter().map(|&i| distinct[i].clone()).collect();
+    // Build manual distinct rows in the same first-occurrence order.
+    let mut first = Vec::new();
+    let mut inverse = Vec::new();
+    for row in &rows {
+        let index = first
+            .iter()
+            .position(|value| value == row)
+            .unwrap_or_else(|| {
+                first.push(row.clone());
+                first.len() - 1
+            });
+        inverse.push(index);
+    }
+    let settings = UMAPConfig {
+        init: Init::Random,
+        n_epochs: Some(10),
+        ..config()
+    };
+    let manual = UMAP::new(settings.clone(), BackendChoice::Flex, NeighborSearch::Exact)
+        .fit(&first)
+        .unwrap();
+    let (unique, returned) = UMAP::new(
+        UMAPConfig {
+            unique: true,
+            ..settings
+        },
+        BackendChoice::Flex,
+        NeighborSearch::Exact,
+    )
+    .fit_transform(&rows)
+    .unwrap();
+    assert_eq!(&returned, unique.embedding());
+    assert_eq!(unique.embedding().len(), rows.len());
+    for (row, &index) in unique.embedding().iter().zip(&inverse) {
+        assert_eq!(row, &manual.embedding()[index]);
+    }
+    assert_eq!(
+        unique.transform(&distinct[..5]).unwrap(),
+        manual.transform(&distinct[..5]).unwrap()
+    );
+}
+
+#[test]
+fn unique_signed_zero_and_validation_are_exact() {
+    let estimator = UMAP::new(
+        UMAPConfig {
+            unique: true,
+            init: Init::Random,
+            ..config()
+        },
+        BackendChoice::Flex,
+        NeighborSearch::Exact,
+    );
+    let rows = vec![
+        vec![0.0, 1.0],
+        vec![-0.0, 1.0],
+        vec![2.0, 3.0],
+        vec![4.0, 5.0],
+    ];
+    let fitted = estimator.fit(&rows).unwrap();
+    assert_eq!(fitted.embedding()[0], fitted.embedding()[1]);
+    assert!(
+        estimator
+            .fit(&[vec![0.0], vec![-0.0]])
+            .unwrap_err()
+            .to_string()
+            .contains("two distinct")
+    );
+    assert!(
+        estimator
+            .fit(&[vec![0.0], vec![f32::NAN]])
+            .unwrap_err()
+            .to_string()
+            .contains("not finite")
+    );
+    assert!(
+        estimator
+            .fit(&[vec![0.0], vec![0.0, 1.0]])
+            .unwrap_err()
+            .to_string()
+            .contains("expected")
+    );
+    assert!(
+        estimator
+            .fit(&[vec![0.0], vec![1.0]])
+            .unwrap_err()
+            .to_string()
+            .contains("graph is empty")
+    );
+    let raw = UMAP::new(
+        UMAPConfig {
+            init: Init::Random,
+            ..config()
+        },
+        BackendChoice::Flex,
+        NeighborSearch::Exact,
+    )
+    .fit(&rows)
+    .unwrap();
+    assert_eq!(raw.embedding().len(), rows.len());
+    assert_ne!(raw.embedding()[0], raw.embedding()[1]);
+}
+
 fn clustered_data() -> Vec<Vec<f32>> {
     (0..60)
         .map(|index| {

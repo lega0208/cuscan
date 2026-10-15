@@ -3,6 +3,8 @@ use burn::{
     tensor::{DType, Device, Int, Tensor, TensorData},
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::backend::StandardUmapOps;
 
@@ -22,6 +24,37 @@ pub const AUTO_EXACT_MAX_ROWS: usize = 4096;
 // A reproducible default when the caller leaves random_state unset.
 const DEFAULT_RANDOM_SEED: u64 = 42;
 const APPROXIMATE_QUERY_BLOCK: usize = 64;
+
+#[cfg(feature = "tracing")]
+fn profile_sync(device: &Device) -> Result<()> {
+    device
+        .sync()
+        .map_err(|error| UmapError::Numerical(format!("profiling synchronization failed: {error}")))
+}
+
+fn distinct_training_rows(data: &[Vec<f32>]) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
+    let mut indices = HashMap::<Vec<u32>, usize>::with_capacity(data.len());
+    let mut rows = Vec::new();
+    let mut inverse = Vec::with_capacity(data.len());
+    for row in data {
+        let key = row
+            .iter()
+            .map(|&value| if value == 0.0 { 0 } else { value.to_bits() })
+            .collect();
+        let index = *indices.entry(key).or_insert_with(|| {
+            let index = rows.len();
+            rows.push(row.clone());
+            index
+        });
+        inverse.push(index);
+    }
+    if rows.len() < 2 {
+        return Err(UmapError::InvalidInput(
+            "unique fitting requires at least two distinct rows".into(),
+        ));
+    }
+    Ok((rows, inverse))
+}
 
 /// Standard, nonparametric UMAP estimator on an explicitly selected backend.
 #[derive(Debug, Clone)]
@@ -63,7 +96,19 @@ impl UMAP {
     pub fn fit(&self, data: &[Vec<f32>]) -> Result<FittedUMAP> {
         self.config.validate()?;
         validate_backend_choice(self.backend)?;
-        let (n, features) = validate_input(data, None)?;
+        let (original_n, features) = validate_input(data, None)?;
+        original_n
+            .checked_mul(self.config.n_components)
+            .ok_or(UmapError::Overflow("original embedding shape"))?;
+        // Validate every original value before canonicalizing or dropping rows.
+        let (distinct, original_to_training) = if self.config.unique {
+            let (rows, inverse) = distinct_training_rows(data)?;
+            (Some(rows), Some(inverse))
+        } else {
+            (None, None)
+        };
+        let data = distinct.as_deref().unwrap_or(data);
+        let n = data.len();
         n.checked_mul(features)
             .ok_or(UmapError::Overflow("input shape"))?;
         if n > i32::MAX as usize {
@@ -100,6 +145,8 @@ impl UMAP {
                 training_data,
                 fit_graph: Tensor::<2, Int>::zeros([1, 0], &device),
                 embedding,
+                original_to_training,
+                expanded_embedding: OnceLock::new(),
                 embedding_tensor,
                 a: 0.0,
                 b: 0.0,
@@ -111,6 +158,8 @@ impl UMAP {
             ));
         }
 
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
         #[cfg(feature = "tracing")]
         let _neighbors_span = tracing::info_span!(
             "neighbor_search",
@@ -145,6 +194,8 @@ impl UMAP {
             NeighborSearch::Auto => unreachable!("search is resolved before dispatch"),
         };
         #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
+        #[cfg(feature = "tracing")]
         drop(_neighbors_span);
         let rows = Tensor::<1, Int>::arange(0..n as i64, &device)
             .cast(burn::tensor::IntDType::I32)
@@ -155,6 +206,8 @@ impl UMAP {
             vec![Tensor::<2>::zeros([n, 1], &device), nonself_distances],
             1,
         );
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
         #[cfg(feature = "tracing")]
         let _graph_span =
             tracing::info_span!("fuzzy_graph", rows = n, neighbors = widths.self_inclusive)
@@ -168,6 +221,8 @@ impl UMAP {
             false,
             u32::try_from(n).map_err(|_| UmapError::Overflow("reference count"))?,
         );
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
         #[cfg(feature = "tracing")]
         drop(_graph_span);
         let heads: Tensor<1, Int> = Tensor::from_dispatch(heads);
@@ -190,6 +245,8 @@ impl UMAP {
         let requested_epochs = self.config.n_epochs.unwrap_or(default_epochs);
         let n_epochs = u32::try_from(requested_epochs)
             .map_err(|_| UmapError::Overflow("optimization epochs"))?;
+        #[cfg(feature = "tracing")]
+        let _schedule_span = tracing::info_span!("schedule", rows = n).entered();
         let (heads, tails, weights, positive, next_positive, negative, next_negative) =
             prepare_schedule(
                 heads,
@@ -199,6 +256,11 @@ impl UMAP {
                 default_epochs,
                 self.config.negative_sample_rate,
             )?;
+
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
+        #[cfg(feature = "tracing")]
+        drop(_schedule_span);
 
         let max_weight = weights
             .clone()
@@ -217,6 +279,8 @@ impl UMAP {
             ));
         }
 
+        #[cfg(feature = "tracing")]
+        let _export_span = tracing::info_span!("spectral_graph_export", rows = n).entered();
         let (init_heads, init_tails, init_weights) = if self.config.init == Init::Spectral {
             let host_heads = heads.to_data().try_to_vec::<i32>().map_err(|error| {
                 UmapError::Numerical(format!("could not read spectral graph heads: {error}"))
@@ -242,6 +306,8 @@ impl UMAP {
             (Vec::new(), Vec::new(), Vec::new())
         };
         #[cfg(feature = "tracing")]
+        drop(_export_span);
+        #[cfg(feature = "tracing")]
         let _initialization_span = tracing::info_span!(
             "initialization",
             rows = n,
@@ -262,6 +328,8 @@ impl UMAP {
         let initial = Tensor::<2>::from_data(TensorData::new(flat, [n, n_components]), &device);
         let (a, b) = fit_curve(self.config.min_dist, self.config.spread)?;
         let rng = optimizer_rng(&initial, seed, &device)?;
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
         #[cfg(feature = "tracing")]
         let _optimization_span =
             tracing::info_span!("optimization", rows = n, epochs = n_epochs).entered();
@@ -286,6 +354,8 @@ impl UMAP {
             true,
         )?;
         #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
+        #[cfg(feature = "tracing")]
         drop(_optimization_span);
         let embedding = tensor_embedding(&embedding_tensor)?;
         Ok(FittedUMAP {
@@ -296,6 +366,8 @@ impl UMAP {
             training_data,
             fit_graph,
             embedding,
+            original_to_training,
+            expanded_embedding: OnceLock::new(),
             embedding_tensor,
             a,
             b,
@@ -315,7 +387,7 @@ impl UMAP {
     )]
     pub fn fit_transform(&self, data: &[Vec<f32>]) -> Result<(FittedUMAP, Embedding)> {
         let fitted = self.fit(data)?;
-        let embedding = fitted.embedding.clone();
+        let embedding = fitted.embedding().clone();
         Ok((fitted, embedding))
     }
 
@@ -338,6 +410,8 @@ pub struct FittedUMAP {
     training_data: Tensor<2>,
     fit_graph: Tensor<2, Int>,
     embedding: Embedding,
+    original_to_training: Option<Vec<usize>>,
+    expanded_embedding: OnceLock<Embedding>,
     embedding_tensor: Tensor<2>,
     a: f32,
     b: f32,
@@ -345,7 +419,15 @@ pub struct FittedUMAP {
 
 impl FittedUMAP {
     pub fn embedding(&self) -> &Embedding {
-        &self.embedding
+        match &self.original_to_training {
+            Some(inverse) => self.expanded_embedding.get_or_init(|| {
+                inverse
+                    .iter()
+                    .map(|&index| self.embedding[index].clone())
+                    .collect()
+            }),
+            None => &self.embedding,
+        }
     }
     pub fn n_features(&self) -> usize {
         self.n_features

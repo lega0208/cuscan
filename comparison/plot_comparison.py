@@ -12,14 +12,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "feedback_clustered.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "umap_comparison.html"
 SAMPLE_SEED = 42
-N_NEIGHBORS = 15
+N_NEIGHBORS = 30
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare umap-learn and fast_umap on one reproducible data sample."
     )
-    parser.add_argument("--sample-size", type=int, default=50_000)
+    parser.add_argument("--sample-size", type=int, default=1_000_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--device", choices=("cuda", "cpu", "wgpu"), default="cuda")
@@ -32,7 +32,8 @@ def load_sample(path: Path, sample_size: int) -> tuple[np.ndarray, list[str | No
         raise ValueError("--sample-size must be positive")
 
     data = pl.scan_parquet(path).select("topic_global", "embedding").collect()
-    sample = data.sample(n=min(sample_size, data.height), seed=SAMPLE_SEED, shuffle=True)
+    # sample = data.sample(n=min(sample_size, data.height), seed=SAMPLE_SEED, shuffle=True)
+    sample = data
     if sample.height <= N_NEIGHBORS:
         raise ValueError(
             f"Need at least {N_NEIGHBORS + 1} sampled rows for n_neighbors={N_NEIGHBORS}; "
@@ -72,6 +73,7 @@ def main() -> None:
         "random_state": None,
         "min_dist": 0.0,
         "verbose": True,
+        "unique": True,
     }
     if args.n_epochs is not None:
         if args.n_epochs <= 0:
@@ -82,7 +84,7 @@ def main() -> None:
 
     from fast_umap import UMAP
 
-    umap_config = {**config, "unique": True}
+    umap_config = {**config}
     # fast_config = {**config, "device": args.device, "n_epochs": 2500}
     fast_config = {
         **{k: v for k, v in config.items() if k != "metric" and k != "verbose"},

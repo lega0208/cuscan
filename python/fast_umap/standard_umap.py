@@ -30,6 +30,7 @@ class UMAP:
         backend: Literal["flex", "cuda"] = "flex",
         device_index: int = 0,
         neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
+        unique: bool = False,
     ) -> None:
         self.n_components = n_components
         self.n_neighbors = n_neighbors
@@ -48,6 +49,7 @@ class UMAP:
         self.backend = backend
         self.device_index = device_index
         self.neighbor_search = neighbor_search
+        self.unique = unique
 
     @staticmethod
     def _input_array(X: ArrayLike) -> NDArray[np.float32]:
@@ -90,6 +92,7 @@ class UMAP:
             backend=self.backend,
             device_index=self.device_index,
             neighbor_search=self.neighbor_search,
+            unique=self.unique,
         )
         self.embedding_ = model.embedding
         self.n_features_in_ = x.shape[1]
