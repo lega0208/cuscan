@@ -15,7 +15,7 @@ use super::model::ParametricUMAPModel;
 /// ```ignore
 /// use fast_umap::prelude::*;
 /// use burn::tensor::Device;
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let config = ParametricUMAPConfig::default();
 /// let umap = ParametricUMAP::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);
@@ -44,7 +44,7 @@ pub fn save_model(
 /// ```ignore
 /// use fast_umap::prelude::*;
 /// use burn::tensor::Device;
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let config = ParametricUMAPConfig::default();
 /// let umap = ParametricUMAP::with_device(config, device.clone());
 /// let fitted = umap.fit(data, None);

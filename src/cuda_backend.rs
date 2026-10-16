@@ -6,16 +6,26 @@
 #[cfg(test)]
 use burn::tensor::{Int, Tensor, TensorData};
 
-/// Return the number of CUDA devices visible to the CUDA driver.
-///
-/// Returns zero if the CUDA driver is unavailable or device discovery fails.
-pub fn device_count() -> usize {
+/// Discover CUDA devices without treating unexpected driver errors as absence.
+/// A missing driver library or the driver's explicit no-device result is
+/// classified as unavailable; initialization and other discovery errors propagate.
+pub fn try_device_count() -> Result<usize, String> {
     // SAFETY: This only checks whether the CUDA driver library can be loaded.
     if !unsafe { cudarc::driver::sys::is_culib_present() } {
-        return 0;
+        return Ok(0);
     }
+    match cudarc::driver::CudaContext::device_count() {
+        Ok(count) => {
+            usize::try_from(count).map_err(|_| format!("invalid CUDA device count: {count}"))
+        }
+        Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NO_DEVICE => Ok(0),
+        Err(error) => Err(error.to_string()),
+    }
+}
 
-    usize::try_from(cudarc::driver::CudaContext::device_count().unwrap_or(0)).unwrap_or(0)
+/// Return the visible device count, propagating unexpected discovery failures.
+pub fn device_count() -> usize {
+    try_device_count().unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"))
 }
 
 /// Return whether at least one CUDA device is available.

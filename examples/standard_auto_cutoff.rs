@@ -48,7 +48,7 @@ fn benchmark(label: &str, backend: BackendChoice) -> Option<usize> {
 }
 
 fn main() {
-    let flex_crossover = benchmark("Flex", BackendChoice::Flex);
+    let cpu_crossover = benchmark("CPU", BackendChoice::Cpu);
     #[cfg(feature = "cuda")]
     let cuda_crossover = if let Some(device) = fast_umap::cuda_backend::device(0) {
         let _ = device;
@@ -63,9 +63,9 @@ fn main() {
         None
     };
 
-    // AUTO_EXACT_MAX_ROWS follows the measured CUDA crossover when present, otherwise Flex.
+    // AUTO_EXACT_MAX_ROWS follows the measured CUDA crossover when present, otherwise CPU.
     println!(
         "CUDA-preferred recommended AUTO_EXACT_MAX_ROWS: {:?}",
-        cuda_crossover.or(flex_crossover)
+        cuda_crossover.or(cpu_crossover)
     );
 }

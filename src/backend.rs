@@ -15,13 +15,12 @@ use burn::backend::{
 ///   pairwise distance matrix; differentiable (backward propagates through
 ///   the selected entries).
 ///
-/// Implementations are provided by CubeCL, Flex, and the handwritten
+/// Implementations are provided by CubeCL and the handwritten
 /// autodiff adapter in `autodiff_ops`.
 #[backend_extension(
-    Cube: cfg(any(feature = "gpu", feature = "cuda")),
-    Flex,
+    Cube: cfg(any(feature = "cpu", feature = "gpu", feature = "cuda")),
     Autodiff,
-    Fusion: cfg(any(feature = "gpu", feature = "cuda")),
+    Fusion: cfg(any(feature = "cpu", feature = "gpu", feature = "cuda")),
 )]
 pub trait UmapOps: Backend {
     #[fusion(dtype = x, shape = {
@@ -91,9 +90,13 @@ pub trait UmapOps: Backend {
 ///
 /// Kept separate from [`UmapOps`] so bounded graph/search work cannot
 /// accidentally route through the differentiable full-pairwise operations.
-#[backend_extension(Cube: cfg(feature = "cuda"), Flex, Fusion: cfg(feature = "cuda"))]
+#[backend_extension(Cube: cfg(any(feature = "cpu", feature = "cuda")), Fusion: cfg(any(feature = "cpu", feature = "cuda")))]
 pub trait StandardUmapOps: Backend {
     #[fusion(meta = |data, k, seed, max_iterations| {
+        assert!(data.shape.len() == 2 && data.shape[0] >= 2 && data.shape[1] > 0,
+            "ANN input requires at least two rows and one feature");
+        assert!(*k > 0 && (*k as usize) < data.shape[0],
+            "ANN neighbor width must be in 1..N");
         let shape = [data.shape[0], *k as usize];
         (
             burn::backend::fusion::custom::TensorSpec::new(shape.into(), burn::tensor::DType::I32),
@@ -278,8 +281,7 @@ pub trait StandardUmapOps: Backend {
     /// `head_offsets`/`head_edges` list, per head row, the original ids of
     /// positive-weight edges with that head in ascending id order;
     /// Parallel backends use atomic coordinate updates and exclusive
-    /// per-head RNG ownership; the serial Flex reference walks edges in id
-    /// order and does not need the CSR. Returns the updated head, tail,
+    /// per-head RNG ownership. Returns the updated head, tail,
     /// positive clocks, negative clocks and RNG state.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]

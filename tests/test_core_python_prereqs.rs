@@ -5,7 +5,7 @@ use fast_umap::{
     validate_parametric_umap_data, validate_parametric_umap_input,
 };
 
-// Flex seeding is process-global; seeded training cases must not race each other.
+// CPU seeding is process-global; seeded training cases must not race each other.
 static TRAINING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn sample_data() -> Vec<Vec<f32>> {
@@ -36,12 +36,12 @@ fn fit(seed: u64, data: Vec<Vec<f32>>) -> fast_umap::FittedParametricUMAP {
         ..Default::default()
     };
     let (_exit_tx, exit_rx) = crossbeam_channel::unbounded();
-    ParametricUMAP::with_device(config, Device::flex().autodiff())
+    ParametricUMAP::with_device(config, Device::cpu().autodiff())
         .fit_with_signal(data, None, exit_rx)
 }
 
 #[test]
-fn flex_cpu_fit_transform_is_finite_reproducible_and_consistent() {
+fn cpu_fit_transform_is_finite_reproducible_and_consistent() {
     let _training_guard = TRAINING_LOCK.lock().unwrap();
     let data = sample_data();
     let first = fit(9999, data.clone());
@@ -224,12 +224,12 @@ fn custom_graph_controls_reach_signal_progress_and_fitted_config() {
     config.optimization.n_epochs = 5;
     config.optimization.verbose = true;
     let (_tx, rx) = crossbeam_channel::unbounded();
-    let signal = ParametricUMAP::with_device(config.clone(), Device::flex().autodiff())
+    let signal = ParametricUMAP::with_device(config.clone(), Device::cpu().autodiff())
         .fit_with_signal(data.clone(), None, rx);
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = events.clone();
     let (_tx, rx) = crossbeam_channel::unbounded();
-    let progress = ParametricUMAP::with_device(config.clone(), Device::flex().autodiff())
+    let progress = ParametricUMAP::with_device(config.clone(), Device::cpu().autodiff())
         .fit_with_progress(
             data.clone(),
             None,
@@ -258,7 +258,7 @@ fn custom_graph_controls_reach_signal_progress_and_fitted_config() {
     config.graph.local_connectivity = 1.0;
     config.graph.bandwidth = 1.0;
     config.graph.set_op_mix_ratio = 1.0;
-    let defaults = ParametricUMAP::with_device(config, Device::flex().autodiff()).fit(data, None);
+    let defaults = ParametricUMAP::with_device(config, Device::cpu().autodiff()).fit(data, None);
     assert_ne!(signal.embedding(), defaults.embedding());
 }
 
@@ -273,7 +273,7 @@ fn cancellation_before_first_epoch_keeps_configured_graph_counts_valid() {
     tx.send(()).unwrap();
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = events.clone();
-    let fitted = ParametricUMAP::with_device(config, Device::flex().autodiff()).fit_with_progress(
+    let fitted = ParametricUMAP::with_device(config, Device::cpu().autodiff()).fit_with_progress(
         sample_data(),
         None,
         rx,

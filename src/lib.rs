@@ -55,6 +55,9 @@
 //! use fast_umap::parametric_umap::trainer;
 //! ```
 
+#[cfg(not(any(feature = "cpu", feature = "cuda", feature = "gpu")))]
+compile_error!("enable at least one backend feature: cpu, cuda, or gpu");
+
 pub mod autodiff_ops;
 pub mod backend;
 #[cfg(feature = "plotters")]
@@ -62,10 +65,8 @@ pub mod chart;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod distances;
-pub mod flex_backend;
-pub mod generic_backend;
 pub mod graph;
-#[cfg(any(feature = "gpu", feature = "cuda"))]
+#[cfg(any(feature = "cpu", feature = "gpu", feature = "cuda"))]
 pub mod kernels;
 pub mod macros;
 #[cfg(feature = "nn-descent")]

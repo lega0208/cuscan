@@ -124,9 +124,58 @@ fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     (query, reference, graph)
 }
 
+fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u64) -> Vec<i32> {
+    const MODULUS: i64 = 2_147_483_647;
+    let n_u64 = u64::try_from(n).unwrap();
+    let query_key = (query_offset % n_u64) as usize;
+    let rng_seed = ((seed % n_u64) as usize + query_key) % n;
+    let mut state = (rng_seed as i64 + 1) % MODULUS;
+    if state == 0 {
+        state = 1;
+    }
+    let mut starts = Vec::with_capacity(capacity);
+    for j in n - capacity..n {
+        let high = state / 127_773;
+        let low = state - high * 127_773;
+        let test = 16_807 * low - 2_836 * high;
+        state = if test <= 0 { test + MODULUS } else { test };
+        let draw = usize::try_from(state - 1).unwrap() % (j + 1);
+        starts.push(if starts.contains(&(draw as i32)) {
+            j as i32
+        } else {
+            draw as i32
+        });
+    }
+    starts
+}
+
+fn self_edge_query_reference(
+    n: usize,
+    capacity: usize,
+    seed: u64,
+    query_offset: u64,
+    query_rows: usize,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let mut indices = Vec::with_capacity(query_rows * capacity);
+    let mut distances = Vec::with_capacity(query_rows * capacity);
+    let mut stats = Vec::with_capacity(query_rows * 2);
+    for row in 0..query_rows {
+        let absolute_offset = query_offset + u64::try_from(row).unwrap();
+        let mut ranked = reference_floyd_starts(n, capacity, seed, absolute_offset)
+            .into_iter()
+            .map(|id| (id, (id as f32 - 0.5).abs()))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+        indices.extend(ranked.iter().map(|&(id, _)| id));
+        distances.extend(ranked.iter().map(|&(_, distance)| distance));
+        stats.extend([capacity as i32, capacity as i32]);
+    }
+    (indices, distances, stats)
+}
+
 #[test]
 fn approximate_query_is_seeded_bounded_and_bipartite() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let (query, reference, graph) = inputs(&device);
     let first = run_query(
         query.clone(),
@@ -181,7 +230,7 @@ fn approximate_query_is_seeded_bounded_and_bipartite() {
 
 #[test]
 fn approximate_query_seed_offsets_preserve_block_identity() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let (query, reference, graph) = inputs(&device);
     let whole = run_query(
         query.clone(),
@@ -219,7 +268,7 @@ fn approximate_query_seed_offsets_preserve_block_identity() {
 
 #[test]
 fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let reference = Tensor::<2>::from_data(
         TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0], [8, 1]),
         &device,
@@ -253,7 +302,7 @@ fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
 
 #[test]
 fn approximate_query_orders_equal_distances_by_reference_id() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let reference = Tensor::<2>::from_data(
         TensorData::new(vec![0.0f32, 0.0, 1.0, -1.0], [4, 1]),
         &device,
@@ -271,12 +320,12 @@ fn approximate_query_orders_equal_distances_by_reference_id() {
 
 #[test]
 fn approximate_query_marks_invalid_graph_indices_in_stats() {
-    assert_invalid_graph_indices_in_stats(&Device::flex());
+    assert_invalid_graph_indices_in_stats(&Device::cpu());
 }
 
 #[test]
-fn approximate_query_prevalidated_matches_validating_entry_on_flex() {
-    let device = Device::flex();
+fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
+    let device = Device::cpu();
     let (query, reference, graph) = inputs(&device);
     let validating = run_query(
         query.clone(),
@@ -309,7 +358,7 @@ fn assert_invalid_graph_indices_in_stats(device: &Device) {
 
 #[test]
 fn approximate_query_uses_seeded_unique_floyd_starts() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let n = 23usize;
     let reference = Tensor::<2>::from_data(
         TensorData::new((0..n).map(|row| row as f32).collect(), [n, 1]),
@@ -425,7 +474,7 @@ fn approximate_query_prevalidated_matches_validating_entry_on_cuda() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn approximate_query_prevalidated_chunks_large_cuda_batch_with_flex_oracle() {
+fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
     let Some(cuda_device) = fast_umap::cuda_backend::device(0) else {
         if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
             panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
@@ -475,42 +524,11 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_flex_oracle() {
         query_offset,
     );
 
-    let flex_device = Device::flex();
-    let flex_reference =
-        Tensor::<2>::from_data(TensorData::new(reference_values, [n, 1]), &flex_device);
-    let flex_query =
-        Tensor::<2>::from_data(TensorData::new(query_values, [query_rows, 1]), &flex_device);
-    let flex_graph =
-        Tensor::<2, Int>::from_data(TensorData::new(graph_values, [n, 1]), &flex_device);
-
-    // CUDA's existing seed key is modulo N; Flex's is modulo the Park–Miller
-    // modulus. Split at each CUDA key wrap and offset the Flex oracle so its
-    // unchanged production RNG generates the same starting keys. The
-    // self-edge graph makes visits=15 output-equivalent to CUDA visits=5000.
-    let n_u64 = u64::try_from(n).unwrap();
-    let mut expected = (Vec::new(), Vec::new(), Vec::new());
-    let mut row_start = 0usize;
-    while row_start < query_rows {
-        let query_key = (query_offset % n_u64 + u64::try_from(row_start % n).unwrap()) % n_u64;
-        let rng_key = (seed % n_u64 + query_key) % n_u64;
-        let rows_until_wrap = usize::try_from(n_u64 - rng_key).unwrap();
-        let end = row_start + rows_until_wrap.min(query_rows - row_start);
-        let query_chunk = flex_query.clone().slice([row_start..end, 0..1]);
-        let chunk = run_prevalidated_query(
-            query_chunk,
-            flex_reference.clone(),
-            flex_graph.clone(),
-            k,
-            candidates,
-            candidates,
-            0,
-            rng_key,
-        );
-        expected.0.extend(chunk.0);
-        expected.1.extend(chunk.1);
-        expected.2.extend(chunk.2);
-        row_start = end;
-    }
+    // With self-edges, search cannot visit beyond the initial Floyd starts.
+    // Compute those starts, sorted distances, and exact search statistics on
+    // the host rather than using another production backend as an oracle.
+    let expected =
+        self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
 
     assert_eq!(actual.0, expected.0, "chunked CUDA indices differ");
     assert_eq!(actual.1, expected.1, "chunked CUDA distances differ");
@@ -520,6 +538,59 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_flex_oracle() {
             .2
             .chunks_exact(2)
             .all(|stats| stats[0] == 15 && stats[1] == 15)
+    );
+}
+
+#[test]
+fn approximate_query_cpu_chunks_large_batch_and_preserves_tail_rows() {
+    let n = 5_000usize;
+    let query_rows = 7_000usize;
+    let k = 15;
+    let candidates = 15;
+    let visits = 5_000;
+    let seed = 42u64;
+    let query_offset = 17u64;
+    let scratch_budget = 256 * 1024 * 1024;
+    let scratch_per_row =
+        candidates as usize * (4 + 4 + 4) + visits as usize * (4 + 4) + 8 + 32 * 4;
+    let max_chunk_rows = scratch_budget / scratch_per_row;
+    assert!(query_rows * scratch_per_row > scratch_budget);
+    assert!(max_chunk_rows < query_rows);
+    let chunk_lengths = (0..query_rows)
+        .step_by(max_chunk_rows)
+        .map(|start| (query_rows - start).min(max_chunk_rows))
+        .collect::<Vec<_>>();
+    assert!(chunk_lengths.len() > 1);
+    assert_ne!(chunk_lengths.last(), Some(&max_chunk_rows));
+
+    let device = Device::cpu();
+    let reference = Tensor::<2>::from_data(
+        TensorData::new((0..n).map(|row| row as f32).collect(), [n, 1]),
+        &device,
+    );
+    let query = Tensor::<2>::from_data(
+        TensorData::new(vec![0.5f32; query_rows], [query_rows, 1]),
+        &device,
+    );
+    let graph = Tensor::<2, Int>::from_data(
+        TensorData::new((0..n).map(|row| row as i32).collect(), [n, 1]),
+        &device,
+    );
+    let actual = run_prevalidated_query(
+        query,
+        reference,
+        graph,
+        k,
+        candidates,
+        visits,
+        seed,
+        query_offset,
+    );
+    let expected =
+        self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
+    assert_eq!(
+        actual, expected,
+        "CPU query chunks/tail differ from host arithmetic reference"
     );
 }
 

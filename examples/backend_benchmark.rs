@@ -1,6 +1,6 @@
 #![cfg(feature = "parametric")]
 
-/// Benchmark the Flex CPU backend across a range of workloads.
+/// Benchmark the CubeCL CPU backend across a range of workloads.
 ///
 /// Usage:
 ///     cargo run --release --example backend_benchmark
@@ -170,7 +170,7 @@ struct TimingResult {
 
 // ── Runners ─────────────────────────────────────────────────────────────────
 
-fn run_flex(sc: &Scenario) -> TimingResult {
+fn run_cpu(sc: &Scenario) -> TimingResult {
     let total_start = Instant::now();
     let data = gen_data(sc.n_samples, sc.n_features);
     let fit_start = Instant::now();
@@ -180,7 +180,7 @@ fn run_flex(sc: &Scenario) -> TimingResult {
     let _ = fitted.into_embedding();
     TimingResult {
         scenario: sc.label.clone(),
-        backend: "Flex CPU".into(),
+        backend: "CubeCL CPU".into(),
         total_secs: total_start.elapsed().as_secs_f64(),
         fit_secs,
     }
@@ -216,7 +216,7 @@ fn main() {
     println!("  Epochs: 50");
 
     println!(
-        "  Backends: Flex CPU{}",
+        "  Backends: CubeCL CPU{}",
         if cfg!(feature = "gpu") { ", WGPU" } else { "" }
     );
     println!();
@@ -236,10 +236,10 @@ fn main() {
     };
 
     {
-        print!("  Flex CPU warmup ... ");
+        print!("  CubeCL CPU warmup ... ");
         std::io::stdout().flush().unwrap();
         let t = Instant::now();
-        let _ = run_flex(&warmup_sc);
+        let _ = run_cpu(&warmup_sc);
         println!("done ({:.2}s)", t.elapsed().as_secs_f64());
     }
     #[cfg(feature = "gpu")]
@@ -265,9 +265,9 @@ fn main() {
             sc.label, sc.n_samples, sc.n_features, hidden_str, sc.n_neighbors, sc.n_components
         );
 
-        print!("  Flex CPU ... ");
+        print!("  CubeCL CPU ... ");
         std::io::stdout().flush().unwrap();
-        let r = run_flex(sc);
+        let r = run_cpu(sc);
         println!("total={:.3}s  fit={:.3}s", r.total_secs, r.fit_secs);
         results.push(r);
         #[cfg(feature = "gpu")]
@@ -290,27 +290,27 @@ fn main() {
     md.push_str("# Backend Benchmark\n\n");
     md.push_str("50 epochs per scenario\n\n");
     md.push_str(
-        "| Scenario | Samples | Features | Hidden | Out | Flex CPU | WGPU | Flex speedup |\n",
+        "| Scenario | Samples | Features | Hidden | Out | CubeCL CPU | WGPU | CPU speedup |\n",
     );
     md.push_str(
         "|----------|---------|----------|--------|-----|----------|------|--------------|\n",
     );
 
     for sc in &scenarios {
-        let flex = results
+        let cpu = results
             .iter()
-            .find(|r| r.backend == "Flex CPU" && r.scenario == sc.label);
+            .find(|r| r.backend == "CubeCL CPU" && r.scenario == sc.label);
         let wgpu = results
             .iter()
             .find(|r| r.backend == "WGPU" && r.scenario == sc.label);
-        let flex_time = flex
+        let cpu_time = cpu
             .map(|r| format!("{:.2}s", r.total_secs))
             .unwrap_or_else(|| "--".into());
         let wgpu_time = wgpu
             .map(|r| format!("{:.2}s", r.total_secs))
             .unwrap_or_else(|| "--".into());
-        let speedup = match (flex, wgpu) {
-            (Some(flex), Some(wgpu)) => format!("{:.1}x", wgpu.total_secs / flex.total_secs),
+        let speedup = match (cpu, wgpu) {
+            (Some(cpu), Some(wgpu)) => format!("{:.1}x", wgpu.total_secs / cpu.total_secs),
             _ => "--".into(),
         };
         let hidden_str = sc
@@ -327,7 +327,7 @@ fn main() {
             sc.n_features,
             hidden_str,
             sc.n_components,
-            flex_time,
+            cpu_time,
             wgpu_time,
             speedup
         ));

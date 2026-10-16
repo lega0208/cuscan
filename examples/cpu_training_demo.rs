@@ -1,15 +1,15 @@
 #![cfg(feature = "parametric")]
 
-//! CPU training demonstration using Burn's Flex backend.
+//! CPU training demonstration using Burn's CubeCL CPU backend.
 //!
-//! Flex provides pure-Rust CPU execution for parametric UMAP without a GPU.
+//! CubeCL CPU provides CPU execution for parametric UMAP without a GPU.
 
 use burn::tensor::Device;
 use fast_umap::prelude::*;
 use rand::RngExt;
 
 fn main() {
-    println!("=== Flex CPU UMAP Demo ===");
+    println!("=== CubeCL CPU UMAP Demo ===");
 
     let num_samples = 100;
     let num_features = 5;
@@ -41,9 +41,9 @@ fn main() {
         ..Default::default()
     };
 
-    let fitted = ParametricUMAP::with_device(config, Device::flex()).fit(data, None);
+    let fitted = ParametricUMAP::with_device(config, Device::cpu()).fit(data, None);
     let embedding = fitted.embedding();
-    println!("Flex CPU UMAP completed successfully!");
+    println!("CubeCL CPU UMAP completed successfully!");
     println!(
         "Embedding shape: {} × {}",
         embedding.len(),

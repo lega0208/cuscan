@@ -158,7 +158,7 @@ fn map_umap_error(error: UmapError) -> PyErr {
   local_connectivity=1.0, set_op_mix_ratio=1.0, n_epochs=None,
   learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0,
   init="spectral", random_state=None, transform_seed=42,
-  transform_queue_size=4.0, backend="flex", device_index=0,
+  transform_queue_size=4.0, backend="auto", device_index=0,
   neighbor_search="auto", unique=false))]
 #[allow(clippy::too_many_arguments)]
 fn fit_umap(
@@ -189,9 +189,14 @@ fn fit_umap(
         _ => return Err(PyValueError::new_err("init must be 'spectral' or 'random'")),
     };
     let backend = match backend {
-        "flex" => BackendChoice::Flex,
+        "auto" => BackendChoice::Auto,
+        "cpu" => BackendChoice::Cpu,
         "cuda" => BackendChoice::Cuda { device_index },
-        _ => return Err(PyValueError::new_err("backend must be 'flex' or 'cuda'")),
+        _ => {
+            return Err(PyValueError::new_err(
+                "backend must be 'auto', 'cpu' or 'cuda'",
+            ));
+        }
     };
     let search = match neighbor_search {
         "auto" => NeighborSearch::Auto,
@@ -412,7 +417,7 @@ fn fit_parametric_umap(
     let (backend_device, device_name) = match device {
         "cuda" => (Device::cuda(DeviceIndex::Default).autodiff(), "cuda"),
         "wgpu" => (Device::wgpu(DeviceKind::DefaultDevice).autodiff(), "wgpu"),
-        "cpu" => (Device::flex().autodiff(), "cpu"),
+        "cpu" => (Device::cpu().autodiff(), "cpu"),
         _ => {
             return Err(PyValueError::new_err(
                 "device must be 'cuda', 'wgpu' or 'cpu'",

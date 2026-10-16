@@ -1,7 +1,7 @@
 /// Compare UMAP training with PCA warm-start enabled.
 ///
 /// Usage:
-///     cargo run --release --features gpu,pca --example pca_comparison
+///     cargo run --release --features gpu,cpu,parametric,pca --example pca_comparison
 use std::time::Instant;
 
 use fast_umap::{
@@ -16,7 +16,7 @@ fn device() -> burn::tensor::Device {
     }
     #[cfg(not(feature = "gpu"))]
     {
-        burn::tensor::Device::flex()
+        burn::tensor::Device::cpu()
     }
 }
 

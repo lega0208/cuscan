@@ -5,7 +5,7 @@
 //! through pairwise distance and k-NN computations.
 //!
 //! The code is generic over any `B: UmapOps` and is NOT tied to CubeCL or
-//! any specific GPU runtime — it works with Flex, WGPU, CUDA, and other
+//! any specific GPU runtime — it works with CPU, WGPU, CUDA, and other
 //! supported CubeCL runtimes.
 
 use std::fmt::Debug;

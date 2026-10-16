@@ -4,8 +4,8 @@ use burn::tensor::Device;
 use fast_umap::prelude::*;
 use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 
-fn flex() -> Device {
-    Device::flex()
+fn cpu() -> Device {
+    Device::cpu()
 }
 
 fn generate_test_data(num_samples: usize, num_features: usize) -> Vec<Vec<f64>> {
@@ -41,7 +41,7 @@ fn test_single_sample_transform() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted = umap.fit(data, None);
 
     let temp_dir = tempfile::tempdir()?;
@@ -50,7 +50,7 @@ fn test_single_sample_transform() -> Result<(), Box<dyn std::error::Error>> {
     fitted.save(&model_path)?;
     assert!(model_path.is_file());
 
-    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 15, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 15, cpu())?;
 
     // Test with single sample
     let single_data: Vec<Vec<f64>> = vec![vec![
@@ -92,7 +92,7 @@ fn test_large_batch_transform() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted = umap.fit(data, None);
 
     let temp_dir = tempfile::tempdir()?;
@@ -101,7 +101,7 @@ fn test_large_batch_transform() -> Result<(), Box<dyn std::error::Error>> {
     fitted.save(&model_path)?;
     assert!(model_path.is_file());
 
-    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 20, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 20, cpu())?;
 
     // Test with large batch
     let large_batch: Vec<Vec<f64>> = generate_test_data(500, 20);
@@ -144,7 +144,7 @@ fn test_different_output_dimensions() -> Result<(), Box<dyn std::error::Error>> 
             ..Default::default()
         };
 
-        let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+        let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
         let fitted = umap.fit(data.clone(), None);
 
         let temp_dir = tempfile::tempdir()?;
@@ -154,7 +154,7 @@ fn test_different_output_dimensions() -> Result<(), Box<dyn std::error::Error>> 
         fitted.save(&model_path)?;
         assert!(model_path.is_file());
 
-        let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 12, flex())?;
+        let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 12, cpu())?;
 
         // Test transformation
         let test_data = vec![data[0].clone()];
@@ -199,7 +199,7 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = temp_dir.path().join("test_edge_overwrite.burnpack");
 
     // Save first model
-    let umap1 = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap1 = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted1 = umap1.fit(data1, None);
     fitted1.save(&model_path)?;
     assert!(model_path.is_file());
@@ -208,7 +208,7 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     assert!(file_size_1 > 0);
 
     // Save second model (should overwrite)
-    let umap2 = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap2 = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted2 = umap2.fit(data2, None);
     fitted2.save(&model_path)?;
     assert!(model_path.is_file());
@@ -217,7 +217,7 @@ fn test_overwrite_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     assert!(file_size_2 > 0);
 
     // Load the second model
-    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 10, flex())?;
+    let loaded_fitted = FittedParametricUMAP::load(&model_path, config, 10, cpu())?;
 
     // Test transformation
     let test_data = vec![vec![1.0; 10]]; // Neutral test data

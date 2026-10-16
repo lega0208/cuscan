@@ -2,7 +2,7 @@
 //!
 //! Computes the top-k principal components of centered data using the
 //! covariance-eigendecomposition approach via power iteration. Works on
-//! any Burn backend (Flex CPU, WGPU, CUDA) without external linear algebra deps.
+//! supported Burn backends without external linear algebra dependencies.
 
 use burn::tensor::{Device, Tensor, TensorData};
 

@@ -4,8 +4,8 @@ use burn::tensor::Device;
 use fast_umap::prelude::*;
 use fast_umap::{FittedParametricUMAP, ParametricUMAP};
 
-fn flex() -> Device {
-    Device::flex()
+fn cpu() -> Device {
+    Device::cpu()
 }
 
 fn generate_test_data(num_samples: usize, num_features: usize) -> Vec<Vec<f64>> {
@@ -48,7 +48,7 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save the model to a temporary file
@@ -83,7 +83,7 @@ fn test_save_load_model() -> Result<(), Box<dyn std::error::Error>> {
         &model_path,
         config,
         4, // Input size
-        flex(),
+        cpu(),
     )?;
 
     // Test that the loaded model can transform data
@@ -131,7 +131,7 @@ fn test_load_with_sample() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save the model
@@ -143,7 +143,7 @@ fn test_load_with_sample() -> Result<(), Box<dyn std::error::Error>> {
     // Test load_with_sample method
     let sample_data = vec![0.0; num_features]; // Sample with correct dimensionality
     let loaded_fitted =
-        FittedParametricUMAP::load_with_sample(&model_path, config, sample_data, flex())?;
+        FittedParametricUMAP::load_with_sample(&model_path, config, sample_data, cpu())?;
 
     // Test transformation
     let test_data = vec![data[0].clone(), data[1].clone()];
@@ -185,7 +185,7 @@ fn test_multiple_save_load_cycles() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+    let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
     let fitted = umap.fit(data.clone(), None);
 
     // Save to temporary file
@@ -206,7 +206,7 @@ fn test_multiple_save_load_cycles() -> Result<(), Box<dyn std::error::Error>> {
             &model_path,
             config.clone(),
             10, // Input size
-            flex(),
+            cpu(),
         )?;
 
         // Test transformation
@@ -260,7 +260,7 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Train and save
-        let umap = ParametricUMAP::with_device(config.clone(), flex().autodiff());
+        let umap = ParametricUMAP::with_device(config.clone(), cpu().autodiff());
         let fitted = umap.fit(data.clone(), None);
 
         let temp_dir = tempfile::tempdir()?;
@@ -273,7 +273,7 @@ fn test_different_configurations() -> Result<(), Box<dyn std::error::Error>> {
         // Load and test
         let model_path_ref = &model_path;
         let loaded_fitted =
-            FittedParametricUMAP::load(model_path_ref, config, *num_features, flex())?;
+            FittedParametricUMAP::load(model_path_ref, config, *num_features, cpu())?;
 
         // Test transformation
         let test_data = vec![data[0].clone()];
@@ -298,7 +298,7 @@ fn test_file_not_found_error() {
     let temp_dir = tempfile::tempdir().unwrap();
     let nonexistent_path = temp_dir.path().join("nonexistent_model.burnpack");
 
-    let result = FittedParametricUMAP::load(&nonexistent_path, config, 10, flex());
+    let result = FittedParametricUMAP::load(&nonexistent_path, config, 10, cpu());
 
     // Should return an error
     assert!(result.is_err());
@@ -310,7 +310,7 @@ fn test_invalid_path_error() {
     let temp_dir = tempfile::tempdir().unwrap();
     let invalid_path = temp_dir.path();
 
-    let result = FittedParametricUMAP::load(invalid_path, config, 10, flex());
+    let result = FittedParametricUMAP::load(invalid_path, config, 10, cpu());
 
     // Should return an error
     assert!(result.is_err());
@@ -323,7 +323,7 @@ fn test_corrupt_burnpack_error() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&corrupt_path, b"not a valid Burnpack record")?;
 
     let result =
-        FittedParametricUMAP::load(&corrupt_path, ParametricUMAPConfig::default(), 10, flex());
+        FittedParametricUMAP::load(&corrupt_path, ParametricUMAPConfig::default(), 10, cpu());
     assert!(result.is_err(), "corrupt Burnpack data must fail to load");
 
     Ok(())

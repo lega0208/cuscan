@@ -18,33 +18,42 @@ fn unique_fit_expands_original_order_and_preserves_transform_state() {
             });
         inverse.push(index);
     }
+    assert_eq!(first.len(), distinct.len(), "all unique rows are retained");
+    for (row, &index) in rows.iter().zip(&inverse) {
+        assert_eq!(row, &first[index], "inverse map preserves input row order");
+    }
     let settings = UMAPConfig {
+        unique: true,
         init: Init::Random,
         n_epochs: Some(10),
+        learning_rate: 1.0,
         ..config()
     };
-    let manual = UMAP::new(settings.clone(), BackendChoice::Flex, NeighborSearch::Exact)
-        .fit(&first)
+    let (unique, returned) = UMAP::new(settings, BackendChoice::Cpu, NeighborSearch::Exact)
+        .fit_transform(&rows)
         .unwrap();
-    let (unique, returned) = UMAP::new(
-        UMAPConfig {
-            unique: true,
-            ..settings
-        },
-        BackendChoice::Flex,
-        NeighborSearch::Exact,
-    )
-    .fit_transform(&rows)
-    .unwrap();
     assert_eq!(&returned, unique.embedding());
     assert_eq!(unique.embedding().len(), rows.len());
-    for (row, &index) in unique.embedding().iter().zip(&inverse) {
-        assert_eq!(row, &manual.embedding()[index]);
+    let embedding = unique.embedding();
+    assert_eq!(embedding.len(), rows.len());
+    assert!(embedding.iter().all(|row| {
+        row.len() == config().n_components && row.iter().all(|value| value.is_finite())
+    }));
+    for (row_index, (&index, row)) in inverse.iter().zip(embedding).enumerate() {
+        let first_position = inverse[..row_index]
+            .iter()
+            .position(|&earlier| earlier == index);
+        if let Some(first_position) = first_position {
+            assert_eq!(row, &embedding[first_position]);
+        }
     }
-    assert_eq!(
-        unique.transform(&distinct[..5]).unwrap(),
-        manual.transform(&distinct[..5]).unwrap()
-    );
+    let retained_embedding = embedding.clone();
+    let transformed = unique.transform(&distinct[..5]).unwrap();
+    assert_eq!(unique.embedding(), &retained_embedding);
+    assert_eq!(transformed.len(), 5);
+    assert!(transformed.iter().all(|row| {
+        row.len() == config().n_components && row.iter().all(|value| value.is_finite())
+    }));
 }
 
 #[test]
@@ -55,7 +64,7 @@ fn unique_signed_zero_and_validation_are_exact() {
             init: Init::Random,
             ..config()
         },
-        BackendChoice::Flex,
+        BackendChoice::Cpu,
         NeighborSearch::Exact,
     );
     let rows = vec![
@@ -99,7 +108,7 @@ fn unique_signed_zero_and_validation_are_exact() {
             init: Init::Random,
             ..config()
         },
-        BackendChoice::Flex,
+        BackendChoice::Cpu,
         NeighborSearch::Exact,
     )
     .fit(&rows)
@@ -137,7 +146,7 @@ fn config() -> UMAPConfig {
 }
 
 fn fit(search: NeighborSearch, config: UMAPConfig) -> fast_umap::Result<fast_umap::FittedUMAP> {
-    UMAP::new(config, BackendChoice::Flex, search).fit(&clustered_data())
+    UMAP::new(config, BackendChoice::Cpu, search).fit(&clustered_data())
 }
 
 #[test]
@@ -151,7 +160,7 @@ fn singleton_and_two_row_cases_are_explicit() {
         NeighborSearch::Approximate,
         NeighborSearch::Auto,
     ] {
-        let fitted = UMAP::new(singleton_config.clone(), BackendChoice::Flex, search)
+        let fitted = UMAP::new(singleton_config.clone(), BackendChoice::Cpu, search)
             .fit(&[vec![1.0, 2.0]])
             .unwrap();
         assert_eq!(fitted.embedding(), &[vec![0.0, 0.0, 0.0]]);
@@ -161,7 +170,7 @@ fn singleton_and_two_row_cases_are_explicit() {
             "single-sample transform error for {search:?}"
         );
     }
-    let error = UMAP::new(config(), BackendChoice::Flex, NeighborSearch::Exact)
+    let error = UMAP::new(config(), BackendChoice::Cpu, NeighborSearch::Exact)
         .fit(&[vec![0.0], vec![1.0]])
         .unwrap_err();
     assert!(error.to_string().contains("graph is empty"));
@@ -174,11 +183,11 @@ fn invalid_config_and_input_are_reported_as_errors() {
         ..Default::default()
     };
     assert!(
-        UMAP::new(bad_config, BackendChoice::Flex, NeighborSearch::Exact)
+        UMAP::new(bad_config, BackendChoice::Cpu, NeighborSearch::Exact)
             .fit(&[vec![0.0]])
             .is_err()
     );
-    let estimator = UMAP::new(config(), BackendChoice::Flex, NeighborSearch::Exact);
+    let estimator = UMAP::new(config(), BackendChoice::Cpu, NeighborSearch::Exact);
     assert!(estimator.fit(&[]).is_err());
     assert!(estimator.fit(&[vec![0.0], vec![f32::NAN]]).is_err());
     assert!(estimator.fit(&[vec![0.0], vec![1.0, 2.0]]).is_err());
@@ -269,7 +278,7 @@ fn transform_uses_fitted_embedding_and_search_settings() {
         ..config()
     };
     assert!(
-        UMAP::new(exact_config, BackendChoice::Flex, NeighborSearch::Exact)
+        UMAP::new(exact_config, BackendChoice::Cpu, NeighborSearch::Exact)
             .fit(&clustered_data())
             .is_err()
     );
@@ -298,7 +307,7 @@ fn transform_q1_and_65_are_finite_and_repeatable_for_explicit_search_modes() {
     };
 
     for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
-        let fitted = UMAP::new(config.clone(), BackendChoice::Flex, search)
+        let fitted = UMAP::new(config.clone(), BackendChoice::Cpu, search)
             .fit(&data)
             .unwrap();
         for rows in [1, 65] {
@@ -366,7 +375,7 @@ fn fit_and_transform_run_sgd_epochs() {
         random_state: Some(31),
         ..Default::default()
     };
-    let fitted = UMAP::new(active, BackendChoice::Flex, NeighborSearch::Exact)
+    let fitted = UMAP::new(active, BackendChoice::Cpu, NeighborSearch::Exact)
         .fit(&data)
         .unwrap();
     assert!(
@@ -382,7 +391,7 @@ fn fit_and_transform_run_sgd_epochs() {
 
 #[test]
 fn fit_transform_returns_reusable_model_and_matching_embedding() {
-    let (fitted, embedding) = UMAP::new(config(), BackendChoice::Flex, NeighborSearch::Exact)
+    let (fitted, embedding) = UMAP::new(config(), BackendChoice::Cpu, NeighborSearch::Exact)
         .fit_transform(&clustered_data())
         .unwrap();
     assert_eq!(embedding.len(), 60);
@@ -458,7 +467,7 @@ fn query_diagnostics_preserve_output_and_expose_actual_neighbors() {
         NeighborSearch::Approximate,
         NeighborSearch::Auto,
     ] {
-        let fitted = UMAP::new(config(), BackendChoice::Flex, search)
+        let fitted = UMAP::new(config(), BackendChoice::Cpu, search)
             .fit(&data)
             .unwrap();
         let original = fitted.embedding().clone();

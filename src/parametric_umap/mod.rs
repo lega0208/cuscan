@@ -739,8 +739,11 @@ mod raw_input_tests {
             ..Default::default()
         };
         let (_exit_tx, exit_rx) = crossbeam_channel::unbounded();
-        let fitted = ParametricUMAP::with_device(config, Device::flex().autodiff())
-            .fit_with_signal(data.clone(), None, exit_rx);
+        let fitted = ParametricUMAP::with_device(config, Device::cpu().autodiff()).fit_with_signal(
+            data.clone(),
+            None,
+            exit_rx,
+        );
 
         let raw_training_tensor = convert_vector_to_tensor(
             data.clone().into_iter().flatten().collect(),

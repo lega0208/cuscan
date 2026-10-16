@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-size", type=int, default=1_000_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--device", choices=("cuda", "cpu", "wgpu"), default="cuda")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--n-epochs", type=int)
     return parser.parse_args()
 
@@ -32,7 +32,7 @@ def load_sample(path: Path, sample_size: int) -> tuple[np.ndarray, list[str | No
         raise ValueError("--sample-size must be positive")
 
     data = pl.scan_parquet(path).select("topic_global", "embedding").collect()
-    
+
     sample = (
         data
         if sample_size >= data.height
@@ -90,10 +90,9 @@ def main() -> None:
 
     umap_config = {**config}
     # fast_config = {**config, "device": args.device, "n_epochs": 2500}
-    backend = "flex" if args.device == "cpu" else "cuda"
     fast_config = {
         **{k: v for k, v in config.items() if k != "metric" and k != "verbose"},
-        "backend": backend,
+        "backend": args.device,
     }
 
     print("starting umap-learn")

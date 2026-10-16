@@ -36,7 +36,7 @@ def fit_umap(
     random_state: int | None = None,
     transform_seed: int = 42,
     transform_queue_size: float = 4.0,
-    backend: Literal["flex", "cuda"] = "flex",
+    backend: Literal["auto", "cpu", "cuda"] = "auto",
     device_index: int = 0,
     neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
     unique: bool = False,

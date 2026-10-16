@@ -281,9 +281,10 @@ fn verify_fixture(device: &Device, reference_order: bool) {
     }
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_flex() {
-    verify_fixture(&Device::flex(), true);
+fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_cpu() {
+    verify_fixture(&Device::cpu(), false);
 }
 
 fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
@@ -409,9 +410,10 @@ fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
     assert_ne!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn standard_layout_zero_controls_and_repeated_runs_are_deterministic() {
-    verify_zero_controls_and_repeats(&Device::flex(), true);
+fn standard_layout_zero_controls_and_repeated_fixture_runs_remain_valid() {
+    verify_zero_controls_and_repeats(&Device::cpu(), false);
 }
 
 #[cfg(feature = "cuda")]

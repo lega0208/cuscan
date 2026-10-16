@@ -62,7 +62,7 @@ fn pre_parametric_move_weights_and_fit_outputs_remain_compatible() {
     let expected_unseen: Vec<Vec<f32>> =
         serde_json::from_value(expected["transform"].clone()).unwrap();
 
-    let fitted = ParametricUMAP::with_device(config.clone(), Device::flex().autodiff())
+    let fitted = ParametricUMAP::with_device(config.clone(), Device::cpu().autodiff())
         .fit(data.clone(), None);
     assert_vectors_close(&as_f32(fitted.embedding().clone()), &expected_fit);
     assert_vectors_close(&as_f32(fitted.transform(data.clone())), &expected_fit);
@@ -72,7 +72,7 @@ fn pre_parametric_move_weights_and_fit_outputs_remain_compatible() {
         "tests/fixtures/pre_parametric_move.burnpack",
         config,
         3,
-        Device::flex(),
+        Device::cpu(),
     )
     .expect("pre-move Burnpack weights must load with the renamed API");
     assert_vectors_close(&as_f32(loaded.transform(data)), &expected_fit);

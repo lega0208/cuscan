@@ -277,7 +277,7 @@ where
 /// use burn::tensor::{Device, Tensor};
 /// use fast_umap::utils::normalize_tensor;
 ///
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let tensor = Tensor::<1>::from_data([1.0f32, 2.0, 3.0], &device);
 /// let normalized_tensor = normalize_tensor(tensor);
 /// ```

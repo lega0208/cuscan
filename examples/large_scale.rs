@@ -18,7 +18,7 @@ fn device() -> Device {
     cfg_select! {
         feature = "cuda" => Device::cuda(DeviceIndex::Default),
         feature = "gpu" => Device::wgpu(DeviceKind::DefaultDevice),
-        _ => Device::flex(),
+        _ => Device::cpu(),
     }
 }
 

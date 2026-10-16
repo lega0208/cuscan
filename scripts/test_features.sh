@@ -1,47 +1,28 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "=== Testing Feature-Based Compilation ==="
-echo
-
-echo "1. Testing default features (gpu + verbose):"
-cargo check --example feature_demo
-echo
-
-echo "2. Testing the umap-rs CPU fallback feature:"
-cargo check --example feature_demo --features cpu --no-default-features
-echo
-
-echo "3. Testing minimal features (Flex CPU backend):"
-cargo check --lib --no-default-features
-echo
-
-echo "4. Testing CUDA backend without default features:"
+# Compilation only: parametric targets are not runtime acceptance for this migration.
+echo '=== Explicit backend feature compilation ==='
+cargo check --lib --no-default-features --features cpu
+cargo check --lib --no-default-features --features cuda,cpu,verbose
+cargo check --lib --no-default-features --features cpu,gpu
+cargo check --lib --no-default-features --features gpu
 cargo check --lib --no-default-features --features cuda
-echo
+cargo check --all-targets --no-default-features --features cpu,parametric
 
-echo "5. Testing GPU and CUDA backends together:"
-cargo check --lib --features gpu,cuda
-echo
+echo '=== Expected backend-free diagnostic ==='
+python - <<'PY'
+import subprocess
+result = subprocess.run(
+    ['cargo', 'check', '--lib', '--no-default-features'], capture_output=True, text=True
+)
+assert result.returncode != 0, 'backend-free build unexpectedly succeeded'
+assert 'enable at least one backend feature: cpu, cuda, or gpu' in result.stderr, result.stderr
+PY
 
-echo "6. Testing CUDA backend tests when CUDA runtime is present:"
-if command -v nvidia-smi >/dev/null 2>&1 || { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q 'libcuda\.so'; }; then
-    FAST_UMAP_REQUIRE_CUDA=1 cargo test --no-default-features --features cuda --lib cuda_backend -- --nocapture
-else
-    echo "SKIPPED: neither nvidia-smi nor libcuda was found"
-fi
-echo
+echo '=== Standard CPU behavior ==='
+for suite in test_standard_umap test_standard_dispatch test_standard_ann test_standard_query test_standard_graph test_standard_layout test_standard_init test_standard_estimator test_standard_quality; do
+    cargo test --no-default-features --features cpu --test "$suite"
+done
 
-echo "7. Testing all non-CUDA features:"
-cargo check --example feature_demo --features all
-echo
-
-echo "8. Testing GPU backend explicitly:"
-cargo check --example backend_choice --features gpu
-echo
-
-echo "9. Testing the Flex CPU device explicitly:"
-cargo check --example backend_choice --no-default-features
-echo
-
-echo "=== Feature Compilation Tests Complete ==="
+echo 'GPU runtime lanes require usable hardware; run explicitly and report unavailable lanes as unverified.'

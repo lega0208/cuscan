@@ -1,7 +1,7 @@
 use burn::backend::Dispatch;
 /// Integration tests for fast-umap.
 ///
-/// These tests use Burn's Flex CPU device so no GPU is required.
+/// These tests use Burn's CubeCL CPU device so no GPU is required.
 /// They cover:
 ///   - Pure utility functions (normalize_data, format_duration, generate_test_data)
 ///   - Tensor round-trips (convert_vector_to_tensor / convert_tensor_to_vector)
@@ -31,10 +31,10 @@ use fast_umap::{
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// Flex CPU device
+// CubeCL CPU device
 // ---------------------------------------------------------------------------
 fn cpu() -> Device {
-    Device::flex()
+    Device::cpu()
 }
 
 // ===========================================================================
@@ -462,7 +462,7 @@ fn model_deep_network() {
 // ===========================================================================
 // Distance functions
 // These live in fast_umap::distances and use crate::backend::Backend.
-// We test them via standard tensor arithmetic directly on the Flex CPU device.
+// We test them via standard tensor arithmetic directly on the CubeCL CPU device.
 // ===========================================================================
 
 /// Compute Euclidean pairwise distances with standard tensor ops
@@ -633,13 +633,13 @@ fn assert_umap_ops_dispatch_and_gradients(device: Device) {
 }
 
 #[test]
-fn flex_umap_ops_dispatch_and_gradients() {
-    assert_umap_ops_dispatch_and_gradients(Device::flex().autodiff());
+fn cpu_umap_ops_dispatch_and_gradients() {
+    assert_umap_ops_dispatch_and_gradients(Device::cpu().autodiff());
 }
 
 #[test]
-fn flex_knn_f64_dispatch_preserves_order_dtype_and_backward() {
-    let device = Device::flex().autodiff();
+fn cpu_knn_f64_dispatch_preserves_order_dtype_and_backward() {
+    let device = Device::cpu().autodiff();
     let pairwise = Tensor::<2>::from_data(
         TensorData::new(
             vec![

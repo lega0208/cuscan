@@ -112,7 +112,7 @@ fn try_cpu_backend(data: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
         println!("Attempting CPU backend...");
 
         let config = ParametricUMAPConfig::default();
-        let umap = ParametricUMAP::with_device(config, burn::tensor::Device::flex());
+        let umap = ParametricUMAP::with_device(config, burn::tensor::Device::cpu());
         // CPU fit can also panic, so we wrap in catch_unwind
         use std::panic::catch_unwind;
 

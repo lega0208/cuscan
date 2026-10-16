@@ -63,22 +63,25 @@ fn run_large_offset_distance_case(device: &Device) {
     assert_eq!(neighbor_distances, [1.0]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn standard_squared_distance_dispatch_uses_flex_for_rectangular_blocks() {
+fn standard_squared_distance_dispatch_uses_cpu_for_rectangular_blocks() {
     assert_eq!(
-        run_distance_block(&Device::flex()),
+        run_distance_block(&Device::cpu()),
         [0.0, 0.0, 9.0, 4.0, 4.0, 1.0]
     );
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn standard_squared_distance_and_self_exclusion_preserve_large_offset_precision_on_flex() {
-    run_large_offset_distance_case(&Device::flex());
+fn standard_squared_distance_and_self_exclusion_preserve_large_offset_precision_on_cpu() {
+    run_large_offset_distance_case(&Device::cpu());
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn exact_neighbors_excludes_global_self_and_orders_ties_by_index_on_flex() {
-    let device = Device::flex();
+fn exact_neighbors_excludes_global_self_and_orders_ties_by_index_on_cpu() {
+    let device = Device::cpu();
     let reference = Tensor::<2>::from_data(
         TensorData::new(vec![0.0f32, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0], [4, 2]),
         &device,
@@ -92,9 +95,10 @@ fn exact_neighbors_excludes_global_self_and_orders_ties_by_index_on_flex() {
     assert_eq!(distances, [1.0, 1.0, 2.0, 0.0, 1.0, 1.0]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn exact_neighbors_is_bipartite_without_implicit_equal_index_exclusion() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let reference = Tensor::<2>::from_data(
         TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 2.0, 0.0], [3, 2]),
         &device,
@@ -105,9 +109,10 @@ fn exact_neighbors_is_bipartite_without_implicit_equal_index_exclusion() {
     assert_eq!(distances, [0.0, 0.0, 2.0]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn exact_neighbors_handles_query_block_boundary_on_flex() {
-    let device = Device::flex();
+fn exact_neighbors_handles_query_block_boundary_on_cpu() {
+    let device = Device::cpu();
     let query = Tensor::<2>::from_data(TensorData::new(vec![0.0f32; 33 * 2], [33, 2]), &device);
     let reference = Tensor::<2>::from_data(
         TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], [3, 2]),

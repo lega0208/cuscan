@@ -9,8 +9,6 @@ use burn::{
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
-const GRAPH_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
-
 #[cube]
 fn smooth_row<F: Float>(
     distances: &Tensor<F>,
@@ -543,6 +541,7 @@ pub(crate) fn fuzzy_graph(
         .checked_mul(DType::I32.size())
         .expect("graph node scratch allocation overflows usize");
     let client = indices.client.clone();
+    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
     let device = indices.device.clone();
     let dtypes = [
         dtype_to_storage_type(distances.dtype),
@@ -623,8 +622,8 @@ pub(crate) fn fuzzy_graph(
         u32::try_from(capacity.max(node_count)).expect("graph zero-init exceeds CubeCL range");
     fuzzy_graph_zero_kernel::launch(
         &client,
-        CubeCount::Static(zero_units.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(zero_units.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         heads.clone().into_tensor_arg(),
         tails.clone().into_tensor_arg(),
         weights.clone().into_tensor_arg(),
@@ -634,8 +633,8 @@ pub(crate) fn fuzzy_graph(
     );
     fuzzy_graph_row_kernel::launch(
         &client,
-        CubeCount::Static(n_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(n_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         indices.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
         rho.clone().into_tensor_arg(),
@@ -650,8 +649,8 @@ pub(crate) fn fuzzy_graph(
     );
     fuzzy_graph_count_kernel::launch(
         &client,
-        CubeCount::Static(n_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(n_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         indices.clone().into_tensor_arg(),
         directed.clone().into_tensor_arg(),
         counts.clone().into_tensor_arg(),
@@ -671,8 +670,8 @@ pub(crate) fn fuzzy_graph(
     );
     fuzzy_graph_scatter_kernel::launch(
         &client,
-        CubeCount::Static(n_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(n_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         indices.into_tensor_arg(),
         directed.clone().into_tensor_arg(),
         cursors.clone().into_tensor_arg(),
@@ -686,8 +685,8 @@ pub(crate) fn fuzzy_graph(
     );
     fuzzy_graph_sort_kernel::launch(
         &client,
-        CubeCount::Static(node_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(node_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         counts.into_tensor_arg(),
         offsets.into_tensor_arg(),
         heads.clone().into_tensor_arg(),
@@ -903,6 +902,7 @@ pub(crate) fn head_csr(
     );
 
     let client = heads.client.clone();
+    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
     let device = heads.device.clone();
     let index_dtype = dtype_to_storage_type(heads.dtype);
     let weight_dtype = dtype_to_storage_type(weights.dtype);
@@ -946,8 +946,8 @@ pub(crate) fn head_csr(
     let zero_units = head_rows_u32.max(ids_len_u32).max(2);
     head_csr_zero_kernel::launch(
         &client,
-        CubeCount::Static(zero_units.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(zero_units.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         counts.clone().into_tensor_arg(),
         ids.clone().into_tensor_arg(),
         invalid.clone().into_tensor_arg(),
@@ -957,8 +957,8 @@ pub(crate) fn head_csr(
     if edge_count > 0 {
         head_csr_count_kernel::launch(
             &client,
-            CubeCount::Static(edge_capacity.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-            GRAPH_CUBE_DIM,
+            CubeCount::Static(edge_capacity.div_ceil(cube_dim.x), 1, 1),
+            cube_dim,
             heads.clone().into_tensor_arg(),
             weights.clone().into_tensor_arg(),
             counts.clone().into_tensor_arg(),
@@ -978,8 +978,8 @@ pub(crate) fn head_csr(
     if edge_count > 0 {
         head_csr_scatter_kernel::launch(
             &client,
-            CubeCount::Static(edge_capacity.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-            GRAPH_CUBE_DIM,
+            CubeCount::Static(edge_capacity.div_ceil(cube_dim.x), 1, 1),
+            cube_dim,
             heads.into_tensor_arg(),
             weights.into_tensor_arg(),
             cursors.into_tensor_arg(),
@@ -989,8 +989,8 @@ pub(crate) fn head_csr(
     }
     head_csr_sort_kernel::launch(
         &client,
-        CubeCount::Static(head_rows_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
-        GRAPH_CUBE_DIM,
+        CubeCount::Static(head_rows_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         offsets.clone().into_tensor_arg(),
         ids.clone().into_tensor_arg(),
         index_dtype,

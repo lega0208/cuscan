@@ -19,13 +19,14 @@ exclude = ["references"]
 resolver = "2"
 
 # docs.rs build configuration.
-# `all-features = true`  — build docs with every feature enabled so nothing
-#                          is hidden behind a flag.
+# CPU builds require a native LLVM bundle; docs.rs must not fetch/link that
+# network-dependent runtime. This documentation build uses CUDA instead.
 # `rustdoc-args`         — pass --cfg docsrs so that doc-only items gated with
 #                          #[cfg(docsrs)] (e.g. nightly doc_cfg annotations)
 #                          are included in the rendered output.
 [package.metadata.docs.rs]
-all-features = true
+no-default-features = true
+features = ["cuda", "parametric", "pca", "nn-descent"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -36,9 +37,8 @@ burn = { version = "0.22.0", default-features = false, features = [
   "extension",
   "linalg",
   "store",
-  "flex",
 ] }
-# Enable CubeCL only with a concrete GPU runtime; Flex needs neither its device nor kernels.
+# Enable CubeCL with a concrete CPU or GPU runtime.
 burn-cubecl = { version = "0.22.0", default-features = false, optional = true }
 crossbeam-channel = "0.5.17"
 ctrlc = "3.5.2"
@@ -70,7 +70,6 @@ burn = { version = "0.22.0", default-features = false, features = [
   "std",
   "extension",
   "store",
-  "flex",
 ] }
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
@@ -103,7 +102,7 @@ gpu = [
   "burn/wgpu",
   "burn/fusion",
 ] # GPU backend with WGPU support
-# CUDA is intentionally excluded from `all` and the default features because it requires a CUDA toolkit.
+# CUDA requires an NVIDIA runtime; CPU remains independently selectable.
 cuda = [
   "dep:burn-cubecl",
   "dep:cubecl",
@@ -113,10 +112,12 @@ cuda = [
   "dep:cudarc",
 ] # NVIDIA CUDA backend
 cpu = [
-  "burn/x86-v4",
-  "burn/simd",
-  "burn/rayon",
-] # Flex backend optimization features
+  "dep:burn-cubecl",
+  "dep:cubecl",
+  "burn/cubecl",
+  "burn/cpu",
+  "burn/fusion",
+] # CubeCL LLVM CPU runtime
 
 tracing = ["dep:tracing", "burn/tracing", "cubecl?/tracing"]
 
@@ -138,7 +139,8 @@ required-features = ["parametric"]
 harness = false
 
 [[bench]]
-name = "standard_umap_flex"
+name = "standard_umap_cpu"
+required-features = ["cpu"]
 harness = false
 
 [[bench]]

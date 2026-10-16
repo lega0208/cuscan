@@ -1,4 +1,4 @@
-//! Direct CubeCL NN-Descent kernel for the CUDA standard-UMAP path.
+//! Direct CubeCL NN-Descent kernels for supported standard-UMAP runtimes.
 
 use burn::{
     backend::{TensorMetadata, cubecl::dtype_to_storage_type, tensor::FloatTensor},
@@ -349,6 +349,58 @@ fn cooperative_merge_tile<F: Float, I: Int>(
     }
 }
 
+#[cube]
+fn sequential_merge_candidate<F: Float, I: Int>(
+    n: usize,
+    row: usize,
+    width: usize,
+    proposal: I,
+    proposal_squared: F,
+    proposal_valid: bool,
+    indices: &mut Tensor<I>,
+    distances: &mut Tensor<F>,
+    row_base: usize,
+) {
+    let max_distance = F::new(3.402_823_5e38_f32);
+    let proposal_index = u32::cast_from(proposal) as usize;
+    if proposal_valid
+        && proposal_index < n
+        && proposal_index != row
+        && proposal_squared <= max_distance
+    {
+        let mut duplicate = false;
+        for slot in 0..width {
+            if indices[row_base + slot] == proposal {
+                duplicate = true;
+            }
+        }
+        if !duplicate {
+            let mut rank = 0usize;
+            for slot in 0..width {
+                let old_id = indices[row_base + slot];
+                let old_index = u32::cast_from(old_id) as usize;
+                if old_index < n
+                    && (distances[row_base + slot] < proposal_squared
+                        || (distances[row_base + slot] == proposal_squared
+                            && old_index < proposal_index))
+                {
+                    rank += 1;
+                }
+            }
+            if rank < width {
+                let mut position = width;
+                while position > rank + 1 {
+                    indices[row_base + position - 1] = indices[row_base + position - 2];
+                    distances[row_base + position - 1] = distances[row_base + position - 2];
+                    position -= 1;
+                }
+                indices[row_base + rank] = proposal;
+                distances[row_base + rank] = proposal_squared;
+            }
+        }
+    }
+}
+
 #[cube(launch)]
 fn ann_step<F: Float, I: Int>(
     data: &Tensor<F>,
@@ -365,6 +417,7 @@ fn ann_step<F: Float, I: Int>(
     new_count: &mut Tensor<Atomic<I>>,
     width: u32,
     do_expand: u32,
+    #[comptime] cpu_merge: bool,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let row = CUBE_POS_X as usize;
@@ -373,93 +426,87 @@ fn ann_step<F: Float, I: Int>(
     let features = data.shape(1);
     let width = width as usize;
     if row < n {
-        let base = row * width;
-        let mut proposal_ids = Shared::<[I]>::new_slice(32usize);
-        let mut proposal_distances = Shared::<[F]>::new_slice(32usize);
-        let mut proposal_valids = Shared::<[I]>::new_slice(32usize);
-        let mut reverse_skip = Shared::<[I]>::new_slice(1usize);
-        let mut toggle = 0u32;
-        let mut slot = lane;
-        while slot < width {
-            output_indices[base + slot] = I::cast_from(n as i32);
-            output_distances[base + slot] = F::new(3.402_823_5e38_f32);
-            slot += 32;
-        }
-        sync_cube();
+        if comptime![cpu_merge] {
+            let base = row * width;
+            let max_distance = F::new(3.402_823_5e38_f32);
+            for slot in 0..width {
+                output_indices[base + slot] = I::cast_from(n as i32);
+                output_distances[base + slot] = max_distance;
+            }
 
-        // Own plus forward proposals form a rectangular, lane-parallel stream.
-        let own_and_forward = if do_expand != 0 {
-            width + width * width
-        } else {
-            width
-        };
-        let mut tile = 0usize;
-        while tile * 32 < own_and_forward {
-            let proposal_position = tile * 32 + lane;
-            let mut proposal = I::cast_from(n as i32);
-            let mut proposal_squared = F::new(3.402_823_5e38_f32);
-            let mut valid = false;
-            let mut reuse = false;
-            if proposal_position < width {
-                proposal = candidates[base + proposal_position];
-                valid = true;
-                reuse = do_expand != 0;
-                if reuse {
+            // This CPU path processes a whole row in one unit: no plane
+            // operations, shared memory, or cross-lane synchronization.
+            for proposal_position in 0..width {
+                let proposal = candidates[base + proposal_position];
+                let mut proposal_squared = max_distance;
+                if do_expand != 0 {
                     proposal_squared = candidate_distances[base + proposal_position];
-                }
-            } else if proposal_position < own_and_forward {
-                let forward_position = proposal_position - width;
-                let outer = forward_position / width;
-                let inner = forward_position - outer * width;
-                let neighbor = u32::cast_from(candidates[base + outer]) as usize;
-                if neighbor < n {
-                    let neighbor_retained = candidate_retained[base + outer] != I::cast_from(0i32);
-                    let inner_retained =
-                        candidate_retained[neighbor * width + inner] != I::cast_from(0i32);
-                    if !neighbor_retained || !inner_retained {
-                        proposal = candidates[neighbor * width + inner];
-                        valid = true;
+                } else {
+                    let candidate_index = u32::cast_from(proposal) as usize;
+                    if candidate_index < n && candidate_index != row {
+                        proposal_squared = F::new(0.0f32);
+                        for feature in 0..features {
+                            let delta = data[row * features + feature]
+                                - data[candidate_index * features + feature];
+                            proposal_squared += delta * delta;
+                        }
                     }
                 }
+                sequential_merge_candidate::<F, I>(
+                    n,
+                    row,
+                    width,
+                    proposal,
+                    proposal_squared,
+                    true,
+                    output_indices,
+                    output_distances,
+                    base,
+                );
             }
-            if valid && !reuse {
-                let candidate_index = u32::cast_from(proposal) as usize;
-                if candidate_index < n && candidate_index != row {
-                    proposal_squared = F::new(0.0f32);
-                    for feature in 0..features {
-                        let delta = data[row * features + feature]
-                            - data[candidate_index * features + feature];
-                        proposal_squared += delta * delta;
-                    }
-                }
-            }
-            toggle = cooperative_merge_tile::<F, I>(
-                n,
-                row,
-                width,
-                proposal,
-                proposal_squared,
-                if valid { 1u32 } else { 0u32 },
-                toggle,
-                output_indices,
-                output_distances,
-                workspace_indices,
-                workspace_distances,
-                &mut proposal_ids,
-                &mut proposal_distances,
-                &mut proposal_valids,
-                base,
-            );
-            tile += 1;
-        }
 
-        if do_expand != 0 {
-            let start = u32::cast_from(reverse_offsets[row]) as usize;
-            let end = u32::cast_from(reverse_offsets[row + 1]) as usize;
-            for position in start..end {
-                let source = u32::cast_from(reverse_sources[position]) as usize;
-                let source_base = source * width;
-                if lane == 0 {
+            if do_expand != 0 {
+                for outer in 0..width {
+                    let neighbor = u32::cast_from(candidates[base + outer]) as usize;
+                    if neighbor < n {
+                        let neighbor_retained =
+                            candidate_retained[base + outer] != I::cast_from(0i32);
+                        for inner in 0..width {
+                            let inner_retained =
+                                candidate_retained[neighbor * width + inner] != I::cast_from(0i32);
+                            if !neighbor_retained || !inner_retained {
+                                let proposal = candidates[neighbor * width + inner];
+                                let candidate_index = u32::cast_from(proposal) as usize;
+                                let mut proposal_squared = max_distance;
+                                if candidate_index < n && candidate_index != row {
+                                    proposal_squared = F::new(0.0f32);
+                                    for feature in 0..features {
+                                        let delta = data[row * features + feature]
+                                            - data[candidate_index * features + feature];
+                                        proposal_squared += delta * delta;
+                                    }
+                                }
+                                sequential_merge_candidate::<F, I>(
+                                    n,
+                                    row,
+                                    width,
+                                    proposal,
+                                    proposal_squared,
+                                    true,
+                                    output_indices,
+                                    output_distances,
+                                    base,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let start = u32::cast_from(reverse_offsets[row]) as usize;
+                let end = u32::cast_from(reverse_offsets[row + 1]) as usize;
+                for position in start..end {
+                    let source = u32::cast_from(reverse_sources[position]) as usize;
+                    let source_base = source * width;
                     let mut row_slot = width;
                     for source_slot in 0..width {
                         if row_slot == width
@@ -468,75 +515,39 @@ fn ann_step<F: Float, I: Int>(
                             row_slot = source_slot;
                         }
                     }
-                    reverse_skip[0] = I::cast_from(
-                        if row_slot < width
-                            && candidate_retained[source_base + row_slot] != I::cast_from(0i32)
+                    let row_retained = row_slot < width
+                        && candidate_retained[source_base + row_slot] != I::cast_from(0i32);
+                    for reverse_slot in 0..width {
+                        if !row_retained
+                            || candidate_retained[source_base + reverse_slot] == I::cast_from(0i32)
                         {
-                            1i32
-                        } else {
-                            0i32
-                        },
-                    );
-                }
-                sync_cube();
-                let row_retained = reverse_skip[0] != I::cast_from(0i32);
-                let mut reverse_tile = 0usize;
-                while reverse_tile * 32 < width {
-                    let reverse_slot = reverse_tile * 32 + lane;
-                    let mut proposal = I::cast_from(n as i32);
-                    let mut valid = false;
-                    if reverse_slot < width
-                        && (!row_retained
-                            || candidate_retained[source_base + reverse_slot] == I::cast_from(0i32))
-                    {
-                        proposal = candidates[source_base + reverse_slot];
-                        valid = true;
-                    }
-                    let mut proposal_squared = F::new(3.402_823_5e38_f32);
-                    if valid {
-                        let candidate_index = u32::cast_from(proposal) as usize;
-                        if candidate_index < n && candidate_index != row {
-                            proposal_squared = F::new(0.0f32);
-                            for feature in 0..features {
-                                let delta = data[row * features + feature]
-                                    - data[candidate_index * features + feature];
-                                proposal_squared += delta * delta;
+                            let proposal = candidates[source_base + reverse_slot];
+                            let candidate_index = u32::cast_from(proposal) as usize;
+                            let mut proposal_squared = max_distance;
+                            if candidate_index < n && candidate_index != row {
+                                proposal_squared = F::new(0.0f32);
+                                for feature in 0..features {
+                                    let delta = data[row * features + feature]
+                                        - data[candidate_index * features + feature];
+                                    proposal_squared += delta * delta;
+                                }
                             }
+                            sequential_merge_candidate::<F, I>(
+                                n,
+                                row,
+                                width,
+                                proposal,
+                                proposal_squared,
+                                true,
+                                output_indices,
+                                output_distances,
+                                base,
+                            );
                         }
                     }
-                    toggle = cooperative_merge_tile::<F, I>(
-                        n,
-                        row,
-                        width,
-                        proposal,
-                        proposal_squared,
-                        if valid { 1u32 } else { 0u32 },
-                        toggle,
-                        output_indices,
-                        output_distances,
-                        workspace_indices,
-                        workspace_distances,
-                        &mut proposal_ids,
-                        &mut proposal_distances,
-                        &mut proposal_valids,
-                        base,
-                    );
-                    reverse_tile += 1;
                 }
             }
-        }
 
-        sync_cube();
-        if toggle != 0 {
-            slot = lane;
-            while slot < width {
-                output_indices[base + slot] = workspace_indices[base + slot];
-                output_distances[base + slot] = workspace_distances[base + slot];
-                slot += 32;
-            }
-            sync_cube();
-        }
-        if lane == 0 {
             let mut row_new = I::cast_from(0i32);
             for output_slot in 0..width {
                 let output_id = output_indices[base + output_slot];
@@ -557,6 +568,195 @@ fn ann_step<F: Float, I: Int>(
             }
             if row_new > I::cast_from(0i32) {
                 new_count[0].fetch_add(row_new);
+            }
+        } else {
+            let base = row * width;
+            let mut proposal_ids = Shared::<[I]>::new_slice(32usize);
+            let mut proposal_distances = Shared::<[F]>::new_slice(32usize);
+            let mut proposal_valids = Shared::<[I]>::new_slice(32usize);
+            let mut reverse_skip = Shared::<[I]>::new_slice(1usize);
+            let mut toggle = 0u32;
+            let mut slot = lane;
+            while slot < width {
+                output_indices[base + slot] = I::cast_from(n as i32);
+                output_distances[base + slot] = F::new(3.402_823_5e38_f32);
+                slot += 32;
+            }
+            sync_cube();
+
+            // Own plus forward proposals form a rectangular, lane-parallel stream.
+            let own_and_forward = if do_expand != 0 {
+                width + width * width
+            } else {
+                width
+            };
+            let mut tile = 0usize;
+            while tile * 32 < own_and_forward {
+                let proposal_position = tile * 32 + lane;
+                let mut proposal = I::cast_from(n as i32);
+                let mut proposal_squared = F::new(3.402_823_5e38_f32);
+                let mut valid = false;
+                let mut reuse = false;
+                if proposal_position < width {
+                    proposal = candidates[base + proposal_position];
+                    valid = true;
+                    reuse = do_expand != 0;
+                    if reuse {
+                        proposal_squared = candidate_distances[base + proposal_position];
+                    }
+                } else if proposal_position < own_and_forward {
+                    let forward_position = proposal_position - width;
+                    let outer = forward_position / width;
+                    let inner = forward_position - outer * width;
+                    let neighbor = u32::cast_from(candidates[base + outer]) as usize;
+                    if neighbor < n {
+                        let neighbor_retained =
+                            candidate_retained[base + outer] != I::cast_from(0i32);
+                        let inner_retained =
+                            candidate_retained[neighbor * width + inner] != I::cast_from(0i32);
+                        if !neighbor_retained || !inner_retained {
+                            proposal = candidates[neighbor * width + inner];
+                            valid = true;
+                        }
+                    }
+                }
+                if valid && !reuse {
+                    let candidate_index = u32::cast_from(proposal) as usize;
+                    if candidate_index < n && candidate_index != row {
+                        proposal_squared = F::new(0.0f32);
+                        for feature in 0..features {
+                            let delta = data[row * features + feature]
+                                - data[candidate_index * features + feature];
+                            proposal_squared += delta * delta;
+                        }
+                    }
+                }
+                toggle = cooperative_merge_tile::<F, I>(
+                    n,
+                    row,
+                    width,
+                    proposal,
+                    proposal_squared,
+                    if valid { 1u32 } else { 0u32 },
+                    toggle,
+                    output_indices,
+                    output_distances,
+                    workspace_indices,
+                    workspace_distances,
+                    &mut proposal_ids,
+                    &mut proposal_distances,
+                    &mut proposal_valids,
+                    base,
+                );
+                tile += 1;
+            }
+
+            if do_expand != 0 {
+                let start = u32::cast_from(reverse_offsets[row]) as usize;
+                let end = u32::cast_from(reverse_offsets[row + 1]) as usize;
+                for position in start..end {
+                    let source = u32::cast_from(reverse_sources[position]) as usize;
+                    let source_base = source * width;
+                    if lane == 0 {
+                        let mut row_slot = width;
+                        for source_slot in 0..width {
+                            if row_slot == width
+                                && candidates[source_base + source_slot] == I::cast_from(row as i32)
+                            {
+                                row_slot = source_slot;
+                            }
+                        }
+                        reverse_skip[0] = I::cast_from(
+                            if row_slot < width
+                                && candidate_retained[source_base + row_slot] != I::cast_from(0i32)
+                            {
+                                1i32
+                            } else {
+                                0i32
+                            },
+                        );
+                    }
+                    sync_cube();
+                    let row_retained = reverse_skip[0] != I::cast_from(0i32);
+                    let mut reverse_tile = 0usize;
+                    while reverse_tile * 32 < width {
+                        let reverse_slot = reverse_tile * 32 + lane;
+                        let mut proposal = I::cast_from(n as i32);
+                        let mut valid = false;
+                        if reverse_slot < width
+                            && (!row_retained
+                                || candidate_retained[source_base + reverse_slot]
+                                    == I::cast_from(0i32))
+                        {
+                            proposal = candidates[source_base + reverse_slot];
+                            valid = true;
+                        }
+                        let mut proposal_squared = F::new(3.402_823_5e38_f32);
+                        if valid {
+                            let candidate_index = u32::cast_from(proposal) as usize;
+                            if candidate_index < n && candidate_index != row {
+                                proposal_squared = F::new(0.0f32);
+                                for feature in 0..features {
+                                    let delta = data[row * features + feature]
+                                        - data[candidate_index * features + feature];
+                                    proposal_squared += delta * delta;
+                                }
+                            }
+                        }
+                        toggle = cooperative_merge_tile::<F, I>(
+                            n,
+                            row,
+                            width,
+                            proposal,
+                            proposal_squared,
+                            if valid { 1u32 } else { 0u32 },
+                            toggle,
+                            output_indices,
+                            output_distances,
+                            workspace_indices,
+                            workspace_distances,
+                            &mut proposal_ids,
+                            &mut proposal_distances,
+                            &mut proposal_valids,
+                            base,
+                        );
+                        reverse_tile += 1;
+                    }
+                }
+            }
+
+            sync_cube();
+            if toggle != 0 {
+                slot = lane;
+                while slot < width {
+                    output_indices[base + slot] = workspace_indices[base + slot];
+                    output_distances[base + slot] = workspace_distances[base + slot];
+                    slot += 32;
+                }
+                sync_cube();
+            }
+            if lane == 0 {
+                let mut row_new = I::cast_from(0i32);
+                for output_slot in 0..width {
+                    let output_id = output_indices[base + output_slot];
+                    let output_index = u32::cast_from(output_id) as usize;
+                    let mut retained = false;
+                    if do_expand != 0 && output_index < n {
+                        for previous_slot in 0..width {
+                            if candidates[base + previous_slot] == output_id {
+                                retained = true;
+                            }
+                        }
+                    }
+                    output_retained[base + output_slot] =
+                        I::cast_from(if retained { 1i32 } else { 0i32 });
+                    if do_expand != 0 && output_index < n && !retained {
+                        row_new += I::cast_from(1i32);
+                    }
+                }
+                if row_new > I::cast_from(0i32) {
+                    new_count[0].fetch_add(row_new);
+                }
             }
         }
     }
@@ -629,6 +829,10 @@ pub(crate) fn approximate_neighbors(
         .expect("ANN reverse offset allocation overflows usize");
     let n_u32 = u32::try_from(n).expect("ANN row count exceeds CubeCL range");
     let width_u32 = u32::try_from(width).expect("ANN candidate width exceeds CubeCL range");
+    // CubeCL's CPU runtime executes a unit serially. Use one unit per row
+    // there; GPU retains the original 32-lane cooperative row kernel.
+    let cpu_merge = data.client.name() == "cpu";
+    let ann_step_dim = CubeDim::new_1d(if cpu_merge { 1 } else { ANN_CUBE_DIM.x });
     let _feature_count_u32 =
         u32::try_from(features).expect("ANN feature count exceeds CubeCL range");
     let client = data.client.clone();
@@ -790,7 +994,7 @@ pub(crate) fn approximate_neighbors(
         ann_step::launch(
             &data.client,
             CubeCount::Static(n_u32, 1, 1),
-            ANN_CUBE_DIM,
+            ann_step_dim,
             data.clone().into_tensor_arg(),
             candidates.clone().into_tensor_arg(),
             candidate_distances.clone().into_tensor_arg(),
@@ -805,6 +1009,7 @@ pub(crate) fn approximate_neighbors(
             new_count.clone().into_tensor_arg(),
             width_u32,
             u32::from(iteration > 0),
+            cpu_merge,
             [
                 dtype_to_storage_type(data.dtype),
                 dtype_to_storage_type(DType::I32),
@@ -881,6 +1086,51 @@ mod tests {
         assert!(!ann_should_stop(525, 16_384, 32));
     }
 
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_ann_merge_preserves_integer_membership_and_lexicographic_ties() {
+        let n = 19usize;
+        let raw_device = CubeDevice::cpu().expect("CPU runtime is enabled for this test");
+        let client = raw_device.client();
+        let data = raw_tensor(
+            &vec![0.0f32; n],
+            Shape::new([n, 1]),
+            DType::F32,
+            &raw_device,
+            &client,
+        );
+        let (indices, distances) = approximate_neighbors(data, 7, 0x5179, 4);
+        let ids = read_i32(&indices);
+        let distances = read_f32(&distances);
+
+        assert_eq!(ids.len(), n * 7);
+        assert_eq!(distances, vec![0.0; n * 7]);
+        for row in 0..n {
+            let row_ids = &ids[row * 7..(row + 1) * 7];
+            assert!(row_ids.iter().all(|&id| id >= 0 && id < n as i32));
+            assert!(!row_ids.contains(&(row as i32)));
+            assert!(row_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        assert_eq!(
+            ids,
+            read_i32(
+                &approximate_neighbors(
+                    raw_tensor(
+                        &vec![0.0f32; n],
+                        Shape::new([n, 1]),
+                        DType::F32,
+                        &raw_device,
+                        &client,
+                    ),
+                    7,
+                    0x5179,
+                    4,
+                )
+                .0
+            )
+        );
+    }
+
     fn raw_tensor<T: burn::tensor::Element>(
         data: &[T],
         shape: Shape,
@@ -911,6 +1161,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
     fn old_rescan_step(
         points: &[f32],
         candidates: &[i32],
@@ -976,6 +1227,7 @@ mod tests {
         (ids, distances)
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers() {
         let Some(_device) = crate::cuda_backend::device(0) else {
@@ -1155,6 +1407,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates() {
         let Some(_device) = crate::cuda_backend::device(0) else {
@@ -1370,6 +1623,7 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             width_u32,
             1,
+            false,
             [dtype_to_storage_type(DType::F32), dtype],
         );
         let actual_ids = read_i32(&output_ids);
@@ -1410,6 +1664,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn ann_step_evaluates_both_mixed_retention_forward_pairs() {
         let Some(_device) = crate::cuda_backend::device(0) else {
@@ -1556,6 +1811,7 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             u32::try_from(width).unwrap(),
             1,
+            false,
             [dtype_to_storage_type(DType::F32), dtype],
         );
 
@@ -1599,6 +1855,7 @@ mod tests {
         assert_eq!(&read_i32(&output_retained)[..width], &[0, 0]);
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn ann_step_device_counter_locks_inclusive_stop_boundary() {
         let Some(_device) = crate::cuda_backend::device(0) else {
@@ -1757,6 +2014,7 @@ mod tests {
                 new_count.clone().into_tensor_arg(),
                 width_u32,
                 1,
+                false,
                 [dtype_to_storage_type(DType::F32), dtype],
             );
 

@@ -12,15 +12,15 @@ use super::{
     Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
     fit_curve, fit_neighbor_widths,
     query::{approximate_query_scratch_layout, query_output_allocation},
-    query_neighbor_width, validate_backend_choice, validate_input, validate_search_settings,
+    query_neighbor_width, validate_input, validate_search_settings,
 };
 
 /// Auto uses exact search for small data and bounded NN-Descent above this row count.
 ///
 /// Measured with `examples/standard_auto_cutoff.rs` (32 features, release, RTX 3080 /
 /// Ryzen 7 9800X3D): CUDA exact beats approximate up to 4k rows (0.46 s vs 0.53 s) and
-/// loses from 8k (1.78 s vs 0.93 s). On Flex, exact stays faster through 16k rows, but
-/// its blocked search grows quadratically, so one shared cutoff follows the CUDA crossover.
+/// loses from 8k (1.78 s vs 0.93 s). The shared cutoff follows that CUDA crossover;
+/// it has not been recalibrated for the CubeCL CPU runtime.
 pub const AUTO_EXACT_MAX_ROWS: usize = 4096;
 // A reproducible default when the caller leaves random_state unset.
 const DEFAULT_RANDOM_SEED: u64 = 42;
@@ -57,7 +57,7 @@ fn distinct_training_rows(data: &[Vec<f32>]) -> Result<(Vec<Vec<f32>>, Vec<usize
     Ok((rows, inverse))
 }
 
-/// Standard, nonparametric UMAP estimator on an explicitly selected backend.
+/// Standard, nonparametric UMAP estimator on the selected backend.
 #[derive(Debug, Clone)]
 pub struct UMAP {
     config: UMAPConfig,
@@ -96,7 +96,6 @@ impl UMAP {
     )]
     pub fn fit(&self, data: &[Vec<f32>]) -> Result<FittedUMAP> {
         self.config.validate()?;
-        validate_backend_choice(self.backend)?;
         let (original_n, features) = validate_input(data, None)?;
         original_n
             .checked_mul(self.config.n_components)
@@ -129,7 +128,7 @@ impl UMAP {
             }
             validate_layout_work(capacity, self.config.negative_sample_rate)?;
         }
-        let device = selected_device(self.backend)?;
+        let (device, backend) = selected_device(self.backend)?;
         let training_data = matrix_tensor(data, &device);
         let n_components = self.config.n_components;
         n.checked_mul(n_components)
@@ -140,7 +139,7 @@ impl UMAP {
             let embedding_tensor = matrix_tensor(&embedding, &device);
             return Ok(FittedUMAP {
                 config: self.config.clone(),
-                backend: self.backend,
+                backend,
                 search,
                 n_features: features,
                 training_data,
@@ -367,7 +366,7 @@ impl UMAP {
         let embedding = tensor_embedding(&embedding_tensor)?;
         Ok(FittedUMAP {
             config: self.config.clone(),
-            backend: self.backend,
+            backend,
             search,
             n_features: features,
             training_data,
@@ -600,12 +599,7 @@ impl FittedUMAP {
                 "Transform unavailable when model was fit with only a single data sample.".into(),
             ));
         }
-        let device = selected_device(self.backend)?;
-        if device != self.training_data.device() {
-            return Err(UmapError::BackendUnavailable(
-                "fitted tensors are not on the selected backend device".into(),
-            ));
-        }
+        let device = self.training_data.device();
         let n = self.training_data.dims()[0];
         let k = query_neighbor_width(n, self.config.n_neighbors)?;
         let graph_capacity = q
@@ -645,7 +639,8 @@ impl FittedUMAP {
                     .map_err(|_| UmapError::Overflow("transform visit budget"))?;
                 if matches!(
                     self.backend,
-                    crate::standard_umap::BackendChoice::Cuda { .. }
+                    crate::standard_umap::BackendChoice::Cpu
+                        | crate::standard_umap::BackendChoice::Cuda { .. }
                 ) {
                     u32::try_from(q).map_err(|_| UmapError::Overflow("transform query rows"))?;
                     let fit_graph = self.fit_graph.as_ref().ok_or_else(|| {
@@ -802,31 +797,12 @@ impl FittedUMAP {
         }
         let sums = directed.clone().sum_dim(1).reshape([q, 1]);
         let normalized = directed.div(sums.clone().mask_fill(sums.equal_elem(0.0), 1.0));
-        let k = indices.dims()[1];
-        let components = self.embedding_tensor.dims()[1];
-        let initial = if matches!(
-            self.backend,
-            crate::standard_umap::BackendChoice::Cuda { .. }
-        ) {
-            cuda_weighted_initialization(
-                &self.embedding_tensor,
-                &indices,
-                &normalized,
-                super::query::TRANSFORM_SCRATCH_BUDGET_BYTES,
-            )?
-        } else {
-            let mut initial = Tensor::<2>::zeros([q, components], &device);
-            for slot in 0..k {
-                let ids = indices.clone().slice_dim(1, slot..slot + 1).reshape([q]);
-                let neighbors = self.embedding_tensor.clone().select(0, ids);
-                let weight = normalized
-                    .clone()
-                    .slice_dim(1, slot..slot + 1)
-                    .repeat_dim(1, components);
-                initial = initial.add(neighbors.mul(weight));
-            }
-            initial
-        };
+        let initial = weighted_initialization(
+            &self.embedding_tensor,
+            &indices,
+            &normalized,
+            super::query::TRANSFORM_SCRATCH_BUDGET_BYTES,
+        )?;
         let (heads, tails, weights, positive, next_positive, negative, next_negative) =
             prepare_schedule(
                 heads,
@@ -939,7 +915,7 @@ fn weighted_initialization_chunk_rows(
     Ok(chunk_rows)
 }
 
-fn cuda_weighted_initialization(
+fn weighted_initialization(
     embedding: &Tensor<2>,
     indices: &Tensor<2, Int>,
     normalized: &Tensor<2>,
@@ -985,17 +961,50 @@ fn cuda_weighted_initialization(
     Ok(Tensor::cat(chunks, 0))
 }
 
-fn selected_device(choice: crate::standard_umap::BackendChoice) -> Result<Device> {
+fn selected_device(
+    choice: crate::standard_umap::BackendChoice,
+) -> Result<(Device, crate::standard_umap::BackendChoice)> {
     match choice {
-        crate::standard_umap::BackendChoice::Flex => Ok(Device::flex()),
+        crate::standard_umap::BackendChoice::Auto => {
+            #[cfg(feature = "cuda")]
+            {
+                let selected =
+                    resolve_backend_choice(choice, crate::cuda_backend::try_device_count())?;
+                match selected {
+                    crate::standard_umap::BackendChoice::Cuda { device_index } => {
+                        let device = Device::cuda(device_index);
+                        Ok((device, selected))
+                    }
+                    other => selected_device(other),
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                selected_device(crate::standard_umap::BackendChoice::Cpu)
+            }
+        }
+        crate::standard_umap::BackendChoice::Cpu => {
+            #[cfg(feature = "cpu")]
+            {
+                let device = construct_cpu_device(Device::cpu)?;
+                Ok((device, crate::standard_umap::BackendChoice::Cpu))
+            }
+            #[cfg(not(feature = "cpu"))]
+            {
+                Err(UmapError::BackendUnavailable(
+                    "CPU backend requires the `cpu` feature".into(),
+                ))
+            }
+        }
         crate::standard_umap::BackendChoice::Cuda { device_index } => {
             #[cfg(feature = "cuda")]
             {
-                crate::cuda_backend::device(device_index).ok_or_else(|| {
-                    UmapError::BackendUnavailable(format!(
-                        "CUDA device index {device_index} is unavailable"
-                    ))
-                })
+                resolve_backend_choice(choice, crate::cuda_backend::try_device_count())?;
+                let device = Device::cuda(device_index);
+                Ok((
+                    device,
+                    crate::standard_umap::BackendChoice::Cuda { device_index },
+                ))
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -1005,6 +1014,63 @@ fn selected_device(choice: crate::standard_umap::BackendChoice) -> Result<Device
                 ))
             }
         }
+    }
+}
+
+fn construct_cpu_device(make_device: impl FnOnce() -> Device) -> Result<Device> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(make_device)).map_err(|_| {
+        UmapError::BackendUnavailable(
+            "CPU backend device construction failed; verify the `cpu` runtime is available".into(),
+        )
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn resolve_backend_choice(
+    choice: crate::standard_umap::BackendChoice,
+    cuda_count: std::result::Result<usize, String>,
+) -> Result<crate::standard_umap::BackendChoice> {
+    use crate::standard_umap::BackendChoice;
+    match choice {
+        BackendChoice::Auto => match cuda_count {
+            Ok(count) if count > 0 => Ok(BackendChoice::Cuda { device_index: 0 }),
+            Ok(_) => {
+                #[cfg(feature = "cpu")]
+                {
+                    Ok(BackendChoice::Cpu)
+                }
+                #[cfg(not(feature = "cpu"))]
+                {
+                    Err(UmapError::BackendUnavailable(
+                        "CUDA is unavailable and CPU backend requires the `cpu` feature".into(),
+                    ))
+                }
+            }
+            Err(error) => Err(UmapError::BackendUnavailable(format!(
+                "CUDA discovery failed: {error}"
+            ))),
+        },
+        BackendChoice::Cpu => {
+            #[cfg(feature = "cpu")]
+            {
+                Ok(BackendChoice::Cpu)
+            }
+            #[cfg(not(feature = "cpu"))]
+            {
+                Err(UmapError::BackendUnavailable(
+                    "CPU backend requires the `cpu` feature".into(),
+                ))
+            }
+        }
+        BackendChoice::Cuda { device_index } => match cuda_count {
+            Ok(count) if device_index < count => Ok(choice),
+            Ok(count) => Err(UmapError::BackendUnavailable(format!(
+                "CUDA device index {device_index} is unavailable; {count} device(s) detected"
+            ))),
+            Err(error) => Err(UmapError::BackendUnavailable(format!(
+                "CUDA discovery failed: {error}"
+            ))),
+        },
     }
 }
 
@@ -1408,6 +1474,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_selection_resolves_only_confirmed_cuda_absence_to_cpu() {
+        use crate::standard_umap::BackendChoice;
+
+        assert_eq!(BackendChoice::default(), BackendChoice::Auto);
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Auto, Ok(2)),
+            Ok(BackendChoice::Cuda { device_index: 0 })
+        );
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Auto, Ok(0)),
+            Ok(BackendChoice::Cpu)
+        );
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Auto, Err("driver fault".into())),
+            Err(UmapError::BackendUnavailable(
+                "CUDA discovery failed: driver fault".into()
+            ))
+        );
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Cpu, Err("must not probe".into())),
+            Ok(BackendChoice::Cpu)
+        );
+        assert!(matches!(
+            resolve_backend_choice(BackendChoice::Cuda { device_index: 1 }, Ok(1)),
+            Err(UmapError::BackendUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn cpu_device_construction_failure_is_reported_without_fallback() {
+        let error =
+            construct_cpu_device(|| panic!("injected CPU construction failure")).unwrap_err();
+        assert_eq!(
+            error,
+            UmapError::BackendUnavailable(
+                "CPU backend device construction failed; verify the `cpu` runtime is available"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
     fn transform_flat_preserves_validation_errors() {
         let data = (0..16)
             .map(|row| vec![row as f32, row as f32 * 0.25])
@@ -1419,7 +1527,7 @@ mod tests {
                 init: Init::Random,
                 ..Default::default()
             },
-            crate::standard_umap::BackendChoice::Flex,
+            crate::standard_umap::BackendChoice::Cpu,
             NeighborSearch::Exact,
         )
         .fit(&data)
@@ -1513,7 +1621,7 @@ mod tests {
         let (embedding, indices, normalized) = weighted_initialization_inputs(device);
         let expected = original_weighted_initialization(&embedding, &indices, &normalized);
         let actual =
-            cuda_weighted_initialization(&embedding, &indices, &normalized, scratch_limit_bytes)
+            weighted_initialization(&embedding, &indices, &normalized, scratch_limit_bytes)
                 .unwrap();
         let expected_values = expected.to_data().try_to_vec::<f32>().unwrap();
         let actual_values = actual.to_data().try_to_vec::<f32>().unwrap();
@@ -1567,7 +1675,7 @@ mod tests {
     fn estimator(search: NeighborSearch) -> UMAP {
         UMAP::new(
             UMAPConfig::default(),
-            crate::standard_umap::BackendChoice::Flex,
+            crate::standard_umap::BackendChoice::Cpu,
             search,
         )
     }
@@ -1614,7 +1722,7 @@ mod tests {
 
     #[test]
     fn first_coordinate_rng_matches_original_full_embedding_bits() {
-        let device = Device::flex();
+        let device = Device::cpu();
         let values = vec![-0.0f32, 99.0, 1.25, -17.0, -3.5, 0.0];
         let embedding = Tensor::<2>::from_data(TensorData::new(values.clone(), [3, 2]), &device);
         for seed in [0, 42, u64::MAX] {
@@ -1677,8 +1785,8 @@ mod tests {
     }
 
     #[test]
-    fn chunked_weighted_initialization_matches_original_on_flex() {
-        assert_chunked_weighted_initialization_matches_original(&Device::flex(), 200);
+    fn chunked_weighted_initialization_matches_original_on_cpu() {
+        assert_chunked_weighted_initialization_matches_original(&Device::cpu(), 200);
     }
 
     #[test]
@@ -1759,8 +1867,8 @@ mod tests {
     }
 
     #[test]
-    fn head_csr_device_matches_host_on_flex() {
-        device_csr_matches_host(&Device::flex());
+    fn head_csr_device_matches_host_on_cpu() {
+        device_csr_matches_host(&Device::cpu());
     }
 
     #[test]
@@ -1787,7 +1895,7 @@ mod tests {
 
     #[test]
     fn transform_graph_marker_errors_checked_per_call() {
-        let device = Device::flex();
+        let device = Device::cpu();
         let valid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0], [1]), &device);
         let invalid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![-2, 0], [2]), &device);
         let expected = Err(UmapError::Numerical(

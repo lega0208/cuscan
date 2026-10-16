@@ -420,7 +420,7 @@ mod tests {
             10.0, 1.0, 7.0, // C
             0.0, 10_000.0, 7.0, // scale outlier
         ];
-        let (encoder_input, knn_indices, distances) = sparse_inputs(data, 4, 3, 2, &Device::flex());
+        let (encoder_input, knn_indices, distances) = sparse_inputs(data, 4, 3, 2, &Device::cpu());
 
         // In raw space A is closest to C; z-scoring would make B closer.
         assert_eq!(knn_indices[..2], [0, 2]);
@@ -454,7 +454,7 @@ mod tests {
             .collect();
         let k = 15;
         let (encoder_input, indices, distances) =
-            sparse_inputs(data.clone(), num_samples, 3, k, &Device::flex());
+            sparse_inputs(data.clone(), num_samples, 3, k, &Device::cpu());
 
         // Raw query neighbors come from [10, ~1, 7]; z-scoring the
         // NN-Descent-only input instead would select [0, ~100, 7].

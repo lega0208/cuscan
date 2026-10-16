@@ -176,7 +176,7 @@ fn queue_control_is_exact_compatible_only_at_its_default() {
 
 #[test]
 fn backend_selection_never_falls_back_from_cuda() {
-    assert!(validate_backend_choice(BackendChoice::Flex).is_ok());
+    assert!(validate_backend_choice(BackendChoice::Cpu).is_ok());
     let error = validate_backend_choice(BackendChoice::Cuda {
         device_index: usize::MAX,
     });

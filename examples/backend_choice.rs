@@ -1,11 +1,11 @@
 #![cfg(feature = "parametric")]
 
-/// Runtime device selection: wgpu or Flex CPU.
+/// Runtime device selection: wgpu or CubeCL CPU.
 ///
 /// Usage:
 ///     cargo run --release --features cuda --example backend_choice -- cuda
 ///     cargo run --release --features gpu --example backend_choice -- wgpu
-///     cargo run --release --example backend_choice -- flex
+///     cargo run --release --example backend_choice -- cpu
 use burn::tensor::Device;
 #[cfg(feature = "gpu")]
 use burn::tensor::DeviceKind;
@@ -30,7 +30,7 @@ fn main() {
         } else if cfg!(feature = "gpu") {
             "wgpu"
         } else {
-            "flex"
+            "cpu"
         }
         .to_string()
     });
@@ -49,9 +49,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        "flex" | "cpu" => Device::flex(),
+        "cpu" => Device::cpu(),
         _ => {
-            eprintln!("Unknown device '{device_choice}'. Use: wgpu or flex");
+            eprintln!("Unknown device '{device_choice}'. Use: wgpu or cpu");
             std::process::exit(1);
         }
     };

@@ -8,7 +8,7 @@ use crate::backend::UmapOps;
 
 mod euclidean;
 mod knn;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod standard_umap;
 
 /// Default work-group (cube) dimensions used by all custom CubeCL kernels.
@@ -18,6 +18,21 @@ mod standard_umap;
 /// DX12) and maximises occupancy for the matrix-shaped dispatch patterns used
 /// by the Euclidean and k-NN kernels.
 pub const DEFAULT_CUBE_DIM: CubeDim = CubeDim::new_2d(32, 32);
+
+/// Bound independent-unit kernels to the selected runtime's actual limits.
+/// Callers derive their cube counts from the returned dimensions, so reducing
+/// a dimension cannot truncate a row, tile, or tail.
+pub(crate) fn legal_cube_dim(client: &cubecl::client::Client, preferred: CubeDim) -> CubeDim {
+    let hardware = &client.properties().hardware;
+    let (max_x, max_y, max_z) = hardware.max_cube_dim;
+    let mut remaining = hardware.max_units_per_cube.max(1);
+    let x = preferred.x.min(max_x).min(remaining).max(1);
+    remaining /= x;
+    let y = preferred.y.min(max_y).min(remaining).max(1);
+    remaining /= y;
+    let z = preferred.z.min(max_z).min(remaining).max(1);
+    CubeDim::new_3d(x, y, z)
+}
 
 /// GPU implementation of the fast-umap [`UmapOps`] extension for [`CubeBackend`].
 ///
@@ -68,7 +83,7 @@ impl UmapOps for CubeBackend {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 impl crate::backend::StandardUmapOps for CubeBackend {
     fn approximate_neighbors(
         data: FloatTensor<Self>,

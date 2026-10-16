@@ -1,7 +1,7 @@
 /// fast-umap benchmark reporter.
 ///
 /// Detects available hardware (CPU model, GPU model via WGPU/Metal/Vulkan),
-/// runs timing loops for every benchmark group on both CPU (Flex) and GPU
+/// runs timing loops for every benchmark group on both CPU (CubeCL CPU) and GPU
 /// (WGPU) backends, then writes hardware-tagged Markdown + SVG files to
 /// `benches/results/`.
 ///
@@ -269,7 +269,7 @@ struct Entry {
 struct Group {
     name: String,
     /// Short canonical identifier used to match CPU↔GPU pairs for comparison.
-    /// E.g. both "model_forward (CPU / Flex)" and "model_forward (GPU / WGPU)"
+    /// E.g. both "model_forward (CPU / CubeCL CPU)" and "model_forward (GPU / WGPU)"
     /// share the key "model_forward".
     key: String,
     entries: Vec<Entry>,
@@ -295,7 +295,7 @@ fn build_model(
 // ─── CPU benchmark suite ──────────────────────────────────────────────────────
 
 fn run_cpu_benchmarks() -> Vec<Group> {
-    let device = Device::flex();
+    let device = Device::cpu();
     let mut groups = Vec::new();
 
     // ── normalize_data ──
@@ -407,7 +407,7 @@ fn run_cpu_benchmarks() -> Vec<Group> {
             });
         }
         groups.push(Group {
-            name: "model_forward (CPU / Flex)".into(),
+            name: "model_forward (CPU / CubeCL CPU)".into(),
             key: "model_forward".into(),
             entries,
         });
@@ -599,7 +599,7 @@ fn write_markdown(path: &str, hw_label: &str, hw_detail: &str, groups: &[Group])
     md.push_str(&format!("# fast-umap — Benchmark Results\n\n"));
     md.push_str(&format!("> **Hardware:** {hw_label}  \n"));
     md.push_str(&format!("> **Detail:** {hw_detail}  \n"));
-    md.push_str("> **Backend:** burn 0.22.0-pre.4 · Flex / WGPU  \n");
+    md.push_str("> **Backend:** burn 0.22.0-pre.4 · CubeCL CPU / WGPU  \n");
     md.push_str("> **Reproduce:** `cargo run --release --bin bench_report`\n\n");
     md.push_str("![chart](benchmark_results.svg)\n\n");
     md.push_str("All times are **[min, mean, max]** over multiple timed iterations.\n\n");
@@ -857,7 +857,7 @@ fn write_comparison_markdown(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[Com
     md.push_str("# fast-umap — CPU vs GPU Comparison\n\n");
     md.push_str(&format!("> **CPU:** {cpu_hw}  \n"));
     md.push_str(&format!("> **GPU:** {gpu_hw} (WGPU / Metal)  \n"));
-    md.push_str("> **Backend:** burn 0.22.0-pre.4 · Flex vs WGPU  \n");
+    md.push_str("> **Backend:** burn 0.22.0-pre.4 · CubeCL CPU vs WGPU  \n");
     md.push_str("> **Reproduce:** `cargo run --release --bin bench_report`\n\n");
     md.push_str("![chart](comparison.svg)\n\n");
     md.push_str("Speedup = CPU mean ÷ GPU mean.  \n");
@@ -989,7 +989,7 @@ fn write_comparison_svg(path: &str, cpu_hw: &str, gpu_hw: &str, comp: &[CompGrou
     .unwrap();
     writeln!(
         w,
-        "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">CPU (Flex)</text>",
+        "<text x=\"{:.1}\" y=\"39\" font-size=\"9\" fill=\"#333\">CPU (CubeCL CPU)</text>",
         lx + 15.0
     )
     .unwrap();
@@ -1155,7 +1155,7 @@ fn main() {
     let results_dir = "benches/results";
 
     // ── CPU benchmarks ───────────────────────────────────────────────────────
-    println!("━━━  Running CPU benchmarks (Flex backend)  ━━━");
+    println!("━━━  Running CPU benchmarks (CubeCL CPU backend)  ━━━");
     let cpu_groups = run_cpu_benchmarks();
 
     // Print a quick summary to stdout

@@ -20,7 +20,7 @@ pub fn forward(x: FloatTensor<CubeBackend>) -> FloatTensor<CubeBackend> {
         x.dtype,
     );
 
-    let cube_dim = DEFAULT_CUBE_DIM;
+    let cube_dim = crate::kernels::legal_cube_dim(&x.client, DEFAULT_CUBE_DIM);
     let cube_count = CubeCount::Static(
         (n as u32).div_ceil(cube_dim.x),
         (n as u32).div_ceil(cube_dim.y),
@@ -59,7 +59,7 @@ pub fn backward(
         x.dtype,
     );
 
-    let cube_dim = DEFAULT_CUBE_DIM;
+    let cube_dim = crate::kernels::legal_cube_dim(&x.client, DEFAULT_CUBE_DIM);
     let cube_count = CubeCount::Static(
         (n as u32).div_ceil(cube_dim.x),
         (d as u32).div_ceil(cube_dim.y),

@@ -27,8 +27,6 @@ use burn::{
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
-const LAYOUT_CUBE_DIM: CubeDim = CubeDim::new_1d(64);
-
 #[cube(launch)]
 fn layout_clock_kernel<F: Float, C: Float, M: Int>(
     weights: &Tensor<F>,
@@ -355,11 +353,12 @@ pub(crate) fn optimize_epoch(
     let edge_u32 = u32::try_from(edge_count).expect("layout edge count exceeds CubeCL range");
 
     let client = head_embedding.client.clone();
+    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(64));
     let mask = empty(&head_embedding, Shape::new([edge_count]), DType::I32);
     layout_clock_kernel::launch(
         &client,
-        CubeCount::Static(edge_u32.div_ceil(LAYOUT_CUBE_DIM.x), 1, 1),
-        LAYOUT_CUBE_DIM,
+        CubeCount::Static(edge_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         weights.into_tensor_arg(),
         epochs_per_sample.into_tensor_arg(),
         epoch_of_next_sample.clone().into_tensor_arg(),
@@ -381,8 +380,8 @@ pub(crate) fn optimize_epoch(
     );
     layout_copy_kernel::launch::<f32>(
         &client,
-        CubeCount::Static(coordinate_u32.div_ceil(LAYOUT_CUBE_DIM.x), 1, 1),
-        LAYOUT_CUBE_DIM,
+        CubeCount::Static(coordinate_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         head_embedding.clone().into_tensor_arg(),
         next.clone().into_tensor_arg(),
     );
@@ -392,8 +391,8 @@ pub(crate) fn optimize_epoch(
     let launch_vertex_batch = |head_start: u32, head_end: u32| {
         layout_vertex_atomic_kernel::launch(
             &client,
-            CubeCount::Static((head_end - head_start).div_ceil(LAYOUT_CUBE_DIM.x), 1, 1),
-            LAYOUT_CUBE_DIM,
+            CubeCount::Static((head_end - head_start).div_ceil(cube_dim.x), 1, 1),
+            cube_dim,
             next.clone().into_tensor_arg(),
             tail_rows.clone().into_tensor_arg(),
             tails.clone().into_tensor_arg(),

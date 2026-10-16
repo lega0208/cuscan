@@ -318,7 +318,7 @@ with warnings.catch_warnings(record=True) as caught:
         from fast_umap import UMAP
         model = UMAP(
             **settings,
-            backend="flex" if device == "cpu" else "cuda",
+            backend=backend,
             neighbor_search="approximate",
         )
     else:

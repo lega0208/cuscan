@@ -17,7 +17,7 @@ See [docs.rs](https://docs.rs/crate/fast-umap/latest) for the full API reference
 - **Scales to 50K+ samples** — NN-Descent approximate KNN avoids the O(n^2) distance matrix
 - **Parametric** — trains a neural network, so you can
   [`transform()`](#transform-new-data) new unseen data instantly
-- **Runtime-selected Burn devices** — WGPU (Metal/Vulkan/DX12), CUDA (NVIDIA), or CPU Flex
+- **Runtime-selected devices** — Standard UMAP supports auto, CPU, or CUDA; parametric execution uses Burn devices
 - **PCA warm-start** — optional PCA pre-training for faster convergence
 - **Parametric Rust API** — use `ParametricUMAP::new(config).fit(data, labels)`
 
@@ -106,8 +106,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 |------|--------|
 | **PCA warm-start** | Pre-trains the network to approximate PCA output before UMAP loss, improving convergence (feature: `pca`) |
 | **NN-Descent** | Approximate KNN graph construction in O(n*k) memory — enables 50K+ sample datasets without the O(n^2) distance matrix (feature: `nn-descent`) |
-| **Generic backend ops** | Pairwise distance and KNN implemented with standard Burn tensor ops, enabling any backend without CubeCL |
-| **Autodiff refactor** | Autodiff backward registration factored out of GPU-only `kernels/` module, now works with all backends |
+| **Shared CubeCL ops** | Pairwise distance and KNN use shared kernels on the selected CPU, CUDA, or WGPU runtime; Standard UMAP supports CPU and CUDA |
+| **Autodiff registration** | Custom-op gradients are registered separately in `autodiff_ops` for supported execution devices |
 
 ---
 
@@ -115,7 +115,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 - **Dimensionality Reduction** — projects high-dimensional data to 2-D or 3-D for visualization
 - **Parametric model** — learned neural network can project new, unseen data via `transform()`
-- **Execution devices** — WGPU (Metal/Vulkan/DX12), CUDA (NVIDIA), and CPU Flex
+- **Execution devices** — CubeCL LLVM CPU and CUDA for Standard UMAP; parametric device support is separate
 - **PCA warm-start** — optional pre-training phase initializes embeddings from PCA for faster convergence (`pca` feature)
 - **NN-Descent** — approximate KNN in O(n*k) memory for datasets > 10K samples, avoiding the O(n^2) distance matrix (`nn-descent` feature)
 - **Automatic differentiation** — full autograd through custom kernels via burn's autodiff backend
@@ -171,8 +171,15 @@ println!("Shape: {} × {}", embedding.len(), embedding[0].len());
 
 ## Python
 
-The Python package wraps the parametric model and supports CPU Flex and GPU
-execution. A Rust toolchain is required to build it from source.
+The Python package exposes the parametric model and Standard UMAP. Standard UMAP
+accepts `backend="auto"`, `backend="cpu"`, or `backend="cuda"`. `auto` prefers
+a discovered usable CUDA device and selects CPU only when CUDA is unavailable;
+explicit selections are strict and execution failures do not trigger fallback.
+
+The Standard CPU backend uses CubeCL's LLVM runtime. The documented local target
+is Linux x86-64, including WSL2. LLVM bundle acquisition may require network
+access on the first build and uses a local cache; JIT compilation requires LLVM
+support. This is not a claim of wheel availability or support for other platforms.
 
 From the repository root, install in editable mode with `uv`:
 
@@ -180,12 +187,12 @@ From the repository root, install in editable mode with `uv`:
 uv sync
 ```
 
-Alternatively, in an activated Python virtual environment, use maturin or pip:
+For a CPU-only local extension build, explicitly select the CPU feature. Avoid
+running `uv sync` before tests, because syncing can replace the local extension:
 
 ```shell
-maturin develop
-# or
-pip install .
+uv run maturin develop --release --no-default-features --features cpu
+uv run --no-sync pytest python/tests/test_standard_*.py
 ```
 
 ```python
@@ -254,9 +261,11 @@ uv run ty check
 
 ---
 
-## Backend Choice: CPU vs GPU with Feature-Based Compilation
+## Parametric devices and Standard UMAP backends
 
-fast-umap supports both CPU and GPU backends with feature-based compilation for optimal flexibility:
+Parametric and Standard UMAP have separate backend contracts. The Burn-device
+examples below describe the parametric API only; they do not establish
+parametric CPU runtime acceptance for the CubeCL CPU migration.
 
 ### GPU Backend (WGPU) - Primary Recommended Backend
 
@@ -283,15 +292,15 @@ let fitted = estimator.fit(data, None);
 
 ### Runtime device selection
 
-`ParametricUMAP` and `FittedParametricUMAP` are backend-independent. Select a Burn device at
-runtime; use Flex for CPU computation or WGPU for GPU computation:
+`ParametricUMAP` and `FittedParametricUMAP` accept a Burn device. This API is
+distinct from Standard UMAP backend selection:
 
 ```rust
 use burn::tensor::{Device, DeviceKind};
 use fast_umap::prelude::*;
 
 let config = ParametricUMAPConfig::default();
-let cpu = ParametricUMAP::with_device(config.clone(), Device::flex());
+let cpu = ParametricUMAP::with_device(config.clone(), Device::cpu());
 let gpu = ParametricUMAP::with_device(config, Device::wgpu(DeviceKind::DefaultDevice));
 let fitted = cpu.fit(data, None);
 ```
@@ -299,23 +308,16 @@ let fitted = cpu.fit(data, None);
 The WGPU device requires the `gpu` feature. CUDA can also be selected through
 Burn's runtime device API when compiled with the `cuda` feature.
 
-### CPU execution
-
-For CPU-only execution, use the Flex device with the same parametric estimator:
-`ParametricUMAP::with_device(config, Device::flex())`. The standard
-(non-parametric) `UMAP` estimator also runs on Flex; see
-[Standard UMAP](#standard-umap).
-
 ## Feature-Based Compilation
 
 fast-umap uses Cargo features to enable only the backends you need:
 
 ```shell
-# GPU backend (default, includes gpu + verbose features)
+# Default features: cuda, cpu, verbose
 cargo build --release
 
-# Flex CPU device without GPU dependencies
-cargo build --release --no-default-features
+# Standard UMAP CubeCL LLVM CPU backend
+cargo build --release --no-default-features --features cpu
 
 # Optional PCA warm-start and approximate NN-Descent
 cargo build --release --features pca,nn-descent
@@ -334,8 +336,8 @@ The [`backend_choice` example](examples/backend_choice.rs) demonstrates runtime 
 # Run with GPU backend
 cargo run --release --features gpu --example backend_choice -- wgpu
 
-# Run with CPU Flex backend
-cargo run --release --example backend_choice -- flex
+# Run with CPU backend
+cargo run --release --no-default-features --features cpu --example backend_choice -- cpu
 ```
 
 ### CPU Testing Examples
@@ -347,8 +349,8 @@ For working CPU examples, see the test suite:
 cargo test --lib
 ```
 
-The tests in `tests/tests.rs` exercise the Burn Flex CPU device for parametric
-training.
+Standard UMAP CPU behavior should be checked with its feature-specific tests;
+parametric tests do not establish CubeCL CPU runtime acceptance.
 
 ---
 
@@ -364,7 +366,7 @@ unchanged.
 use fast_umap::{BackendChoice, NeighborSearch, UMAP, UMAPConfig};
 
 let config = UMAPConfig { random_state: Some(42), ..UMAPConfig::default() };
-let fitted = UMAP::new(config, BackendChoice::Flex, NeighborSearch::Auto).fit(&data)?;
+let fitted = UMAP::new(config, BackendChoice::Auto, NeighborSearch::Auto).fit(&data)?;
 let embedding = fitted.embedding();          // Vec<Vec<f32>>, one row per sample
 let projected = fitted.transform(&new_data)?; // place unseen rows in the fitted map
 ```
@@ -372,15 +374,16 @@ let projected = fitted.transform(&new_data)?; // place unseen rows in the fitted
 ```python
 import fast_umap
 
-model = fast_umap.UMAP(n_neighbors=15, random_state=42, backend="cuda")
+model = fast_umap.UMAP(n_neighbors=15, random_state=42, backend="auto")
 embedding = model.fit_transform(X)
 projected = model.transform(X_new)
 ```
 
-- **Backends:** `BackendChoice::Flex` (CPU) or `BackendChoice::Cuda { device_index }`
-  (`cuda` feature). The choice is explicit and never silently replaced; WGPU is
-  not supported for standard UMAP. Neighbor search, the fuzzy graph and SGD run
-  on the selected backend; spectral initialization runs on the host.
+- **Backends:** `BackendChoice::{Auto, Cpu, Cuda { device_index }}`. `Auto`
+  prefers discovered usable CUDA and selects CPU only when CUDA is unavailable.
+  Unexpected discovery errors propagate; explicit selections are strict, and
+  construction or execution failures never cause backend substitution. WGPU
+  is not newly supported for Standard UMAP. Spectral initialization is host-side.
 - **Neighbor search:** `Exact` (blocked exact search, no N x N matrix),
   `Approximate` (NN-Descent for fit, bounded graph search for transform), or
   `Auto` (`Exact` up to `AUTO_EXACT_MAX_ROWS` rows, `Approximate` above).
@@ -397,8 +400,8 @@ projected = model.transform(X_new)
   row order, with identical coordinates for identical rows, while transform
   uses the distinct training graph. Unique fits need at least two distinct rows;
   the existing empty-graph error still applies to a two-row training graph.
-- **Quality:** five-seed trustworthiness@15 against frozen umap-learn 0.5.12
-  references is within 0.02 on Flex and CUDA (`tests/test_standard_quality.rs`).
+- **Quality:** previously recorded backend quality measurements do not establish
+  CubeCL CPU acceptance; no new CPU quality claim is made here.
 - **Spectral solver:** small components use faer 0.24.4 dense self-adjoint EVD;
   larger components use locked-trivial block thick-restart Krylov iteration
   with cached operator images and faer Rayleigh–Ritz EVD. The sparse iteration has a fixed numerical budget,
@@ -415,21 +418,21 @@ Burn/CubeCL tracing. The library does not install a subscriber. Profiling benche
 install one only when `FAST_UMAP_TRACE` is set; leave it unset for timing runs.
 
 ```sh
-cargo bench --no-default-features --features cpu --bench standard_umap_flex
+cargo bench --no-default-features --features cpu --bench standard_umap_cpu
 cargo bench --no-default-features --features cuda --bench standard_umap_cuda
 
 # Chrome/Perfetto trace (import the JSON file into ui.perfetto.dev)
-FAST_UMAP_TRACE=standard-flex.json RUST_LOG=fast_umap=trace cargo bench \
-  --no-default-features --features tracing --bench standard_umap_flex -- --test
+FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace cargo bench \
+  --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
 FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench \
   --no-default-features --features cuda,tracing --bench standard_umap_cuda -- --test
 
 # Console span timings instead of a trace file
 FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench \
-  --no-default-features --features tracing --bench standard_umap_flex -- --test
+  --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
 ```
 
-CUDA requires a working NVIDIA runtime and never falls back to Flex. Traces are
+CUDA requires a working NVIDIA runtime. Traces are
 host-side spans, not GPU kernel timings. Fit stage boundaries explicitly synchronize
 the selected device when `tracing` is enabled; enabling detailed tracing adds
 overhead. The benches measure complete fit and transform calls, including host
@@ -556,17 +559,19 @@ cargo run --release --example cpu_training_demo
 
 ### Backend Choice — CPU vs GPU selection
 
-Demonstrates how to choose between the CPU Flex and WGPU devices at runtime:
+Demonstrates selecting configured devices for the parametric model; this example
+does not document or verify Standard UMAP CPU support:
 
 ```shell
 # Run with WGPU backend
 cargo run --release --features gpu --example backend_choice -- wgpu
 
-# Run with CPU Flex backend
-cargo run --release --example backend_choice -- flex
+# Run with CPU backend
+cargo run --release --no-default-features --features cpu --example backend_choice -- cpu
 ```
 
-Both devices use the parametric model and support transforming new data.
+This example selects Burn devices for the parametric model. Its CPU example is
+not acceptance evidence for Standard UMAP or a claim of parametric CPU support.
 
 ### Simple — random data, 2-D embedding
 
@@ -671,7 +676,7 @@ writing any files.
 Demonstrates CPU backend capabilities:
 
 ```shell
-# Run CPU Flex demo
+# Run CPU training demo (parametric behavior is outside Standard CPU acceptance)
 cargo run --release --example cpu_training_demo
 ```
 
@@ -685,7 +690,7 @@ The feature-based compilation system provides:
 
 **✅ Smaller Binaries**
 - GPU-only: exclude CPU dependencies (save ~5MB)
-- CPU Flex builds can omit the `gpu` feature
+- CPU-only Standard builds select the `cpu` feature without the `gpu` feature
 - Library mode: minimal footprint for integration
 
 **✅ Clear Feature Matrix**
@@ -751,9 +756,8 @@ FittedParametricUMAP with .embedding() and .transform()
 | [`parametric_umap`] | -- | Parametric estimator/model, private trainer, and weight persistence |
 | [`graph`] | -- | Shared graph, metric, and manifold math/configuration |
 | [`backend`] | -- | Backend trait extension for custom kernel dispatch |
-| [`generic_backend`] | -- | Backend ops via standard Burn tensor math (works on any backend) |
 | [`autodiff_ops`] | -- | Autodiff backward registration for custom ops |
-| [`kernels`] | `gpu` | Custom CubeCL GPU kernels (Euclidean distance, k-NN) |
+| [`kernels`] | `cpu`, `cuda`, or `gpu` | Shared CubeCL kernels; Standard UMAP kernels require `cpu` or `cuda` |
 | [`pca`] | `pca` | PCA warm-start for initial embedding |
 | [`nn_descent`] | `nn-descent` | NN-Descent approximate KNN graph construction |
 | [`chart`] | `plotters` | 2-D scatter plots and loss curves |
@@ -781,7 +785,8 @@ For explicit device selection or configuration, use `ParametricUMAP::with_device
 
 ## Testing
 
-Tests use Burn’s Flex CPU device by default; no GPU is required.
+The Standard CPU test lane uses CubeCL LLVM and does not require a GPU. Parametric
+test behavior is separate and is not acceptance evidence for Standard CPU.
 
 ```shell
 cargo test

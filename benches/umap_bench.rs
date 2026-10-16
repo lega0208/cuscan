@@ -2,7 +2,7 @@
 
 /// Criterion benchmarks for fast-umap.
 ///
-/// All benchmarks run on Burn's Flex CPU device so no GPU is
+/// All benchmarks run on Burn's CubeCL CPU device so no GPU is
 /// required and they integrate easily into CI.
 ///
 /// Benchmark groups:
@@ -24,7 +24,7 @@ use fast_umap::{
 };
 
 fn cpu() -> Device {
-    Device::flex()
+    Device::cpu()
 }
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ pub fn euclidean(x: Tensor<2>) -> Tensor<1> {
 /// use burn::tensor::{Device, Tensor};
 /// use fast_umap::distances::euclidean_knn;
 ///
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let x = Tensor::<2>::from_data([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], &device);
 /// let k = 2;
 /// let result = euclidean_knn(x, k);
@@ -140,7 +140,7 @@ pub fn manhattan(tensor: Tensor<2>) -> Tensor<1> {
 /// use burn::tensor::{Device, Tensor};
 /// use fast_umap::distances::cosine;
 ///
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let tensor = Tensor::<2>::from_data(
 ///     [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
 ///     &device,
@@ -207,7 +207,7 @@ pub fn cosine(tensor: Tensor<2>) -> Tensor<1> {
 /// use burn::tensor::{Device, Tensor};
 /// use fast_umap::distances::minkowski;
 ///
-/// let device = Device::flex();
+/// let device = Device::cpu();
 /// let tensor = Tensor::<2>::from_data(
 ///     [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
 ///     &device,

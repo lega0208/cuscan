@@ -3,10 +3,14 @@ use burn::{
     tensor::{Device, Tensor, TensorData},
 };
 use fast_umap::backend::StandardUmapOps;
+#[cfg(feature = "cuda")]
 use serde_json::json;
+#[cfg(feature = "cuda")]
 use std::io::Write;
+#[cfg(feature = "cuda")]
 use std::process::{Command, Stdio};
 
+#[cfg(feature = "cuda")]
 fn source_tree_digest(commit: &str) -> String {
     let output = Command::new("git")
         .args(["rev-parse", &format!("{commit}:src")])
@@ -19,6 +23,7 @@ fn source_tree_digest(commit: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+#[cfg(feature = "cuda")]
 fn frozen_source_digest() -> String {
     let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
     for args in [
@@ -37,6 +42,7 @@ fn frozen_source_digest() -> String {
     source_tree_digest(commit)
 }
 
+#[cfg(feature = "cuda")]
 fn git_blob_digest(bytes: &[u8]) -> String {
     let mut child = Command::new("git")
         .args(["hash-object", "--stdin"])
@@ -252,7 +258,6 @@ fn old_rescan_oracle(
     (ids, distance_bits)
 }
 
-#[cfg(feature = "cuda")]
 struct FullJoinTrace {
     ids: Vec<i32>,
     distance_bits: Vec<u32>,
@@ -260,7 +265,6 @@ struct FullJoinTrace {
     stop_reason: &'static str,
 }
 
-#[cfg(feature = "cuda")]
 fn generalized_full_join_oracle(
     points: &[f32],
     n: usize,
@@ -416,7 +420,6 @@ fn generalized_full_join_oracle(
     }
 }
 
-#[cfg(feature = "cuda")]
 fn e2_points(shape_index: usize, n: usize, features: usize) -> Vec<f32> {
     (0..n)
         .flat_map(|row| {
@@ -617,6 +620,47 @@ fn cuda_ann_matches_generalized_full_join_e2_grid() {
     }
 }
 
+#[test]
+fn cpu_ann_matches_independent_full_join_host_reference() {
+    let n = 31usize;
+    let features = 4usize;
+    let k = 3usize;
+    let seed = 0x5179;
+    let iterations = 5;
+    let points = e2_points(2, n, features);
+    let expected = generalized_full_join_oracle(&points, n, features, k, seed, iterations);
+    assert!(matches!(expected.stop_reason, "zero" | "cap"));
+    assert!(expected.new_ids_per_expansion.len() <= iterations as usize + 1);
+    if expected.stop_reason == "zero" {
+        assert_eq!(expected.new_ids_per_expansion.last(), Some(&0));
+    } else {
+        assert_ne!(expected.new_ids_per_expansion.last(), Some(&0));
+    }
+    let data = Tensor::<2>::from_data(TensorData::new(points, [n, features]), &Device::cpu());
+    let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+        data.into_dispatch(),
+        k as u32,
+        seed,
+        iterations,
+    );
+    let ids = Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
+        .to_data()
+        .try_to_vec::<i32>()
+        .unwrap();
+    let distance_bits = Tensor::<2>::from_dispatch(distances)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids, expected.ids,
+        "CPU ANN differs from independent host reference"
+    );
+    assert_eq!(distance_bits, expected.distance_bits);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
@@ -681,18 +725,18 @@ fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
 }
 
 #[test]
-fn flex_ann_is_deterministic_unique_and_sorted() {
-    let (ids, distances) = run(Device::flex(), 7, 6);
+fn cpu_ann_is_deterministic_unique_and_sorted() {
+    let (ids, distances) = run(Device::cpu(), 7, 6);
     assert_eq!((ids.len(), distances.len()), (48 * 5, 48 * 5));
     check_rows(&ids, &distances, 48, 5);
-    assert_eq!((ids, distances), run(Device::flex(), 7, 6));
+    assert_eq!((ids, distances), run(Device::cpu(), 7, 6));
     // Zero iterations expose the seeded random starts directly.
-    assert_ne!(run(Device::flex(), 7, 0).0, run(Device::flex(), 8, 0).0);
+    assert_ne!(run(Device::cpu(), 7, 0).0, run(Device::cpu(), 8, 0).0);
 }
 
 #[test]
-fn flex_ann_resolves_equal_distances_by_neighbor_index() {
-    let device = Device::flex();
+fn cpu_ann_resolves_equal_distances_by_neighbor_index() {
+    let device = Device::cpu();
     let data = Tensor::<2>::from_data(
         TensorData::new(
             vec![0.0f32, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0],
@@ -715,9 +759,9 @@ fn flex_ann_resolves_equal_distances_by_neighbor_index() {
 }
 
 #[test]
-fn flex_ann_refines_seed_candidates_with_more_neighbor_joins() {
-    let (seeded, _) = run(Device::flex(), 29, 0);
-    let (refined, _) = run(Device::flex(), 29, 8);
+fn cpu_ann_refines_seed_candidates_with_more_neighbor_joins() {
+    let (seeded, _) = run(Device::cpu(), 29, 0);
+    let (refined, _) = run(Device::cpu(), 29, 8);
     assert!(
         recall_score(&refined) > recall_score(&seeded),
         "NN-Descent iterations should improve the seed graph"
@@ -763,7 +807,7 @@ fn required_cuda_mode_fails_when_cuda_support_is_not_compiled() {
 
 #[test]
 fn ann_rejects_invalid_tiny_width_instead_of_exact_fallback() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let data = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0], [2, 1]), &device);
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

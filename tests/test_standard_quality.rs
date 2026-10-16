@@ -2,17 +2,18 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Int, Tensor, TensorData},
 };
+#[cfg(feature = "cuda")]
+use fast_umap::standard_umap::UmapError;
 use fast_umap::{
     backend::StandardUmapOps,
     standard_umap::{
-        BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, UmapError, approximate_query_budget,
+        BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, approximate_query_budget,
     },
 };
 use serde_json::Value;
+use std::{collections::HashSet, fs::File, io::Read};
+#[cfg(feature = "cuda")]
 use std::{
-    collections::HashSet,
-    fs::File,
-    io::Read,
     io::Write,
     process::{Command, Stdio},
 };
@@ -160,6 +161,7 @@ fn matrix_from_npz(archive: &mut ZipArchive<File>, name: &str) -> Matrix {
     npy_matrix(&bytes)
 }
 
+#[cfg(feature = "cuda")]
 fn matrix_from_npz_path(path: &std::path::Path, name: &str) -> Matrix {
     let mut archive = ZipArchive::new(File::open(path).unwrap())
         .unwrap_or_else(|error| panic!("could not open {}: {error}", path.display()));
@@ -201,13 +203,13 @@ fn backend(device: &Device) -> BackendChoice {
     if cfg!(feature = "cuda") && fast_umap::cuda_backend::device(0).as_ref() == Some(device) {
         BackendChoice::Cuda { device_index: 0 }
     } else {
-        BackendChoice::Flex
+        BackendChoice::Cpu
     }
 }
 
 #[cfg(not(feature = "cuda"))]
 fn backend(_: &Device) -> BackendChoice {
-    BackendChoice::Flex
+    BackendChoice::Cpu
 }
 
 fn distances(left: &[f32], right: &[f32], width: usize) -> f64 {
@@ -323,6 +325,7 @@ fn matrix_from_embedding(embedding: &[Vec<f32>]) -> Matrix {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f64 {
     let n = original.rows;
     assert_eq!(embedded.rows, n, "trustworthiness row shape");
@@ -369,6 +372,7 @@ fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f6
     1.0 - 2.0 * penalty as f64 / normalizer
 }
 
+#[cfg(feature = "cuda")]
 fn assert_approximate_fit_quality(
     device: &Device,
     name: &str,
@@ -573,8 +577,8 @@ fn run_quality(device: Device) {
         .abs();
     eprintln!(
         "{} fit trustworthiness@15 mean gap: {fit_gap:.6}",
-        if matches!(backend, BackendChoice::Flex) {
-            "Flex"
+        if matches!(backend, BackendChoice::Cpu) {
+            "CPU"
         } else {
             "CUDA"
         }
@@ -588,8 +592,8 @@ fn run_quality(device: Device) {
         .abs();
     eprintln!(
         "{} transform trustworthiness@15 mean gap: {transform_gap:.6}",
-        if matches!(backend, BackendChoice::Flex) {
-            "Flex"
+        if matches!(backend, BackendChoice::Cpu) {
+            "CPU"
         } else {
             "CUDA"
         }
@@ -660,8 +664,8 @@ fn run_recall(device: Device) {
     let query_recall = query_weighted_hits as f64 / query_weighted_rows as f64;
     eprintln!(
         "{} ANN tie-aware recall: fit@14={fit_recall:.6}, transform-query@15={query_recall:.6}",
-        if device == Device::flex() {
-            "Flex"
+        if device == Device::cpu() {
+            "CPU"
         } else {
             "CUDA"
         }
@@ -677,13 +681,13 @@ fn run_recall(device: Device) {
 }
 
 #[test]
-fn standard_ann_recall_on_flex() {
-    run_recall(Device::flex());
+fn standard_ann_recall_on_cpu() {
+    run_recall(Device::cpu());
 }
 
 #[test]
-fn standard_quality_trustworthiness_on_flex() {
-    run_quality(Device::flex());
+fn standard_quality_trustworthiness_on_cpu() {
+    run_quality(Device::cpu());
 }
 
 #[cfg(feature = "cuda")]
@@ -996,10 +1000,10 @@ fn fit_without_dense_matrix(backend: BackendChoice, rows: usize) {
 /// A dense N x N f32 matrix at N=20,000 needs 1.6 GB; the sparse pipeline
 /// stays O(N*K). Measured ~40 s in release on a Ryzen 7 9800X3D.
 #[test]
-fn flex_fit_larger_than_dense_memory_budget_completes() {
+fn cpu_fit_larger_than_dense_memory_budget_completes() {
     let rows = 20_000usize;
     assert!(rows * rows * std::mem::size_of::<f32>() > 1_500_000_000);
-    fit_without_dense_matrix(BackendChoice::Flex, rows);
+    fit_without_dense_matrix(BackendChoice::Cpu, rows);
 }
 
 /// N=60,000 dense f32 distances need 14.4 GB, beyond a 10 GiB RTX 3080.

@@ -3,9 +3,9 @@
 pub(crate) mod ann;
 mod config;
 mod estimator;
-pub(crate) mod graph;
+
 pub mod init;
-pub(crate) mod layout;
+
 pub mod neighbors;
 pub(crate) mod query;
 

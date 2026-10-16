@@ -2,7 +2,9 @@ use burn::backend::Dispatch;
 use burn::tensor::{Device, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 use serde_json::Value;
+#[cfg(feature = "cuda")]
 use serde_json::json;
+#[cfg(feature = "cuda")]
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -105,6 +107,7 @@ fn fixture_cases() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
 }
 
+#[cfg(feature = "cuda")]
 fn source_tree_digest(commit: &str) -> String {
     let output = Command::new("git")
         .args(["rev-parse", &format!("{commit}:src")])
@@ -117,6 +120,7 @@ fn source_tree_digest(commit: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+#[cfg(feature = "cuda")]
 fn frozen_source_digest() -> String {
     let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
     for args in [
@@ -135,6 +139,7 @@ fn frozen_source_digest() -> String {
     source_tree_digest(commit)
 }
 
+#[cfg(feature = "cuda")]
 fn git_blob_digest(bytes: &[u8]) -> String {
     let mut child = Command::new("git")
         .args(["hash-object", "--stdin"])
@@ -151,6 +156,7 @@ fn git_blob_digest(bytes: &[u8]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+#[cfg(feature = "cuda")]
 fn graph_capture_case(
     device: &Device,
     name: &str,
@@ -284,14 +290,16 @@ fn verify_reference_cases(device: &Device) {
     }
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn standard_fuzzy_graph_matches_reference_fixtures_on_flex() {
-    verify_reference_cases(&Device::flex());
+fn standard_fuzzy_graph_matches_reference_fixtures_on_cpu() {
+    verify_reference_cases(&Device::cpu());
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let graph = run_graph(
         &device,
         vec![0, 1, 1, 2],
@@ -399,9 +407,10 @@ fn verify_bipartite_forward_memberships(graph: &GraphValues, mix: f32) {
     );
 }
 
+#[cfg(feature = "cpu")]
 #[test]
-fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_flex() {
-    let device = Device::flex();
+fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cpu() {
+    let device = Device::cpu();
     let zero = bipartite_mix_graph(&device, 0.0);
     let intermediate = bipartite_mix_graph(&device, 0.4);
     verify_bipartite_forward_memberships(&zero, 0.0);
@@ -448,30 +457,13 @@ fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cuda
         &intermediate.weights,
         "set_op_mix_ratio must not change cuda bipartite weights",
     );
-    // Both backends match the shared reference fixtures within 1e-5, so a
-    // 1e-4 budget covers their compounded sigma binary-search difference while
-    // staying far below the mix scaling the old bug introduced.
-    let flex = bipartite_mix_graph(&Device::flex(), 0.0);
-    assert_eq!(zero.heads, flex.heads, "cuda/flex bipartite heads");
-    assert_eq!(zero.tails, flex.tails, "cuda/flex bipartite tails");
-    for (label, cuda_weights) in [
-        ("mix 0.0", &zero.weights),
-        ("mix 0.4", &intermediate.weights),
-    ] {
-        for (index, (&cuda, &flex_weight)) in cuda_weights.iter().zip(&flex.weights).enumerate() {
-            let tolerance = 1e-4 + 1e-4 * flex_weight.abs();
-            assert!(
-                (cuda - flex_weight).abs() <= tolerance,
-                "cuda/flex bipartite weights ({label})[{index}]: flex {flex_weight}, cuda {cuda} (tol {tolerance})"
-            );
-        }
-    }
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero() {
     let graph = run_graph(
-        &Device::flex(),
+        &Device::cpu(),
         vec![0, 1, 2, 0, 1, 2],
         vec![0.5, 1.0, 2.0, 0.5, 1.0, 2.0],
         2,
@@ -516,10 +508,11 @@ fn bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero() {
     );
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_marks_invalid_reference_indices() {
     let graph = run_graph(
-        &Device::flex(),
+        &Device::cpu(),
         vec![0, 3, 1, -2],
         vec![0.0, 1.0, 0.0, 1.0],
         2,

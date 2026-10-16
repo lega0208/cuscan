@@ -52,7 +52,7 @@ pub fn forward(
         int_dtype,
     );
 
-    let cube_dim = KNN_CUBE_DIM;
+    let cube_dim = crate::kernels::legal_cube_dim(&client, KNN_CUBE_DIM);
     let cube_count = CubeCount::Static((n as u32).div_ceil(cube_dim.x), 1, 1);
     knn_kernel::launch(
         &client,
@@ -114,7 +114,7 @@ pub fn backward(
         int_dtype,
     );
 
-    let cube_dim = KNN_CUBE_DIM;
+    let cube_dim = crate::kernels::legal_cube_dim(&pairwise_distances.client, KNN_CUBE_DIM);
     let cube_count = CubeCount::Static((n as u32).div_ceil(cube_dim.x), 1, 1);
     knn_backward_kernel::launch(
         &pairwise_distances.client,

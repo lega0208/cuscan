@@ -43,8 +43,8 @@ fn exercise_blocks(device: Device) {
 }
 
 #[test]
-fn exact_consumer_crosses_blocks_on_flex() {
-    exercise_blocks(Device::flex());
+fn exact_consumer_crosses_blocks_on_cpu() {
+    exercise_blocks(Device::cpu());
 }
 
 #[cfg(feature = "cuda")]
@@ -62,7 +62,7 @@ fn exact_consumer_crosses_blocks_on_actual_cuda() {
 
 #[test]
 fn exact_consumer_rejects_invalid_widths_and_alignment() {
-    let device = Device::flex();
+    let device = Device::cpu();
     let fit = Tensor::<2>::zeros([3, 2], &device);
     let query = Tensor::<2>::zeros([2, 2], &device);
     assert!(exact_neighbors(fit.clone(), fit.clone(), 0, true).is_err());

@@ -179,10 +179,11 @@ pub(super) fn exact_neighbors(
         query.dtype,
     );
     let client = query.client.clone();
+    let cube_dim = crate::kernels::legal_cube_dim(&client, NEIGHBOR_CUBE_DIM);
     exact_neighbors_kernel::launch(
         &client,
-        CubeCount::Static(query_rows_u32.div_ceil(NEIGHBOR_CUBE_DIM.x), 1, 1),
-        NEIGHBOR_CUBE_DIM,
+        CubeCount::Static(query_rows_u32.div_ceil(cube_dim.x), 1, 1),
+        cube_dim,
         query.into_tensor_arg(),
         reference.into_tensor_arg(),
         k,
@@ -236,15 +237,16 @@ pub(super) fn squared_euclidean_distance_block(
         query.dtype,
     );
     let client = query.client.clone();
+    let cube_dim = crate::kernels::legal_cube_dim(&client, DISTANCE_TILE);
     let cube_count = CubeCount::Static(
-        query_rows_u32.div_ceil(DISTANCE_TILE.x),
-        reference_rows_u32.div_ceil(DISTANCE_TILE.y),
+        query_rows_u32.div_ceil(cube_dim.x),
+        reference_rows_u32.div_ceil(cube_dim.y),
         1,
     );
     squared_euclidean_distance_block_kernel::launch(
         &client,
         cube_count,
-        DISTANCE_TILE,
+        cube_dim,
         query.into_tensor_arg(),
         reference.into_tensor_arg(),
         output.clone().into_tensor_arg(),

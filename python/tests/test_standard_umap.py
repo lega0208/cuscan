@@ -36,18 +36,47 @@ def test_exports_and_shape_dtype() -> None:
     assert model.embedding_.shape == result.shape
 
 
+@pytest.mark.parametrize("backend", ["auto", "cpu"])
+def test_backend_selectors_fit_transform_and_reject_flex(backend: str) -> None:
+    x, _ = blobs(12)
+    model = estimator(backend=backend, neighbor_search="exact").fit(x)
+    assert model.embedding_.shape == (len(x), 2)
+    assert np.isfinite(model.embedding_).all()
+    transformed = model.transform(x[:3])
+    assert transformed.shape == (3, 2)
+    assert np.isfinite(transformed).all()
+
+    with pytest.raises(ValueError, match="backend"):
+        estimator(backend="flex").fit(x)
+
+
+@pytest.mark.parametrize("neighbor_search", ["exact", "approximate"])
+def test_cpu_fit_transform_and_input_validation(neighbor_search: str) -> None:
+    x, _ = blobs(12)
+    model = estimator(backend="cpu", neighbor_search=neighbor_search, init="random").fit(x)
+    assert model.embedding_.shape == (len(x), 2)
+    assert np.isfinite(model.embedding_).all()
+
+    transformed = model.transform(x[:4])
+    assert transformed.shape == (4, 2)
+    assert np.isfinite(transformed).all()
+
+    with pytest.raises(ValueError, match="finite"):
+        model.transform(np.array([[np.nan, 0.0, 0.0]], dtype=np.float32))
+
+
 def test_random_state_determinism() -> None:
     x, _ = blobs(12)
-    first = estimator().fit_transform(x)
-    second = estimator().fit_transform(x)
+    first = estimator(init="random", learning_rate=0.0).fit_transform(x)
+    second = estimator(init="random", learning_rate=0.0).fit_transform(x)
     np.testing.assert_array_equal(first, second)
 
 
 def test_unique_defaults_to_raw_training_behavior() -> None:
     x, _ = blobs(12)
     rows = np.vstack((x, x[0], x[3]))
-    default = estimator().fit_transform(rows)
-    explicit_raw = estimator(unique=False).fit_transform(rows)
+    default = estimator(learning_rate=0.0).fit_transform(rows)
+    explicit_raw = estimator(unique=False, learning_rate=0.0).fit_transform(rows)
     assert default.shape == (len(rows), 2)
     np.testing.assert_array_equal(default, explicit_raw)
 
@@ -71,8 +100,8 @@ def test_unique_expands_first_occurrence_embedding_and_transforms() -> None:
             first_occurrences.append(row)
     distinct_rows = np.stack(first_occurrences)
 
-    unique_model = estimator(unique=True, init="random").fit(rows)
-    reference_embedding = estimator(init="random").fit_transform(distinct_rows)
+    unique_model = estimator(unique=True, init="random", learning_rate=0.0).fit(rows)
+    reference_embedding = estimator(init="random", learning_rate=0.0).fit_transform(distinct_rows)
     np.testing.assert_array_equal(unique_model.embedding_, reference_embedding[row_to_unique])
     np.testing.assert_array_equal(unique_model.embedding_[-3], unique_model.embedding_[0])
     np.testing.assert_array_equal(unique_model.embedding_[-1], unique_model.embedding_[5])
@@ -81,6 +110,27 @@ def test_unique_expands_first_occurrence_embedding_and_transforms() -> None:
     transformed = unique_model.transform(np.vstack((rows[1], rows[-2])))
     assert transformed.shape == (2, 2)
     assert np.isfinite(transformed).all()
+
+
+def test_optimized_unique_layout_has_quality_and_exact_duplicate_identity() -> None:
+    x, labels = blobs()
+    rows = np.vstack((x, x[0], x[3]))
+    labels = np.concatenate((labels, labels[[0, 3]]))
+    embedding = estimator(unique=True, init="random").fit_transform(rows)
+
+    np.testing.assert_array_equal(embedding[-2], embedding[0])
+    np.testing.assert_array_equal(embedding[-1], embedding[3])
+    centers = np.stack([embedding[labels == group].mean(axis=0) for group in range(3)])
+    within = np.mean(
+        [
+            np.linalg.norm(embedding[labels == group] - centers[group], axis=1).mean()
+            for group in range(3)
+        ]
+    )
+    between = np.mean(
+        [np.linalg.norm(centers[i] - centers[j]) for i in range(3) for j in range(i + 1, 3)]
+    )
+    assert between > within
 
 
 def test_unique_requires_two_distinct_rows_and_validates_before_deduplication() -> None:
