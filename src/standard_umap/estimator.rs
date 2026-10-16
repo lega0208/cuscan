@@ -1,5 +1,5 @@
 use burn::{
-    backend::Dispatch,
+    backend::{Dispatch, tensor::IntTensor},
     tensor::{DType, Device, Int, Tensor, TensorData},
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -10,8 +10,9 @@ use crate::backend::StandardUmapOps;
 
 use super::{
     Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
-    fit_curve, fit_neighbor_widths, query_neighbor_width, validate_backend_choice, validate_input,
-    validate_search_settings,
+    fit_curve, fit_neighbor_widths,
+    query::{approximate_query_scratch_layout, query_output_allocation},
+    query_neighbor_width, validate_backend_choice, validate_input, validate_search_settings,
 };
 
 /// Auto uses exact search for small data and bounded NN-Descent above this row count.
@@ -143,7 +144,7 @@ impl UMAP {
                 search,
                 n_features: features,
                 training_data,
-                fit_graph: Tensor::<2, Int>::zeros([1, 0], &device),
+                fit_graph: None,
                 embedding,
                 original_to_training,
                 expanded_embedding: OnceLock::new(),
@@ -241,6 +242,7 @@ impl UMAP {
                 "fuzzy graph contains invalid neighbor indices".into(),
             ));
         }
+        let fit_graph = ValidatedFitGraph(fit_graph);
         let default_epochs = if n <= 10_000 { 500 } else { 200 };
         let requested_epochs = self.config.n_epochs.unwrap_or(default_epochs);
         let n_epochs = u32::try_from(requested_epochs)
@@ -325,9 +327,14 @@ impl UMAP {
         )?;
         #[cfg(feature = "tracing")]
         drop(_initialization_span);
+        let rng = optimizer_rng_from_first_coordinates(
+            flat.chunks_exact(n_components).map(|row| row[0]),
+            n,
+            seed,
+            &device,
+        )?;
         let initial = Tensor::<2>::from_data(TensorData::new(flat, [n, n_components]), &device);
         let (a, b) = fit_curve(self.config.min_dist, self.config.spread)?;
-        let rng = optimizer_rng(&initial, seed, &device)?;
         #[cfg(feature = "tracing")]
         profile_sync(&device)?;
         #[cfg(feature = "tracing")]
@@ -364,7 +371,7 @@ impl UMAP {
             search,
             n_features: features,
             training_data,
-            fit_graph,
+            fit_graph: Some(fit_graph),
             embedding,
             original_to_training,
             expanded_embedding: OnceLock::new(),
@@ -408,10 +415,33 @@ pub struct FittedUMAP {
     search: NeighborSearch,
     n_features: usize,
     training_data: Tensor<2>,
-    fit_graph: Tensor<2, Int>,
+    fit_graph: Option<ValidatedFitGraph>,
     embedding: Embedding,
     original_to_training: Option<Vec<usize>>,
     expanded_embedding: OnceLock<Embedding>,
+    embedding_tensor: Tensor<2>,
+    a: f32,
+    b: f32,
+}
+
+/// A fit graph whose indices were validated by the fit fuzzy-graph marker.
+#[derive(Debug, Clone)]
+struct ValidatedFitGraph(Tensor<2, Int>);
+
+impl ValidatedFitGraph {
+    fn clone_dispatch(&self) -> IntTensor<Dispatch> {
+        self.0.clone().into_dispatch()
+    }
+}
+
+#[cfg(all(test, feature = "tracing"))]
+struct OriginalFitState {
+    config: UMAPConfig,
+    backend: crate::standard_umap::BackendChoice,
+    search: NeighborSearch,
+    n_features: usize,
+    training_data: Tensor<2>,
+    fit_graph: Tensor<2, Int>,
     embedding_tensor: Tensor<2>,
     a: f32,
     b: f32,
@@ -433,17 +463,38 @@ impl FittedUMAP {
         self.n_features
     }
 
+    #[cfg(all(test, feature = "tracing"))]
+    fn original_fit_state(&self) -> OriginalFitState {
+        let fit_graph = match &self.fit_graph {
+            Some(graph) => graph.0.clone(),
+            None => Tensor::<2, Int>::zeros([1, 0], &self.training_data.device()),
+        };
+        OriginalFitState {
+            config: self.config.clone(),
+            backend: self.backend,
+            search: self.search,
+            n_features: self.n_features,
+            training_data: self.training_data.clone(),
+            fit_graph,
+            embedding_tensor: self.embedding_tensor.clone(),
+            a: self.a,
+            b: self.b,
+        }
+    }
+
     /// Diagnostic read-only copy of the fit's non-self neighbor ids, row-major
     /// `[rows, width]`; reads back from the device. Not part of the stable API.
     #[cfg(feature = "tracing")]
     #[doc(hidden)]
     pub fn diagnostic_fit_graph(&self) -> Result<(Vec<i32>, usize)> {
-        let width = self.fit_graph.dims()[1];
-        let ids = self
-            .fit_graph
-            .to_data()
-            .try_to_vec::<i32>()
-            .map_err(|error| UmapError::Numerical(format!("could not read fit graph: {error}")))?;
+        let Some(fit_graph) = &self.fit_graph else {
+            return Ok((Vec::new(), 0));
+        };
+        let width = fit_graph.0.dims()[1];
+        let ids =
+            fit_graph.0.to_data().try_to_vec::<i32>().map_err(|error| {
+                UmapError::Numerical(format!("could not read fit graph: {error}"))
+            })?;
         Ok((ids, width))
     }
 
@@ -464,9 +515,86 @@ impl FittedUMAP {
         )
     )]
     pub fn transform(&self, data: &[Vec<f32>]) -> Result<Embedding> {
+        self.transform_impl(data, None)
+    }
+
+    /// Transform owned row-major input without nested row allocations.
+    #[doc(hidden)]
+    pub fn transform_flat(
+        &self,
+        data: Vec<f32>,
+        n_rows: usize,
+        n_features: usize,
+    ) -> Result<Vec<f32>> {
+        if n_rows == 0 {
+            return Err(UmapError::InvalidInput(
+                "input must contain at least one row".into(),
+            ));
+        }
+        if n_features == 0 {
+            return Err(UmapError::InvalidInput(
+                "input must contain at least one feature".into(),
+            ));
+        }
+        if n_features != self.n_features {
+            return Err(UmapError::InvalidInput(format!(
+                "input has {n_features} features; expected {}",
+                self.n_features
+            )));
+        }
+        let elements = n_rows
+            .checked_mul(n_features)
+            .ok_or(UmapError::Overflow("transform input shape"))?;
+        if data.len() != elements {
+            return Err(UmapError::InvalidInput(format!(
+                "flat input has {} values; expected {elements}",
+                data.len()
+            )));
+        }
+        if let Some(position) = data.iter().position(|value| !value.is_finite()) {
+            return Err(UmapError::InvalidInput(format!(
+                "value at row {}, feature {} is not finite",
+                position / n_features,
+                position % n_features
+            )));
+        }
+        self.transform_flat_impl(data, n_rows, n_features, None)
+    }
+
+    /// Return the transform and the actual training-neighbor IDs used by it.
+    ///
+    /// Diagnostic readbacks are deliberately separate from timed transforms.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    pub fn diagnostic_transform(&self, data: &[Vec<f32>]) -> Result<(Embedding, Vec<i32>)> {
+        let mut indices = Vec::new();
+        let embedding = self.transform_impl(data, Some(&mut indices))?;
+        Ok((embedding, indices))
+    }
+
+    fn transform_impl(
+        &self,
+        data: &[Vec<f32>],
+        diagnostic_indices: Option<&mut Vec<i32>>,
+    ) -> Result<Embedding> {
         let (q, query_features) = validate_input(data, Some(self.n_features))?;
         q.checked_mul(query_features)
             .ok_or(UmapError::Overflow("transform input shape"))?;
+        let flat = data.iter().flat_map(|row| row.iter().copied()).collect();
+        let values = self.transform_flat_impl(flat, q, query_features, diagnostic_indices)?;
+        Ok(values
+            .chunks_exact(self.embedding_tensor.dims()[1])
+            .map(|row| row.to_vec())
+            .collect())
+    }
+
+    fn transform_flat_impl(
+        &self,
+        data: Vec<f32>,
+        q: usize,
+        query_features: usize,
+        diagnostic_indices: Option<&mut Vec<i32>>,
+    ) -> Result<Vec<f32>> {
         if self.training_data.dims()[0] == 1 {
             return Err(UmapError::InvalidInput(
                 "Transform unavailable when model was fit with only a single data sample.".into(),
@@ -478,7 +606,6 @@ impl FittedUMAP {
                 "fitted tensors are not on the selected backend device".into(),
             ));
         }
-        let queries = matrix_tensor(data, &device);
         let n = self.training_data.dims()[0];
         let k = query_neighbor_width(n, self.config.n_neighbors)?;
         let graph_capacity = q
@@ -501,7 +628,7 @@ impl FittedUMAP {
         let (indices, distances) = match self.search {
             NeighborSearch::Exact => {
                 let result = super::neighbors::exact_neighbors(
-                    queries,
+                    Tensor::from_data(TensorData::new(data, [q, query_features]), &device),
                     self.training_data.clone(),
                     k,
                     false,
@@ -510,21 +637,42 @@ impl FittedUMAP {
             }
             NeighborSearch::Approximate => {
                 let budget = approximate_query_budget(n, k, self.config.transform_queue_size)?;
-                let mut all_indices = Vec::new();
-                let mut all_distances = Vec::new();
-                for start in (0..q).step_by(APPROXIMATE_QUERY_BLOCK) {
-                    let end = (start + APPROXIMATE_QUERY_BLOCK).min(q);
-                    let block = matrix_tensor(&data[start..end], &device);
+                let k_u32 =
+                    u32::try_from(k).map_err(|_| UmapError::Overflow("transform query width"))?;
+                let candidates = u32::try_from(budget.candidates)
+                    .map_err(|_| UmapError::Overflow("transform candidate budget"))?;
+                let visits = u32::try_from(budget.visits)
+                    .map_err(|_| UmapError::Overflow("transform visit budget"))?;
+                if matches!(
+                    self.backend,
+                    crate::standard_umap::BackendChoice::Cuda { .. }
+                ) {
+                    u32::try_from(q).map_err(|_| UmapError::Overflow("transform query rows"))?;
+                    let fit_graph = self.fit_graph.as_ref().ok_or_else(|| {
+                        UmapError::Numerical("validated fit graph unavailable".into())
+                    })?;
+                    approximate_query_scratch_layout(
+                        q,
+                        budget.candidates,
+                        budget.visits,
+                        fit_graph.0.dims()[1],
+                    )?;
+                    query_output_allocation(q, k)?;
+
                     let (indices, distances, stats) =
-                        <Dispatch as StandardUmapOps>::approximate_query(
-                            block.into_dispatch(),
+                        <Dispatch as StandardUmapOps>::approximate_query_prevalidated(
+                            Tensor::<2>::from_data(
+                                TensorData::new(data, [q, query_features]),
+                                &device,
+                            )
+                            .into_dispatch(),
                             self.training_data.clone().into_dispatch(),
-                            self.fit_graph.clone().into_dispatch(),
-                            k as u32,
-                            budget.candidates as u32,
-                            budget.visits as u32,
+                            fit_graph.clone_dispatch(),
+                            k_u32,
+                            candidates,
+                            visits,
                             self.config.transform_seed,
-                            start as u64,
+                            0,
                         );
                     let stats: Tensor<2, Int> = Tensor::from_dispatch(stats);
                     if stats
@@ -541,13 +689,72 @@ impl FittedUMAP {
                             "approximate query encountered an invalid fitted neighbor graph".into(),
                         ));
                     }
-                    all_indices.push(Tensor::<2, Int>::from_dispatch(indices));
-                    all_distances.push(Tensor::<2>::from_dispatch(distances));
+                    (
+                        Tensor::<2, Int>::from_dispatch(indices),
+                        Tensor::<2>::from_dispatch(distances),
+                    )
+                } else {
+                    let mut all_indices = Vec::new();
+                    let mut all_distances = Vec::new();
+                    for start in (0..q).step_by(APPROXIMATE_QUERY_BLOCK) {
+                        let end = (start + APPROXIMATE_QUERY_BLOCK).min(q);
+                        let block = Tensor::<2>::from_data(
+                            TensorData::new(
+                                data[start * query_features..end * query_features].to_vec(),
+                                [end - start, query_features],
+                            ),
+                            &device,
+                        );
+                        let graph = self
+                            .fit_graph
+                            .as_ref()
+                            .ok_or_else(|| {
+                                UmapError::Numerical("validated fit graph unavailable".into())
+                            })?
+                            .clone_dispatch();
+                        let (indices, distances, stats) =
+                            <Dispatch as StandardUmapOps>::approximate_query_prevalidated(
+                                block.into_dispatch(),
+                                self.training_data.clone().into_dispatch(),
+                                graph,
+                                k_u32,
+                                candidates,
+                                visits,
+                                self.config.transform_seed,
+                                u64::try_from(start)
+                                    .map_err(|_| UmapError::Overflow("query row offset"))?,
+                            );
+                        let stats: Tensor<2, Int> = Tensor::from_dispatch(stats);
+                        if stats
+                            .to_data()
+                            .try_to_vec::<i32>()
+                            .map_err(|error| {
+                                UmapError::Numerical(format!(
+                                    "could not inspect approximate-query stats: {error}"
+                                ))
+                            })?
+                            .contains(&-1)
+                        {
+                            return Err(UmapError::Numerical(
+                                "approximate query encountered an invalid fitted neighbor graph"
+                                    .into(),
+                            ));
+                        }
+                        all_indices.push(Tensor::<2, Int>::from_dispatch(indices));
+                        all_distances.push(Tensor::<2>::from_dispatch(distances));
+                    }
+                    (Tensor::cat(all_indices, 0), Tensor::cat(all_distances, 0))
                 }
-                (Tensor::cat(all_indices, 0), Tensor::cat(all_distances, 0))
             }
             NeighborSearch::Auto => unreachable!("fitted search mode is resolved"),
         };
+        if let Some(output) = diagnostic_indices {
+            *output = indices.to_data().try_to_vec::<i32>().map_err(|error| {
+                UmapError::Numerical(format!(
+                    "could not read query neighbor diagnostics: {error}"
+                ))
+            })?;
+        }
         #[cfg(feature = "tracing")]
         drop(_neighbors_span);
         let local_connectivity = (self.config.local_connectivity - 1.0).max(0.0);
@@ -597,16 +804,29 @@ impl FittedUMAP {
         let normalized = directed.div(sums.clone().mask_fill(sums.equal_elem(0.0), 1.0));
         let k = indices.dims()[1];
         let components = self.embedding_tensor.dims()[1];
-        let mut initial = Tensor::<2>::zeros([q, components], &device);
-        for slot in 0..k {
-            let ids = indices.clone().slice_dim(1, slot..slot + 1).reshape([q]);
-            let neighbors = self.embedding_tensor.clone().select(0, ids);
-            let weight = normalized
-                .clone()
-                .slice_dim(1, slot..slot + 1)
-                .repeat_dim(1, components);
-            initial = initial.add(neighbors.mul(weight));
-        }
+        let initial = if matches!(
+            self.backend,
+            crate::standard_umap::BackendChoice::Cuda { .. }
+        ) {
+            cuda_weighted_initialization(
+                &self.embedding_tensor,
+                &indices,
+                &normalized,
+                super::query::TRANSFORM_SCRATCH_BUDGET_BYTES,
+            )?
+        } else {
+            let mut initial = Tensor::<2>::zeros([q, components], &device);
+            for slot in 0..k {
+                let ids = indices.clone().slice_dim(1, slot..slot + 1).reshape([q]);
+                let neighbors = self.embedding_tensor.clone().select(0, ids);
+                let weight = normalized
+                    .clone()
+                    .slice_dim(1, slot..slot + 1)
+                    .repeat_dim(1, components);
+                initial = initial.add(neighbors.mul(weight));
+            }
+            initial
+        };
         let (heads, tails, weights, positive, next_positive, negative, next_negative) =
             prepare_schedule(
                 heads,
@@ -634,7 +854,21 @@ impl FittedUMAP {
             ));
         }
         let transform_seed = self.config.transform_seed;
-        let rng = optimizer_rng(&initial, transform_seed, &device)?;
+        let first_coordinates = initial
+            .clone()
+            .slice_dim(1, 0..1)
+            .reshape([q])
+            .to_data()
+            .try_to_vec::<f32>()
+            .map_err(|error| {
+                UmapError::Numerical(format!("could not initialize optimizer RNG: {error}"))
+            })?;
+        let rng = optimizer_rng_from_first_coordinates(
+            first_coordinates.into_iter(),
+            q,
+            transform_seed,
+            &device,
+        )?;
         #[cfg(feature = "tracing")]
         let _optimization_span =
             tracing::info_span!("optimization", rows = q, epochs = n_epochs_u32).entered();
@@ -660,8 +894,95 @@ impl FittedUMAP {
         )?;
         #[cfg(feature = "tracing")]
         drop(_optimization_span);
-        tensor_embedding(&embedding)
+        embedding
+            .to_data()
+            .try_to_vec::<f32>()
+            .map_err(|error| UmapError::Numerical(format!("could not read embedding: {error}")))
     }
+}
+
+fn weighted_initialization_chunk_rows(
+    query_rows: usize,
+    k: usize,
+    components: usize,
+    scratch_limit_bytes: usize,
+) -> Result<usize> {
+    // Include gather/reshape storage, indices, and live slot, repeated weight,
+    // product, old accumulator and new accumulator tensors, including k=2.
+    let row_words = k
+        .checked_mul(components)
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_add(k))
+        .and_then(|value| {
+            components
+                .checked_mul(5)
+                .and_then(|extra| value.checked_add(extra))
+        })
+        .ok_or(UmapError::Overflow("transform initialization scratch"))?;
+    let row_bytes = row_words
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(UmapError::Overflow("transform initialization scratch"))?;
+    let chunk_rows = scratch_limit_bytes / row_bytes;
+    if chunk_rows == 0 {
+        return Err(UmapError::InvalidInput(
+            "one transform initialization row exceeds the 256 MiB scratch budget".into(),
+        ));
+    }
+    query_rows
+        .checked_mul(components)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(UmapError::Overflow("transform initialization output"))?;
+    chunk_rows
+        .min(query_rows)
+        .checked_mul(k)
+        .ok_or(UmapError::Overflow("transform initialization scratch"))?;
+    Ok(chunk_rows)
+}
+
+fn cuda_weighted_initialization(
+    embedding: &Tensor<2>,
+    indices: &Tensor<2, Int>,
+    normalized: &Tensor<2>,
+    scratch_limit_bytes: usize,
+) -> Result<Tensor<2>> {
+    let [query_rows, k] = indices.dims();
+    let components = embedding.dims()[1];
+    let chunk_rows =
+        weighted_initialization_chunk_rows(query_rows, k, components, scratch_limit_bytes)?;
+    let device = embedding.device();
+    let mut chunks = Vec::new();
+    for start in (0..query_rows).step_by(chunk_rows) {
+        let rows = (query_rows - start).min(chunk_rows);
+        let end = start + rows;
+        let index_count = rows
+            .checked_mul(k)
+            .ok_or(UmapError::Overflow("transform initialization scratch"))?;
+        let ids = indices
+            .clone()
+            .slice_dim(0, start..end)
+            .reshape([index_count]);
+        let neighbors = embedding
+            .clone()
+            .select(0, ids)
+            .reshape([rows, k, components]);
+        let weights = normalized.clone().slice_dim(0, start..end);
+        // Preserve the original left-to-right float32 sum, including the
+        // initial zero addition. A parallel reduction changes RNG seed bits.
+        let mut sum = Tensor::<2>::zeros([rows, components], &device);
+        for slot in 0..k {
+            let values = neighbors
+                .clone()
+                .slice_dim(1, slot..slot + 1)
+                .reshape([rows, components]);
+            let weight = weights
+                .clone()
+                .slice_dim(1, slot..slot + 1)
+                .repeat_dim(1, components);
+            sum = sum.add(values.mul(weight));
+        }
+        chunks.push(sum);
+    }
+    Ok(Tensor::cat(chunks, 0))
 }
 
 fn selected_device(choice: crate::standard_umap::BackendChoice) -> Result<Device> {
@@ -778,6 +1099,36 @@ fn prepare_schedule(
     ))
 }
 
+fn optimizer_rng_from_first_coordinates(
+    values: impl Iterator<Item = f32>,
+    rows: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<Tensor<2, Int>> {
+    let mut random = StdRng::seed_from_u64(seed);
+    let base = [
+        random.random_range(i32::MIN..i32::MAX) as i64,
+        random.random_range(i32::MIN..i32::MAX) as i64,
+        random.random_range(i32::MIN..i32::MAX) as i64,
+    ];
+    let mut state = Vec::with_capacity(
+        rows.checked_mul(3)
+            .ok_or(UmapError::Overflow("optimizer RNG state"))?,
+    );
+    for value in values {
+        let offset = f64::from(value).to_bits() as i64;
+        for value in base {
+            state.push(value.wrapping_add(offset));
+        }
+    }
+    Ok(Tensor::from_data(
+        TensorData::new(state, [rows, 3]),
+        (device, DType::I64),
+    ))
+}
+
+// The frozen transform oracle retains the original full-embedding readback.
+#[cfg(test)]
 fn optimizer_rng(embedding: &Tensor<2>, seed: u64, device: &Device) -> Result<Tensor<2, Int>> {
     let values = embedding.to_data().try_to_vec::<f32>().map_err(|error| {
         UmapError::Numerical(format!("could not initialize optimizer RNG: {error}"))
@@ -900,6 +1251,55 @@ fn edge_schedule(
             "layout edge arrays have different lengths".into(),
         ));
     }
+    if !shared {
+        let head_rows_u32 =
+            u32::try_from(head_rows).map_err(|_| UmapError::Overflow("layout head offsets"))?;
+        i32::try_from(head_rows).map_err(|_| UmapError::Overflow("layout head offsets"))?;
+        let edges = heads.dims()[0];
+        i32::try_from(edges).map_err(|_| UmapError::Overflow("layout edge id"))?;
+        // Include both scratch and fixed-capacity outputs in this conservative bound.
+        let words = head_rows
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(3))
+            .and_then(|value| value.checked_add(edges.max(1)))
+            .ok_or(UmapError::Overflow("transform CSR allocation"))?;
+        let bytes = words
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(UmapError::Overflow("transform CSR allocation"))?;
+        if bytes > super::query::TRANSFORM_SCRATCH_BUDGET_BYTES {
+            return Err(UmapError::InvalidInput(
+                "transform CSR allocation exceeds the 256 MiB scratch budget".into(),
+            ));
+        }
+        let (offsets, ids) = <Dispatch as StandardUmapOps>::head_csr(
+            heads.clone().into_dispatch(),
+            weights.clone().into_dispatch(),
+            head_rows_u32,
+        );
+        let offsets = Tensor::<1, Int>::from_dispatch(offsets);
+        let marker = offsets
+            .clone()
+            .slice(0..1)
+            .to_data()
+            .try_to_vec::<i32>()
+            .map_err(|error| {
+                UmapError::Numerical(format!("could not read layout CSR marker: {error}"))
+            })?[0];
+        match marker {
+            0 => return Ok((offsets, Tensor::from_dispatch(ids))),
+            -2 => {
+                return Err(UmapError::Numerical(
+                    "layout edge endpoint out of range".into(),
+                ));
+            }
+            -3 => {
+                return Err(UmapError::Numerical(
+                    "layout edge has invalid weight".into(),
+                ));
+            }
+            _ => return Err(UmapError::Numerical("invalid layout CSR marker".into())),
+        }
+    }
     let heads = heads
         .to_data()
         .try_to_vec::<i32>()
@@ -1007,6 +1407,163 @@ fn tensor_embedding(tensor: &Tensor<2>) -> Result<Embedding> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transform_flat_preserves_validation_errors() {
+        let data = (0..16)
+            .map(|row| vec![row as f32, row as f32 * 0.25])
+            .collect::<Vec<_>>();
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 3,
+                n_epochs: Some(0),
+                init: Init::Random,
+                ..Default::default()
+            },
+            crate::standard_umap::BackendChoice::Flex,
+            NeighborSearch::Exact,
+        )
+        .fit(&data)
+        .unwrap();
+        for (nested, flat, rows, features) in [
+            (vec![], vec![], 0, 2),
+            (vec![vec![]], vec![], 1, 0),
+            (vec![vec![1.0]], vec![1.0], 1, 1),
+            (vec![vec![1.0, f32::NAN]], vec![1.0, f32::NAN], 1, 2),
+            (
+                vec![vec![1.0, 2.0], vec![f32::INFINITY, 0.0]],
+                vec![1.0, 2.0, f32::INFINITY, 0.0],
+                2,
+                2,
+            ),
+        ] {
+            assert_eq!(
+                fitted.transform_flat(flat, rows, features).unwrap_err(),
+                fitted.transform(&nested).unwrap_err()
+            );
+        }
+        assert!(matches!(
+            fitted.transform_flat(vec![1.0], 1, 2),
+            Err(UmapError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            fitted.transform_flat(vec![], usize::MAX, 2),
+            Err(UmapError::Overflow("transform input shape"))
+        ));
+    }
+
+    fn weighted_initialization_inputs(device: &Device) -> (Tensor<2>, Tensor<2, Int>, Tensor<2>) {
+        let embedding = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![
+                    -0.125, 1.25, 2.5, -3.75, 4.125, 5.5, -6.25, 7.75, 8.5, -9.125,
+                ],
+                [5, 2],
+            ),
+            device,
+        );
+        let indices = Tensor::<2, Int>::from_data(
+            TensorData::new(
+                vec![
+                    0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0,
+                ],
+                [7, 3],
+            ),
+            device,
+        );
+        let normalized = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![
+                    0.125, 0.25, 0.625, 0.5, 0.125, 0.375, 0.25, 0.625, 0.125, 0.375, 0.25, 0.375,
+                    0.625, 0.125, 0.25, 0.125, 0.625, 0.25, 0.5, 0.25, 0.25,
+                ],
+                [7, 3],
+            ),
+            device,
+        );
+        (embedding, indices, normalized)
+    }
+
+    fn original_weighted_initialization(
+        embedding: &Tensor<2>,
+        indices: &Tensor<2, Int>,
+        normalized: &Tensor<2>,
+    ) -> Tensor<2> {
+        let [query_rows, k] = indices.dims();
+        let components = embedding.dims()[1];
+        let mut initial = Tensor::<2>::zeros([query_rows, components], &embedding.device());
+        for slot in 0..k {
+            let ids = indices
+                .clone()
+                .slice_dim(1, slot..slot + 1)
+                .reshape([query_rows]);
+            let neighbors = embedding.clone().select(0, ids);
+            let weight = normalized
+                .clone()
+                .slice_dim(1, slot..slot + 1)
+                .repeat_dim(1, components);
+            initial = initial.add(neighbors.mul(weight));
+        }
+        initial
+    }
+
+    fn assert_chunked_weighted_initialization_matches_original(
+        device: &Device,
+        scratch_limit_bytes: usize,
+    ) {
+        let (embedding, indices, normalized) = weighted_initialization_inputs(device);
+        let expected = original_weighted_initialization(&embedding, &indices, &normalized);
+        let actual =
+            cuda_weighted_initialization(&embedding, &indices, &normalized, scratch_limit_bytes)
+                .unwrap();
+        let expected_values = expected.to_data().try_to_vec::<f32>().unwrap();
+        let actual_values = actual.to_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(
+            actual_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let query_rows = indices.dims()[0];
+        let components = embedding.dims()[1];
+        let expected_first = expected_values
+            .iter()
+            .step_by(components)
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let actual_first = actual_values
+            .iter()
+            .step_by(components)
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_first, expected_first);
+        let expected_rng = optimizer_rng_from_first_coordinates(
+            expected_values.iter().step_by(components).copied(),
+            query_rows,
+            42,
+            device,
+        )
+        .unwrap()
+        .to_data()
+        .try_to_vec::<i64>()
+        .unwrap();
+        let actual_rng = optimizer_rng_from_first_coordinates(
+            actual_values.iter().step_by(components).copied(),
+            query_rows,
+            42,
+            device,
+        )
+        .unwrap()
+        .to_data()
+        .try_to_vec::<i64>()
+        .unwrap();
+        assert_eq!(actual_rng, expected_rng);
+    }
+
     fn estimator(search: NeighborSearch) -> UMAP {
         UMAP::new(
             UMAPConfig::default(),
@@ -1056,10 +1613,167 @@ mod tests {
     }
 
     #[test]
+    fn first_coordinate_rng_matches_original_full_embedding_bits() {
+        let device = Device::flex();
+        let values = vec![-0.0f32, 99.0, 1.25, -17.0, -3.5, 0.0];
+        let embedding = Tensor::<2>::from_data(TensorData::new(values.clone(), [3, 2]), &device);
+        for seed in [0, 42, u64::MAX] {
+            let original = optimizer_rng(&embedding, seed, &device)
+                .unwrap()
+                .to_data()
+                .try_to_vec::<i64>()
+                .unwrap();
+            let reduced = optimizer_rng_from_first_coordinates(
+                values.chunks_exact(2).map(|row| row[0]),
+                3,
+                seed,
+                &device,
+            )
+            .unwrap()
+            .to_data()
+            .try_to_vec::<i64>()
+            .unwrap();
+            assert_eq!(reduced, original);
+            assert_ne!(&reduced[0..3], &reduced[3..6]);
+        }
+    }
+
+    #[test]
+    fn weighted_initialization_scratch_accounting_checks_limits_and_overflow() {
+        const ROW_BYTES: usize = (2 * 3 * 2 + 3 + 5 * 2) * std::mem::size_of::<f32>();
+        assert_eq!(
+            weighted_initialization_chunk_rows(7, 3, 2, ROW_BYTES),
+            Ok(1)
+        );
+        assert_eq!(
+            weighted_initialization_chunk_rows(7, 3, 2, ROW_BYTES * 2),
+            Ok(2)
+        );
+        assert_eq!(
+            weighted_initialization_chunk_rows(7, 3, 2, ROW_BYTES - 1),
+            Err(UmapError::InvalidInput(
+                "one transform initialization row exceeds the 256 MiB scratch budget".into()
+            ))
+        );
+        assert_eq!(
+            weighted_initialization_chunk_rows(1, usize::MAX, 2, usize::MAX),
+            Err(UmapError::Overflow("transform initialization scratch"))
+        );
+        assert_eq!(
+            weighted_initialization_chunk_rows(usize::MAX, 1, 1, 32),
+            Err(UmapError::Overflow("transform initialization output"))
+        );
+        const TWO_NEIGHBOR_ROW_BYTES: usize = (2 * 2 * 8 + 2 + 5 * 8) * std::mem::size_of::<f32>();
+        assert_eq!(
+            weighted_initialization_chunk_rows(7, 2, 8, TWO_NEIGHBOR_ROW_BYTES * 2),
+            Ok(2)
+        );
+        assert_eq!(
+            weighted_initialization_chunk_rows(7, 2, 8, TWO_NEIGHBOR_ROW_BYTES - 1),
+            Err(UmapError::InvalidInput(
+                "one transform initialization row exceeds the 256 MiB scratch budget".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn chunked_weighted_initialization_matches_original_on_flex() {
+        assert_chunked_weighted_initialization_matches_original(&Device::flex(), 200);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_chunked_weighted_initialization_matches_original_with_small_limit() {
+        let Some(device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+        // Q=7 and two rows per chunk leaves a one-row final chunk.
+        assert_eq!(weighted_initialization_chunk_rows(7, 3, 2, 200), Ok(2));
+        assert_chunked_weighted_initialization_matches_original(&device, 200);
+    }
+
+    #[test]
     fn head_csr_keeps_empty_graph_tensor_nonempty() {
         let (offsets, edge_ids) = build_head_csr(&[0, 1], &[0.0, 0.0], 3).unwrap();
         assert_eq!(offsets, vec![0, 0, 0, 0]);
         assert_eq!(edge_ids, vec![1]);
+    }
+
+    fn device_csr_matches_host(device: &Device) {
+        let cases = [
+            (vec![2, 0, 2, 1, 0, 2], vec![1.0, 0.0, 2.0, 1.0, 3.0, 0.0]),
+            (
+                vec![0, 0, 1, 1, 2, 2, 0, 0],
+                vec![1.0, 0.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0],
+            ),
+            (vec![0, 1, 0], vec![0.0, 0.0, 0.0]),
+        ];
+        for (heads, weights) in cases {
+            let (expected_offsets, expected_ids) = build_head_csr(&heads, &weights, 4).unwrap();
+            let edges = heads.len();
+            for _ in 0..3 {
+                let (offsets, ids) = <Dispatch as StandardUmapOps>::head_csr(
+                    Tensor::<1, Int>::from_data(TensorData::new(heads.clone(), [edges]), device)
+                        .into_dispatch(),
+                    Tensor::<1>::from_data(TensorData::new(weights.clone(), [edges]), device)
+                        .into_dispatch(),
+                    4,
+                );
+                let offsets = Tensor::<1, Int>::from_dispatch(offsets)
+                    .to_data()
+                    .try_to_vec::<i32>()
+                    .unwrap();
+                let ids = Tensor::<1, Int>::from_dispatch(ids)
+                    .to_data()
+                    .try_to_vec::<i32>()
+                    .unwrap();
+                assert_eq!(offsets, expected_offsets);
+                assert_eq!(&ids[..expected_ids.len()], expected_ids);
+            }
+        }
+        for (heads, weights, marker) in [
+            (vec![-1, 0], vec![1.0, 1.0], -2),
+            (vec![4, 0], vec![0.0, 1.0], -2),
+            (vec![0, 1], vec![f32::NAN, 1.0], -3),
+            (vec![0, 1], vec![f32::INFINITY, 1.0], -3),
+            (vec![0, 1], vec![f32::NEG_INFINITY, 1.0], -3),
+            (vec![0, 1], vec![-1.0, 1.0], -3),
+            (vec![0, -1], vec![-1.0, 1.0], -3),
+            (vec![-1, 0], vec![1.0, -1.0], -2),
+        ] {
+            let (offsets, _) = <Dispatch as StandardUmapOps>::head_csr(
+                Tensor::<1, Int>::from_data(TensorData::new(heads, [2]), device).into_dispatch(),
+                Tensor::<1>::from_data(TensorData::new(weights, [2]), device).into_dispatch(),
+                4,
+            );
+            let offsets = Tensor::<1, Int>::from_dispatch(offsets)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap();
+            assert_eq!(offsets[0], marker);
+        }
+    }
+
+    #[test]
+    fn head_csr_device_matches_host_on_flex() {
+        device_csr_matches_host(&Device::flex());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn head_csr_device_matches_host_on_cuda() {
+        if let Some(device) = crate::cuda_backend::device(0) {
+            device_csr_matches_host(&device);
+        } else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+        }
     }
 
     #[test]
@@ -1069,5 +1783,21 @@ mod tests {
         assert!(build_head_csr(&[0], &[f32::NAN], 1).is_err());
         assert!(build_head_csr(&[0], &[-1.0], 1).is_err());
         assert!(build_head_csr(&[0], &[], 1).is_err());
+    }
+
+    #[test]
+    fn transform_graph_marker_errors_checked_per_call() {
+        let device = Device::flex();
+        let valid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0], [1]), &device);
+        let invalid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![-2, 0], [2]), &device);
+        let expected = Err(UmapError::Numerical(
+            "fuzzy graph contains invalid neighbor indices".into(),
+        ));
+
+        assert_eq!(check_graph_marker(&valid_heads), Ok(()));
+        assert_eq!(check_graph_marker(&invalid_heads), expected);
+        assert_eq!(check_graph_marker(&valid_heads), Ok(()));
+        assert_eq!(check_graph_marker(&invalid_heads), expected);
+        assert_eq!(check_graph_marker(&valid_heads), Ok(()));
     }
 }

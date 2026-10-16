@@ -101,6 +101,36 @@ impl crate::backend::StandardUmapOps for CubeBackend {
         )
     }
 
+    fn approximate_query_prevalidated(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+        graph: IntTensor<Self>,
+        k: u32,
+        candidate_capacity: u32,
+        visit_capacity: u32,
+        seed: u64,
+        query_offset: u64,
+    ) -> (IntTensor<Self>, FloatTensor<Self>, IntTensor<Self>) {
+        standard_umap::approximate_query_prevalidated(
+            query,
+            reference,
+            graph,
+            k,
+            candidate_capacity,
+            visit_capacity,
+            seed,
+            query_offset,
+        )
+    }
+
+    fn head_csr(
+        heads: IntTensor<Self>,
+        weights: FloatTensor<Self>,
+        head_rows: u32,
+    ) -> (IntTensor<Self>, IntTensor<Self>) {
+        standard_umap::head_csr(heads, weights, head_rows)
+    }
+
     fn fuzzy_graph(
         indices: IntTensor<Self>,
         distances: FloatTensor<Self>,

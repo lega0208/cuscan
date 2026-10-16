@@ -32,8 +32,12 @@ def load_sample(path: Path, sample_size: int) -> tuple[np.ndarray, list[str | No
         raise ValueError("--sample-size must be positive")
 
     data = pl.scan_parquet(path).select("topic_global", "embedding").collect()
-    # sample = data.sample(n=min(sample_size, data.height), seed=SAMPLE_SEED, shuffle=True)
-    sample = data
+    
+    sample = (
+        data
+        if sample_size >= data.height
+        else data.sample(n=sample_size, seed=SAMPLE_SEED, shuffle=True)
+    )
     if sample.height <= N_NEIGHBORS:
         raise ValueError(
             f"Need at least {N_NEIGHBORS + 1} sampled rows for n_neighbors={N_NEIGHBORS}; "
@@ -86,9 +90,10 @@ def main() -> None:
 
     umap_config = {**config}
     # fast_config = {**config, "device": args.device, "n_epochs": 2500}
+    backend = "flex" if args.device == "cpu" else "cuda"
     fast_config = {
         **{k: v for k, v in config.items() if k != "metric" and k != "verbose"},
-        "backend": "cuda",
+        "backend": backend,
     }
 
     print("starting umap-learn")

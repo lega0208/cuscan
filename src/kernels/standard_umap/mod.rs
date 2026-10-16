@@ -15,9 +15,9 @@ pub(super) mod layout;
 pub(super) mod query;
 
 pub(super) use ann::approximate_neighbors;
-pub(super) use graph::fuzzy_graph;
+pub(super) use graph::{fuzzy_graph, head_csr};
 pub(super) use layout::optimize_epoch;
-pub(super) use query::approximate_query;
+pub(super) use query::{approximate_query, approximate_query_prevalidated};
 
 const DISTANCE_TILE: CubeDim = CubeDim::new_2d(16, 16);
 const NEIGHBOR_CUBE_DIM: CubeDim = CubeDim::new_1d(32);

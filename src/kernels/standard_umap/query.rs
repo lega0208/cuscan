@@ -1,3 +1,6 @@
+use crate::standard_umap::query::{
+    approximate_query_scratch_layout, query_chunk_rows, query_output_allocation,
+};
 use burn::{
     backend::{
         TensorMetadata,
@@ -21,6 +24,9 @@ fn approximate_query_kernel<F: Float, I: Int>(
     visit_capacity: u32,
     seed: u32,
     query_offset: u32,
+    row_start: u32,
+    chunk_rows: u32,
+    validate_graph: u32,
     candidate_ids: &mut Tensor<I>,
     candidate_distances: &mut Tensor<F>,
     candidate_expanded: &mut Tensor<I>,
@@ -31,7 +37,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
     stats: &mut Tensor<I>,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
-    let row = ABSOLUTE_POS_X as usize;
+    let local_row = ABSOLUTE_POS_X as usize;
+    let row = row_start as usize + local_row;
     let query_rows = query.shape(0);
     let reference_rows = reference.shape(0);
     let features = query.shape(1);
@@ -39,18 +46,20 @@ fn approximate_query_kernel<F: Float, I: Int>(
     let c = candidate_capacity as usize;
     let v = visit_capacity as usize;
     let k_usize = k as usize;
-    if row < query_rows {
+    if local_row < chunk_rows as usize && row < query_rows {
         let mut invalid_graph = false;
-        for node in 0..reference_rows {
-            for slot in 0..graph_width {
-                let edge = i32::cast_from(graph[node * graph_width + slot]);
-                if edge < -1 || edge >= reference_rows as i32 {
-                    invalid_graph = true;
+        if validate_graph != 0u32 {
+            for node in 0..reference_rows {
+                for slot in 0..graph_width {
+                    let edge = i32::cast_from(graph[node * graph_width + slot]);
+                    if edge < -1 || edge >= reference_rows as i32 {
+                        invalid_graph = true;
+                    }
                 }
             }
         }
-        let candidate_base = row * c;
-        let seen_base = row * v;
+        let candidate_base = local_row * c;
+        let seen_base = local_row * v;
         for slot in 0..c {
             candidate_ids[candidate_base + slot] = I::cast_from(-1i32);
             candidate_distances[candidate_base + slot] = F::new(3.402_823_5e38_f32);
@@ -267,6 +276,66 @@ pub(crate) fn approximate_query(
     FloatTensor<CubeBackend>,
     IntTensor<CubeBackend>,
 ) {
+    approximate_query_impl(
+        query,
+        reference,
+        graph,
+        k,
+        candidate_capacity,
+        visit_capacity,
+        seed,
+        query_offset,
+        1,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn approximate_query_prevalidated(
+    query: FloatTensor<CubeBackend>,
+    reference: FloatTensor<CubeBackend>,
+    graph: IntTensor<CubeBackend>,
+    k: u32,
+    candidate_capacity: u32,
+    visit_capacity: u32,
+    seed: u64,
+    query_offset: u64,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
+    approximate_query_impl(
+        query,
+        reference,
+        graph,
+        k,
+        candidate_capacity,
+        visit_capacity,
+        seed,
+        query_offset,
+        0,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approximate_query_impl(
+    query: FloatTensor<CubeBackend>,
+    reference: FloatTensor<CubeBackend>,
+    graph: IntTensor<CubeBackend>,
+    k: u32,
+    candidate_capacity: u32,
+    visit_capacity: u32,
+    seed: u64,
+    query_offset: u64,
+    validate_graph: u32,
+    chunk_prevalidated: bool,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
     let query = into_contiguous(query);
     let reference = into_contiguous(reference);
     let graph = into_contiguous(graph);
@@ -279,24 +348,52 @@ pub(crate) fn approximate_query(
     assert_eq!(query.dtype, DType::F32);
     assert_eq!(reference.dtype, DType::F32);
     assert_eq!(graph.dtype, DType::I32);
-    assert!(k > 0 && k as usize <= reference_rows);
-    assert!(candidate_capacity > 0 && candidate_capacity as usize <= reference_rows);
-    assert!(visit_capacity > 0 && visit_capacity as usize <= reference_rows);
+    assert!(k > 0);
+    assert!(candidate_capacity > 0);
+    assert!(visit_capacity > 0);
     assert!(candidate_capacity >= k && visit_capacity >= candidate_capacity);
-    let query_rows_u32 = u32::try_from(query_rows).expect("query block exceeds u32");
+    let _query_rows_u32 = u32::try_from(query_rows).expect("query block exceeds u32");
     let reference_rows_u32 = u32::try_from(reference_rows).expect("reference count exceeds u32");
     i32::try_from(reference_rows).expect("reference indices exceed i32");
     let offset = u32::try_from(query_offset % u64::from(reference_rows_u32))
         .expect("query offset conversion failed");
     let seed = u32::try_from(seed % u64::from(reference_rows_u32)).expect("seed conversion failed");
-    let output_len = query_rows
-        .checked_mul(k as usize)
-        .expect("query output size overflows usize");
-    let candidate_len = query_rows
-        .checked_mul(candidate_capacity as usize)
+    query_rows
+        .checked_mul(features)
+        .expect("query input shape overflows usize");
+    reference_rows
+        .checked_mul(features)
+        .expect("reference input shape overflows usize");
+    reference_rows
+        .checked_mul(graph_width)
+        .expect("query graph shape overflows usize");
+    let k_usize = usize::try_from(k).expect("query width conversion failed");
+    let candidate_capacity_usize =
+        usize::try_from(candidate_capacity).expect("candidate capacity conversion failed");
+    let visit_capacity_usize =
+        usize::try_from(visit_capacity).expect("visit capacity conversion failed");
+    assert!(k_usize <= reference_rows);
+    assert!(candidate_capacity_usize <= reference_rows);
+    assert!(visit_capacity_usize <= reference_rows);
+    let output_allocation = query_output_allocation(query_rows, k_usize)
+        .expect("query output sizes must be checked before backend invocation");
+    let max_chunk_rows = if chunk_prevalidated {
+        approximate_query_scratch_layout(
+            query_rows,
+            candidate_capacity_usize,
+            visit_capacity_usize,
+            graph_width,
+        )
+        .expect("prevalidated query scratch must pass estimator preflight")
+        .max_chunk_rows
+    } else {
+        query_rows
+    };
+    let candidate_len = max_chunk_rows
+        .checked_mul(candidate_capacity_usize)
         .expect("candidate buffer size overflows usize");
-    let visit_len = query_rows
-        .checked_mul(visit_capacity as usize)
+    let visit_len = max_chunk_rows
+        .checked_mul(visit_capacity_usize)
         .expect("visited buffer size overflows usize");
     let index_bytes = |elements: usize| {
         elements
@@ -346,52 +443,58 @@ pub(crate) fn approximate_query(
     let indices = CubeTensor::new_contiguous(
         query.client.clone(),
         query.device.clone(),
-        Shape::new([query_rows, k as usize]),
-        query.client.empty(index_bytes(output_len)),
+        Shape::new([query_rows, k_usize]),
+        query.client.empty(output_allocation.output_indices_bytes),
         DType::I32,
     );
     let distances = CubeTensor::new_contiguous(
         query.client.clone(),
         query.device.clone(),
-        Shape::new([query_rows, k as usize]),
-        query.client.empty(float_bytes(output_len)),
+        Shape::new([query_rows, k_usize]),
+        query.client.empty(output_allocation.output_distances_bytes),
         query.dtype,
     );
     let stats = CubeTensor::new_contiguous(
         query.client.clone(),
         query.device.clone(),
         Shape::new([query_rows, 2]),
-        query.client.empty(index_bytes(
-            query_rows
-                .checked_mul(2)
-                .expect("query stats allocation overflows usize"),
-        )),
+        query.client.empty(output_allocation.stats_bytes),
         DType::I32,
     );
     let client = query.client.clone();
     let query_storage = dtype_to_storage_type(query.dtype);
     let graph_storage = dtype_to_storage_type(graph.dtype);
-    approximate_query_kernel::launch(
-        &client,
-        CubeCount::Static(query_rows_u32, 1, 1),
-        QUERY_CUBE_DIM,
-        query.into_tensor_arg(),
-        reference.into_tensor_arg(),
-        graph.into_tensor_arg(),
-        k,
-        candidate_capacity,
-        visit_capacity,
-        seed,
-        offset,
-        candidate_ids.clone().into_tensor_arg(),
-        candidate_distances.clone().into_tensor_arg(),
-        candidate_expanded.clone().into_tensor_arg(),
-        seen_ids.clone().into_tensor_arg(),
-        seen_distances.clone().into_tensor_arg(),
-        indices.clone().into_tensor_arg(),
-        distances.clone().into_tensor_arg(),
-        stats.clone().into_tensor_arg(),
-        [query_storage, graph_storage],
-    );
+    let mut row_start = 0;
+    while row_start < query_rows {
+        let rows = query_chunk_rows(query_rows, row_start, max_chunk_rows);
+        let row_start_u32 = u32::try_from(row_start).expect("query row start exceeds u32");
+        let rows_u32 = u32::try_from(rows).expect("query chunk exceeds u32");
+        approximate_query_kernel::launch(
+            &client,
+            CubeCount::Static(rows_u32, 1, 1),
+            QUERY_CUBE_DIM,
+            query.clone().into_tensor_arg(),
+            reference.clone().into_tensor_arg(),
+            graph.clone().into_tensor_arg(),
+            k,
+            candidate_capacity,
+            visit_capacity,
+            seed,
+            offset,
+            row_start_u32,
+            rows_u32,
+            validate_graph,
+            candidate_ids.clone().into_tensor_arg(),
+            candidate_distances.clone().into_tensor_arg(),
+            candidate_expanded.clone().into_tensor_arg(),
+            seen_ids.clone().into_tensor_arg(),
+            seen_distances.clone().into_tensor_arg(),
+            indices.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            stats.clone().into_tensor_arg(),
+            [query_storage, graph_storage],
+        );
+        row_start += rows;
+    }
     (indices, distances, stats)
 }

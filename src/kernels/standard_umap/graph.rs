@@ -698,3 +698,311 @@ pub(crate) fn fuzzy_graph(
     );
     (heads, tails, weights, rho, sigma, directed)
 }
+
+#[cube(launch)]
+fn head_csr_zero_kernel<I: Int>(
+    counts: &mut Tensor<I>,
+    ids: &mut Tensor<I>,
+    invalid: &mut Tensor<I>,
+    edge_capacity: u32,
+    #[define(I)] _dtype: ElemType,
+) {
+    let position = ABSOLUTE_POS_X as usize;
+    if position < counts.shape(0) {
+        counts[position] = I::cast_from(0i32);
+    }
+    if position < ids.shape(0) {
+        ids[position] = I::cast_from(1i32);
+    }
+    if position < 2 {
+        invalid[position] = I::cast_from(edge_capacity);
+    }
+}
+
+#[cube(launch)]
+fn head_csr_count_kernel<F: Float, I: Int>(
+    heads: &Tensor<I>,
+    weights: &Tensor<F>,
+    counts: &mut Tensor<Atomic<I>>,
+    invalid: &mut Tensor<Atomic<I>>,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let edge = ABSOLUTE_POS_X as usize;
+    if edge < heads.shape(0) {
+        let head = heads[edge];
+        let weight = weights[edge];
+        let head_valid = head >= I::cast_from(0i32) && head < I::cast_from(counts.shape(0) as u32);
+        let weight_valid = weight >= F::new(0.0f32) && weight <= F::new(f32::MAX);
+        if !head_valid {
+            invalid[0].fetch_min(I::cast_from(edge as u32));
+        }
+        if !weight_valid {
+            invalid[1].fetch_min(I::cast_from(edge as u32));
+        }
+        if head_valid && weight_valid && weight > F::new(0.0f32) {
+            let row = u32::cast_from(head) as usize;
+            counts[row].fetch_add(I::cast_from(1i32));
+        }
+    }
+}
+
+#[cube(launch)]
+fn head_csr_prefix_kernel<I: Int>(
+    counts: &Tensor<I>,
+    offsets: &mut Tensor<I>,
+    cursors: &mut Tensor<Atomic<I>>,
+    #[define(I)] _dtype: ElemType,
+) {
+    if ABSOLUTE_POS_X == 0 {
+        let head_rows = counts.shape(0);
+        let mut running = I::cast_from(0i32);
+        for head in 0..head_rows {
+            offsets[head] = running;
+            cursors[head].store(running);
+            running += counts[head];
+        }
+        offsets[head_rows] = running;
+    }
+}
+
+#[cube(launch)]
+fn head_csr_scatter_kernel<F: Float, I: Int>(
+    heads: &Tensor<I>,
+    weights: &Tensor<F>,
+    cursors: &mut Tensor<Atomic<I>>,
+    ids: &mut Tensor<I>,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let edge = ABSOLUTE_POS_X as usize;
+    if edge < heads.shape(0) {
+        let head = heads[edge];
+        let weight = weights[edge];
+        let head_valid = head >= I::cast_from(0i32) && head < I::cast_from(cursors.shape(0) as u32);
+        let weight_valid = weight >= F::new(0.0f32) && weight <= F::new(f32::MAX);
+        if head_valid && weight_valid && weight > F::new(0.0f32) {
+            let row = u32::cast_from(head) as usize;
+            let position = u32::cast_from(cursors[row].fetch_add(I::cast_from(1i32))) as usize;
+            // Count and scatter use the same validity/filter predicates, so
+            // the cursor cannot advance beyond this fixed-capacity output.
+            ids[position] = I::cast_from(edge as u32);
+        }
+    }
+}
+
+#[cube(launch)]
+fn head_csr_sort_kernel<I: Int>(
+    offsets: &Tensor<I>,
+    ids: &mut Tensor<I>,
+    #[define(I)] _dtype: ElemType,
+) {
+    let head = ABSOLUTE_POS_X as usize;
+    let head_rows = offsets.shape(0) - 1;
+    if head < head_rows {
+        let start = u32::cast_from(offsets[head]) as usize;
+        let end = u32::cast_from(offsets[head + 1]) as usize;
+        let mut position = start + 1;
+        while position < end {
+            let edge_id = ids[position];
+            let mut insert = position;
+            while insert > start {
+                let previous = insert - 1;
+                if ids[previous] < edge_id {
+                    break;
+                }
+                ids[insert] = ids[previous];
+                insert -= 1;
+            }
+            ids[insert] = edge_id;
+            position += 1;
+        }
+    }
+}
+
+#[cube(launch)]
+fn head_csr_marker_kernel<I: Int>(
+    invalid: &Tensor<Atomic<I>>,
+    offsets: &mut Tensor<I>,
+    edge_capacity: u32,
+    #[define(I)] _dtype: ElemType,
+) {
+    if ABSOLUTE_POS_X == 0 {
+        let first_bad_head = invalid[0].load();
+        let first_bad_weight = invalid[1].load();
+        let capacity = I::cast_from(edge_capacity);
+        if first_bad_head < capacity || first_bad_weight < capacity {
+            offsets[0] = if first_bad_head <= first_bad_weight {
+                I::cast_from(-2i32)
+            } else {
+                I::cast_from(-3i32)
+            };
+        }
+    }
+}
+
+pub(crate) fn head_csr(
+    heads: IntTensor<CubeBackend>,
+    weights: FloatTensor<CubeBackend>,
+    head_rows: u32,
+) -> (IntTensor<CubeBackend>, IntTensor<CubeBackend>) {
+    let heads = into_contiguous(heads);
+    let weights = into_contiguous(weights);
+    let [edge_count] = heads.shape().dims::<1>();
+    assert_eq!(
+        weights.shape().dims::<1>(),
+        [edge_count],
+        "layout edge arrays have different lengths"
+    );
+    assert_eq!(heads.dtype, DType::I32, "layout edge heads must be i32");
+    assert_eq!(weights.dtype, DType::F32, "layout edge weights must be f32");
+    assert_eq!(
+        heads.device, weights.device,
+        "layout edge arrays must share a device"
+    );
+    let head_rows = usize::try_from(head_rows).expect("layout head rows exceed usize");
+    assert!(head_rows > 0, "layout head rows must be positive");
+    i32::try_from(head_rows).expect("layout head rows exceed i32");
+    let head_rows_u32 = u32::try_from(head_rows).expect("layout head rows exceed u32");
+    let edge_capacity = u32::try_from(edge_count).expect("layout edge count exceeds u32");
+    i32::try_from(edge_count).expect("layout edge ids exceed i32");
+    let offsets_len = head_rows
+        .checked_add(1)
+        .expect("layout head offsets overflow usize");
+    let _offsets_len_u32 = u32::try_from(offsets_len).expect("layout offsets exceed CubeCL range");
+    let ids_len = edge_count.max(1);
+    let ids_len_u32 = u32::try_from(ids_len).expect("layout ids exceed CubeCL range");
+
+    let index_size = DType::I32.size();
+    let counts_bytes = head_rows
+        .checked_mul(index_size)
+        .expect("head CSR count allocation overflows usize");
+    let cursors_bytes = head_rows
+        .checked_mul(index_size)
+        .expect("head CSR cursor allocation overflows usize");
+    let invalid_bytes = 2usize
+        .checked_mul(index_size)
+        .expect("head CSR validation allocation overflows usize");
+    let offsets_bytes = offsets_len
+        .checked_mul(index_size)
+        .expect("head CSR offsets allocation overflows usize");
+    let ids_bytes = ids_len
+        .checked_mul(index_size)
+        .expect("head CSR ids allocation overflows usize");
+    let scratch_bytes = counts_bytes
+        .checked_add(cursors_bytes)
+        .and_then(|bytes| bytes.checked_add(invalid_bytes))
+        .expect("head CSR scratch allocation overflows usize");
+    let output_bytes = offsets_bytes
+        .checked_add(ids_bytes)
+        .expect("head CSR output allocation overflows usize");
+    let allocation_bytes = scratch_bytes
+        .checked_add(output_bytes)
+        .expect("head CSR total allocation overflows usize");
+    assert!(
+        allocation_bytes <= 256 * 1024 * 1024,
+        "head CSR allocations exceed 256 MiB"
+    );
+
+    let client = heads.client.clone();
+    let device = heads.device.clone();
+    let index_dtype = dtype_to_storage_type(heads.dtype);
+    let weight_dtype = dtype_to_storage_type(weights.dtype);
+    let dtypes = [weight_dtype, index_dtype];
+    let counts = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([head_rows]),
+        client.empty(counts_bytes),
+        DType::I32,
+    );
+    let cursors = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([head_rows]),
+        client.empty(cursors_bytes),
+        DType::I32,
+    );
+    let offsets = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([offsets_len]),
+        client.empty(offsets_bytes),
+        DType::I32,
+    );
+    let ids = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([ids_len]),
+        client.empty(ids_bytes),
+        DType::I32,
+    );
+    let invalid = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([2]),
+        client.empty(invalid_bytes),
+        DType::I32,
+    );
+
+    let zero_units = head_rows_u32.max(ids_len_u32).max(2);
+    head_csr_zero_kernel::launch(
+        &client,
+        CubeCount::Static(zero_units.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
+        GRAPH_CUBE_DIM,
+        counts.clone().into_tensor_arg(),
+        ids.clone().into_tensor_arg(),
+        invalid.clone().into_tensor_arg(),
+        edge_capacity,
+        index_dtype,
+    );
+    if edge_count > 0 {
+        head_csr_count_kernel::launch(
+            &client,
+            CubeCount::Static(edge_capacity.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
+            GRAPH_CUBE_DIM,
+            heads.clone().into_tensor_arg(),
+            weights.clone().into_tensor_arg(),
+            counts.clone().into_tensor_arg(),
+            invalid.clone().into_tensor_arg(),
+            dtypes,
+        );
+    }
+    head_csr_prefix_kernel::launch(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        counts.clone().into_tensor_arg(),
+        offsets.clone().into_tensor_arg(),
+        cursors.clone().into_tensor_arg(),
+        index_dtype,
+    );
+    if edge_count > 0 {
+        head_csr_scatter_kernel::launch(
+            &client,
+            CubeCount::Static(edge_capacity.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
+            GRAPH_CUBE_DIM,
+            heads.into_tensor_arg(),
+            weights.into_tensor_arg(),
+            cursors.into_tensor_arg(),
+            ids.clone().into_tensor_arg(),
+            dtypes,
+        );
+    }
+    head_csr_sort_kernel::launch(
+        &client,
+        CubeCount::Static(head_rows_u32.div_ceil(GRAPH_CUBE_DIM.x), 1, 1),
+        GRAPH_CUBE_DIM,
+        offsets.clone().into_tensor_arg(),
+        ids.clone().into_tensor_arg(),
+        index_dtype,
+    );
+    head_csr_marker_kernel::launch(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        invalid.into_tensor_arg(),
+        offsets.clone().into_tensor_arg(),
+        edge_capacity,
+        index_dtype,
+    );
+    (offsets, ids)
+}

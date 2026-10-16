@@ -133,6 +133,35 @@ pub trait StandardUmapOps: Backend {
         query_offset: u64,
     ) -> (IntTensor<Self>, FloatTensor<Self>, IntTensor<Self>);
 
+    #[fusion(meta = |query, reference, graph, k, candidate_capacity, visit_capacity, seed, query_offset| {
+        let rows = query.shape[0];
+        let shape = [rows, *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), graph.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), query.dtype),
+            burn::backend::fusion::custom::TensorSpec::new([rows, 2].into(), graph.dtype),
+        )
+    })]
+    /// Search a proximity graph previously validated by the caller.
+    ///
+    /// Every graph entry must be `-1` or in `[0, reference.shape(0))`; the
+    /// caller must have validated this graph once (for example, via the fit
+    /// marker and its private validation token). This skips the per-row whole-
+    /// graph scan. If the precondition is violated, per-edge bounds checks
+    /// still protect memory safety, but results are not promised to mark the
+    /// graph with `[-1, -1]` statistics.
+    #[allow(clippy::too_many_arguments)]
+    fn approximate_query_prevalidated(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+        graph: IntTensor<Self>,
+        k: u32,
+        candidate_capacity: u32,
+        visit_capacity: u32,
+        seed: u64,
+        query_offset: u64,
+    ) -> (IntTensor<Self>, FloatTensor<Self>, IntTensor<Self>);
+
     #[fusion(meta = |indices, distances, local_connectivity, bandwidth, set_op_mix_ratio, bipartite, n_reference| {
         let n = indices.shape[0];
         let k = indices.shape[1];
@@ -200,6 +229,40 @@ pub trait StandardUmapOps: Backend {
         query: FloatTensor<Self>,
         reference: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
+
+    #[fusion(meta = |heads, weights, head_rows| {
+        let offsets_len = usize::try_from(*head_rows)
+            .expect("layout head rows exceed usize")
+            .checked_add(1)
+            .expect("layout head offsets overflow usize");
+        let ids_len = heads.shape[0].max(1);
+        (
+            burn::backend::fusion::custom::TensorSpec::new(
+                [offsets_len].into(),
+                burn::tensor::DType::I32,
+            ),
+            burn::backend::fusion::custom::TensorSpec::new(
+                [ids_len].into(),
+                burn::tensor::DType::I32,
+            ),
+        )
+    })]
+    /// Build a stable per-head CSR of positive-weight layout edges.
+    ///
+    /// `offsets` has shape `[head_rows + 1]`; its final value is the valid
+    /// prefix length in `ids`, whose fixed shape is `[heads.len().max(1)]`.
+    /// Each head's prefix segment contains original COO edge positions in
+    /// ascending order. Unused `ids` capacity is initialized to `1`; when the
+    /// valid prefix is empty, this is the same non-empty dummy used by the host
+    /// oracle. Invalid endpoints set `offsets[0]` to `-2`, and non-finite or
+    /// negative weights set it to `-3`. When several edges are invalid, the
+    /// earliest edge wins and an invalid endpoint wins over an invalid weight
+    /// on that same edge.
+    fn head_csr(
+        heads: IntTensor<Self>,
+        weights: FloatTensor<Self>,
+        head_rows: u32,
+    ) -> (IntTensor<Self>, IntTensor<Self>);
 
     #[fusion(meta = |head_embedding, tail_embedding, heads, tails, weights, epochs_per_sample, epoch_of_next_sample, epochs_per_negative_sample, epoch_of_next_negative_sample, rng_state, head_offsets, head_edges, epoch, a, b, gamma, alpha, negative_sample_rate, move_other, shared_embeddings| {
         (

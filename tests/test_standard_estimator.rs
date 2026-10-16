@@ -146,17 +146,21 @@ fn singleton_and_two_row_cases_are_explicit() {
         n_components: 3,
         ..config()
     };
-    let fitted = UMAP::new(singleton_config, BackendChoice::Flex, NeighborSearch::Exact)
-        .fit(&[vec![1.0, 2.0]])
-        .unwrap();
-    assert_eq!(fitted.embedding(), &[vec![0.0, 0.0, 0.0]]);
-    assert!(
-        fitted
-            .transform(&[vec![1.0, 2.0]])
-            .unwrap_err()
-            .to_string()
-            .contains("only a single data sample")
-    );
+    for search in [
+        NeighborSearch::Exact,
+        NeighborSearch::Approximate,
+        NeighborSearch::Auto,
+    ] {
+        let fitted = UMAP::new(singleton_config.clone(), BackendChoice::Flex, search)
+            .fit(&[vec![1.0, 2.0]])
+            .unwrap();
+        assert_eq!(fitted.embedding(), &[vec![0.0, 0.0, 0.0]]);
+        assert_eq!(
+            fitted.transform(&[vec![1.0, 2.0]]).unwrap_err().to_string(),
+            "Transform unavailable when model was fit with only a single data sample.",
+            "single-sample transform error for {search:?}"
+        );
+    }
     let error = UMAP::new(config(), BackendChoice::Flex, NeighborSearch::Exact)
         .fit(&[vec![0.0], vec![1.0]])
         .unwrap_err();
@@ -278,6 +282,57 @@ fn transform_uses_fitted_embedding_and_search_settings() {
 }
 
 #[test]
+fn transform_q1_and_65_are_finite_and_repeatable_for_explicit_search_modes() {
+    let data: Vec<Vec<f32>> = (0..16)
+        .map(|row| {
+            let value = row as f32;
+            vec![value, (value * 0.31).sin()]
+        })
+        .collect();
+    let config = UMAPConfig {
+        n_neighbors: 15,
+        n_epochs: Some(0),
+        init: Init::Random,
+        random_state: Some(41),
+        ..Default::default()
+    };
+
+    for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
+        let fitted = UMAP::new(config.clone(), BackendChoice::Flex, search)
+            .fit(&data)
+            .unwrap();
+        for rows in [1, 65] {
+            let query: Vec<Vec<f32>> = (0..rows)
+                .map(|row| {
+                    let value = row as f32;
+                    vec![value * 0.17 + 0.25, (value * 0.23).cos()]
+                })
+                .collect();
+            let first = fitted.transform(&query).unwrap();
+            assert_eq!(first.len(), rows, "{search:?}, {rows} query rows");
+            assert!(
+                first
+                    .iter()
+                    .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite())),
+                "{search:?}, {rows} query rows"
+            );
+            let repeated = fitted.transform(&query).unwrap();
+            let bits = |embedding: &[Vec<f32>]| {
+                embedding
+                    .iter()
+                    .map(|row| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                bits(&first),
+                bits(&repeated),
+                "{search:?}, {rows} query rows"
+            );
+        }
+    }
+}
+
+#[test]
 fn zero_epochs_returns_scaled_initialization() {
     let fitted = fit(NeighborSearch::Exact, config()).unwrap();
     assert!(
@@ -391,4 +446,50 @@ fn standard_estimator_smoke_runs_on_requested_cuda_device() {
             .flatten()
             .all(|value| value.is_finite())
     );
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn query_diagnostics_preserve_output_and_expose_actual_neighbors() {
+    let data = clustered_data();
+    let query = vec![vec![-8.0, 0.0], vec![8.0, 0.0], vec![0.0, 12.0]];
+    for search in [
+        NeighborSearch::Exact,
+        NeighborSearch::Approximate,
+        NeighborSearch::Auto,
+    ] {
+        let fitted = UMAP::new(config(), BackendChoice::Flex, search)
+            .fit(&data)
+            .unwrap();
+        let original = fitted.embedding().clone();
+        let expected = fitted.transform(&query).unwrap();
+        let (actual, indices) = fitted.diagnostic_transform(&query).unwrap();
+        let bits = |embedding: &Vec<Vec<f32>>| {
+            embedding
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&expected), bits(&actual));
+        assert_eq!(fitted.embedding(), &original);
+        assert_eq!(indices.len(), query.len() * config().n_neighbors);
+        for neighbors in indices.chunks_exact(config().n_neighbors) {
+            let unique: std::collections::HashSet<_> = neighbors.iter().copied().collect();
+            assert_eq!(unique.len(), config().n_neighbors);
+            assert!(
+                neighbors
+                    .iter()
+                    .all(|&id| id >= 0 && (id as usize) < data.len())
+            );
+        }
+        let invalid = vec![vec![f32::NAN, 0.0]];
+        assert_eq!(
+            fitted.transform(&invalid).unwrap_err().to_string(),
+            fitted
+                .diagnostic_transform(&invalid)
+                .unwrap_err()
+                .to_string()
+        );
+    }
 }

@@ -66,6 +66,28 @@ impl StandardUmapOps for burn::backend::Flex {
         )
     }
 
+    fn approximate_query_prevalidated(
+        query: FloatTensor<Self>,
+        reference: FloatTensor<Self>,
+        graph: IntTensor<Self>,
+        k: u32,
+        candidate_capacity: u32,
+        visit_capacity: u32,
+        seed: u64,
+        query_offset: u64,
+    ) -> (IntTensor<Self>, FloatTensor<Self>, IntTensor<Self>) {
+        <Self as StandardUmapOps>::approximate_query(
+            query,
+            reference,
+            graph,
+            k,
+            candidate_capacity,
+            visit_capacity,
+            seed,
+            query_offset,
+        )
+    }
+
     fn fuzzy_graph(
         indices: IntTensor<Self>,
         distances: FloatTensor<Self>,
@@ -232,6 +254,113 @@ impl StandardUmapOps for burn::backend::Flex {
         squared_distances
             .try_into_primitive::<Self>()
             .expect("squared-distance output must remain on Flex")
+    }
+
+    fn head_csr(
+        heads: IntTensor<Self>,
+        weights: FloatTensor<Self>,
+        head_rows: u32,
+    ) -> (IntTensor<Self>, IntTensor<Self>) {
+        let heads: burn::tensor::Tensor<1, burn::tensor::Int> =
+            burn::tensor::Tensor::from_primitive::<Self>(heads);
+        let weights: burn::tensor::Tensor<1> =
+            burn::tensor::Tensor::from_primitive::<Self>(weights);
+        let [edge_count] = heads.dims();
+        assert_eq!(
+            weights.dims(),
+            [edge_count],
+            "layout edge arrays have different lengths"
+        );
+        assert_eq!(
+            heads.dtype(),
+            burn::tensor::DType::I32,
+            "layout edge heads must be i32"
+        );
+        assert_eq!(
+            weights.dtype(),
+            burn::tensor::DType::F32,
+            "layout edge weights must be f32"
+        );
+        let head_rows = usize::try_from(head_rows).expect("layout head rows exceed usize");
+        assert!(head_rows > 0, "layout head rows must be positive");
+        i32::try_from(head_rows).expect("layout head rows exceed i32");
+        u32::try_from(edge_count).expect("layout edge count exceeds u32");
+        i32::try_from(edge_count).expect("layout edge ids exceed i32");
+        let offsets_len = head_rows
+            .checked_add(1)
+            .expect("layout head offsets overflow usize");
+        let ids_len = edge_count.max(1);
+        let host_heads = heads
+            .to_data()
+            .try_to_vec::<i32>()
+            .expect("could not read layout edges");
+        let host_weights = weights
+            .to_data()
+            .try_to_vec::<f32>()
+            .expect("could not read layout weights");
+
+        let mut counts = vec![0usize; head_rows];
+        let mut first_error = None;
+        for (&head, &weight) in host_heads.iter().zip(&host_weights) {
+            let row = usize::try_from(head).ok().filter(|&row| row < head_rows);
+            let valid_weight = weight.is_finite() && weight >= 0.0;
+            if row.is_none() {
+                first_error.get_or_insert(-2i32);
+            }
+            if !valid_weight {
+                first_error.get_or_insert(-3i32);
+            }
+            if let (Some(row), true) = (row, valid_weight) {
+                if weight > 0.0 {
+                    counts[row] = counts[row]
+                        .checked_add(1)
+                        .expect("layout edge count overflows usize");
+                }
+            }
+        }
+
+        let mut offsets = vec![0i32; offsets_len];
+        for row in 0..head_rows {
+            let next = usize::try_from(offsets[row])
+                .expect("layout edge count must be nonnegative")
+                .checked_add(counts[row])
+                .expect("layout edge count overflows usize");
+            offsets[row + 1] = i32::try_from(next).expect("layout edge count exceeds i32");
+        }
+        let mut cursors = offsets[..head_rows].to_vec();
+        let mut ids = vec![1i32; ids_len];
+        for (edge, (&head, &weight)) in host_heads.iter().zip(&host_weights).enumerate() {
+            let Some(row) = usize::try_from(head).ok().filter(|&row| row < head_rows) else {
+                continue;
+            };
+            if !weight.is_finite() || weight < 0.0 || weight == 0.0 {
+                continue;
+            }
+            let position =
+                usize::try_from(cursors[row]).expect("layout CSR cursor must be nonnegative");
+            ids[position] = i32::try_from(edge).expect("layout edge id exceeds i32");
+            cursors[row] = cursors[row]
+                .checked_add(1)
+                .expect("layout CSR cursor overflows i32");
+        }
+        if let Some(marker) = first_error {
+            offsets[0] = marker;
+        }
+
+        let device = heads.device();
+        let offsets = burn::tensor::Tensor::<1, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(offsets, [offsets_len]),
+            &device,
+        )
+        .try_into_primitive::<Self>()
+        .expect("layout CSR offsets must remain on Flex");
+        let ids = burn::tensor::Tensor::<1, burn::tensor::Int>::from_data(
+            burn::tensor::TensorData::new(ids, [ids_len]),
+            &device,
+        )
+        .try_into_primitive::<Self>()
+        .expect("layout CSR edge ids must remain on Flex");
+        (offsets, ids)
     }
 
     #[allow(clippy::too_many_arguments)]

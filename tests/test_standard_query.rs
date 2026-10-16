@@ -13,16 +13,81 @@ fn run_query(
     seed: u64,
     query_offset: u64,
 ) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
-    let (indices, distances, stats) = <Dispatch as StandardUmapOps>::approximate_query(
-        query.into_dispatch(),
-        reference.into_dispatch(),
-        graph.into_dispatch(),
+    run_query_with_entry(
+        query,
+        reference,
+        graph,
         k,
         candidate_capacity,
         visit_capacity,
         seed,
         query_offset,
-    );
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prevalidated_query(
+    query: Tensor<2>,
+    reference: Tensor<2>,
+    graph: Tensor<2, Int>,
+    k: u32,
+    candidate_capacity: u32,
+    visit_capacity: u32,
+    seed: u64,
+    query_offset: u64,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    run_query_with_entry(
+        query,
+        reference,
+        graph,
+        k,
+        candidate_capacity,
+        visit_capacity,
+        seed,
+        query_offset,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_query_with_entry(
+    query: Tensor<2>,
+    reference: Tensor<2>,
+    graph: Tensor<2, Int>,
+    k: u32,
+    candidate_capacity: u32,
+    visit_capacity: u32,
+    seed: u64,
+    query_offset: u64,
+    prevalidated: bool,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let query = query.into_dispatch();
+    let reference = reference.into_dispatch();
+    let graph = graph.into_dispatch();
+    let (indices, distances, stats) = if prevalidated {
+        <Dispatch as StandardUmapOps>::approximate_query_prevalidated(
+            query,
+            reference,
+            graph,
+            k,
+            candidate_capacity,
+            visit_capacity,
+            seed,
+            query_offset,
+        )
+    } else {
+        <Dispatch as StandardUmapOps>::approximate_query(
+            query,
+            reference,
+            graph,
+            k,
+            candidate_capacity,
+            visit_capacity,
+            seed,
+            query_offset,
+        )
+    };
     (
         Tensor::<2, Int>::from_dispatch(indices)
             .into_data()
@@ -206,12 +271,40 @@ fn approximate_query_orders_equal_distances_by_reference_id() {
 
 #[test]
 fn approximate_query_marks_invalid_graph_indices_in_stats() {
+    assert_invalid_graph_indices_in_stats(&Device::flex());
+}
+
+#[test]
+fn approximate_query_prevalidated_matches_validating_entry_on_flex() {
     let device = Device::flex();
-    let reference = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0], [2, 1]), &device);
-    let query = Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), &device);
-    let graph = Tensor::<2, Int>::from_data(TensorData::new(vec![2, -1], [2, 1]), &device);
-    let (_, _, stats) = run_query(query, reference, graph, 1, 1, 1, 0, 0);
-    assert_eq!(stats, [-1, -1]);
+    let (query, reference, graph) = inputs(&device);
+    let validating = run_query(
+        query.clone(),
+        reference.clone(),
+        graph.clone(),
+        2,
+        4,
+        10,
+        19,
+        40,
+    );
+    let prevalidated = run_prevalidated_query(query, reference, graph, 2, 4, 10, 19, 40);
+    assert_eq!(prevalidated, validating);
+}
+
+fn assert_invalid_graph_indices_in_stats(device: &Device) {
+    let reference =
+        Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0], [4, 1]), device);
+    let query = Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device);
+    for invalid_index in [i32::MIN, -2, 4, i32::MAX] {
+        // Put the invalid edge in an otherwise disconnected, non-start row:
+        // validation covers arbitrary graph contents, not just visited edges.
+        let mut graph = vec![-1; 4 * 2];
+        graph[7] = invalid_index;
+        let graph = Tensor::<2, Int>::from_data(TensorData::new(graph, [4, 2]), device);
+        let (_, _, stats) = run_query(query.clone(), reference.clone(), graph, 1, 1, 1, 0, 0);
+        assert_eq!(stats, [-1, -1], "invalid graph index {invalid_index}");
+    }
 }
 
 #[test]
@@ -300,4 +393,145 @@ fn approximate_query_runs_on_cuda_when_requested() {
         4
     );
     assert_eq!(stats, [4, 4]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn approximate_query_prevalidated_matches_validating_entry_on_cuda() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
+            panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+    let (query, reference, graph) = inputs(&device);
+    let validating = run_query(
+        query.clone(),
+        reference.clone(),
+        graph.clone(),
+        2,
+        4,
+        10,
+        19,
+        40,
+    );
+    let prevalidated = run_prevalidated_query(query, reference, graph, 2, 4, 10, 19, 40);
+    assert_eq!(prevalidated.0, validating.0, "indices differ");
+    assert_eq!(prevalidated.1, validating.1, "distances differ");
+    assert_eq!(prevalidated.2, validating.2, "stats differ");
+    assert!(!prevalidated.2.contains(&-1));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn approximate_query_prevalidated_chunks_large_cuda_batch_with_flex_oracle() {
+    let Some(cuda_device) = fast_umap::cuda_backend::device(0) else {
+        if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
+            panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+
+    let n = 5_000usize;
+    let query_rows = 7_000usize;
+    let k = 15;
+    let candidates = 15;
+    let visits = 5_000;
+    let seed = 42u64;
+    let query_offset = 17u64;
+    let scratch_budget = 256 * 1024 * 1024;
+    let scratch_per_row = usize::try_from(candidates).unwrap() * (4 + 4 + 4)
+        + usize::try_from(visits).unwrap() * (4 + 4)
+        + (4 + 4)
+        + 32 * 4;
+    let max_chunk_rows = scratch_budget / scratch_per_row;
+    assert!(query_rows * scratch_per_row > scratch_budget);
+    assert!(max_chunk_rows < query_rows);
+    assert_ne!(query_rows % max_chunk_rows, 0);
+    let reference_values = (0..n).map(|row| row as f32).collect::<Vec<_>>();
+    let graph_values = (0..n).map(|row| row as i32).collect::<Vec<_>>();
+    let query_values = vec![0.5f32; query_rows];
+
+    let cuda_reference = Tensor::<2>::from_data(
+        TensorData::new(reference_values.clone(), [n, 1]),
+        &cuda_device,
+    );
+    let cuda_query = Tensor::<2>::from_data(
+        TensorData::new(query_values.clone(), [query_rows, 1]),
+        &cuda_device,
+    );
+    let cuda_graph =
+        Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), &cuda_device);
+    let actual = run_prevalidated_query(
+        cuda_query,
+        cuda_reference,
+        cuda_graph,
+        k,
+        candidates,
+        visits,
+        seed,
+        query_offset,
+    );
+
+    let flex_device = Device::flex();
+    let flex_reference =
+        Tensor::<2>::from_data(TensorData::new(reference_values, [n, 1]), &flex_device);
+    let flex_query =
+        Tensor::<2>::from_data(TensorData::new(query_values, [query_rows, 1]), &flex_device);
+    let flex_graph =
+        Tensor::<2, Int>::from_data(TensorData::new(graph_values, [n, 1]), &flex_device);
+
+    // CUDA's existing seed key is modulo N; Flex's is modulo the Park–Miller
+    // modulus. Split at each CUDA key wrap and offset the Flex oracle so its
+    // unchanged production RNG generates the same starting keys. The
+    // self-edge graph makes visits=15 output-equivalent to CUDA visits=5000.
+    let n_u64 = u64::try_from(n).unwrap();
+    let mut expected = (Vec::new(), Vec::new(), Vec::new());
+    let mut row_start = 0usize;
+    while row_start < query_rows {
+        let query_key = (query_offset % n_u64 + u64::try_from(row_start % n).unwrap()) % n_u64;
+        let rng_key = (seed % n_u64 + query_key) % n_u64;
+        let rows_until_wrap = usize::try_from(n_u64 - rng_key).unwrap();
+        let end = row_start + rows_until_wrap.min(query_rows - row_start);
+        let query_chunk = flex_query.clone().slice([row_start..end, 0..1]);
+        let chunk = run_prevalidated_query(
+            query_chunk,
+            flex_reference.clone(),
+            flex_graph.clone(),
+            k,
+            candidates,
+            candidates,
+            0,
+            rng_key,
+        );
+        expected.0.extend(chunk.0);
+        expected.1.extend(chunk.1);
+        expected.2.extend(chunk.2);
+        row_start = end;
+    }
+
+    assert_eq!(actual.0, expected.0, "chunked CUDA indices differ");
+    assert_eq!(actual.1, expected.1, "chunked CUDA distances differ");
+    assert_eq!(actual.2, expected.2, "chunked CUDA stats differ");
+    assert!(
+        actual
+            .2
+            .chunks_exact(2)
+            .all(|stats| stats[0] == 15 && stats[1] == 15)
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn approximate_query_marks_invalid_graph_indices_in_stats_on_cuda() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
+            panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+    assert_invalid_graph_indices_in_stats(&device);
 }

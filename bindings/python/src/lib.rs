@@ -13,7 +13,7 @@ use fast_umap::{
     validate_parametric_umap_data,
 };
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -48,22 +48,98 @@ impl FittedUMAP {
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f32>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        self.transform_owned(py, x, false).map(|(array, _)| array)
+    }
+
+    /// Timed diagnostic for verifying GIL release around the native transform.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    fn _timed_transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, u64, u64)> {
+        let (array, timing) = self.transform_owned(py, x, true)?;
+        let (start_ns, end_ns) = timing.expect("timed transform captures native timestamps");
+        Ok((array, start_ns, end_ns))
+    }
+
+    /// Untimed diagnostic exposing the actual neighbor IDs used by transform.
+    #[cfg(feature = "tracing")]
+    fn _diagnostic_transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i32>>)> {
         let data: Vec<Vec<f32>> = x
             .as_array()
             .rows()
             .into_iter()
             .map(|row| row.to_vec())
             .collect();
-        let embedding = self.inner.transform(&data).map_err(map_umap_error)?;
+        let (embedding, indices) = self
+            .inner
+            .diagnostic_transform(&data)
+            .map_err(map_umap_error)?;
         let rows = embedding.len();
-        let columns = embedding
-            .first()
-            .map_or(self.inner.embedding()[0].len(), Vec::len);
+        let columns = self.inner.embedding()[0].len();
+        let width = indices.len() / rows;
         let values = embedding.into_iter().flatten().collect();
-        Ok(Array2::from_shape_vec((rows, columns), values)
-            .expect("transform output is rectangular")
-            .into_pyarray(py))
+        Ok((
+            Array2::from_shape_vec((rows, columns), values)
+                .expect("transform output is rectangular")
+                .into_pyarray(py),
+            Array2::from_shape_vec((rows, width), indices)
+                .expect("neighbor diagnostics are rectangular")
+                .into_pyarray(py),
+        ))
     }
+}
+
+impl FittedUMAP {
+    fn transform_owned<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        timed: bool,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Option<(u64, u64)>)> {
+        let shape = x.shape();
+        let (n_rows, n_features) = (shape[0], shape[1]);
+        let data = if x.is_c_contiguous() {
+            x.as_slice()
+                .expect("C-contiguous input has a slice")
+                .to_vec()
+        } else {
+            x.as_array()
+                .as_standard_layout()
+                .into_owned()
+                .into_raw_vec_and_offset()
+                .0
+        };
+        drop(x);
+
+        let n_components = self.inner.embedding()[0].len();
+        let inner = &self.inner;
+        let (result, timing) = py.detach(move || {
+            let start_ns = timed.then(unix_time_ns);
+            let result = inner.transform_flat(data, n_rows, n_features);
+            let timing = start_ns.map(|start_ns| (start_ns, unix_time_ns()));
+            (result, timing)
+        });
+        let values = result.map_err(map_umap_error)?;
+        let array = Array2::from_shape_vec((n_rows, n_components), values)
+            .expect("flat transform output shape is validated by Rust");
+        Ok((array.into_pyarray(py), timing))
+    }
+}
+
+fn unix_time_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos()
+        .try_into()
+        .expect("native diagnostic timestamp fits u64 nanoseconds")
 }
 
 fn map_umap_error(error: UmapError) -> PyErr {
@@ -355,9 +431,10 @@ fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "parametric")]
     module.add_class::<FittedParametricUMAP>()?;
-    module.add_class::<FittedUMAP>()?;
     #[cfg(feature = "parametric")]
     module.add_function(wrap_pyfunction!(fit_parametric_umap, module)?)?;
+
+    module.add_class::<FittedUMAP>()?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
     Ok(())
 }

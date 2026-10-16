@@ -1,4 +1,7 @@
 import os
+import threading
+import time
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -122,6 +125,55 @@ def test_transform_held_out_sample_near_cluster() -> None:
     )
 
 
+def test_native_transform_accepts_contiguous_and_strided_inputs() -> None:
+    x, _ = blobs(12)
+    model = estimator().fit(x)
+    native_model = model._model
+    expected = native_model.transform(x)
+
+    transposed = np.ascontiguousarray(x.T).T
+    reverse_strided = np.ascontiguousarray(x[::-1, ::-1])[::-1, ::-1]
+    assert not transposed.flags.c_contiguous
+    assert not reverse_strided.flags.c_contiguous
+    assert any(stride < 0 for stride in reverse_strided.strides)
+
+    np.testing.assert_array_equal(native_model.transform(transposed), expected)
+    np.testing.assert_array_equal(native_model.transform(reverse_strided), expected)
+
+
+def test_native_transform_rejects_invalid_shape_and_nonfinite_values() -> None:
+    x, _ = blobs(12)
+    native_model = estimator().fit(x)._model
+
+    with pytest.raises(ValueError, match="features"):
+        native_model.transform(np.zeros((2, x.shape[1] + 1), dtype=np.float32))
+    nonfinite = np.zeros((2, x.shape[1]), dtype=np.float32)
+    nonfinite[1, 0] = np.nan
+    with pytest.raises(ValueError, match="not finite"):
+        native_model.transform(nonfinite)
+
+
+def test_native_fitted_model_rejects_transform_from_another_thread() -> None:
+    x, _ = blobs(12)
+    native_model = estimator().fit(x)._model
+    errors: list[BaseException] = []
+
+    def transform_from_worker() -> None:
+        try:
+            native_model.transform(x[:1])
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=transform_from_worker)
+    worker.start()
+    worker.join()
+
+    assert len(errors) == 1
+    assert type(errors[0]).__name__ == "PanicException"
+    assert type(errors[0]).__module__ == "pyo3_runtime"
+    assert "FittedUMAP is unsendable, but sent to another thread" in str(errors[0])
+
+
 def test_singleton_is_zero_and_transform_error_is_preserved() -> None:
     model = estimator().fit(np.array([[2.0, 3.0]], dtype=np.float32))
     np.testing.assert_array_equal(model.embedding_, np.zeros((1, 2), dtype=np.float32))
@@ -155,3 +207,46 @@ def test_cuda_backend() -> None:
     result = estimator(backend="cuda").fit_transform(x)
     assert result.shape == (len(x), 2)
     assert np.isfinite(result).all()
+
+
+@pytest.mark.skipif(
+    os.environ.get("FAST_UMAP_REQUIRE_CUDA") != "1",
+    reason="CUDA required only in CUDA validation runs",
+)
+def test_cuda_transform_releases_gil_for_at_least_half_second() -> None:
+    x, _ = blobs(12)
+    model = estimator(backend="cuda", init="random", neighbor_search="exact", n_epochs=200).fit(x)
+    query = np.random.default_rng(23).normal(size=(8192, x.shape[1])).astype(np.float32)
+
+    stop = threading.Event()
+    started = threading.Event()
+    counter_timestamps: list[int] = []
+
+    def count_during_native_transform() -> None:
+        while not stop.is_set():
+            counter_timestamps.append(time.time_ns())
+            started.set()
+            time.sleep(0.001)
+
+    counter = threading.Thread(target=count_during_native_transform)
+    counter.start()
+    assert started.wait(timeout=5)
+    try:
+        output, start_ns, end_ns = model._model._timed_transform(query)  # ty: ignore[unresolved-attribute]
+    finally:
+        stop.set()
+        counter.join(timeout=5)
+
+    assert not counter.is_alive()
+    assert end_ns - start_ns >= 500_000_000, "native CUDA transform took less than 500 ms"
+    during_transform = [stamp for stamp in counter_timestamps if start_ns <= stamp <= end_ns]
+    print(
+        f"native_transform_ns={end_ns - start_ns} "
+        f"counter_ticks_inside_native={len(during_transform)}"
+    )
+    assert len(during_transform) >= 10, "fewer than ten Python counter ticks overlapped native work"
+    assert all(later - earlier >= 1_000_000 for earlier, later in pairwise(during_transform)), (
+        "Python counter ticks were less than 1 ms apart"
+    )
+    assert output.shape == (len(query), model.n_components)
+    assert np.isfinite(output).all()
