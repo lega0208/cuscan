@@ -662,13 +662,16 @@ fn run_recall(device: Device) {
     }
     let fit_recall = fit_weighted_hits as f64 / fit_weighted_rows as f64;
     let query_recall = query_weighted_hits as f64 / query_weighted_rows as f64;
+    #[cfg(feature = "cpu")]
+    let device_name = if device == Device::cpu() {
+        "CPU"
+    } else {
+        "CUDA"
+    };
+    #[cfg(not(feature = "cpu"))]
+    let device_name = "CUDA";
     eprintln!(
-        "{} ANN tie-aware recall: fit@14={fit_recall:.6}, transform-query@15={query_recall:.6}",
-        if device == Device::cpu() {
-            "CPU"
-        } else {
-            "CUDA"
-        }
+        "{device_name} ANN tie-aware recall: fit@14={fit_recall:.6}, transform-query@15={query_recall:.6}"
     );
     assert!(
         fit_recall >= RECALL_LIMIT,
@@ -681,11 +684,13 @@ fn run_recall(device: Device) {
 }
 
 #[test]
+#[cfg(feature = "cpu")]
 fn standard_ann_recall_on_cpu() {
     run_recall(Device::cpu());
 }
 
 #[test]
+#[cfg(feature = "cpu")]
 fn standard_quality_trustworthiness_on_cpu() {
     run_quality(Device::cpu());
 }
@@ -999,6 +1004,7 @@ fn fit_without_dense_matrix(backend: BackendChoice, rows: usize) {
 
 /// A dense N x N f32 matrix at N=20,000 needs 1.6 GB; the sparse pipeline
 /// stays O(N*K). Measured ~40 s in release on a Ryzen 7 9800X3D.
+#[cfg(feature = "cpu")]
 #[test]
 fn cpu_fit_larger_than_dense_memory_budget_completes() {
     let rows = 20_000usize;

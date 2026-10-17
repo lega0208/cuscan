@@ -1721,6 +1721,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn first_coordinate_rng_matches_original_full_embedding_bits() {
         let device = Device::cpu();
         let values = vec![-0.0f32, 99.0, 1.25, -17.0, -3.5, 0.0];
@@ -1785,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn chunked_weighted_initialization_matches_original_on_cpu() {
         assert_chunked_weighted_initialization_matches_original(&Device::cpu(), 200);
     }
@@ -1867,6 +1869,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn head_csr_device_matches_host_on_cpu() {
         device_csr_matches_host(&Device::cpu());
     }
@@ -1894,6 +1897,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn transform_graph_marker_errors_checked_per_call() {
         let device = Device::cpu();
         let valid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0], [1]), &device);

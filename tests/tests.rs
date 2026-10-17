@@ -33,8 +33,14 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // CubeCL CPU device
 // ---------------------------------------------------------------------------
+#[cfg(feature = "cpu")]
 fn cpu() -> Device {
     Device::cpu()
+}
+
+#[cfg(all(not(feature = "cpu"), feature = "cuda"))]
+fn cpu() -> Device {
+    fast_umap::cuda_backend::device(0).expect("CUDA device required for CUDA-only tests")
 }
 
 // ===========================================================================
@@ -633,11 +639,13 @@ fn assert_umap_ops_dispatch_and_gradients(device: Device) {
 }
 
 #[test]
+#[cfg(feature = "cpu")]
 fn cpu_umap_ops_dispatch_and_gradients() {
     assert_umap_ops_dispatch_and_gradients(Device::cpu().autodiff());
 }
 
 #[test]
+#[cfg(feature = "cpu")]
 fn cpu_knn_f64_dispatch_preserves_order_dtype_and_backward() {
     let device = Device::cpu().autodiff();
     let pairwise = Tensor::<2>::from_data(

@@ -570,6 +570,22 @@ fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
             .chunks_exact(2)
             .all(|stats| stats[0] == 15 && stats[1] == 15)
     );
+
+    let mut invalid_graph_values = graph_values;
+    invalid_graph_values[n - 1] = -2;
+    let invalid_graph =
+        Tensor::<2, Int>::from_data(TensorData::new(invalid_graph_values, [n, 1]), device);
+    let (_, _, invalid_stats) = run_query(
+        Tensor::<2>::from_data(TensorData::new(query_values, [query_rows, 1]), device),
+        Tensor::<2>::from_data(TensorData::new(reference_values, [n, 1]), device),
+        invalid_graph,
+        k,
+        candidates,
+        visits,
+        seed,
+        query_offset,
+    );
+    assert_eq!(invalid_stats, vec![-1; query_rows * 2]);
 }
 
 #[cfg(feature = "cuda")]

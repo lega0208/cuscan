@@ -123,7 +123,8 @@ pub trait StandardUmapOps: Backend {
     })]
     /// Search a proximity graph with bounded retained and unique-evaluation capacities.
     /// The last result contains `[peak_candidates, unique_evaluations]` per query;
-    /// invalid graph indices are marked by `[-1, -1]`.
+    /// invalid graph indices anywhere in the graph are validated once per call and
+    /// mark every query with `[-1, -1]` statistics.
     #[allow(clippy::too_many_arguments)]
     fn approximate_query(
         query: FloatTensor<Self>,

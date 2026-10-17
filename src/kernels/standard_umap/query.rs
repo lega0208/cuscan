@@ -15,6 +15,34 @@ use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 const QUERY_CUBE_DIM: CubeDim = CubeDim::new_1d(1);
 
 #[cube(launch)]
+fn query_flag_zero_kernel<I: Int>(flag: &mut Tensor<I>, #[define(I)] _dtype: ElemType) {
+    if ABSOLUTE_POS_X == 0 {
+        flag[0] = I::cast_from(0u32);
+    }
+}
+
+#[cube(launch)]
+fn query_validate_graph_kernel<I: Int>(
+    graph: &Tensor<I>,
+    reference_rows: u32,
+    row_start: u32,
+    invalid_flag: &mut Tensor<Atomic<I>>,
+    #[define(I)] _dtype: ElemType,
+) {
+    let row = row_start as usize + ABSOLUTE_POS_X as usize;
+    let reference_count = graph.shape(0);
+    let graph_width = graph.shape(1);
+    if row < reference_count {
+        for slot in 0..graph_width {
+            let edge = i32::cast_from(graph[row * graph_width + slot]);
+            if edge < -1 || edge >= reference_rows as i32 {
+                invalid_flag[0].fetch_max(I::cast_from(1u32));
+            }
+        }
+    }
+}
+
+#[cube(launch)]
 fn approximate_query_kernel<F: Float, I: Int>(
     query: &Tensor<F>,
     reference: &Tensor<F>,
@@ -26,7 +54,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
     query_offset: u32,
     row_start: u32,
     chunk_rows: u32,
-    validate_graph: u32,
+    invalid_flag: ComptimeOption<&Tensor<I>>,
+    #[comptime] checked: bool,
     candidate_ids: &mut Tensor<I>,
     candidate_distances: &mut Tensor<F>,
     candidate_expanded: &mut Tensor<I>,
@@ -48,15 +77,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
     let k_usize = k as usize;
     if local_row < chunk_rows as usize && row < query_rows {
         let mut invalid_graph = false;
-        if validate_graph != 0u32 {
-            for node in 0..reference_rows {
-                for slot in 0..graph_width {
-                    let edge = i32::cast_from(graph[node * graph_width + slot]);
-                    if edge < -1 || edge >= reference_rows as i32 {
-                        invalid_graph = true;
-                    }
-                }
-            }
+        if checked {
+            invalid_graph = i32::cast_from(invalid_flag.unwrap()[0]) != 0;
         }
         let candidate_base = local_row * c;
         let seen_base = local_row * v;
@@ -285,8 +307,7 @@ pub(crate) fn approximate_query(
         visit_capacity,
         seed,
         query_offset,
-        1,
-        false,
+        true,
     )
 }
 
@@ -314,8 +335,7 @@ pub(crate) fn approximate_query_prevalidated(
         visit_capacity,
         seed,
         query_offset,
-        0,
-        true,
+        false,
     )
 }
 
@@ -329,8 +349,7 @@ fn approximate_query_impl(
     visit_capacity: u32,
     seed: u64,
     query_offset: u64,
-    validate_graph: u32,
-    chunk_prevalidated: bool,
+    checked: bool,
 ) -> (
     IntTensor<CubeBackend>,
     FloatTensor<CubeBackend>,
@@ -377,18 +396,14 @@ fn approximate_query_impl(
     assert!(visit_capacity_usize <= reference_rows);
     let output_allocation = query_output_allocation(query_rows, k_usize)
         .expect("query output sizes must be checked before backend invocation");
-    let max_chunk_rows = if chunk_prevalidated {
-        approximate_query_scratch_layout(
-            query_rows,
-            candidate_capacity_usize,
-            visit_capacity_usize,
-            graph_width,
-        )
-        .expect("prevalidated query scratch must pass estimator preflight")
-        .max_chunk_rows
-    } else {
-        query_rows
-    };
+    let max_chunk_rows = approximate_query_scratch_layout(
+        query_rows,
+        candidate_capacity_usize,
+        visit_capacity_usize,
+        graph_width,
+    )
+    .expect("query scratch must pass estimator preflight")
+    .max_chunk_rows;
     let candidate_len = max_chunk_rows
         .checked_mul(candidate_capacity_usize)
         .expect("candidate buffer size overflows usize");
@@ -464,6 +479,56 @@ fn approximate_query_impl(
     let client = query.client.clone();
     let query_storage = dtype_to_storage_type(query.dtype);
     let graph_storage = dtype_to_storage_type(graph.dtype);
+    let invalid_flag = if checked {
+        Some(CubeTensor::new_contiguous(
+            client.clone(),
+            query.device.clone(),
+            Shape::new([1]),
+            client.empty(DType::I32.size()),
+            DType::I32,
+        ))
+    } else {
+        None
+    };
+    if checked {
+        let validation_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
+        let validation_rows_per_cube = usize::try_from(validation_dim.num_elems())
+            .expect("validation cube size exceeds usize");
+        let max_validation_cubes = usize::try_from(client.properties().hardware.max_cube_count.0)
+            .expect("maximum validation cube count exceeds usize");
+        let max_validation_rows = max_validation_cubes
+            .checked_mul(validation_rows_per_cube)
+            .expect("maximum validation segment size overflows usize");
+        assert!(max_validation_rows > 0);
+        let invalid_flag_tensor = invalid_flag.as_ref().unwrap();
+        query_flag_zero_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            invalid_flag_tensor.clone().into_tensor_arg(),
+            graph_storage,
+        );
+        let mut validation_row_start = 0usize;
+        while validation_row_start < reference_rows {
+            let rows = (reference_rows - validation_row_start).min(max_validation_rows);
+            let validation_cubes = rows.div_ceil(validation_rows_per_cube);
+            query_validate_graph_kernel::launch(
+                &client,
+                CubeCount::Static(
+                    u32::try_from(validation_cubes).expect("validation cube count exceeds u32"),
+                    1,
+                    1,
+                ),
+                validation_dim,
+                graph.clone().into_tensor_arg(),
+                reference_rows_u32,
+                u32::try_from(validation_row_start).expect("validation row start exceeds u32"),
+                invalid_flag_tensor.clone().into_tensor_arg(),
+                graph_storage,
+            );
+            validation_row_start += rows;
+        }
+    }
     let mut row_start = 0;
     while row_start < query_rows {
         let rows = query_chunk_rows(query_rows, row_start, max_chunk_rows);
@@ -488,7 +553,11 @@ fn approximate_query_impl(
             offset,
             row_start_u32,
             rows_u32,
-            validate_graph,
+            match invalid_flag.as_ref() {
+                Some(flag) => ComptimeOptionArgs::Some(flag.clone().into_tensor_arg()),
+                None => ComptimeOptionArgs::None,
+            },
+            checked,
             candidate_ids.clone().into_tensor_arg(),
             candidate_distances.clone().into_tensor_arg(),
             candidate_expanded.clone().into_tensor_arg(),

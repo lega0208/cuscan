@@ -9,13 +9,106 @@ use burn::{
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
+const GLOBAL_SUM_CHUNK_SIZE: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SmoothThresholds {
+    floor_connectivity: u32,
+    fraction: f32,
+    minimum_positive: u32,
+    interpolate: bool,
+}
+
+fn smooth_thresholds(local_connectivity: f32, k: usize) -> SmoothThresholds {
+    let floor_connectivity = local_connectivity as usize;
+    let fraction = local_connectivity - floor_connectivity as f32;
+    let minimum_positive = (local_connectivity as usize).saturating_add(
+        if local_connectivity > floor_connectivity as f32 {
+            1
+        } else {
+            0
+        },
+    );
+    // k is bounded by the checked COO capacity (<= i32::MAX / 2), so k + 1
+    // fits in u32. Any threshold above k is behaviorally equivalent: no row
+    // can meet it, and rank searches cannot select a rank beyond the row.
+    let above_width = k + 1;
+    SmoothThresholds {
+        floor_connectivity: u32::try_from(floor_connectivity.min(above_width)).unwrap(),
+        fraction,
+        minimum_positive: u32::try_from(minimum_positive.min(above_width)).unwrap(),
+        interpolate: fraction > 1e-5f32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SmoothThresholds, smooth_thresholds};
+
+    #[test]
+    fn smooth_thresholds_preserve_f32_boundary_expressions() {
+        for (local_connectivity, expected) in [
+            (
+                0.0,
+                SmoothThresholds {
+                    floor_connectivity: 0,
+                    fraction: 0.0,
+                    minimum_positive: 0,
+                    interpolate: false,
+                },
+            ),
+            (
+                1.0,
+                SmoothThresholds {
+                    floor_connectivity: 1,
+                    fraction: 0.0,
+                    minimum_positive: 1,
+                    interpolate: false,
+                },
+            ),
+            (
+                1.5,
+                SmoothThresholds {
+                    floor_connectivity: 1,
+                    fraction: 0.5,
+                    minimum_positive: 2,
+                    interpolate: true,
+                },
+            ),
+            (
+                1.00001,
+                SmoothThresholds {
+                    floor_connectivity: 1,
+                    fraction: 1.00001 - 1.0,
+                    minimum_positive: 2,
+                    interpolate: true,
+                },
+            ),
+        ] {
+            assert_eq!(smooth_thresholds(local_connectivity, 4), expected);
+        }
+        assert_eq!(
+            smooth_thresholds(f32::MAX, 4),
+            SmoothThresholds {
+                floor_connectivity: 5,
+                fraction: f32::MAX - (usize::MAX as f32),
+                minimum_positive: 5,
+                interpolate: true,
+            }
+        );
+    }
+}
+
 #[cube]
 fn smooth_row<F: Float>(
     distances: &Tensor<F>,
+    global_mean: &Tensor<F>,
     row: usize,
-    n: usize,
     k: usize,
-    local_connectivity: f32,
+    floor_connectivity: u32,
+    fraction: f32,
+    minimum_positive: u32,
+    interpolate: u32,
     target_sum: f32,
 ) -> (F, F) {
     let mut positive_count = 0usize;
@@ -30,11 +123,9 @@ fn smooth_row<F: Float>(
         }
     }
 
-    let floor_connectivity = local_connectivity as usize;
-    let fraction = local_connectivity - floor_connectivity as f32;
     let mut rho = F::new(0.0f32);
     if positive_count > 0 {
-        if floor_connectivity == 0 {
+        if floor_connectivity == 0u32 {
             let mut first = positive_max;
             for slot in 0..k {
                 let distance = distances[row * k + slot];
@@ -44,8 +135,8 @@ fn smooth_row<F: Float>(
             }
             rho = first * F::cast_from(fraction);
         } else {
-            let lo_rank = floor_connectivity - 1;
-            let hi_rank = floor_connectivity;
+            let lo_rank = (floor_connectivity - 1u32) as usize;
+            let hi_rank = floor_connectivity as usize;
             let mut before = positive_max;
             let mut after = positive_max;
             for candidate_slot in 0..k {
@@ -69,39 +160,25 @@ fn smooth_row<F: Float>(
                     }
                 }
             }
-            if fraction > 1e-5f32 {
+            if interpolate != 0u32 {
                 rho = before + (after - before) * F::cast_from(fraction);
             } else {
                 rho = before;
             }
         }
-        let minimum_positive = (local_connectivity as usize)
-            + if local_connectivity > floor_connectivity as f32 {
-                1usize
-            } else {
-                0usize
-            };
-        if positive_count < minimum_positive {
+        if positive_count < minimum_positive as usize {
             rho = positive_max;
         }
     }
 
     let mut row_sum = F::new(0.0f32);
-    let mut global_sum = F::new(0.0f32);
-    for query in 0..n {
-        for slot in 0..k {
-            let value = distances[query * k + slot];
-            global_sum += value;
-            if query == row {
-                row_sum += value;
-            }
-        }
+    for slot in 0..k {
+        row_sum += distances[row * k + slot];
     }
-    let total = F::cast_from((n * k) as u32);
     let floor_mean = if rho > F::new(0.0f32) {
         row_sum / F::cast_from(k as u32)
     } else {
-        global_sum / total
+        F::cast_from(global_mean[0])
     };
     let mut lo = F::new(0.0f32);
     let mut hi = F::new(3.402_823_5e38_f32);
@@ -147,6 +224,44 @@ fn smooth_row<F: Float>(
         mid = sigma_floor;
     }
     (rho, mid)
+}
+
+#[cube(launch)]
+fn fuzzy_graph_global_sum_partial_kernel<F: Float>(
+    distances: &Tensor<F>,
+    partials: &mut Tensor<F>,
+    element_count: u32,
+    #[define(F)] _dtype: ElemType,
+) {
+    let chunk = ABSOLUTE_POS_X as usize;
+    if chunk < partials.shape(0) {
+        let start = chunk * GLOBAL_SUM_CHUNK_SIZE;
+        let mut end = start + GLOBAL_SUM_CHUNK_SIZE;
+        if end > element_count as usize {
+            end = element_count as usize;
+        }
+        let mut sum = F::new(0.0f32);
+        for index in start..end {
+            sum += distances[index];
+        }
+        partials[chunk] = sum;
+    }
+}
+
+#[cube(launch)]
+fn fuzzy_graph_global_mean_finalize_kernel<F: Float>(
+    partials: &Tensor<F>,
+    mean: &mut Tensor<F>,
+    element_count: u32,
+    #[define(F)] _dtype: ElemType,
+) {
+    if ABSOLUTE_POS_X == 0u32 {
+        let mut sum = F::new(0.0f32);
+        for index in 0..partials.shape(0) {
+            sum += partials[index];
+        }
+        mean[0] = sum / F::cast_from(element_count);
+    }
 }
 
 /// Evaluate the edge contribution of `indices[row, slot]` against the already
@@ -273,11 +388,15 @@ fn fuzzy_graph_zero_kernel<F: Float, I: Int>(
 fn fuzzy_graph_row_kernel<F: Float, I: Int>(
     indices: &Tensor<I>,
     distances: &Tensor<F>,
+    global_mean: &Tensor<F>,
     rho_out: &mut Tensor<F>,
     sigma_out: &mut Tensor<F>,
     directed_out: &mut Tensor<F>,
     invalid_flag: &mut Tensor<Atomic<I>>,
-    local_connectivity: f32,
+    floor_connectivity: u32,
+    fraction: f32,
+    minimum_positive: u32,
+    interpolate: u32,
     target_sum: f32,
     bipartite: u32,
     n_reference: u32,
@@ -287,7 +406,17 @@ fn fuzzy_graph_row_kernel<F: Float, I: Int>(
     let n = indices.shape(0);
     let k = indices.shape(1);
     if row < n {
-        let (rho, sigma) = smooth_row(distances, row, n, k, local_connectivity, target_sum);
+        let (rho, sigma) = smooth_row(
+            distances,
+            global_mean,
+            row,
+            k,
+            floor_connectivity,
+            fraction,
+            minimum_positive,
+            interpolate,
+            target_sum,
+        );
         rho_out[row] = rho;
         sigma_out[row] = sigma;
         let mut invalid = false;
@@ -523,6 +652,14 @@ pub(crate) fn fuzzy_graph(
         "fuzzy graph COO indices exceed i32 range"
     );
     let n_u32 = u32::try_from(n).expect("query row count exceeds CubeCL range");
+    let element_count = n
+        .checked_mul(k)
+        .expect("fuzzy graph distance count overflows usize");
+    let element_count_u32 =
+        u32::try_from(element_count).expect("fuzzy graph distance count exceeds CubeCL range");
+    let partial_count = element_count.div_ceil(GLOBAL_SUM_CHUNK_SIZE).max(1);
+    let partial_count_u32 =
+        u32::try_from(partial_count).expect("global reduction partial count exceeds CubeCL range");
     let node_u32 = u32::try_from(node_count).expect("graph node count exceeds CubeCL range");
     let index_bytes = capacity
         .checked_mul(DType::I32.size())
@@ -537,6 +674,10 @@ pub(crate) fn fuzzy_graph(
         .checked_mul(k)
         .and_then(|value| value.checked_mul(distances.dtype.size()))
         .expect("directed membership allocation overflows usize");
+    let partial_bytes = partial_count
+        .checked_mul(DType::F32.size())
+        .expect("global reduction partial allocation overflows usize");
+    let mean_bytes = DType::F32.size();
     let node_index_bytes = node_count
         .checked_mul(DType::I32.size())
         .expect("graph node scratch allocation overflows usize");
@@ -590,6 +731,20 @@ pub(crate) fn fuzzy_graph(
         client.empty(directed_bytes),
         distances.dtype,
     );
+    let partials = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([partial_count]),
+        client.empty(partial_bytes),
+        DType::F32,
+    );
+    let global_mean = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::new([1]),
+        client.empty(mean_bytes),
+        DType::F32,
+    );
     let counts = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -631,17 +786,41 @@ pub(crate) fn fuzzy_graph(
         invalid_flag.clone().into_tensor_arg(),
         dtypes,
     );
+    let reduction_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
+    fuzzy_graph_global_sum_partial_kernel::launch(
+        &client,
+        CubeCount::Static(partial_count_u32.div_ceil(reduction_dim.x), 1, 1),
+        reduction_dim,
+        distances.clone().into_tensor_arg(),
+        partials.clone().into_tensor_arg(),
+        element_count_u32,
+        dtype_to_storage_type(distances.dtype),
+    );
+    fuzzy_graph_global_mean_finalize_kernel::launch(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        partials.into_tensor_arg(),
+        global_mean.clone().into_tensor_arg(),
+        element_count_u32,
+        dtype_to_storage_type(distances.dtype),
+    );
+    let thresholds = smooth_thresholds(local_connectivity, k);
     fuzzy_graph_row_kernel::launch(
         &client,
         CubeCount::Static(n_u32.div_ceil(cube_dim.x), 1, 1),
         cube_dim,
         indices.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
+        global_mean.into_tensor_arg(),
         rho.clone().into_tensor_arg(),
         sigma.clone().into_tensor_arg(),
         directed.clone().into_tensor_arg(),
         invalid_flag.clone().into_tensor_arg(),
-        local_connectivity,
+        thresholds.floor_connectivity,
+        thresholds.fraction,
+        thresholds.minimum_positive,
+        thresholds.interpolate as u32,
         (k as f32).log2() * bandwidth,
         bipartite as u32,
         u32::try_from(n_reference).expect("reference count exceeds CubeCL range"),

@@ -2,13 +2,6 @@ use burn::backend::Dispatch;
 use burn::tensor::{Device, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 use serde_json::Value;
-#[cfg(feature = "cuda")]
-use serde_json::json;
-#[cfg(feature = "cuda")]
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
 
 const FIXTURE: &str = include_str!("fixtures/standard_umap_reference.json");
 
@@ -103,111 +96,230 @@ fn close(actual: &[f32], expected: &[f32], label: &str) {
     }
 }
 
-fn fixture_cases() -> Value {
-    serde_json::from_str(FIXTURE).unwrap()
-}
-
-#[cfg(feature = "cuda")]
-fn source_tree_digest(commit: &str) -> String {
-    let output = Command::new("git")
-        .args(["rev-parse", &format!("{commit}:src")])
-        .output()
-        .expect("git must be available to identify product source");
-    assert!(
-        output.status.success(),
-        "could not resolve {commit}:src tree digest"
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-#[cfg(feature = "cuda")]
-fn frozen_source_digest() -> String {
-    let commit = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
-    for args in [
-        vec!["diff", "--quiet", commit, "--", "src"],
-        vec!["diff", "--cached", "--quiet", commit, "--", "src"],
-    ] {
-        let status = Command::new("git")
-            .args(&args)
-            .status()
-            .expect("git must be available to verify frozen product source");
-        assert!(
-            status.success(),
-            "working product src differs from frozen source commit"
-        );
-    }
-    source_tree_digest(commit)
-}
-
-#[cfg(feature = "cuda")]
-fn git_blob_digest(bytes: &[u8]) -> String {
-    let mut child = Command::new("git")
-        .args(["hash-object", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(bytes).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "could not digest deterministic graph inputs"
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-#[cfg(feature = "cuda")]
-fn graph_capture_case(
-    device: &Device,
-    name: &str,
-    indices: Vec<i32>,
-    distances: Vec<f32>,
+fn f64_mean_oracle(
+    indices: &[i32],
+    distances: &[f32],
     n: usize,
     k: usize,
     local_connectivity: f32,
-    bandwidth: f32,
-    mix: f32,
     bipartite: bool,
     n_reference: usize,
-) -> Value {
-    let graph = run_graph(
-        device,
-        indices.clone(),
-        distances.clone(),
+) -> GraphValues {
+    let mean =
+        (distances.iter().map(|&value| value as f64).sum::<f64>() / distances.len() as f64) as f32;
+    let floor_connectivity = local_connectivity as usize;
+    let fraction = local_connectivity - floor_connectivity as f32;
+    let minimum_positive =
+        floor_connectivity + usize::from(local_connectivity > floor_connectivity as f32);
+    let target = (k as f32).log2();
+    let mut rho = vec![0.0; n];
+    let mut sigma = vec![0.0; n];
+    let mut directed = vec![0.0; n * k];
+    for row in 0..n {
+        let mut positive: Vec<f32> = distances[row * k..(row + 1) * k]
+            .iter()
+            .copied()
+            .filter(|value| *value > 0.0)
+            .collect();
+        positive.sort_by(f32::total_cmp);
+        if !positive.is_empty() {
+            let positive_max = *positive.last().unwrap();
+            rho[row] = if floor_connectivity == 0 {
+                positive[0] * fraction
+            } else {
+                let before = positive
+                    .get(floor_connectivity - 1)
+                    .copied()
+                    .unwrap_or(positive_max);
+                let after = positive
+                    .get(floor_connectivity)
+                    .copied()
+                    .unwrap_or(positive_max);
+                if fraction > 1e-5 {
+                    before + (after - before) * fraction
+                } else {
+                    before
+                }
+            };
+            if positive.len() < minimum_positive {
+                rho[row] = positive_max;
+            }
+        }
+        let floor_mean = if rho[row] > 0.0 {
+            distances[row * k..(row + 1) * k].iter().sum::<f32>() / k as f32
+        } else {
+            mean
+        };
+        let (mut lo, mut hi, mut mid) = (0.0f32, f32::MAX, 1.0f32);
+        for _ in 0..64 {
+            let mut sum = 0.0f32;
+            for &distance in &distances[row * k + 1..(row + 1) * k] {
+                let delta = distance - rho[row];
+                let mut value = (-delta.max(0.0) / if mid == 0.0 { 1.0 } else { mid }).exp();
+                if delta <= 0.0 {
+                    value = 1.0;
+                }
+                sum += value;
+            }
+            if (sum - target).abs() < 1e-5 {
+                break;
+            }
+            if sum > target {
+                hi = mid;
+                mid = (lo + hi) * 0.5;
+            } else if hi == f32::MAX {
+                lo = mid;
+                mid *= 2.0;
+            } else {
+                lo = mid;
+                mid = (lo + hi) * 0.5;
+            }
+        }
+        sigma[row] = mid.max(floor_mean * 1e-3);
+        for slot in 0..k {
+            let distance = distances[row * k + slot];
+            let delta = distance - rho[row];
+            let mut value =
+                (-delta.max(0.0) / if sigma[row] == 0.0 { 1.0 } else { sigma[row] }).exp();
+            if distance <= rho[row] || sigma[row] == 0.0 {
+                value = 1.0;
+            }
+            let index = indices[row * k + slot];
+            if index < 0 || index as usize >= n_reference || (!bipartite && index as usize == row) {
+                value = 0.0;
+            }
+            directed[row * k + slot] = value;
+        }
+    }
+    let mut forward = std::collections::BTreeMap::<(i32, i32), f32>::new();
+    for row in 0..n {
+        for slot in 0..k {
+            let tail = indices[row * k + slot];
+            if tail < 0 || tail as usize >= n_reference || directed[row * k + slot] <= 0.0 {
+                continue;
+            }
+            *forward.entry((row as i32, tail)).or_default() += directed[row * k + slot];
+        }
+    }
+    let mut heads = vec![0; 2 * n * k];
+    let mut tails = vec![0; 2 * n * k];
+    let mut weights = vec![0.0; 2 * n * k];
+    let mut edge_count = 0;
+    for (&(head, tail), &membership) in &forward {
+        let weight = if bipartite {
+            membership
+        } else {
+            let reverse = forward.get(&(tail, head)).copied().unwrap_or(0.0);
+            membership + reverse - membership * reverse
+        };
+        if weight > 0.0 {
+            heads[edge_count] = head;
+            tails[edge_count] = tail;
+            weights[edge_count] = weight;
+            edge_count += 1;
+            if !bipartite && head != tail {
+                heads[edge_count] = tail;
+                tails[edge_count] = head;
+                weights[edge_count] = weight;
+                edge_count += 1;
+            }
+        }
+    }
+    GraphValues {
+        heads,
+        tails,
+        weights,
+        rho,
+        sigma,
+        directed,
+    }
+}
+
+fn verify_f64_mean_case(
+    device: &Device,
+    indices: Vec<i32>,
+    distances: Vec<f32>,
+    shape: [usize; 2],
+    local_connectivity: f32,
+    bipartite: bool,
+    n_reference: usize,
+) {
+    let [n, k] = shape;
+    let expected = f64_mean_oracle(
+        &indices,
+        &distances,
         n,
         k,
         local_connectivity,
-        bandwidth,
-        mix,
         bipartite,
         n_reference,
     );
-    let input = serde_json::to_vec(&json!({
-        "indices": indices,
-        "distance_bits": distances.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "shape": [n, k],
-        "local_connectivity_bits": local_connectivity.to_bits(),
-        "bandwidth_bits": bandwidth.to_bits(),
-        "mix_bits": mix.to_bits(),
-        "bipartite": bipartite,
-        "n_reference": n_reference,
-    }))
-    .unwrap();
-    json!({
-        "name": name,
-        "operation": "fuzzy_graph",
-        "dtype": "f32/i32",
-        "shape": [n, k],
-        "bipartite": bipartite,
-        "n_reference": n_reference,
-        "input_digest": git_blob_digest(&input),
-        "heads": graph.heads,
-        "tails": graph.tails,
-        "weight_bits": graph.weights.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "rho_bits": graph.rho.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "sigma_bits": graph.sigma.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "directed_bits": graph.directed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-    })
+    let graph = run_graph(
+        device,
+        indices,
+        distances,
+        n,
+        k,
+        local_connectivity,
+        1.0,
+        1.0,
+        bipartite,
+        n_reference,
+    );
+    close(&graph.rho, &expected.rho, "f64 mean oracle rho");
+    close(&graph.sigma, &expected.sigma, "f64 mean oracle sigma");
+    close(
+        &graph.directed,
+        &expected.directed,
+        "f64 mean oracle directed",
+    );
+    let actual_edges: std::collections::BTreeMap<_, _> = graph
+        .heads
+        .iter()
+        .zip(&graph.tails)
+        .zip(&graph.weights)
+        .filter_map(|((&head, &tail), &weight)| (weight > 0.0).then_some(((head, tail), weight)))
+        .collect();
+    let expected_edges: std::collections::BTreeMap<_, _> = expected
+        .heads
+        .iter()
+        .zip(&expected.tails)
+        .zip(&expected.weights)
+        .filter_map(|((&head, &tail), &weight)| (weight > 0.0).then_some(((head, tail), weight)))
+        .collect();
+    assert_eq!(
+        actual_edges
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_edges
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "positive final fuzzy edge support"
+    );
+    close(
+        &actual_edges.values().copied().collect::<Vec<_>>(),
+        &expected_edges.values().copied().collect::<Vec<_>>(),
+        "f64 mean oracle final edge weights",
+    );
+    let epochs = 200.0f32;
+    let actual_maximum = actual_edges.values().copied().fold(0.0f32, f32::max);
+    let expected_maximum = expected_edges.values().copied().fold(0.0f32, f32::max);
+    let actual_eligible: std::collections::BTreeSet<_> = actual_edges
+        .iter()
+        .filter_map(|(&edge, &weight)| (weight >= actual_maximum / epochs).then_some(edge))
+        .collect();
+    let expected_eligible: std::collections::BTreeSet<_> = expected_edges
+        .iter()
+        .filter_map(|(&edge, &weight)| (weight >= expected_maximum / epochs).then_some(edge))
+        .collect();
+    assert_eq!(
+        actual_eligible, expected_eligible,
+        "positive-epoch edge eligibility at the standard max_weight/epochs cutoff"
+    );
+}
+
+fn fixture_cases() -> Value {
+    serde_json::from_str(FIXTURE).unwrap()
 }
 
 fn verify_reference_cases(device: &Device) {
@@ -294,6 +406,91 @@ fn verify_reference_cases(device: &Device) {
 #[test]
 fn standard_fuzzy_graph_matches_reference_fixtures_on_cpu() {
     verify_reference_cases(&Device::cpu());
+}
+
+fn verify_global_mean_oracle_cases(device: &Device) {
+    verify_f64_mean_case(
+        device,
+        vec![1, 1, 0, 0],
+        vec![0.0, 0.0, 0.5, 0.5],
+        [2, 2],
+        1.0,
+        false,
+        2,
+    );
+    verify_f64_mean_case(
+        device,
+        vec![1, 0, 0, 1, 1, 0],
+        vec![0.0, 0.5, 0.25, 0.0, 0.0, 1.5],
+        [3, 2],
+        0.0,
+        false,
+        3,
+    );
+    verify_f64_mean_case(
+        device,
+        vec![1, 0, 0, 1, 1, 0],
+        vec![0.0, 0.5, 0.25, 0.0, 0.0, 1.5],
+        [3, 2],
+        1.00001,
+        false,
+        3,
+    );
+    verify_f64_mean_case(
+        device,
+        vec![0, 1, 2, 1, 2, 3],
+        vec![0.0, 0.5, 0.0, 1.0, 1.5, 0.25],
+        [3, 2],
+        0.5,
+        true,
+        4,
+    );
+    for local_connectivity in [0.5, 1.5, 2.0] {
+        verify_f64_mean_case(
+            device,
+            vec![1, 2, 0, 2, 0, 1],
+            vec![0.0, 0.5, 0.25, 0.0, 0.0, 1.5],
+            [3, 2],
+            local_connectivity,
+            false,
+            3,
+        );
+    }
+
+    let (n, k) = (69, 15);
+    let indices = (0..n)
+        .flat_map(|row| (1..=k).map(move |slot| ((row + slot) % n) as i32))
+        .collect();
+    let distances = (0..n * k)
+        .map(|index| {
+            if index < k {
+                0.0
+            } else {
+                ((index * 37 % 997) as f32 + 1.0) / 113.0
+            }
+        })
+        .collect();
+    assert_ne!((n * k) % 1024, 0);
+    verify_f64_mean_case(device, indices, distances, [n, k], 0.5, false, n);
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cpu() {
+    verify_global_mean_oracle_cases(&Device::cpu());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cuda() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    verify_global_mean_oracle_cases(&device);
 }
 
 #[cfg(feature = "cpu")]
@@ -540,126 +737,4 @@ fn standard_fuzzy_graph_matches_reference_fixtures_on_cuda() {
         return;
     };
     verify_reference_cases(&device);
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn standard_fuzzy_graph_cuda_source_tagged_capture_oracle() {
-    const SOURCE: &str = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e";
-    let Some(device) = fast_umap::cuda_backend::device(0) else {
-        assert!(
-            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-            "CUDA is required"
-        );
-        return;
-    };
-    let mut cases = Vec::new();
-    for case in fixture_cases()["graph_cases"].as_array().unwrap() {
-        let n = case["n"].as_u64().unwrap() as usize;
-        let k = case["k"].as_u64().unwrap() as usize;
-        let indices = ints(&case["indices"]);
-        let distances = floats(&case["distances"]);
-        cases.push(graph_capture_case(
-            &device,
-            case["name"].as_str().unwrap(),
-            indices,
-            distances,
-            n,
-            k,
-            case["local_connectivity"].as_f64().unwrap() as f32,
-            case["bandwidth"].as_f64().unwrap() as f32,
-            case["set_op_mix_ratio"].as_f64().unwrap() as f32,
-            false,
-            n,
-        ));
-    }
-    cases.push(graph_capture_case(
-        &device,
-        "invalid-index-marker",
-        vec![0, 3, 1, -2],
-        vec![0.0, 1.0, 0.0, 1.0],
-        2,
-        2,
-        1.0,
-        1.0,
-        1.0,
-        false,
-        2,
-    ));
-    cases.push(graph_capture_case(
-        &device,
-        "bipartite-equal-index-and-duplicates",
-        BIPARTITE_MIX_INDICES.to_vec(),
-        BIPARTITE_MIX_DISTANCES.to_vec(),
-        BIPARTITE_MIX_N,
-        BIPARTITE_MIX_K,
-        1.0,
-        1.0,
-        0.4,
-        true,
-        BIPARTITE_MIX_N_REFERENCE,
-    ));
-    cases.push(graph_capture_case(
-        &device,
-        "bipartite-hub",
-        vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 0, 1, 2],
-        vec![
-            0.0, 0.5, 1.0, 0.0, 0.25, 0.75, 0.0, 0.5, 1.0, 0.0, 0.25, 0.5,
-        ],
-        4,
-        3,
-        1.0,
-        1.0,
-        1.0,
-        true,
-        4,
-    ));
-    let semantic_capture = json!({
-        "schema": "fast-umap.cuda-graph-capture.v1",
-        "operation": "fuzzy_graph",
-        "dtype": "f32/i32",
-        "cases": cases,
-    });
-    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_CAPTURE_PATH") {
-        // Capture export is the frozen-baseline operation; candidate runs do not
-        // claim that their product source is the oracle's source.
-        let mut capture = semantic_capture.as_object().unwrap().clone();
-        capture.insert("source_commit".to_owned(), json!(SOURCE));
-        capture.insert(
-            "product_src_tree_digest".to_owned(),
-            json!(frozen_source_digest()),
-        );
-        std::fs::write(path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
-    }
-    if let Some(path) = std::env::var_os("FAST_UMAP_CUDA_GRAPH_ORACLE_PATH") {
-        let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(oracle["source_commit"], SOURCE, "oracle source revision");
-        assert_eq!(
-            oracle["product_src_tree_digest"],
-            source_tree_digest(SOURCE),
-            "oracle product source provenance"
-        );
-        let oracle_keys = oracle
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected_keys = semantic_capture
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut expected_oracle_keys = expected_keys.clone();
-        expected_oracle_keys.insert("source_commit".to_owned());
-        expected_oracle_keys.insert("product_src_tree_digest".to_owned());
-        assert_eq!(oracle_keys, expected_oracle_keys, "oracle semantic key set");
-        for (field, value) in semantic_capture.as_object().unwrap() {
-            assert_eq!(
-                oracle[field], *value,
-                "CUDA graph semantic oracle mismatch in {field}"
-            );
-        }
-    }
 }
