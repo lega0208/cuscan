@@ -11,6 +11,88 @@ use crate::standard_umap::ann::candidate_width;
 
 const ANN_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 
+fn ann_launch_geometry(
+    client: &cubecl::client::Client,
+    feature_size: usize,
+    n_rows: u32,
+) -> (bool, CubeDim) {
+    let cpu_merge = client.name() == "cpu";
+    if cpu_merge {
+        (true, CubeDim::new_1d(1))
+    } else {
+        validate_cooperative_ann_launch(
+            &client.properties().hardware,
+            client.features(),
+            feature_size,
+            n_rows,
+        );
+        (false, ANN_CUBE_DIM)
+    }
+}
+
+fn validate_cooperative_ann_launch(
+    hardware: &cubecl::ir::HardwareProperties,
+    features: &cubecl::features::Features,
+    feature_size: usize,
+    n_rows: u32,
+) {
+    use cubecl::features::Plane;
+
+    assert!(
+        features.plane.contains(Plane::Ops),
+        "cooperative ANN requires Plane::Ops for plane_any; observed plane features {:?}",
+        features.plane
+    );
+    // plane_any is whole-cube; the guaranteed plane must cover all 32 tiled units.
+    // A wider plane is valid because inactive lanes contribute false.
+    assert!(
+        hardware.plane_size_min >= ANN_CUBE_DIM.x,
+        "cooperative ANN requires guaranteed plane width >= {}; observed min={}, max={}",
+        ANN_CUBE_DIM.x,
+        hardware.plane_size_min,
+        hardware.plane_size_max
+    );
+    assert!(
+        hardware.max_units_per_cube >= ANN_CUBE_DIM.x && hardware.max_cube_dim.0 >= ANN_CUBE_DIM.x,
+        "cooperative ANN requires 32 units and x dimension; observed units={}, max_cube_dim={:?}",
+        hardware.max_units_per_cube,
+        hardware.max_cube_dim
+    );
+    let shared_bytes = 32 * (2 * DType::I32.size() + feature_size) + DType::I32.size();
+    // This is a lower bound: compiler padding/alignment and internal usage are
+    // excluded; CubeCL's launch-time shared-memory checks remain authoritative.
+    assert!(
+        shared_bytes <= hardware.max_shared_memory_size,
+        "cooperative ANN requires at least {shared_bytes} shared bytes (lower bound); observed {}",
+        hardware.max_shared_memory_size
+    );
+    assert!(
+        hardware.max_cube_count.0 >= n_rows,
+        "cooperative ANN requires x cube count >= {n_rows}; observed {}",
+        hardware.max_cube_count.0
+    );
+}
+
+fn ann_independent_launch(client: &cubecl::client::Client, units: u32) -> (CubeCount, CubeDim) {
+    let dim = crate::kernels::legal_cube_dim(client, CubeDim::new_1d(ANN_CUBE_DIM.x));
+    let count =
+        ann_independent_cube_count(units, dim.x, client.properties().hardware.max_cube_count.0);
+    (CubeCount::Static(count, 1, 1), dim)
+}
+
+fn ann_independent_cube_count(units: u32, units_per_cube: u32, max_cubes: u32) -> u32 {
+    assert!(
+        units_per_cube > 0,
+        "ANN independent launch dimension must be nonzero"
+    );
+    let count = units.div_ceil(units_per_cube);
+    assert!(
+        count <= max_cubes,
+        "ANN independent launch requires x cube count {count}; maximum is {max_cubes}"
+    );
+    count
+}
+
 fn ann_should_stop(new_count: i32, n: usize, width: usize) -> bool {
     let capacity = n
         .checked_mul(width)
@@ -829,10 +911,14 @@ pub(crate) fn approximate_neighbors(
         .expect("ANN reverse offset allocation overflows usize");
     let n_u32 = u32::try_from(n).expect("ANN row count exceeds CubeCL range");
     let width_u32 = u32::try_from(width).expect("ANN candidate width exceeds CubeCL range");
-    // CubeCL's CPU runtime executes a unit serially. Use one unit per row
-    // there; GPU retains the original 32-lane cooperative row kernel.
-    let cpu_merge = data.client.name() == "cpu";
-    let ann_step_dim = CubeDim::new_1d(if cpu_merge { 1 } else { ANN_CUBE_DIM.x });
+    // CubeCL's CPU runtime executes a unit serially. Keep its one-unit geometry;
+    // the cooperative GPU path is validated, never clamped.
+    let (cpu_merge, ann_step_dim) = ann_launch_geometry(&data.client, data.dtype.size(), n_u32);
+    assert!(
+        n_u32 <= data.client.properties().hardware.max_cube_count.0,
+        "ANN row launch requires x cube count {n_u32}; maximum is {}",
+        data.client.properties().hardware.max_cube_count.0
+    );
     let _feature_count_u32 =
         u32::try_from(features).expect("ANN feature count exceeds CubeCL range");
     let client = data.client.clone();
@@ -872,16 +958,11 @@ pub(crate) fn approximate_neighbors(
         data.client.empty(index_bytes),
         DType::I32,
     );
+    let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
     ann_init::launch(
         &data.client,
-        CubeCount::Static(
-            u32::try_from(n)
-                .expect("ANN row count exceeds CubeCL range")
-                .div_ceil(ANN_CUBE_DIM.x),
-            1,
-            1,
-        ),
-        ANN_CUBE_DIM,
+        helper_count,
+        helper_dim,
         candidates.clone().into_tensor_arg(),
         u32::try_from(n).expect("ANN row count exceeds CubeCL range"),
         u32::try_from(width).expect("ANN candidate width exceeds CubeCL range"),
@@ -946,6 +1027,7 @@ pub(crate) fn approximate_neighbors(
     );
     for iteration in 0..=max_iterations {
         if iteration > 0 {
+            let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
             reverse_zero::launch(
                 &data.client,
                 CubeCount::Static(1, 1, 1),
@@ -955,15 +1037,15 @@ pub(crate) fn approximate_neighbors(
             );
             reverse_zero::launch(
                 &data.client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count.clone(),
+                helper_dim,
                 reverse_counts.clone().into_tensor_arg(),
                 dtype_to_storage_type(DType::I32),
             );
             reverse_count::launch(
                 &data.client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count.clone(),
+                helper_dim,
                 candidates.clone().into_tensor_arg(),
                 reverse_counts.clone().into_tensor_arg(),
                 n_u32,
@@ -981,8 +1063,8 @@ pub(crate) fn approximate_neighbors(
             );
             reverse_scatter::launch(
                 &data.client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count,
+                helper_dim,
                 candidates.clone().into_tensor_arg(),
                 reverse_cursors.clone().into_tensor_arg(),
                 reverse_sources.clone().into_tensor_arg(),
@@ -1051,10 +1133,11 @@ pub(crate) fn approximate_neighbors(
         ),
         DType::F32,
     );
+    let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
     ann_output::launch(
         &data.client,
-        CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-        ANN_CUBE_DIM,
+        helper_count,
+        helper_dim,
         candidates.into_tensor_arg(),
         candidate_distances.into_tensor_arg(),
         output_indices.clone().into_tensor_arg(),
@@ -1074,6 +1157,25 @@ mod tests {
     use super::*;
     use burn_cubecl::CubeDevice;
 
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn ann_cpu_runtime_identity_matches_pinned_capability_and_reports_topology() {
+        let raw_device = CubeDevice::cpu().expect("CPU runtime is enabled for this test");
+        let client = raw_device.client();
+        let cores = client.properties().hardware.num_cpu_cores;
+        println!(
+            "ANN runtime identity: name={}, num_cpu_cores={cores:?}",
+            client.name()
+        );
+        assert_eq!(client.name() == "cpu", cores.is_some());
+        #[cfg(feature = "cuda")]
+        if crate::cuda_backend::device(0).is_some() {
+            let cuda_client = CubeDevice::cuda(0).expect("observed CUDA device").client();
+            println!("ANN CUDA runtime identity: name={}", cuda_client.name());
+            assert_ne!(cuda_client.name(), "cpu");
+        }
+    }
+
     #[test]
     fn ann_stop_threshold_uses_inclusive_integer_equivalent() {
         assert!(ann_should_stop(0, 1, 1));
@@ -1084,6 +1186,12 @@ mod tests {
         assert!(!ann_should_stop(2, 1, 1999));
         assert!(ann_should_stop(524, 16_384, 32));
         assert!(!ann_should_stop(525, 16_384, 32));
+    }
+
+    #[test]
+    fn ann_independent_cube_count_rejects_excess_cube_count() {
+        assert_eq!(ann_independent_cube_count(67, 32, 3), 3);
+        assert!(std::panic::catch_unwind(|| ann_independent_cube_count(67, 32, 2)).is_err());
     }
 
     #[cfg(feature = "cpu")]
@@ -1161,7 +1269,86 @@ mod tests {
             .collect()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cooperative_preflight_checks_plane_and_dtype_aware_shared_memory() {
+        let raw_device = CubeDevice::cpu().expect("CPU runtime is enabled for this test");
+        let mut hardware = raw_device.client().properties().hardware.clone();
+        hardware.plane_size_min = 32;
+        hardware.plane_size_max = 64;
+        hardware.max_units_per_cube = 32;
+        hardware.max_cube_dim.0 = 32;
+        hardware.max_cube_count.0 = 16;
+        hardware.max_shared_memory_size = 516;
+        let mut features = cubecl::features::Features::default();
+        features.plane.insert(cubecl::features::Plane::Ops);
+        validate_cooperative_ann_launch(&hardware, &features, DType::F32.size(), 16);
+        validate_cooperative_ann_launch(&hardware, &features, DType::F64.size(), 16);
+        let mut wide_plane = hardware.clone();
+        wide_plane.plane_size_min = 64;
+        validate_cooperative_ann_launch(&wide_plane, &features, DType::F64.size(), 16);
+        let mut dtype_boundary = hardware.clone();
+        dtype_boundary.max_shared_memory_size = 388;
+        validate_cooperative_ann_launch(&dtype_boundary, &features, DType::F32.size(), 16);
+        dtype_boundary.max_shared_memory_size = 515;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&dtype_boundary, &features, DType::F64.size(), 16)
+            })
+            .is_err()
+        );
+
+        let mut no_plane_ops = features.clone();
+        no_plane_ops.plane.clear();
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&hardware, &no_plane_ops, 4, 16)
+            })
+            .is_err()
+        );
+        let mut narrow_plane = hardware.clone();
+        narrow_plane.plane_size_min = 31;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&narrow_plane, &features, 4, 16)
+            })
+            .is_err()
+        );
+        let mut small_cube = hardware.clone();
+        small_cube.max_units_per_cube = 31;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&small_cube, &features, 4, 16)
+            })
+            .is_err()
+        );
+        let mut small_axis = hardware.clone();
+        small_axis.max_cube_dim.0 = 31;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&small_axis, &features, 4, 16)
+            })
+            .is_err()
+        );
+        let mut little_shared = hardware.clone();
+        little_shared.max_shared_memory_size = 387;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&little_shared, &features, DType::F32.size(), 16)
+            })
+            .is_err()
+        );
+        let mut few_cubes = hardware;
+        few_cubes.max_cube_count.0 = 15;
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_cooperative_ann_launch(&few_cubes, &features, 4, 16)
+            })
+            .is_err()
+        );
+    }
+
+    #[cfg(any(feature = "cpu", feature = "cuda"))]
     fn old_rescan_step(
         points: &[f32],
         candidates: &[i32],
@@ -1229,15 +1416,31 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers() {
-        let Some(_device) = crate::cuda_backend::device(0) else {
+    fn reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers_cuda() {
+        if crate::cuda_backend::device(0).is_none() {
             assert!(
                 std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
                 "CUDA is required"
             );
             return;
-        };
-        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
+        }
+        reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers_on_device(
+            CubeDevice::cuda(0).expect("CUDA device was just detected"),
+        );
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers_cpu() {
+        reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers_on_device(
+            CubeDevice::cpu().expect("CPU runtime is enabled for this test"),
+        );
+    }
+
+    #[cfg(any(feature = "cpu", feature = "cuda"))]
+    fn reverse_csr_matches_host_gate_and_is_complete_across_reused_buffers_on_device(
+        raw_device: CubeDevice,
+    ) {
         let client = raw_device.client();
         let n = 67usize;
         let width = 13usize;
@@ -1310,6 +1513,7 @@ mod tests {
         let launch_dtype = dtype_to_storage_type(DType::I32);
         let n_u32 = u32::try_from(n).unwrap();
         let width_u32 = u32::try_from(width).unwrap();
+        let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32);
         for (iteration, matrix) in matrices.into_iter().enumerate() {
             let candidates = raw_tensor(
                 &matrix,
@@ -1320,15 +1524,15 @@ mod tests {
             );
             reverse_zero::launch(
                 &client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count.clone(),
+                helper_dim,
                 counts.clone().into_tensor_arg(),
                 launch_dtype,
             );
             reverse_count::launch(
                 &client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count.clone(),
+                helper_dim,
                 candidates.clone().into_tensor_arg(),
                 counts.clone().into_tensor_arg(),
                 n_u32,
@@ -1346,8 +1550,8 @@ mod tests {
             );
             reverse_scatter::launch(
                 &client,
-                CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-                ANN_CUBE_DIM,
+                helper_count.clone(),
+                helper_dim,
                 candidates.into_tensor_arg(),
                 cursors.clone().into_tensor_arg(),
                 sources.clone().into_tensor_arg(),
@@ -1407,23 +1611,39 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates_cpu() {
+        ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates_on_device(
+            CubeDevice::cpu().expect("CPU runtime is enabled for this test"),
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
-    fn ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates() {
-        let Some(_device) = crate::cuda_backend::device(0) else {
+    fn ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates_cuda() {
+        if crate::cuda_backend::device(0).is_none() {
             assert!(
                 std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
                 "CUDA is required"
             );
             return;
-        };
+        }
+        ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates_on_device(
+            CubeDevice::cuda(0).expect("CUDA device was just detected"),
+        );
+    }
+
+    #[cfg(any(feature = "cpu", feature = "cuda"))]
+    fn ann_step_reverse_matches_old_rescan_for_injected_duplicate_and_invalid_candidates_on_device(
+        raw_device: CubeDevice,
+    ) {
         let n = 9usize;
         let width = 6usize;
         let features = 2usize;
         let points = (0..n)
             .flat_map(|row| [row as f32 * 0.25, ((row * 5) % 7) as f32 * 0.5])
             .collect::<Vec<_>>();
-        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
         let client = raw_device.client();
         let data = raw_tensor(
             &points,
@@ -1518,18 +1738,19 @@ mod tests {
         );
         let n_u32 = u32::try_from(n).unwrap();
         let width_u32 = u32::try_from(width).unwrap();
+        let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32);
         let dtype = dtype_to_storage_type(DType::I32);
         reverse_zero::launch(
             &client,
-            CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-            ANN_CUBE_DIM,
+            helper_count.clone(),
+            helper_dim,
             counts.clone().into_tensor_arg(),
             dtype,
         );
         reverse_count::launch(
             &client,
-            CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-            ANN_CUBE_DIM,
+            helper_count.clone(),
+            helper_dim,
             candidate_tensor.clone().into_tensor_arg(),
             counts.clone().into_tensor_arg(),
             n_u32,
@@ -1547,8 +1768,8 @@ mod tests {
         );
         reverse_scatter::launch(
             &client,
-            CubeCount::Static(n_u32.div_ceil(ANN_CUBE_DIM.x), 1, 1),
-            ANN_CUBE_DIM,
+            helper_count.clone(),
+            helper_dim,
             candidate_tensor.clone().into_tensor_arg(),
             cursors.clone().into_tensor_arg(),
             sources.clone().into_tensor_arg(),
@@ -1605,10 +1826,11 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             dtype,
         );
+        let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
         ann_step::launch(
             &client,
             CubeCount::Static(n_u32, 1, 1),
-            ANN_CUBE_DIM,
+            step_dim,
             data.clone().into_tensor_arg(),
             candidate_tensor.into_tensor_arg(),
             candidate_distance_tensor.into_tensor_arg(),
@@ -1623,7 +1845,7 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             width_u32,
             1,
-            false,
+            cpu_merge,
             [dtype_to_storage_type(DType::F32), dtype],
         );
         let actual_ids = read_i32(&output_ids);
@@ -1664,19 +1886,35 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn ann_step_evaluates_both_mixed_retention_forward_pairs_cpu() {
+        ann_step_evaluates_both_mixed_retention_forward_pairs_on_device(
+            CubeDevice::cpu().expect("CPU runtime is enabled for this test"),
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
-    fn ann_step_evaluates_both_mixed_retention_forward_pairs() {
-        let Some(_device) = crate::cuda_backend::device(0) else {
+    fn ann_step_evaluates_both_mixed_retention_forward_pairs_cuda() {
+        if crate::cuda_backend::device(0).is_none() {
             assert!(
                 std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
                 "CUDA is required"
             );
             return;
-        };
+        }
+        ann_step_evaluates_both_mixed_retention_forward_pairs_on_device(
+            CubeDevice::cuda(0).expect("CUDA device was just detected"),
+        );
+    }
+
+    #[cfg(any(feature = "cpu", feature = "cuda"))]
+    fn ann_step_evaluates_both_mixed_retention_forward_pairs_on_device(raw_device: CubeDevice) {
         let n = 7usize;
         let width = 2usize;
         let features = 1usize;
+        let n_u32 = u32::try_from(n).unwrap();
         let points = [0.0f32, 10.0, 11.0, 0.1, 50.0, -0.1, 60.0];
         let mut candidates = vec![n as i32; n * width];
         candidates[0..2].copy_from_slice(&[1, 2]);
@@ -1687,7 +1925,6 @@ mod tests {
         retained[2..4].copy_from_slice(&[0, 1]); // new c=3, retained c=4
         retained[4..6].copy_from_slice(&[1, 0]); // retained c=5, new c=6
 
-        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
         let client = raw_device.client();
         let data = raw_tensor(
             &points,
@@ -1793,10 +2030,11 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             dtype,
         );
+        let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
         ann_step::launch(
             &client,
             CubeCount::Static(u32::try_from(n).unwrap(), 1, 1),
-            ANN_CUBE_DIM,
+            step_dim,
             data.into_tensor_arg(),
             candidate_tensor.into_tensor_arg(),
             candidate_distances.into_tensor_arg(),
@@ -1811,7 +2049,7 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             u32::try_from(width).unwrap(),
             1,
-            false,
+            cpu_merge,
             [dtype_to_storage_type(DType::F32), dtype],
         );
 
@@ -1855,17 +2093,31 @@ mod tests {
         assert_eq!(&read_i32(&output_retained)[..width], &[0, 0]);
     }
 
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn ann_step_device_counter_locks_inclusive_stop_boundary_cpu() {
+        ann_step_device_counter_locks_inclusive_stop_boundary_on_device(
+            CubeDevice::cpu().expect("CPU runtime is enabled for this test"),
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
-    fn ann_step_device_counter_locks_inclusive_stop_boundary() {
-        let Some(_device) = crate::cuda_backend::device(0) else {
+    fn ann_step_device_counter_locks_inclusive_stop_boundary_cuda() {
+        if crate::cuda_backend::device(0).is_none() {
             assert!(
                 std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
                 "CUDA is required"
             );
             return;
-        };
+        }
+        ann_step_device_counter_locks_inclusive_stop_boundary_on_device(
+            CubeDevice::cuda(0).expect("CUDA device was just detected"),
+        );
+    }
 
+    #[cfg(any(feature = "cpu", feature = "cuda"))]
+    fn ann_step_device_counter_locks_inclusive_stop_boundary_on_device(raw_device: CubeDevice) {
         let n = 16_384usize;
         let width = 32usize;
         let elements = n * width;
@@ -1895,8 +2147,8 @@ mod tests {
             25, 26, 27, 28, 29, 30, 31, 32,
         ]);
 
-        let raw_device = CubeDevice::cuda(0).expect("CUDA device was just detected");
         let client = raw_device.client();
+        let n_u32 = u32::try_from(n).unwrap();
         let data = raw_tensor(
             &points,
             Shape::new([n, 1]),
@@ -1921,7 +2173,6 @@ mod tests {
         let reverse_sources =
             raw_tensor(&[0i32], Shape::new([1]), DType::I32, &raw_device, &client);
         let dtype = dtype_to_storage_type(DType::I32);
-        let n_u32 = u32::try_from(n).unwrap();
         let width_u32 = u32::try_from(width).unwrap();
         for target_new in [524usize, 525] {
             let affected_start = 64usize;
@@ -1996,10 +2247,11 @@ mod tests {
                 new_count.clone().into_tensor_arg(),
                 dtype,
             );
+            let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
             ann_step::launch(
                 &client,
                 CubeCount::Static(n_u32, 1, 1),
-                ANN_CUBE_DIM,
+                step_dim,
                 data.clone().into_tensor_arg(),
                 candidate_tensor.into_tensor_arg(),
                 candidate_distances.clone().into_tensor_arg(),
@@ -2014,7 +2266,7 @@ mod tests {
                 new_count.clone().into_tensor_arg(),
                 width_u32,
                 1,
-                false,
+                cpu_merge,
                 [dtype_to_storage_type(DType::F32), dtype],
             );
 

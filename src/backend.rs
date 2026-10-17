@@ -280,9 +280,15 @@ pub trait StandardUmapOps: Backend {
     ///
     /// `head_offsets`/`head_edges` list, per head row, the original ids of
     /// positive-weight edges with that head in ascending id order;
-    /// Parallel backends use atomic coordinate updates and exclusive
-    /// per-head RNG ownership. Returns the updated head, tail,
-    /// positive clocks, negative clocks and RNG state.
+    /// The operation consumes and overwrites `epoch_of_next_sample`,
+    /// `epoch_of_next_negative_sample`, and `rng_state` in place. Retained
+    /// clones of those inputs observe the overwrites; callers must not read
+    /// such clones after this call. Supply unaliased mutable state buffers,
+    /// separate from the corresponding interval tensors. Head and tail inputs
+    /// are copied, so retained observers of those inputs remain isolated.
+    /// Parallel backends use atomic coordinate updates and exclusive per-head
+    /// RNG ownership. Returns the updated head, tail, positive clocks,
+    /// negative clocks and RNG state.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn optimize_epoch(

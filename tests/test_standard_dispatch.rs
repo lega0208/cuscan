@@ -130,7 +130,9 @@ fn exact_neighbors_handles_query_block_boundary_on_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn standard_squared_distance_dispatch_uses_cuda_when_available() {
-    let Some(device) = fast_umap::cuda_backend::device(0) else {
+    let observed_device = fast_umap::cuda_backend::device(0);
+    eprintln!("cuda_backend::device(0) = {observed_device:?}");
+    let Some(device) = observed_device else {
         if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
             panic!("FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available");
         }

@@ -469,6 +469,11 @@ fn approximate_query_impl(
         let rows = query_chunk_rows(query_rows, row_start, max_chunk_rows);
         let row_start_u32 = u32::try_from(row_start).expect("query row start exceeds u32");
         let rows_u32 = u32::try_from(rows).expect("query chunk exceeds u32");
+        assert!(
+            rows_u32 <= client.properties().hardware.max_cube_count.0,
+            "query chunk requires x cube count {rows_u32}; maximum is {}",
+            client.properties().hardware.max_cube_count.0
+        );
         approximate_query_kernel::launch(
             &client,
             CubeCount::Static(rows_u32, 1, 1),

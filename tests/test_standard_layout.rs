@@ -2,6 +2,7 @@ use burn::backend::Dispatch;
 use burn::backend::tensor::IntTensor;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
+use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/standard_umap_reference.json");
@@ -42,6 +43,73 @@ fn check_close(actual: &[f32], expected: &[f32], label: &str) {
             (actual - expected).abs() <= 1e-5,
             "{label}[{index}]: {actual} != {expected}"
         );
+    }
+}
+
+fn tausworthe_step(state: &mut [i64]) -> i32 {
+    let mut next = [0i64; 3];
+    next[0] = (((state[0] & 4_294_967_294i64).wrapping_shl(12)) & 0xffff_ffff)
+        ^ ((((state[0].wrapping_shl(13)) & 0xffff_ffff) ^ state[0]) >> 19);
+    next[1] = (((state[1] & 4_294_967_288i64).wrapping_shl(4)) & 0xffff_ffff)
+        ^ ((((state[1].wrapping_shl(2)) & 0xffff_ffff) ^ state[1]) >> 25);
+    next[2] = (((state[2] & 4_294_967_280i64).wrapping_shl(17)) & 0xffff_ffff)
+        ^ ((((state[2].wrapping_shl(3)) & 0xffff_ffff) ^ state[2]) >> 11);
+    state.copy_from_slice(&next);
+    (next[0] ^ next[1] ^ next[2]) as i32
+}
+
+fn single_head_reference(
+    head: &mut [f32],
+    fixed_tail: &[f32],
+    dimensions: usize,
+    next_positive: &mut f64,
+    next_negative: &mut f64,
+    rng: &mut [i64],
+    epoch: u32,
+) {
+    if *next_positive <= f64::from(epoch) {
+        *next_positive += 1.0;
+        let a = 1.576_943_5f32;
+        let b = 0.895_060_9f32;
+        let alpha = 0.25f32;
+        let mut distance = 0.0f32;
+        for column in 0..dimensions {
+            let difference = head[column] - fixed_tail[dimensions + column];
+            distance += difference * difference;
+        }
+        if distance > 0.0 {
+            let coefficient =
+                -2.0f32 * a * b * distance.powf(b - 1.0f32) / (a * distance.powf(b) + 1.0f32);
+            for column in 0..dimensions {
+                let difference = head[column] - fixed_tail[dimensions + column];
+                let gradient = (coefficient * difference).clamp(-4.0, 4.0);
+                head[column] += gradient * alpha;
+            }
+        }
+        let count = (f64::from(epoch) - *next_negative) as i32;
+        *next_negative += f64::from(count);
+        for _ in 0..count {
+            let remainder = tausworthe_step(rng) % 2;
+            let sampled = (if remainder < 0 {
+                remainder + 2
+            } else {
+                remainder
+            }) as usize;
+            let mut distance = 0.0f32;
+            for column in 0..dimensions {
+                let difference = head[column] - fixed_tail[sampled * dimensions + column];
+                distance += difference * difference;
+            }
+            if distance > 0.0 {
+                let coefficient =
+                    2.0f32 * 1.7 * b / ((0.001f32 + distance) * (a * distance.powf(b) + 1.0f32));
+                for column in 0..dimensions {
+                    let difference = head[column] - fixed_tail[sampled * dimensions + column];
+                    let gradient = (coefficient * difference).clamp(-4.0, 4.0);
+                    head[column] += gradient * alpha;
+                }
+            }
+        }
     }
 }
 
@@ -287,18 +355,252 @@ fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_cpu()
     verify_fixture(&Device::cpu(), false);
 }
 
-fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
+/// Exercises the fused Dispatch backend with production dtypes: f32
+/// coordinates/atomics, f64 clocks, i64 RNG `[head_rows, 3]`, and i32 indices.
+#[cfg(feature = "cpu")]
+#[test]
+fn standard_layout_single_head_f64_reference_continues_actual_state() {
+    let device = Device::cpu();
+    for dimensions in [1usize, 2, 3, 5] {
+        let mut expected_head = (0..dimensions)
+            .map(|column| 0.35f32 + column as f32 * 0.07)
+            .collect::<Vec<_>>();
+        let expected_tail = (0..2 * dimensions)
+            .map(|index| -0.2f32 + index as f32 * 0.11)
+            .collect::<Vec<_>>();
+        let mut expected_positive = 0.0f64;
+        let mut expected_negative = 0.0f64;
+        // The first Tausworthe draw has a negative signed i32 result, so the
+        // reference also exercises the kernel's nonnegative-index fixup.
+        let mut expected_rng = vec![1i64 << 19, 0, 0];
+        let mut actual_positive = 0.0f64;
+        let mut actual_negative = 0.0f64;
+        let mut actual_rng = expected_rng.clone();
+        let mut head = Tensor::<2>::from_data(
+            TensorData::new(expected_head.clone(), [1, dimensions]),
+            &device,
+        );
+        let mut tail = Tensor::<2>::from_data(
+            TensorData::new(expected_tail.clone(), [2, dimensions]),
+            &device,
+        );
+        let (observed_offsets, observed_edges) = <Dispatch as StandardUmapOps>::head_csr(
+            Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), &device).into_dispatch(),
+            Tensor::<1>::from_data(TensorData::new(vec![1.0f32], [1]), &device).into_dispatch(),
+            1,
+        );
+        let observed_offsets: Tensor<1, Int> = Tensor::from_dispatch(observed_offsets);
+        let observed_edges: Tensor<1, Int> = Tensor::from_dispatch(observed_edges);
+        assert_eq!(
+            observed_offsets.to_data().try_to_vec::<i32>().unwrap(),
+            [0, 1]
+        );
+        assert_eq!(observed_edges.to_data().try_to_vec::<i32>().unwrap(), [0]);
+        let (head_offsets, head_edges) = csr(&device, &[0], &[1.0], 1);
+        for epoch in 0..2 {
+            let head_before = expected_head.clone();
+            let positive = Tensor::<1>::from_data(
+                TensorData::new(vec![1.0f64], [1]),
+                (&device, burn::tensor::DType::F64),
+            );
+            let next_positive = Tensor::<1>::from_data(
+                TensorData::new(vec![actual_positive], [1]),
+                (&device, burn::tensor::DType::F64),
+            );
+            let negative = Tensor::<1>::from_data(
+                TensorData::new(vec![1.0f64], [1]),
+                (&device, burn::tensor::DType::F64),
+            );
+            let next_negative = Tensor::<1>::from_data(
+                TensorData::new(vec![actual_negative], [1]),
+                (&device, burn::tensor::DType::F64),
+            );
+            let rng = Tensor::<2, Int>::from_data(
+                TensorData::new(actual_rng.clone(), [1, 3]),
+                (&device, burn::tensor::DType::I64),
+            );
+            let heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), &device);
+            let tails = Tensor::<1, Int>::from_data(TensorData::new(vec![1i32], [1]), &device);
+            let weights = Tensor::<1>::from_data(TensorData::new(vec![1.0f32], [1]), &device);
+            let retained_head = head.clone();
+            let retained_tail = tail.clone();
+            let (next_head, next_tail, next_positive, next_negative, next_rng) =
+                <Dispatch as StandardUmapOps>::optimize_epoch(
+                    head.into_dispatch(),
+                    tail.into_dispatch(),
+                    heads.into_dispatch(),
+                    tails.into_dispatch(),
+                    weights.into_dispatch(),
+                    positive.into_dispatch(),
+                    next_positive.into_dispatch(),
+                    negative.into_dispatch(),
+                    next_negative.into_dispatch(),
+                    rng.into_dispatch(),
+                    head_offsets.clone(),
+                    head_edges.clone(),
+                    epoch,
+                    1.576_943_5,
+                    0.895_060_9,
+                    1.7,
+                    0.25,
+                    1.0,
+                    false,
+                    false,
+                );
+            head = Tensor::from_dispatch(next_head);
+            tail = Tensor::from_dispatch(next_tail);
+            let next_positive: Tensor<1> = Tensor::from_dispatch(next_positive);
+            let next_negative: Tensor<1> = Tensor::from_dispatch(next_negative);
+            let next_rng: Tensor<2, Int> = Tensor::from_dispatch(next_rng);
+            actual_positive = next_positive.to_data().try_to_vec::<f64>().unwrap()[0];
+            actual_negative = next_negative.to_data().try_to_vec::<f64>().unwrap()[0];
+            actual_rng = next_rng.to_data().try_to_vec::<i64>().unwrap();
+            single_head_reference(
+                &mut expected_head,
+                &expected_tail,
+                dimensions,
+                &mut expected_positive,
+                &mut expected_negative,
+                &mut expected_rng,
+                epoch,
+            );
+            let actual_head = head.to_data().try_to_vec::<f32>().unwrap();
+            // A single active head serializes all coordinate writes; the host
+            // reference preserves f32 operation and edge order. Keep the
+            // tolerance at 1e-5 for backend `powf` rounding rather than
+            // claiming a bitwise contract.
+            check_close(
+                &actual_head,
+                &expected_head,
+                "single-head reference coordinates",
+            );
+            assert_eq!(
+                retained_head.to_data().try_to_vec::<f32>().unwrap(),
+                head_before
+            );
+            assert_eq!(tail.to_data().try_to_vec::<f32>().unwrap(), expected_tail);
+            assert_eq!(
+                retained_tail.to_data().try_to_vec::<f32>().unwrap(),
+                expected_tail
+            );
+            assert_eq!(actual_positive, expected_positive);
+            assert_eq!(actual_negative, expected_negative);
+            assert_eq!(actual_rng, expected_rng);
+        }
+    }
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn standard_layout_runs_estimator_produced_f64_clock_state() {
+    let data = (0..12)
+        .map(|row| vec![row as f32 * 0.1, (row as f32 * 0.4).sin()])
+        .collect::<Vec<_>>();
+    let config = UMAPConfig {
+        n_neighbors: 4,
+        n_epochs: Some(2),
+        init: Init::Random,
+        random_state: Some(31),
+        ..Default::default()
+    };
+    let baseline = UMAP::new(
+        UMAPConfig {
+            n_epochs: Some(0),
+            ..config.clone()
+        },
+        BackendChoice::Cpu,
+        NeighborSearch::Exact,
+    )
+    .fit(&data)
+    .unwrap();
+    let fitted = UMAP::new(config, BackendChoice::Cpu, NeighborSearch::Exact)
+        .fit(&data)
+        .unwrap();
+    assert_eq!(fitted.embedding().len(), data.len());
+    assert_ne!(fitted.embedding(), baseline.embedding());
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .flatten()
+            .all(|coordinate| coordinate.is_finite())
+    );
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn standard_layout_plain_cube_backend_active_update_preserves_observers() {
+    use burn::backend::ops::{FloatTensorOps, IntTensorOps};
+    use burn_cubecl::{CubeBackend, CubeDevice, ops::into_data_sync, tensor::CubeTensor};
+
+    let device = CubeDevice::Cpu(Default::default());
+    let make_float = |values: Vec<f32>, shape: [usize; 2]| {
+        CubeBackend::float_from_data(TensorData::new(values, shape), &device)
+    };
+    let make_float_1d = |values: Vec<f32>| {
+        CubeBackend::float_from_data(TensorData::new(values.clone(), [values.len()]), &device)
+    };
+    let make_i32 = |values: Vec<i32>, shape: [usize; 1]| {
+        CubeBackend::int_from_data(TensorData::new(values, shape), &device)
+    };
+    let head_data = vec![0.0f32, 1.0];
+    let tail_data = vec![1.0f32, 0.0];
+    let head = make_float(head_data.clone(), [1, 2]);
+    let tail = make_float(tail_data.clone(), [1, 2]);
+    let retained_head = head.clone();
+    let retained_tail = tail.clone();
+    let (new_head, new_tail, positive_clock, negative_clock, rng) =
+        <CubeBackend as StandardUmapOps>::optimize_epoch(
+            head,
+            tail,
+            make_i32(vec![0], [1]),
+            make_i32(vec![0], [1]),
+            make_float_1d(vec![1.0]),
+            CubeBackend::float_from_data(TensorData::new(vec![1.0f64], [1]), &device),
+            CubeBackend::float_from_data(TensorData::new(vec![0.0f64], [1]), &device),
+            CubeBackend::float_from_data(TensorData::new(vec![1.0f64], [1]), &device),
+            CubeBackend::float_from_data(TensorData::new(vec![0.0f64], [1]), &device),
+            CubeBackend::int_from_data(TensorData::new(vec![11i64, 12, 13], [1, 3]), &device),
+            make_i32(vec![0, 1], [2]),
+            make_i32(vec![0], [1]),
+            0,
+            1.576_943_5,
+            0.895_060_9,
+            1.7,
+            0.25,
+            0.0,
+            false,
+            false,
+        );
+    let output = |tensor: CubeTensor| into_data_sync(tensor);
+    let new_head = output(new_head);
+    let new_tail = output(new_tail);
+    let positive_clock = output(positive_clock);
+    let negative_clock = output(negative_clock);
+    let rng = output(rng);
+    assert_ne!(new_head, TensorData::new(head_data.clone(), [1, 2]));
+    assert_eq!(new_tail, TensorData::new(tail_data.clone(), [1, 2]));
+    assert_eq!(output(retained_head), TensorData::new(head_data, [1, 2]));
+    assert_eq!(output(retained_tail), TensorData::new(tail_data, [1, 2]));
+    assert_eq!(positive_clock, TensorData::new(vec![1.0f64], [1]));
+    assert_eq!(negative_clock, TensorData::new(vec![0.0f64], [1]));
+    assert_eq!(rng, TensorData::new(vec![11i64, 12, 13], [1, 3]));
+}
+
+fn verify_zero_controls_and_repeats(device: &Device, _reference_order: bool) {
     let case: Value = serde_json::from_str(FIXTURE).unwrap();
     let probe = &case["optimizer_probes"][0];
     let frames = probe["epochs"].as_array().unwrap();
-    verify_frames(device, probe, 2, frames, reference_order);
-    verify_frames(device, probe, 2, frames, reference_order);
+    verify_frames(device, probe, 2, frames, _reference_order);
+    verify_frames(device, probe, 2, frames, _reference_order);
 
     let head_data = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let tail_data = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let rng_data = vec![41i64, 42, 43, 44, 45, 46];
     let run = |edge_count: usize, alpha: f32, gamma: f32, rate: f32| {
-        let (head_offsets, head_edges) = csr(device, &[0], &[1.0], 2);
+        let empty_heads = vec![0i32; edge_count];
+        let empty_weights = vec![1.0f32; edge_count];
+        let (head_offsets, head_edges) = csr(device, &empty_heads, &empty_weights, 2);
         let head = Tensor::<2>::from_data(TensorData::new(head_data.clone(), [2, 3]), device);
         let tail = Tensor::<2>::from_data(TensorData::new(tail_data.clone(), [2, 3]), device);
         let heads = Tensor::<1, Int>::from_data(
@@ -314,17 +616,17 @@ fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
             device,
         );
         let positive = Tensor::<1>::from_data(
-            TensorData::new(vec![1.0f32][..edge_count].to_vec(), [edge_count]),
-            device,
+            TensorData::new(vec![1.0f64][..edge_count].to_vec(), [edge_count]),
+            (device, burn::tensor::DType::F64),
         );
         let next_positive = positive.clone();
         let negative = Tensor::<1>::from_data(
-            TensorData::new(vec![1.0f32][..edge_count].to_vec(), [edge_count]),
-            device,
+            TensorData::new(vec![1.0f64][..edge_count].to_vec(), [edge_count]),
+            (device, burn::tensor::DType::F64),
         );
         let next_negative = Tensor::<1>::from_data(
-            TensorData::new(vec![0.0f32][..edge_count].to_vec(), [edge_count]),
-            device,
+            TensorData::new(vec![0.0f64][..edge_count].to_vec(), [edge_count]),
+            (device, burn::tensor::DType::F64),
         );
         let rng = Tensor::<2, Int>::from_data(
             TensorData::new(rng_data.clone(), [2, 3]),
@@ -362,19 +664,22 @@ fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
     let rng: Tensor<2, Int> = Tensor::from_dispatch(rng);
     let head_data_after = head.to_data().try_to_vec::<f32>().unwrap();
     let tail_data_after = tail.to_data().try_to_vec::<f32>().unwrap();
-    if reference_order {
-        assert_eq!(head_data_after, head_data);
-        assert_eq!(tail_data_after, tail_data);
-    } else {
-        assert!(
-            head_data_after
-                .iter()
-                .chain(&tail_data_after)
-                .all(|v| v.is_finite())
-        );
-    }
-    assert_eq!(next_pos.to_data().try_to_vec::<f32>().unwrap(), [2.0]);
-    assert_eq!(next_neg.to_data().try_to_vec::<f32>().unwrap(), [0.0]);
+    assert_eq!(head_data_after, head_data);
+    assert_eq!(tail_data_after, tail_data);
+    assert_eq!(next_pos.to_data().try_to_vec::<f64>().unwrap(), [2.0]);
+    assert_eq!(next_neg.to_data().try_to_vec::<f64>().unwrap(), [0.0]);
+    assert_eq!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
+
+    let (head, tail, next_pos, next_neg, rng) = run(0, 0.8, 1.0, 1.0);
+    let head: Tensor<2> = Tensor::from_dispatch(head);
+    let tail: Tensor<2> = Tensor::from_dispatch(tail);
+    let next_pos: Tensor<1> = Tensor::from_dispatch(next_pos);
+    let next_neg: Tensor<1> = Tensor::from_dispatch(next_neg);
+    let rng: Tensor<2, Int> = Tensor::from_dispatch(rng);
+    assert_eq!(head.to_data().try_to_vec::<f32>().unwrap(), head_data);
+    assert_eq!(tail.to_data().try_to_vec::<f32>().unwrap(), tail_data);
+    assert!(next_pos.to_data().try_to_vec::<f64>().unwrap().is_empty());
+    assert!(next_neg.to_data().try_to_vec::<f64>().unwrap().is_empty());
     assert_eq!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
 
     let (expected_head, expected_tail, _, _, _) = run(1, 0.8, 0.0, 0.0);
@@ -384,29 +689,20 @@ fn verify_zero_controls_and_repeats(device: &Device, reference_order: bool) {
     let rng: Tensor<2, Int> = Tensor::from_dispatch(rng);
     let head_data_after = head.to_data().try_to_vec::<f32>().unwrap();
     let tail_data_after = tail.to_data().try_to_vec::<f32>().unwrap();
-    if reference_order {
-        assert_eq!(
-            head_data_after,
-            Tensor::<2>::from_dispatch(expected_head)
-                .to_data()
-                .try_to_vec::<f32>()
-                .unwrap()
-        );
-        assert_eq!(
-            tail_data_after,
-            Tensor::<2>::from_dispatch(expected_tail)
-                .to_data()
-                .try_to_vec::<f32>()
-                .unwrap()
-        );
-    } else {
-        assert!(
-            head_data_after
-                .iter()
-                .chain(&tail_data_after)
-                .all(|v| v.is_finite())
-        );
-    }
+    assert_eq!(
+        head_data_after,
+        Tensor::<2>::from_dispatch(expected_head)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+    );
+    assert_eq!(
+        tail_data_after,
+        Tensor::<2>::from_dispatch(expected_tail)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+    );
     assert_ne!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
 }
 

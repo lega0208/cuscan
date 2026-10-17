@@ -24,8 +24,19 @@ pub const DEFAULT_CUBE_DIM: CubeDim = CubeDim::new_2d(32, 32);
 /// a dimension cannot truncate a row, tile, or tail.
 pub(crate) fn legal_cube_dim(client: &cubecl::client::Client, preferred: CubeDim) -> CubeDim {
     let hardware = &client.properties().hardware;
-    let (max_x, max_y, max_z) = hardware.max_cube_dim;
-    let mut remaining = hardware.max_units_per_cube.max(1);
+    legal_cube_dim_for_limits(
+        preferred,
+        hardware.max_cube_dim,
+        hardware.max_units_per_cube,
+    )
+}
+
+fn legal_cube_dim_for_limits(
+    preferred: CubeDim,
+    (max_x, max_y, max_z): (u32, u32, u32),
+    max_units_per_cube: u32,
+) -> CubeDim {
+    let mut remaining = max_units_per_cube.max(1);
     let x = preferred.x.min(max_x).min(remaining).max(1);
     remaining /= x;
     let y = preferred.y.min(max_y).min(remaining).max(1);
@@ -245,3 +256,28 @@ impl crate::backend::StandardUmapOps for CubeBackend {
 }
 
 // The autodiff implementation is handwritten in src/autodiff_ops.rs.
+
+#[cfg(test)]
+mod launch_limit_tests {
+    use super::*;
+
+    #[test]
+    fn legal_cube_dim_respects_axis_and_unit_limits_and_preserves_tails() {
+        for (preferred, axis_limits, units, expected) in [
+            (CubeDim::new_1d(32), (32, 1, 1), 1, (1, 1, 1)),
+            (CubeDim::new_1d(32), (32, 1, 1), 8, (8, 1, 1)),
+            (CubeDim::new_1d(32), (32, 1, 1), 64, (32, 1, 1)),
+            (CubeDim::new_1d(64), (64, 1, 1), 64, (64, 1, 1)),
+            (CubeDim::new_1d(64), (16, 1, 1), 64, (16, 1, 1)),
+            (CubeDim::new_2d(16, 16), (16, 16, 1), 256, (16, 16, 1)),
+            (CubeDim::new_2d(32, 32), (32, 32, 1), 1024, (32, 32, 1)),
+            (CubeDim::new_2d(32, 32), (32, 32, 1), 64, (32, 2, 1)),
+        ] {
+            let dim = legal_cube_dim_for_limits(preferred, axis_limits, units);
+            assert_eq!((dim.x, dim.y, dim.z), expected);
+            let work = 67u32;
+            let cubes = work.div_ceil(dim.x);
+            assert!(cubes * dim.x >= work, "tail is covered by the final cube");
+        }
+    }
+}

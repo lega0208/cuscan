@@ -3,6 +3,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_query(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -27,6 +28,7 @@ fn run_query(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_prevalidated_query(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -51,6 +53,7 @@ fn run_prevalidated_query(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_query_with_entry(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -104,6 +107,7 @@ fn run_query_with_entry(
     )
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     // A path graph makes traversal observable: a query near row 5 can reach
     // its nearest point only by following several retained training edges.
@@ -124,6 +128,7 @@ fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     (query, reference, graph)
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u64) -> Vec<i32> {
     const MODULUS: i64 = 2_147_483_647;
     let n_u64 = u64::try_from(n).unwrap();
@@ -149,6 +154,7 @@ fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u6
     starts
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn self_edge_query_reference(
     n: usize,
     capacity: usize,
@@ -173,6 +179,7 @@ fn self_edge_query_reference(
     (indices, distances, stats)
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_is_seeded_bounded_and_bipartite() {
     let device = Device::cpu();
@@ -228,6 +235,7 @@ fn approximate_query_is_seeded_bounded_and_bipartite() {
     assert_eq!(distances, [0.0]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_seed_offsets_preserve_block_identity() {
     let device = Device::cpu();
@@ -266,6 +274,7 @@ fn approximate_query_seed_offsets_preserve_block_identity() {
     assert_eq!(whole.2, split_stats);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
     let device = Device::cpu();
@@ -300,6 +309,7 @@ fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
     );
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_orders_equal_distances_by_reference_id() {
     let device = Device::cpu();
@@ -318,11 +328,13 @@ fn approximate_query_orders_equal_distances_by_reference_id() {
     assert_eq!(distances, [0.0, 0.0, 1.0]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_marks_invalid_graph_indices_in_stats() {
     assert_invalid_graph_indices_in_stats(&Device::cpu());
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
     let device = Device::cpu();
@@ -341,6 +353,7 @@ fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
     assert_eq!(prevalidated, validating);
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn assert_invalid_graph_indices_in_stats(device: &Device) {
     let reference =
         Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0], [4, 1]), device);
@@ -356,6 +369,7 @@ fn assert_invalid_graph_indices_in_stats(device: &Device) {
     }
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_uses_seeded_unique_floyd_starts() {
     let device = Device::cpu();
@@ -482,7 +496,16 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
         eprintln!("SKIPPED: no CUDA device");
         return;
     };
+    assert_prevalidated_chunks_large_batch_with_host_oracle(&cuda_device);
+}
 
+#[cfg(feature = "cpu")]
+#[test]
+fn approximate_query_cpu_chunks_large_batch_with_host_oracle() {
+    assert_prevalidated_chunks_large_batch_with_host_oracle(&Device::cpu());
+}
+
+fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
     let n = 5_000usize;
     let query_rows = 7_000usize;
     let k = 15;
@@ -503,20 +526,27 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
     let graph_values = (0..n).map(|row| row as i32).collect::<Vec<_>>();
     let query_values = vec![0.5f32; query_rows];
 
-    let cuda_reference = Tensor::<2>::from_data(
-        TensorData::new(reference_values.clone(), [n, 1]),
-        &cuda_device,
-    );
-    let cuda_query = Tensor::<2>::from_data(
+    let reference =
+        Tensor::<2>::from_data(TensorData::new(reference_values.clone(), [n, 1]), device);
+    let query = Tensor::<2>::from_data(
         TensorData::new(query_values.clone(), [query_rows, 1]),
-        &cuda_device,
+        device,
     );
-    let cuda_graph =
-        Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), &cuda_device);
+    let graph = Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), device);
     let actual = run_prevalidated_query(
-        cuda_query,
-        cuda_reference,
-        cuda_graph,
+        query.clone(),
+        reference.clone(),
+        graph.clone(),
+        k,
+        candidates,
+        visits,
+        seed,
+        query_offset,
+    );
+    let checked = run_query(
+        query,
+        reference,
+        graph,
         k,
         candidates,
         visits,
@@ -530,67 +560,15 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
     let expected =
         self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
 
-    assert_eq!(actual.0, expected.0, "chunked CUDA indices differ");
-    assert_eq!(actual.1, expected.1, "chunked CUDA distances differ");
-    assert_eq!(actual.2, expected.2, "chunked CUDA stats differ");
+    assert_eq!(checked, actual, "checked/prevalidated chunk outputs differ");
+    assert_eq!(actual.0, expected.0, "chunked query indices differ");
+    assert_eq!(actual.1, expected.1, "chunked query distances differ");
+    assert_eq!(actual.2, expected.2, "chunked query stats differ");
     assert!(
         actual
             .2
             .chunks_exact(2)
             .all(|stats| stats[0] == 15 && stats[1] == 15)
-    );
-}
-
-#[test]
-fn approximate_query_cpu_chunks_large_batch_and_preserves_tail_rows() {
-    let n = 5_000usize;
-    let query_rows = 7_000usize;
-    let k = 15;
-    let candidates = 15;
-    let visits = 5_000;
-    let seed = 42u64;
-    let query_offset = 17u64;
-    let scratch_budget = 256 * 1024 * 1024;
-    let scratch_per_row =
-        candidates as usize * (4 + 4 + 4) + visits as usize * (4 + 4) + 8 + 32 * 4;
-    let max_chunk_rows = scratch_budget / scratch_per_row;
-    assert!(query_rows * scratch_per_row > scratch_budget);
-    assert!(max_chunk_rows < query_rows);
-    let chunk_lengths = (0..query_rows)
-        .step_by(max_chunk_rows)
-        .map(|start| (query_rows - start).min(max_chunk_rows))
-        .collect::<Vec<_>>();
-    assert!(chunk_lengths.len() > 1);
-    assert_ne!(chunk_lengths.last(), Some(&max_chunk_rows));
-
-    let device = Device::cpu();
-    let reference = Tensor::<2>::from_data(
-        TensorData::new((0..n).map(|row| row as f32).collect(), [n, 1]),
-        &device,
-    );
-    let query = Tensor::<2>::from_data(
-        TensorData::new(vec![0.5f32; query_rows], [query_rows, 1]),
-        &device,
-    );
-    let graph = Tensor::<2, Int>::from_data(
-        TensorData::new((0..n).map(|row| row as i32).collect(), [n, 1]),
-        &device,
-    );
-    let actual = run_prevalidated_query(
-        query,
-        reference,
-        graph,
-        k,
-        candidates,
-        visits,
-        seed,
-        query_offset,
-    );
-    let expected =
-        self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
-    assert_eq!(
-        actual, expected,
-        "CPU query chunks/tail differ from host arithmetic reference"
     );
 }
 

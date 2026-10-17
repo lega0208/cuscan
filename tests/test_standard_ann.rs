@@ -3,7 +3,7 @@ use burn::{
     tensor::{Device, Tensor, TensorData},
 };
 use fast_umap::backend::StandardUmapOps;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 use serde_json::json;
 #[cfg(feature = "cuda")]
 use std::io::Write;
@@ -143,7 +143,7 @@ fn recall_score(ids: &[i32]) -> usize {
     hits
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn old_rescan_oracle(
     points: &[f32],
     n: usize,
@@ -444,6 +444,61 @@ fn e2_points(shape_index: usize, n: usize, features: usize) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
+fn assert_generalized_full_join_cases(device: &Device) {
+    for (shape_index, n, features, k, iterations) in [
+        (0usize, 7usize, 3usize, 2usize, 3u32),
+        (1, 19, 1, 3, 4),
+        (2, 31, 5, 4, 5),
+        (3, 67, 3, 8, 5),
+    ] {
+        let points = e2_points(shape_index, n, features);
+        let expected = generalized_full_join_oracle(&points, n, features, k, 0x5179, iterations);
+        let data = Tensor::<2>::from_data(TensorData::new(points, [n, features]), device);
+        let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            data.into_dispatch(),
+            k as u32,
+            0x5179,
+            iterations,
+        );
+        let ids = Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let distance_bits = Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids, expected.ids,
+            "full-join oracle n={n}, f={features}, k={k}"
+        );
+        assert_eq!(distance_bits, expected.distance_bits);
+    }
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_matches_frozen_full_join_oracle_grid() {
+    assert_generalized_full_join_cases(&Device::cpu());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_ann_matches_frozen_full_join_oracle_grid() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    assert_generalized_full_join_cases(&device);
+}
+
 fn ordered_host_proposals(
     points: &[f32],
     n: usize,
@@ -620,6 +675,7 @@ fn cuda_ann_matches_generalized_full_join_e2_grid() {
     }
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_matches_independent_full_join_host_reference() {
     let n = 31usize;
@@ -671,6 +727,17 @@ fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
         );
         return;
     };
+    assert_old_rescan_oracle_cases(&device);
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
+    assert_old_rescan_oracle_cases(&Device::cpu());
+}
+
+#[cfg(any(feature = "cpu", feature = "cuda"))]
+fn assert_old_rescan_oracle_cases(device: &Device) {
     let fixtures = [
         ("hub-ties", 19usize, 2usize),
         ("duplicate-points", 23usize, 3usize),
@@ -694,7 +761,7 @@ fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
             .collect::<Vec<_>>();
         let k = 3usize;
         let iterations = 5;
-        let data = Tensor::<2>::from_data(TensorData::new(points.clone(), [n, features]), &device);
+        let data = Tensor::<2>::from_data(TensorData::new(points.clone(), [n, features]), device);
         let (actual_ids, actual_distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
             data.into_dispatch(),
             k as u32,
@@ -724,6 +791,70 @@ fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
     }
 }
 
+#[cfg(any(feature = "cpu", feature = "cuda"))]
+fn assert_ann_candidate_width_matrix(device: &Device) {
+    for (n, features, k) in [(7usize, 3usize, 1usize), (43, 1, 7), (43, 3, 8), (47, 5, 9)] {
+        let points = (0..n)
+            .flat_map(|row| {
+                (0..features)
+                    .map(move |column| ((row * (column + 3) + column * 5) % 23) as f32 * 0.125)
+            })
+            .collect::<Vec<_>>();
+        let width = (k * 4).min(64).min(n - 1);
+        if k >= 7 {
+            assert!(matches!(width, 28 | 32 | 36));
+        }
+        let iterations = 4;
+        let data = Tensor::<2>::from_data(TensorData::new(points.clone(), [n, features]), device);
+        let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            data.into_dispatch(),
+            k as u32,
+            0x5179,
+            iterations,
+        );
+        let actual_ids = Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let actual_distance_bits = Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        let expected = old_rescan_oracle(&points, n, features, k, 0x5179, iterations);
+        assert_eq!(
+            actual_ids, expected.0,
+            "ANN width {width}, n={n}, f={features}"
+        );
+        assert_eq!(
+            actual_distance_bits, expected.1,
+            "ANN distance width {width}, n={n}, f={features}"
+        );
+    }
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_matches_independent_oracle_across_candidate_widths_and_odd_shapes() {
+    assert_ann_candidate_width_matrix(&Device::cpu());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_ann_matches_independent_oracle_across_candidate_widths_and_odd_shapes() {
+    let Some(device) = fast_umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    assert_ann_candidate_width_matrix(&device);
+}
+
+#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_is_deterministic_unique_and_sorted() {
     let (ids, distances) = run(Device::cpu(), 7, 6);
@@ -734,6 +865,7 @@ fn cpu_ann_is_deterministic_unique_and_sorted() {
     assert_ne!(run(Device::cpu(), 7, 0).0, run(Device::cpu(), 8, 0).0);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_resolves_equal_distances_by_neighbor_index() {
     let device = Device::cpu();
@@ -758,6 +890,7 @@ fn cpu_ann_resolves_equal_distances_by_neighbor_index() {
     assert_eq!(&distances[..4], &[1.0; 4]);
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_refines_seed_candidates_with_more_neighbor_joins() {
     let (seeded, _) = run(Device::cpu(), 29, 0);
@@ -805,6 +938,7 @@ fn required_cuda_mode_fails_when_cuda_support_is_not_compiled() {
     );
 }
 
+#[cfg(feature = "cpu")]
 #[test]
 fn ann_rejects_invalid_tiny_width_instead_of_exact_fallback() {
     let device = Device::cpu();
@@ -971,7 +1105,7 @@ fn cuda_ann_source_tagged_capture_oracle() {
     assert_eq!(ids, run_odd_dimension_case(&device));
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn ann_edge_cases(device: &Device) -> serde_json::Value {
     use fast_umap::standard_umap::approximate_query_budget;
     let reference_values = vec![0.0f32, 1.0, 2.0, 3.0];
@@ -1052,6 +1186,15 @@ fn ann_edge_cases(device: &Device) -> serde_json::Value {
         }),
         other => panic!("expected checked budget overflow, got {other:?}"),
     };
+    #[cfg(feature = "cuda")]
+    let overflow_input_digest = git_blob_digest(
+        &extreme_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    #[cfg(not(feature = "cuda"))]
+    let overflow_input_digest = String::new();
     json!({
         "operation": "approximate_query-invalid-markers+approximate_neighbors-overflow+approximate_query_budget-overflow",
         "dtype": "f32/i32/u64",
@@ -1063,14 +1206,30 @@ fn ann_edge_cases(device: &Device) -> serde_json::Value {
         "invalid_graph": [-2, 1, 2, 3],
         "invalid_graph_stats": invalid_stats,
         "overflow_input_bits": extreme_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "overflow_input_digest": git_blob_digest(&extreme_values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()),
+        "overflow_input_digest": overflow_input_digest,
         "overflow_fit_ids": overflow_ids,
         "overflow_fit_distance_bits": overflow_distance_bits,
         "representability_error": budget_error,
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_edge_cases_preserve_markers_and_checked_overflow() {
+    let cases = ann_edge_cases(&Device::cpu());
+    assert!(
+        cases["sentinel_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value.as_i64().unwrap() >= 0)
+    );
+    assert_eq!(cases["invalid_graph_stats"], serde_json::json!([-1, -1]));
+    assert_eq!(cases["overflow_fit_ids"].as_array().unwrap().len(), 8);
+    assert!(cases["representability_error"].is_object());
+}
+
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn odd_dimension_points(rows: usize) -> Vec<f32> {
     (0..rows)
         .flat_map(|row| {
@@ -1087,7 +1246,7 @@ fn odd_dimension_points(rows: usize) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_odd_dimension_case(device: &Device) -> Vec<i32> {
     let data = Tensor::<2>::from_data(TensorData::new(odd_dimension_points(67), [67, 3]), device);
     let (indices, _) =
@@ -1096,4 +1255,24 @@ fn run_odd_dimension_case(device: &Device) -> Vec<i32> {
         .to_data()
         .try_to_vec::<i32>()
         .unwrap()
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_handles_odd_feature_and_row_counts() {
+    let ids = run_odd_dimension_case(&Device::cpu());
+    let points = odd_dimension_points(67);
+    let expected = old_rescan_oracle(&points, 67, 3, 33, 0x5eed, 7);
+    assert_eq!(ids.len(), 67 * 33);
+    assert_eq!(
+        ids, expected.0,
+        "odd-shape IDs differ from frozen host oracle"
+    );
+    for (row, neighbors) in ids.chunks_exact(33).enumerate() {
+        assert!(
+            neighbors
+                .iter()
+                .all(|&id| (0..67).contains(&id) && id != row as i32)
+        );
+    }
 }
