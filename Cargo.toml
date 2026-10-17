@@ -47,6 +47,7 @@ burn-cubecl = { version = "0.22.0", default-features = false, optional = true }
 crossbeam-channel = "0.5.17"
 ctrlc = "3.5.2"
 cubecl = { version = "0.11.0", default-features = false, optional = true }
+cubecl-cpu = { version = "0.11.0", default-features = false, optional = true }
 cudarc = { version = "0.19.10", features = [
   "std",
   "driver",
@@ -122,6 +123,7 @@ cpu = [
   "burn/cpu",
   "burn/fusion",
 ] # CubeCL LLVM CPU runtime
+cubecl-ir-dump = ["dep:cubecl-cpu", "cubecl-cpu/pliron-dump"]
 
 tracing = ["dep:tracing", "burn/tracing", "cubecl?/tracing"]
 
@@ -228,6 +230,17 @@ required-features = ["tracing"]
 name = "ann_construction_worker"
 required-features = ["cuda"]
 
+[[example]]
+name = "ann_phase0_dump"
+required-features = ["cpu"]
+
+[[example]]
+name = "ann_codegen_microbench"
+required-features = ["cpu"]
+
+[[example]]
+name = "ann_phase0_replay"
+required-features = ["cpu"]
 
 [[bin]]
 name = "bench_report"

@@ -3047,6 +3047,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "cubecl",
+ "cubecl-cpu",
  "cubecl-environment",
  "cubecl-server",
  "cudarc",
