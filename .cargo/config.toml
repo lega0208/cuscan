@@ -1,0 +1,8 @@
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/sbin/clang"
+rustflags = [
+  "-C",
+  "link-arg=-fuse-ld=mold",
+  "-Zshare-generics=y",
+  "-Zthreads=0",
+]

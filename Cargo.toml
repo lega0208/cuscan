@@ -18,6 +18,10 @@ default-members = ["."]
 exclude = ["references"]
 resolver = "2"
 
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
 # docs.rs build configuration.
 # CPU builds require a native LLVM bundle; docs.rs must not fetch/link that
 # network-dependent runtime. This documentation build uses CUDA instead.
