@@ -9,6 +9,9 @@
 //! (includes kernel JIT/compilation) and later runs are warm. Stage spans come
 //! from the library `tracing` spans, which insert device barriers. Prints one
 //! JSON line with per-run `fit_seconds` and `stage_seconds`.
+//! Stderr run markers use Unix nanoseconds. Calibrate realtime against perf's
+//! monotonic clock before and after recording to select warm sample windows;
+//! summary durations are not timestamps.
 
 use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 use std::{collections::BTreeMap, error::Error, path::Path, time::Instant};
@@ -155,9 +158,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             backend,
             search,
         );
+        eprintln!(
+            "profile_run_start run={run} unix_ns={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
         let start = Instant::now();
         let fitted = model.fit(&data)?;
         fit_seconds.push(start.elapsed().as_secs_f64());
+        eprintln!(
+            "profile_run_end run={run} unix_ns={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
         if fitted.embedding().iter().flatten().any(|v| !v.is_finite()) {
             return Err("fit produced a non-finite embedding".into());
         }

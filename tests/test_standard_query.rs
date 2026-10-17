@@ -2,6 +2,66 @@ use burn::backend::Dispatch;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 
+#[cfg(feature = "cpu")]
+#[test]
+fn query_phase1_byte_capture() {
+    let Ok(directory) = std::env::var("QUERY_PHASE1_CAPTURE_DIR") else {
+        return;
+    };
+    let mode = std::env::var("QUERY_PHASE1_CAPTURE_MODE")
+        .expect("explicit capture or verify mode is required");
+    assert!(mode == "capture" || mode == "verify");
+    let device = Device::cpu();
+    let n = 32768usize;
+    // Scratch per row: 4*12 + n*8 + 8 + 128 = 262328 bytes.
+    // The 256 MiB budget therefore fits 1023 rows; 1027 spans two chunks.
+    let rows = 1027usize;
+    let reference = Tensor::<2>::from_data(
+        TensorData::new((0..n).map(|i| i as f32 * 0.125).collect(), [n, 1]),
+        &device,
+    );
+    let query = Tensor::<2>::from_data(
+        TensorData::new(
+            (0..rows).map(|i| i as f32 * 0.25 + 0.1).collect(),
+            [rows, 1],
+        ),
+        &device,
+    );
+    let graph =
+        Tensor::<2, Int>::from_data(TensorData::new((0..n as i32).collect(), [n, 1]), &device);
+    let start = std::time::Instant::now();
+    let (indices, distances, _) = run_query(query, reference, graph, 4, 4, n as u32, 42, 17);
+    eprintln!("phase1 query rows={rows} elapsed={:?}", start.elapsed());
+    let directory = std::path::Path::new(&directory);
+    for (name, bytes) in [
+        (
+            "indices.i32le",
+            indices
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "distances.f32le",
+            distances
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let path = directory.join(name);
+        if mode == "capture" {
+            std::fs::write(path, bytes).unwrap();
+        } else {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "query bytes differ: {name}"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_query(
@@ -503,6 +563,31 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
 #[test]
 fn approximate_query_cpu_chunks_large_batch_with_host_oracle() {
     assert_prevalidated_chunks_large_batch_with_host_oracle(&Device::cpu());
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn approximate_query_cpu_handles_single_row_chunk() {
+    let device = Device::cpu();
+    let n = 8usize;
+    let query_rows = 1usize;
+    let seed = 42u64;
+    let query_offset = 17u64;
+    let actual = run_prevalidated_query(
+        Tensor::<2>::from_data(TensorData::new(vec![0.5f32], [query_rows, 1]), &device),
+        Tensor::<2>::from_data(
+            TensorData::new((0..n).map(|row| row as f32).collect(), [n, 1]),
+            &device,
+        ),
+        Tensor::<2, Int>::from_data(TensorData::new((0..n as i32).collect(), [n, 1]), &device),
+        4,
+        4,
+        n as u32,
+        seed,
+        query_offset,
+    );
+    let expected = self_edge_query_reference(n, 4, seed, query_offset, query_rows);
+    assert_eq!(actual, expected);
 }
 
 fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {

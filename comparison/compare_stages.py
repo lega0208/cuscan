@@ -11,13 +11,15 @@ Then run from the repository root:
     uv run --no-sync python comparison/compare_stages.py [--html stages.html]
 
 Both implementations fit the same clustered float32 input (the generator from
-scripts/compare_umap_spans.py with configurable center scale/noise) in a fresh subprocess
-each. The defaults overlap the clusters so the k-NN graph is connected: with the original
-well-separated clusters (--center-scale 5 --noise 0.35) fast-umap spectral init currently
-fails with "component-centroid affinities underflowed"; use --init random for those.
-Each process performs exactly one fit, so timings are cold: they include CubeCL kernel JIT
-and numba compilation in that process (on-disk caches from earlier processes may still
-apply).
+scripts/compare_umap_spans.py with configurable center scale/noise) in separate subprocesses.
+By default Rust performs one cold fit, including CubeCL kernel JIT in that process (on-disk
+caches from earlier processes may still apply), and Python performs one fit including numba
+compilation. With --rust-runs N for N >= 2, Rust performs N fits in one process: run 0 is
+cold and later runs are warmed; the comparison uses the per-stage median of runs 1 through
+N-1. Python still performs one fit. The defaults overlap the clusters so the k-NN graph is
+connected: with the original well-separated clusters (--center-scale 5 --noise 0.35)
+fast-umap spectral init currently fails with "component-centroid affinities underflowed";
+use --init random for those.
 
 Rust stages come from the library's `tracing` spans (with device barriers). Python
 stages are measured by wrapping the umap-learn module functions that `UMAP.fit` calls:
@@ -30,9 +32,11 @@ umap-learn has no separate spectral graph export step.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -147,17 +151,35 @@ def _run(command: list[str], label: str) -> dict[str, Any]:
     return spans.last_json(completed.stdout)
 
 
-def _summarize(result: dict[str, Any]) -> dict[str, float | None]:
-    """Return {stage: ms} for the single cold fit, including other/total."""
-    (total,) = result["fit_seconds"]
+def _summarize(result: dict[str, Any], run_indices: range | None = None) -> dict[str, float | None]:
+    """Return per-stage milliseconds, optionally taking medians over selected runs."""
+    if run_indices is None:
+        run_indices = range(len(result["fit_seconds"]))
+    indices = list(run_indices)
+    total = statistics.median(result["fit_seconds"][index] for index in indices)
     row: dict[str, float | None] = {}
+    residuals = [result["fit_seconds"][index] for index in indices]
     for stage in STAGES:
         values = result["stage_seconds"].get(stage)
-        row[stage] = None if values is None else values[0] * 1e3
-    measured = sum(value for value in row.values() if value is not None)
-    row["other"] = total * 1e3 - measured
+        if values is not None:
+            for position, index in enumerate(indices):
+                residuals[position] -= values[index]
+        row[stage] = (
+            None if values is None else statistics.median(values[index] for index in indices) * 1e3
+        )
+    row["other"] = statistics.median(residuals) * 1e3
     row["total"] = total * 1e3
     return row
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _speedup(rust: float | None, python: float | None) -> float | None:
@@ -282,6 +304,12 @@ def main() -> int:
     parser.add_argument("--init", choices=["spectral", "random"], default="spectral")
     parser.add_argument("--search", choices=["approximate", "exact"], default="approximate")
     parser.add_argument("--backend", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument(
+        "--rust-runs",
+        type=_positive_int,
+        default=1,
+        help="number of Rust fits; with 2+ runs, compare warmed runs only",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--center-scale", type=float, default=1.0)
     parser.add_argument("--noise", type=float, default=1.0)
@@ -309,6 +337,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as temp:
         input_path = Path(temp) / "input.f32le"
         make_clustered_input(args.rows, args.features, args.center_scale, args.noise, input_path)
+        input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
         shared = ["--neighbors", str(args.neighbors), "--seed", str(args.seed)]
         shared += ["--min-dist", str(args.min_dist)]
         rust = _run(
@@ -320,7 +349,7 @@ def main() -> int:
                 str(args.epochs),
                 *shared,
                 "--runs",
-                "1",
+                str(args.rust_runs),
                 "--backend",
                 args.backend,
                 "--search",
@@ -338,16 +367,46 @@ def main() -> int:
             python_command.append("--seeded-python")
         python = _run(python_command, "python")
 
-    rows = _rows(_summarize(rust), _summarize(python))
+    comparison_runs = range(1, args.rust_runs) if args.rust_runs >= 2 else range(1)
+    rows = _rows(_summarize(rust, comparison_runs), _summarize(python))
     title = (
         f"fast-umap {args.backend} vs umap-learn 0.5.12: {args.rows:,}x{args.features}, "
         f"{args.epochs} epochs, k={args.neighbors}, {args.search} search, {args.init} init, "
         f"{os.cpu_count()} CPUs"
     )
     print(title)
-    _print_table("Cold run (one fit per fresh process)", rows)
+    if args.rust_runs == 1:
+        _print_table("Cold run (one fit per fresh process)", rows)
+    else:
+        for index in range(args.rust_runs):
+            label = "cold" if index == 0 else "warmed"
+            _print_table(
+                f"Rust run {index} ({label})",
+                _rows(_summarize(rust, range(index, index + 1)), _summarize(python)),
+            )
+        _print_table(f"Comparison (median of Rust warmed runs 1-{args.rust_runs - 1})", rows)
     if args.json:
-        args.json.write_text(json.dumps({"rust": rust, "python": python, "rows": rows}, indent=2))
+        metadata = {
+            "input_sha256": input_sha256,
+            "rows": args.rows,
+            "features": args.features,
+            "epochs": args.epochs,
+            "neighbors": args.neighbors,
+            "min_dist": args.min_dist,
+            "init": args.init,
+            "search": args.search,
+            "backend": args.backend,
+            "seed": args.seed,
+            "center_scale": args.center_scale,
+            "noise": args.noise,
+            "rust_runs": args.rust_runs,
+            "seeded_python": args.seeded_python,
+        }
+        args.json.write_text(
+            json.dumps(
+                {"metadata": metadata, "rust": rust, "python": python, "rows": rows}, indent=2
+            )
+        )
     if args.html:
         _write_html(args.html, rows, title)
     return 0

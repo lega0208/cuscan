@@ -717,6 +717,48 @@ fn cpu_ann_matches_independent_full_join_host_reference() {
     assert_eq!(distance_bits, expected.distance_bits);
 }
 
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_covers_parallel_width_boundaries() {
+    let cores = std::thread::available_parallelism().unwrap().get();
+    for n in [
+        cores.saturating_sub(1).max(2),
+        cores.max(2),
+        cores + 1,
+        2 * cores + 3,
+    ] {
+        let k = 3.min(n - 1);
+        let points = e2_points(2, n, 4);
+        let expected = generalized_full_join_oracle(&points, n, 4, k, 42, 3);
+        let data = Tensor::<2>::from_data(TensorData::new(points, [n, 4]), &Device::cpu());
+        let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            data.into_dispatch(),
+            k as u32,
+            42,
+            3,
+        );
+        assert_eq!(
+            Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap(),
+            expected.ids,
+            "row coverage n={n}"
+        );
+        assert_eq!(
+            Tensor::<2>::from_dispatch(distances)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            expected.distance_bits,
+            "distance bits n={n}"
+        );
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_matches_old_rescan_host_oracle_across_reverse_fixtures() {
@@ -947,6 +989,38 @@ fn ann_rejects_invalid_tiny_width_instead_of_exact_fallback() {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ =
                 <Dispatch as StandardUmapOps>::approximate_neighbors(data.into_dispatch(), 0, 1, 3);
+        }))
+        .is_err()
+    );
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_ann_handles_minimal_two_row_input_and_rejects_single_row_input() {
+    let device = Device::cpu();
+    let data = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 3.0], [2, 1]), &device);
+    let (indices, distances) =
+        <Dispatch as StandardUmapOps>::approximate_neighbors(data.into_dispatch(), 1, 42, 3);
+    let ids = Tensor::<2, burn::tensor::Int>::from_dispatch(indices)
+        .to_data()
+        .try_to_vec::<i32>()
+        .unwrap();
+    let distances = Tensor::<2>::from_dispatch(distances)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    assert_eq!(ids, [1, 0]);
+    assert_eq!(distances, [3.0, 3.0]);
+
+    let singleton = Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), &device);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = <Dispatch as StandardUmapOps>::approximate_neighbors(
+                singleton.into_dispatch(),
+                1,
+                42,
+                3,
+            );
         }))
         .is_err()
     );

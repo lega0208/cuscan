@@ -14,6 +14,28 @@ use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
 const QUERY_CUBE_DIM: CubeDim = CubeDim::new_1d(1);
 
+fn query_cpu_chunk_geometry(
+    rows: u32,
+    cores: u32,
+    max_cube_dim_x: u32,
+    max_units_per_cube: u32,
+    max_cube_count: u32,
+) -> (CubeCount, CubeDim) {
+    assert!(rows > 0, "query chunk row count must be nonzero");
+    let dim_x = rows
+        .min(cores)
+        .min(max_cube_dim_x)
+        .min(max_units_per_cube)
+        .max(1);
+    let dim = CubeDim::new_1d(dim_x);
+    let count = rows.div_ceil(dim_x);
+    assert!(
+        count <= max_cube_count,
+        "query chunk requires x cube count {count}; maximum is {max_cube_count}"
+    );
+    (CubeCount::Static(count, 1, 1), dim)
+}
+
 #[cube(launch)]
 fn query_flag_zero_kernel<I: Int>(flag: &mut Tensor<I>, #[define(I)] _dtype: ElemType) {
     if ABSOLUTE_POS_X == 0 {
@@ -534,15 +556,29 @@ fn approximate_query_impl(
         let rows = query_chunk_rows(query_rows, row_start, max_chunk_rows);
         let row_start_u32 = u32::try_from(row_start).expect("query row start exceeds u32");
         let rows_u32 = u32::try_from(rows).expect("query chunk exceeds u32");
-        assert!(
-            rows_u32 <= client.properties().hardware.max_cube_count.0,
-            "query chunk requires x cube count {rows_u32}; maximum is {}",
-            client.properties().hardware.max_cube_count.0
-        );
+        let (cube_count, cube_dim) = if client.name() == "cpu" {
+            let cores = std::thread::available_parallelism()
+                .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX));
+            let hardware = &client.properties().hardware;
+            query_cpu_chunk_geometry(
+                rows_u32,
+                cores,
+                hardware.max_cube_dim.0,
+                hardware.max_units_per_cube,
+                hardware.max_cube_count.0,
+            )
+        } else {
+            assert!(
+                rows_u32 <= client.properties().hardware.max_cube_count.0,
+                "query chunk requires x cube count {rows_u32}; maximum is {}",
+                client.properties().hardware.max_cube_count.0
+            );
+            (CubeCount::Static(rows_u32, 1, 1), QUERY_CUBE_DIM)
+        };
         approximate_query_kernel::launch(
             &client,
-            CubeCount::Static(rows_u32, 1, 1),
-            QUERY_CUBE_DIM,
+            cube_count,
+            cube_dim,
             query.clone().into_tensor_arg(),
             reference.clone().into_tensor_arg(),
             graph.clone().into_tensor_arg(),
@@ -571,4 +607,52 @@ fn approximate_query_impl(
         row_start += rows;
     }
     (indices, distances, stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CubeCount, query_cpu_chunk_geometry};
+
+    fn geometry(rows: u32, cores: u32, max_x: u32, max_units: u32, max_cubes: u32) -> (u32, u32) {
+        let (CubeCount::Static(count, 1, 1), dim) =
+            query_cpu_chunk_geometry(rows, cores, max_x, max_units, max_cubes)
+        else {
+            panic!("query geometry must use a static one-dimensional count");
+        };
+        (count, dim.x)
+    }
+
+    #[test]
+    fn query_cpu_chunk_geometry_caps_width_and_ceil_counts() {
+        assert_eq!(geometry(1023, 15, 32, 32, 1023), (69, 15));
+        assert_eq!(geometry(4, 15, 32, 32, 4), (1, 4));
+        assert_eq!(geometry(23, 32, 32, 32, 23), (1, 23));
+        assert_eq!(geometry(23, 32, 7, 32, 23), (4, 7));
+        assert_eq!(geometry(23, 32, 32, 5, 23), (5, 5));
+        assert_eq!(geometry(23, 6, 7, 5, 23), (5, 5));
+    }
+
+    #[test]
+    fn query_cpu_chunk_geometry_rejects_cube_count_overflow() {
+        assert!(std::panic::catch_unwind(|| geometry(23, 7, 7, 7, 3)).is_err());
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn query_cpu_chunk_geometry_reports_runtime_limits() {
+        let client = burn_cubecl::CubeDevice::cpu().unwrap().client();
+        let hardware = &client.properties().hardware;
+        let cores = u32::try_from(std::thread::available_parallelism().unwrap().get()).unwrap();
+        for rows in [1023, 4] {
+            let (count, dim) = query_cpu_chunk_geometry(
+                rows,
+                cores,
+                hardware.max_cube_dim.0,
+                hardware.max_units_per_cube,
+                hardware.max_cube_count.0,
+            );
+            eprintln!("query runtime rows={rows} cores={cores} count={count:?} dim={dim:?}");
+            assert!(dim.x <= rows && dim.x <= cores);
+        }
+    }
 }

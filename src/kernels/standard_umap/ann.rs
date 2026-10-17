@@ -15,18 +15,53 @@ fn ann_launch_geometry(
     client: &cubecl::client::Client,
     feature_size: usize,
     n_rows: u32,
-) -> (bool, CubeDim) {
+) -> (bool, CubeCount, CubeDim) {
     let cpu_merge = client.name() == "cpu";
+    let hardware = &client.properties().hardware;
+    if !cpu_merge {
+        validate_cooperative_ann_launch(hardware, client.features(), feature_size, n_rows);
+    }
+    ann_launch_geometry_with_limits(
+        cpu_merge,
+        (
+            hardware.max_cube_dim.0,
+            hardware.max_cube_dim.1,
+            hardware.max_cube_dim.2,
+        ),
+        hardware.max_units_per_cube,
+        hardware.max_cube_count.0,
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .try_into()
+            .unwrap_or(u32::MAX),
+        n_rows,
+    )
+}
+
+fn ann_launch_geometry_with_limits(
+    cpu_merge: bool,
+    max_cube_dim: (u32, u32, u32),
+    max_units_per_cube: u32,
+    max_cubes: u32,
+    cores: u32,
+    n_rows: u32,
+) -> (bool, CubeCount, CubeDim) {
     if cpu_merge {
-        (true, CubeDim::new_1d(1))
+        assert!(n_rows > 0, "ANN row count must be nonzero");
+        let dim_x = n_rows
+            .min(cores)
+            .min(max_cube_dim.0)
+            .min(max_units_per_cube)
+            .max(1);
+        let dim = CubeDim::new_1d(dim_x);
+        let count = ann_independent_cube_count(n_rows, dim.x, max_cubes);
+        (true, CubeCount::Static(count, 1, 1), dim)
     } else {
-        validate_cooperative_ann_launch(
-            &client.properties().hardware,
-            client.features(),
-            feature_size,
-            n_rows,
+        assert!(
+            n_rows <= max_cubes,
+            "ANN cooperative cube count exceeds hardware limit"
         );
-        (false, ANN_CUBE_DIM)
+        (false, CubeCount::Static(n_rows, 1, 1), ANN_CUBE_DIM)
     }
 }
 
@@ -502,7 +537,11 @@ fn ann_step<F: Float, I: Int>(
     #[comptime] cpu_merge: bool,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
-    let row = CUBE_POS_X as usize;
+    let row = if comptime![cpu_merge] {
+        (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize
+    } else {
+        CUBE_POS_X as usize
+    };
     let lane = UNIT_POS_X as usize;
     let n = data.shape(0);
     let features = data.shape(1);
@@ -876,6 +915,7 @@ pub(crate) fn approximate_neighbors(
     seed: u64,
     max_iterations: u32,
 ) -> (CubeTensor, CubeTensor) {
+    let debug_timing = std::env::var_os("FAST_UMAP_ANN_DEBUG").is_some();
     let data = into_contiguous(data);
     let [n, features] = data.shape().dims::<2>();
     assert!(
@@ -911,14 +951,9 @@ pub(crate) fn approximate_neighbors(
         .expect("ANN reverse offset allocation overflows usize");
     let n_u32 = u32::try_from(n).expect("ANN row count exceeds CubeCL range");
     let width_u32 = u32::try_from(width).expect("ANN candidate width exceeds CubeCL range");
-    // CubeCL's CPU runtime executes a unit serially. Keep its one-unit geometry;
-    // the cooperative GPU path is validated, never clamped.
-    let (cpu_merge, ann_step_dim) = ann_launch_geometry(&data.client, data.dtype.size(), n_u32);
-    assert!(
-        n_u32 <= data.client.properties().hardware.max_cube_count.0,
-        "ANN row launch requires x cube count {n_u32}; maximum is {}",
-        data.client.properties().hardware.max_cube_count.0
-    );
+    // CPU geometry is row-parallel; cooperative CUDA geometry is validated, never clamped.
+    let (cpu_merge, ann_step_count, ann_step_dim) =
+        ann_launch_geometry(&data.client, data.dtype.size(), n_u32);
     let _feature_count_u32 =
         u32::try_from(features).expect("ANN feature count exceeds CubeCL range");
     let client = data.client.clone();
@@ -959,6 +994,7 @@ pub(crate) fn approximate_neighbors(
         DType::I32,
     );
     let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
+    let init_start = debug_timing.then(std::time::Instant::now);
     ann_init::launch(
         &data.client,
         helper_count,
@@ -969,6 +1005,13 @@ pub(crate) fn approximate_neighbors(
         (seed % 2_147_483_646u64) as u32 + 1,
         dtype_to_storage_type(DType::I32),
     );
+    if let Some(start) = init_start {
+        let _ = data.client.read_one_unchecked(candidates.handle.clone());
+        eprintln!(
+            "ann_debug init_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let mut candidate_distances = CubeTensor::new_contiguous(
         data.client.clone(),
         data.device.clone(),
@@ -1026,6 +1069,7 @@ pub(crate) fn approximate_neighbors(
         DType::I32,
     );
     for iteration in 0..=max_iterations {
+        let helper_start = debug_timing.then(std::time::Instant::now);
         if iteration > 0 {
             let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
             reverse_zero::launch(
@@ -1073,38 +1117,98 @@ pub(crate) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             );
         }
-        ann_step::launch(
-            &data.client,
-            CubeCount::Static(n_u32, 1, 1),
-            ann_step_dim,
-            data.clone().into_tensor_arg(),
-            candidates.clone().into_tensor_arg(),
-            candidate_distances.clone().into_tensor_arg(),
-            candidate_retained.clone().into_tensor_arg(),
-            reverse_offsets.clone().into_tensor_arg(),
-            reverse_sources.clone().into_tensor_arg(),
-            next_candidates.clone().into_tensor_arg(),
-            next_distances.clone().into_tensor_arg(),
-            workspace_indices.clone().into_tensor_arg(),
-            workspace_distances.clone().into_tensor_arg(),
-            next_retained.clone().into_tensor_arg(),
-            new_count.clone().into_tensor_arg(),
-            width_u32,
-            u32::from(iteration > 0),
-            cpu_merge,
-            [
-                dtype_to_storage_type(data.dtype),
-                dtype_to_storage_type(DType::I32),
-            ],
-        );
-        std::mem::swap(&mut candidates, &mut next_candidates);
-        std::mem::swap(&mut candidate_distances, &mut next_distances);
-        std::mem::swap(&mut candidate_retained, &mut next_retained);
-        if iteration > 0 {
-            let bytes = data.client.read_one_unchecked(new_count.handle.clone());
-            let new_ids = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
-            if ann_should_stop(new_ids, n, width) {
-                break;
+        if let Some(start) = helper_start {
+            let _ = data
+                .client
+                .read_one_unchecked(reverse_counts.handle.clone());
+            let helper_ms = if iteration > 0 {
+                start.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
+            let step_start = std::time::Instant::now();
+            ann_step::launch(
+                &data.client,
+                ann_step_count.clone(),
+                ann_step_dim,
+                data.clone().into_tensor_arg(),
+                candidates.clone().into_tensor_arg(),
+                candidate_distances.clone().into_tensor_arg(),
+                candidate_retained.clone().into_tensor_arg(),
+                reverse_offsets.clone().into_tensor_arg(),
+                reverse_sources.clone().into_tensor_arg(),
+                next_candidates.clone().into_tensor_arg(),
+                next_distances.clone().into_tensor_arg(),
+                workspace_indices.clone().into_tensor_arg(),
+                workspace_distances.clone().into_tensor_arg(),
+                next_retained.clone().into_tensor_arg(),
+                new_count.clone().into_tensor_arg(),
+                width_u32,
+                u32::from(iteration > 0),
+                cpu_merge,
+                [
+                    dtype_to_storage_type(data.dtype),
+                    dtype_to_storage_type(DType::I32),
+                ],
+            );
+            let _ = data
+                .client
+                .read_one_unchecked(next_candidates.handle.clone());
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let readback_start = std::time::Instant::now();
+            std::mem::swap(&mut candidates, &mut next_candidates);
+            std::mem::swap(&mut candidate_distances, &mut next_distances);
+            std::mem::swap(&mut candidate_retained, &mut next_retained);
+            if iteration > 0 {
+                let bytes = data.client.read_one_unchecked(new_count.handle.clone());
+                let new_ids = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                let stop = ann_should_stop(new_ids, n, width);
+                eprintln!(
+                    "ann_debug iteration={iteration} new_count={new_ids} helper_ms={helper_ms:.3} step_ms={step_ms:.3} readback_ms={:.3} stop={stop}",
+                    readback_start.elapsed().as_secs_f64() * 1000.0
+                );
+                if stop {
+                    break;
+                }
+            } else {
+                eprintln!(
+                    "ann_debug iteration={iteration} new_count=NA helper_ms={helper_ms:.3} step_ms={step_ms:.3} readback_ms=NA stop=false"
+                );
+            }
+        } else {
+            ann_step::launch(
+                &data.client,
+                ann_step_count.clone(),
+                ann_step_dim,
+                data.clone().into_tensor_arg(),
+                candidates.clone().into_tensor_arg(),
+                candidate_distances.clone().into_tensor_arg(),
+                candidate_retained.clone().into_tensor_arg(),
+                reverse_offsets.clone().into_tensor_arg(),
+                reverse_sources.clone().into_tensor_arg(),
+                next_candidates.clone().into_tensor_arg(),
+                next_distances.clone().into_tensor_arg(),
+                workspace_indices.clone().into_tensor_arg(),
+                workspace_distances.clone().into_tensor_arg(),
+                next_retained.clone().into_tensor_arg(),
+                new_count.clone().into_tensor_arg(),
+                width_u32,
+                u32::from(iteration > 0),
+                cpu_merge,
+                [
+                    dtype_to_storage_type(data.dtype),
+                    dtype_to_storage_type(DType::I32),
+                ],
+            );
+            std::mem::swap(&mut candidates, &mut next_candidates);
+            std::mem::swap(&mut candidate_distances, &mut next_distances);
+            std::mem::swap(&mut candidate_retained, &mut next_retained);
+            if iteration > 0 {
+                let bytes = data.client.read_one_unchecked(new_count.handle.clone());
+                let new_ids = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                if ann_should_stop(new_ids, n, width) {
+                    break;
+                }
             }
         }
     }
@@ -1134,6 +1238,7 @@ pub(crate) fn approximate_neighbors(
         DType::F32,
     );
     let (helper_count, helper_dim) = ann_independent_launch(&data.client, n_u32);
+    let output_start = debug_timing.then(std::time::Instant::now);
     ann_output::launch(
         &data.client,
         helper_count,
@@ -1149,6 +1254,15 @@ pub(crate) fn approximate_neighbors(
             dtype_to_storage_type(DType::I32),
         ],
     );
+    if let Some(start) = output_start {
+        let _ = data
+            .client
+            .read_one_unchecked(output_indices.handle.clone());
+        eprintln!(
+            "ann_debug output_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     (output_indices, output_distances)
 }
 
@@ -1174,6 +1288,30 @@ mod tests {
             println!("ANN CUDA runtime identity: name={}", cuda_client.name());
             assert_ne!(cuda_client.name(), "cpu");
         }
+    }
+
+    #[test]
+    fn ann_launch_geometry_uses_legal_cpu_width_and_ceil_count() {
+        let limits = (8, 1, 1);
+        for (rows, cores, units, expected_dim, expected_count) in
+            [(67, 6, 8, 6, 12), (67, 16, 8, 8, 9), (3, 16, 8, 3, 1)]
+        {
+            let (cpu, count, dim) =
+                ann_launch_geometry_with_limits(true, limits, units, 16, cores, rows);
+            assert!(cpu);
+            assert_eq!((dim.x, dim.y, dim.z), (expected_dim, 1, 1));
+            assert!(matches!(count, CubeCount::Static(n, 1, 1) if n == expected_count));
+        }
+        let (cpu, count, dim) = ann_launch_geometry_with_limits(false, limits, 8, 67, 16, 67);
+        assert!(!cpu);
+        assert!(matches!(count, CubeCount::Static(n, 1, 1) if n == 67));
+        assert_eq!((dim.x, dim.y, dim.z), (32, 1, 1));
+        assert!(
+            std::panic::catch_unwind(|| {
+                ann_launch_geometry_with_limits(true, limits, 8, 2, 4, 67)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1826,10 +1964,11 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             dtype,
         );
-        let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
+        let (cpu_merge, step_count, step_dim) =
+            ann_launch_geometry(&client, data.dtype.size(), n_u32);
         ann_step::launch(
             &client,
-            CubeCount::Static(n_u32, 1, 1),
+            step_count,
             step_dim,
             data.clone().into_tensor_arg(),
             candidate_tensor.into_tensor_arg(),
@@ -2030,10 +2169,11 @@ mod tests {
             new_count.clone().into_tensor_arg(),
             dtype,
         );
-        let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
+        let (cpu_merge, step_count, step_dim) =
+            ann_launch_geometry(&client, data.dtype.size(), n_u32);
         ann_step::launch(
             &client,
-            CubeCount::Static(u32::try_from(n).unwrap(), 1, 1),
+            step_count,
             step_dim,
             data.into_tensor_arg(),
             candidate_tensor.into_tensor_arg(),
@@ -2247,10 +2387,11 @@ mod tests {
                 new_count.clone().into_tensor_arg(),
                 dtype,
             );
-            let (cpu_merge, step_dim) = ann_launch_geometry(&client, data.dtype.size(), n_u32);
+            let (cpu_merge, step_count, step_dim) =
+                ann_launch_geometry(&client, data.dtype.size(), n_u32);
             ann_step::launch(
                 &client,
-                CubeCount::Static(n_u32, 1, 1),
+                step_count,
                 step_dim,
                 data.clone().into_tensor_arg(),
                 candidate_tensor.into_tensor_arg(),
