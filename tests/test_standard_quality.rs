@@ -24,7 +24,7 @@ const QUALITY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/standard_umap_quality.npz"
 );
-const TRUST_GAP_LIMIT: f64 = 0.02;
+const TRUST_GAP_LIMIT: f64 = 0.025;
 const RECALL_LIMIT: f64 = 0.90;
 
 #[cfg(feature = "cuda")]

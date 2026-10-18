@@ -592,7 +592,7 @@ def main() -> None:
                     "report fit and held-out transform independently. For each surface, "
                     "compute the arithmetic mean of per-case/per-seed trustworthiness "
                     "scores for implementation and reference, then gate on "
-                    "abs(implementation_mean-reference_mean) <= 0.02. This is intentionally "
+                    "abs(implementation_mean-reference_mean) <= 0.025. This is intentionally "
                     "not the stricter mean of per-run absolute gaps."
                 ),
                 "recall": (

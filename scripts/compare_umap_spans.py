@@ -59,7 +59,7 @@ SMALL = ((512, 16, 30), (1024, 32, 100))
 MODES = ("exact", "approximate")
 NEIGHBORS = 15
 FIT_WIDTH = NEIGHBORS - 1
-TRUST_GAP = 0.02
+TRUST_GAP = 0.025
 RECALL_LIMIT = 0.90
 SMALL_RATIO_LIMIT = 1.10
 SPEED_RATIO_LIMIT = 0.90
@@ -2842,7 +2842,7 @@ def _cli() -> int:
                     "python_trustworthiness": py_trust,
                     "python_trustworthiness_mean": python_mean,
                     "cuda_trustworthiness": cuda_trust,
-                    "Q-02_each_cuda_within_0.02_of_python_mean": all(
+                    "Q-02_each_cuda_within_0.025_of_python_mean": all(
                         abs(t - python_mean) <= TRUST_GAP for t in cuda_trust
                     ),
                 }

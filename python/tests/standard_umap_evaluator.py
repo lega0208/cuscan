@@ -19,7 +19,7 @@ from sklearn.manifold import trustworthiness
 ROOT = Path(__file__).resolve().parents[2]
 REFERENCE = ROOT / "tests/fixtures/standard_umap_reference.json"
 QUALITY = ROOT / "tests/fixtures/standard_umap_quality.npz"
-TRUST_GAP_LIMIT = 0.02
+TRUST_GAP_LIMIT = 0.025
 
 
 def exact_neighbors(

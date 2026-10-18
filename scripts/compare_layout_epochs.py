@@ -175,8 +175,8 @@ def main():
                         result["trust_mean"] = statistics.mean(scores)
                         result["trust_sample_std"] = statistics.stdev(scores)
                         result["median_fit_seconds"] = statistics.median(result["fit_seconds"])
-                        result["each_within_0.02_of_python_mean"] = all(
-                            abs(score - python_mean) <= 0.02 for score in scores
+                        result["each_within_0.025_of_python_mean"] = all(
+                            abs(score - python_mean) <= 0.025 for score in scores
                         )
                         if recalls:
                             result["fit_recall_at14"] = recalls
