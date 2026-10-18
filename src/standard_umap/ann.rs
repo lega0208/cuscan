@@ -1,7 +1,9 @@
-//! Shared bounded NN-Descent candidate sizing.
+//! Working graph width, independent of the sampled new/old pool capacity.
 
-const MAX_CANDIDATES: usize = 32;
+// The k-only graph lost exact neighbors on the small nonlinear regression
+// (213/240 hits). A four-edge margin preserves alternative paths for refinement.
+const HEAP_MARGIN: usize = 4;
 
 pub(crate) fn candidate_width(n: usize, k: usize) -> usize {
-    k.max(k.saturating_mul(4).min(MAX_CANDIDATES)).min(n - 1)
+    k.saturating_add(HEAP_MARGIN).min(n - 1)
 }

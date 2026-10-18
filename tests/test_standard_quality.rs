@@ -161,7 +161,7 @@ fn matrix_from_npz(archive: &mut ZipArchive<File>, name: &str) -> Matrix {
     npy_matrix(&bytes)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn matrix_from_npz_path(path: &std::path::Path, name: &str) -> Matrix {
     let mut archive = ZipArchive::new(File::open(path).unwrap())
         .unwrap_or_else(|error| panic!("could not open {}: {error}", path.display()));
@@ -325,7 +325,7 @@ fn matrix_from_embedding(embedding: &[Vec<f32>]) -> Matrix {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f64 {
     let n = original.rows;
     assert_eq!(embedded.rows, n, "trustworthiness row shape");
@@ -372,7 +372,7 @@ fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f6
     1.0 - 2.0 * penalty as f64 / normalizer
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn assert_approximate_fit_quality(
     device: &Device,
     name: &str,
@@ -713,12 +713,7 @@ fn standard_quality_trustworthiness_on_cuda() {
     run_quality(device);
 }
 
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
-    let Some(device) = device_for_cuda() else {
-        return;
-    };
+fn run_approximate_fit_quality_per_frozen_fixture_case(device: &Device) {
     let (reference, cases) = fixture();
     let seeds: Vec<u64> = reference["controls"]["seeds"]
         .as_array()
@@ -738,7 +733,7 @@ fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
             .map(|score| score["fit_trustworthiness_at_15"].as_f64().unwrap())
             .collect::<Vec<_>>();
         assert_approximate_fit_quality(
-            &device,
+            device,
             &name,
             &train,
             &seeds,
@@ -749,16 +744,26 @@ fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
     }
 }
 
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_approximate_fit_quality_per_frozen_fixture_case() {
+    run_approximate_fit_quality_per_frozen_fixture_case(&Device::cpu());
+}
+
 #[cfg(feature = "cuda")]
 #[test]
-fn cuda_approximate_fit_quality_campaign() {
+fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
+    let Some(device) = device_for_cuda() else {
+        return;
+    };
+    run_approximate_fit_quality_per_frozen_fixture_case(&device);
+}
+
+fn run_approximate_fit_quality_campaign(device: &Device) {
     if std::env::var_os("FAST_UMAP_RUN_ANN_CAMPAIGN").is_none() {
         eprintln!("SKIPPED: set FAST_UMAP_RUN_ANN_CAMPAIGN=1 to run the frozen large ANN campaign");
         return;
     }
-    let Some(device) = device_for_cuda() else {
-        return;
-    };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let reference_path = root.join("ann_campaign_reference.json");
     let quality_path = root.join("ann_campaign_quality.npz");
@@ -810,15 +815,47 @@ fn cuda_approximate_fit_quality_campaign() {
             "campaign score seed order"
         );
     }
-    assert_approximate_fit_quality(
-        &device,
-        "campaign",
-        &train,
-        &seeds,
-        25,
-        15,
-        &reference_trust,
-    );
+    assert_approximate_fit_quality(device, "campaign", &train, &seeds, 25, 15, &reference_trust);
+    // This additional Phase2 gate does not replace the frozen campaign's
+    // k=24 nonself recall/trustworthiness definition or its existing limits.
+    for &seed in &seeds {
+        let data = Tensor::<2>::from_data(
+            TensorData::new(train.values.clone(), [train.rows, train.cols]),
+            device,
+        );
+        let (ids, _) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+            data.into_dispatch(),
+            14,
+            seed,
+            (train.rows as f64).log2().round().max(5.0) as u32,
+        );
+        let ids = Tensor::<2, Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let nonself = tie_aware_recall(&ids, &train, &train, 14, true);
+        let self_inclusive = (1.0 + 14.0 * nonself) / 15.0;
+        eprintln!("PHASE2_CAMPAIGN_RECALL seed={seed} self_inclusive_at15={self_inclusive:.9}");
+        assert!(
+            self_inclusive >= 0.958,
+            "campaign seed {seed}: additional self-inclusive recall@15 {self_inclusive:.9} below 0.958"
+        );
+    }
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_approximate_fit_quality_campaign() {
+    run_approximate_fit_quality_campaign(&Device::cpu());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_approximate_fit_quality_campaign() {
+    let Some(device) = device_for_cuda() else {
+        return;
+    };
+    run_approximate_fit_quality_campaign(&device);
 }
 
 #[cfg(feature = "cuda")]
