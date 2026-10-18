@@ -181,6 +181,12 @@ is Linux x86-64, including WSL2. LLVM bundle acquisition may require network
 access on the first build and uses a local cache; JIT compilation requires LLVM
 support. This is not a claim of wheel availability or support for other platforms.
 
+CubeCL caches autotune results, CPU throughput calibration and compiled CUDA
+kernels on disk: in `target/environment/` when the working directory is inside a
+Cargo workspace, otherwise in the user cache directory (`~/.cache/cubecl` on
+Linux). The first fit on a machine pays a one-time calibration (several seconds on
+CPU); later processes reuse it. CPU kernels are still JIT-compiled once per process.
+
 From the repository root, install in editable mode with `uv`:
 
 ```shell

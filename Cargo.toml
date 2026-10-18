@@ -98,11 +98,15 @@ ciborium = "0.2.2"
 log = "0.4"
 
 [features]
+# Every backend feature enables CubeCL persistence so autotune, throughput calibration and
+# GPU compilation results are cached on disk across processes. Without it, each process
+# repeats CPU throughput calibration (~7 s) and recompiles every CUDA kernel.
 default = ["cuda", "cpu", "verbose"]
 # Core backend features
 gpu = [
   "dep:burn-cubecl",
   "dep:cubecl",
+  "cubecl/persistence",
   "burn/cubecl",
   "burn/wgpu",
   "burn/fusion",
@@ -111,6 +115,7 @@ gpu = [
 cuda = [
   "dep:burn-cubecl",
   "dep:cubecl",
+  "cubecl/persistence",
   "burn/cubecl",
   "burn/cuda",
   "burn/fusion",
@@ -119,6 +124,7 @@ cuda = [
 cpu = [
   "dep:burn-cubecl",
   "dep:cubecl",
+  "cubecl/persistence",
   "burn/cubecl",
   "burn/cpu",
   "burn/fusion",
