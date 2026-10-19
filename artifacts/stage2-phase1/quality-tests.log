@@ -1,9 +1,0 @@
-
-running 7 tests
-test cuda_transform_error_source_tagged_capture_oracle ... ok
-test standard_quality_trustworthiness_on_flex ... ok
-test cuda_fit_larger_than_device_dense_memory_completes ... ok
-test standard_ann_recall_on_flex ... ok
-test standard_ann_recall_on_cuda ... ok
-test standard_quality_trustworthiness_on_cuda ... ok
-test flex_fit_larger_than_dense_memory_budget_completes has been running for over 60 seconds

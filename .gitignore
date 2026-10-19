@@ -23,3 +23,5 @@ artifacts/**/*.sqlite
 artifacts/**/reverse-*.json
 artifacts/**/harness.diff
 artifacts/**/*.stderr.txt
+
+.ignore
