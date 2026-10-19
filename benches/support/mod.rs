@@ -8,23 +8,46 @@ struct Workload {
     fit_rows: usize,
     query_rows: usize,
     features: usize,
+    neighbors: usize,
     epochs: usize,
+    search: NeighborSearch,
+    transform_queue_size: f64,
 }
 
-const WORKLOADS: [Workload; 2] = [
+// `representative` is the exact-search baseline workload and must stay unchanged so that
+// before/after timings remain comparable. `approximate` uses 8,192 fit rows, which is above
+// the documented Auto cutoff (4,096), and requests `NeighborSearch::Approximate` explicitly so
+// that both the approximate fit and approximate transform query paths always execute.
+const WORKLOADS: [Workload; 3] = [
     Workload {
         name: "smoke",
         fit_rows: 96,
         query_rows: 16,
         features: 8,
+        neighbors: 8,
         epochs: 9,
+        search: NeighborSearch::Exact,
+        transform_queue_size: 4.0,
     },
     Workload {
         name: "representative",
         fit_rows: 1024,
         query_rows: 128,
         features: 32,
+        neighbors: 8,
         epochs: 100,
+        search: NeighborSearch::Exact,
+        transform_queue_size: 4.0,
+    },
+    Workload {
+        name: "approximate",
+        fit_rows: 8192,
+        query_rows: 128,
+        features: 32,
+        neighbors: 15,
+        epochs: 100,
+        search: NeighborSearch::Approximate,
+        transform_queue_size: 4.0,
     },
 ];
 
@@ -43,17 +66,26 @@ fn data(rows: usize, features: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn estimator(backend: BackendChoice, epochs: usize) -> UMAP {
+fn estimator(backend: BackendChoice, workload: &Workload) -> UMAP {
     let config = UMAPConfig {
         n_components: 2,
-        n_neighbors: 8,
-        n_epochs: Some(epochs),
+        n_neighbors: workload.neighbors,
+        n_epochs: Some(workload.epochs),
         init: Init::Random,
         random_state: Some(SEED),
         transform_seed: SEED,
+        transform_queue_size: workload.transform_queue_size,
         ..UMAPConfig::default()
     };
-    UMAP::new(config, backend, NeighborSearch::Exact)
+    UMAP::new(config, backend, workload.search)
+}
+
+fn search_label(search: NeighborSearch) -> &'static str {
+    match search {
+        NeighborSearch::Exact => "exact",
+        NeighborSearch::Approximate => "approximate",
+        NeighborSearch::Auto => "auto",
+    }
 }
 
 pub fn benchmarks(c: &mut Criterion, backend_name: &str, backend: BackendChoice) {
@@ -62,13 +94,14 @@ pub fn benchmarks(c: &mut Criterion, backend_name: &str, backend: BackendChoice)
     for workload in &WORKLOADS {
         let fit_data = data(workload.fit_rows, workload.features);
         let query_data = data(workload.query_rows, workload.features);
-        let estimator = estimator(backend, workload.epochs);
+        let estimator = estimator(backend, workload);
         let transform_epochs = workload.epochs / 3;
+        let search = search_label(workload.search);
         let mut group =
             c.benchmark_group(format!("standard_umap/{backend_name}/{}", workload.name));
         group.bench_function(
             format!(
-                "fit/{}x{}_exact_random_{}epochs",
+                "fit/{}x{}_{search}_random_{}epochs",
                 workload.fit_rows, workload.features, workload.epochs
             ),
             |b| {
@@ -81,7 +114,7 @@ pub fn benchmarks(c: &mut Criterion, backend_name: &str, backend: BackendChoice)
         );
         group.bench_function(
             format!(
-                "transform/{}x{}_against_{}_exact_random_{}epochs",
+                "transform/{}x{}_against_{}_{search}_random_{}epochs",
                 workload.query_rows, workload.features, workload.fit_rows, transform_epochs
             ),
             |b| {

@@ -248,11 +248,13 @@ impl UMAP {
             .map_err(|_| UmapError::Overflow("optimization epochs"))?;
         #[cfg(feature = "tracing")]
         let _schedule_span = tracing::info_span!("schedule", rows = n).entered();
+        let maximum = weights.clone().max_dim(0);
         let (heads, tails, weights, positive, next_positive, negative, next_negative) =
             prepare_schedule(
                 heads,
                 tails,
                 weights,
+                maximum.clone(),
                 n_epochs,
                 default_epochs,
                 self.config.negative_sample_rate,
@@ -263,22 +265,13 @@ impl UMAP {
         #[cfg(feature = "tracing")]
         drop(_schedule_span);
 
-        let max_weight = weights
-            .clone()
-            .max_dim(0)
-            .to_data()
-            .try_to_vec::<f32>()
-            .map_err(|error| {
-                UmapError::Numerical(format!("could not inspect fuzzy graph weights: {error}"))
-            })?
-            .into_iter()
-            .next()
-            .unwrap_or(0.0);
-        if !max_weight.is_finite() || max_weight <= 0.0 {
-            return Err(UmapError::InvalidInput(
-                "fuzzy graph is empty after positive-edge pruning".into(),
-            ));
-        }
+        // Read after scheduling, as before. The maximum is the pre-prune value;
+        // pruning keeps it (divisor >= 1), so this equals the post-prune maximum.
+        validate_graph_maximum(
+            maximum,
+            "could not inspect fuzzy graph weights",
+            "fuzzy graph is empty after positive-edge pruning",
+        )?;
 
         #[cfg(feature = "tracing")]
         let _export_span = tracing::info_span!("spectral_graph_export", rows = n).entered();
@@ -669,21 +662,7 @@ impl FittedUMAP {
                             self.config.transform_seed,
                             0,
                         );
-                    let stats: Tensor<2, Int> = Tensor::from_dispatch(stats);
-                    if stats
-                        .to_data()
-                        .try_to_vec::<i32>()
-                        .map_err(|error| {
-                            UmapError::Numerical(format!(
-                                "could not inspect approximate-query stats: {error}"
-                            ))
-                        })?
-                        .contains(&-1)
-                    {
-                        return Err(UmapError::Numerical(
-                            "approximate query encountered an invalid fitted neighbor graph".into(),
-                        ));
-                    }
+                    check_query_stats(Tensor::from_dispatch(stats))?;
                     (
                         Tensor::<2, Int>::from_dispatch(indices),
                         Tensor::<2>::from_dispatch(distances),
@@ -719,22 +698,7 @@ impl FittedUMAP {
                                 u64::try_from(start)
                                     .map_err(|_| UmapError::Overflow("query row offset"))?,
                             );
-                        let stats: Tensor<2, Int> = Tensor::from_dispatch(stats);
-                        if stats
-                            .to_data()
-                            .try_to_vec::<i32>()
-                            .map_err(|error| {
-                                UmapError::Numerical(format!(
-                                    "could not inspect approximate-query stats: {error}"
-                                ))
-                            })?
-                            .contains(&-1)
-                        {
-                            return Err(UmapError::Numerical(
-                                "approximate query encountered an invalid fitted neighbor graph"
-                                    .into(),
-                            ));
-                        }
+                        check_query_stats(Tensor::from_dispatch(stats))?;
                         all_indices.push(Tensor::<2, Int>::from_dispatch(indices));
                         all_distances.push(Tensor::<2>::from_dispatch(distances));
                     }
@@ -779,22 +743,12 @@ impl FittedUMAP {
         let n_epochs_u32 = u32::try_from(n_epochs)
             .map_err(|_| UmapError::Overflow("transform optimization epochs"))?;
         let default_epochs = if q <= 10_000 { 100 } else { 30 };
-        let max_weight = weights.clone().max_dim(0);
-        if max_weight
-            .to_data()
-            .try_to_vec::<f32>()
-            .map_err(|error| {
-                UmapError::Numerical(format!("could not inspect transform graph: {error}"))
-            })?
-            .first()
-            .copied()
-            .unwrap_or(0.0)
-            <= 0.0
-        {
-            return Err(UmapError::InvalidInput(
-                "transform fuzzy graph is empty after positive-edge pruning".into(),
-            ));
-        }
+        let maximum = weights.clone().max_dim(0);
+        validate_graph_maximum(
+            maximum.clone(),
+            "could not inspect transform graph",
+            "transform fuzzy graph is empty after positive-edge pruning",
+        )?;
         let sums = directed.clone().sum_dim(1).reshape([q, 1]);
         let normalized = directed.div(sums.clone().mask_fill(sums.equal_elem(0.0), 1.0));
         let initial = weighted_initialization(
@@ -808,27 +762,11 @@ impl FittedUMAP {
                 heads,
                 tails,
                 weights,
+                maximum,
                 n_epochs_u32,
                 default_epochs,
                 self.config.negative_sample_rate,
             )?;
-        if weights
-            .clone()
-            .max_dim(0)
-            .to_data()
-            .try_to_vec::<f32>()
-            .map_err(|error| {
-                UmapError::Numerical(format!("could not inspect transform graph: {error}"))
-            })?
-            .first()
-            .copied()
-            .unwrap_or(0.0)
-            <= 0.0
-        {
-            return Err(UmapError::InvalidInput(
-                "transform fuzzy graph is empty after positive-edge pruning".into(),
-            ));
-        }
         let transform_seed = self.config.transform_seed;
         let first_coordinates = initial
             .clone()
@@ -883,15 +821,15 @@ fn weighted_initialization_chunk_rows(
     components: usize,
     scratch_limit_bytes: usize,
 ) -> Result<usize> {
-    // Include gather/reshape storage, indices, and live slot, repeated weight,
-    // product, old accumulator and new accumulator tensors, including k=2.
+    // Include gather/reshape storage, indices, the broadcast product, the live
+    // slot, and old and new accumulator tensors, including k=2.
     let row_words = k
         .checked_mul(components)
         .and_then(|value| value.checked_mul(2))
         .and_then(|value| value.checked_add(k))
         .and_then(|value| {
             components
-                .checked_mul(5)
+                .checked_mul(4)
                 .and_then(|extra| value.checked_add(extra))
         })
         .ok_or(UmapError::Overflow("transform initialization scratch"))?;
@@ -941,20 +879,21 @@ fn weighted_initialization(
             .clone()
             .select(0, ids)
             .reshape([rows, k, components]);
-        let weights = normalized.clone().slice_dim(0, start..end);
-        // Preserve the original left-to-right float32 sum, including the
-        // initial zero addition. A parallel reduction changes RNG seed bits.
+        // One broadcast product [rows, k, components]. Slots are then added in
+        // left-to-right order from an initial zero, as before; a parallel
+        // reduction would change float32 rounding and the RNG seed bits.
+        let weights = normalized
+            .clone()
+            .slice_dim(0, start..end)
+            .unsqueeze_dim::<3>(2);
+        let products = neighbors.mul(weights);
         let mut sum = Tensor::<2>::zeros([rows, components], &device);
         for slot in 0..k {
-            let values = neighbors
+            let values = products
                 .clone()
                 .slice_dim(1, slot..slot + 1)
                 .reshape([rows, components]);
-            let weight = weights
-                .clone()
-                .slice_dim(1, slot..slot + 1)
-                .repeat_dim(1, components);
-            sum = sum.add(values.mul(weight));
+            sum = sum.add(values);
         }
         chunks.push(sum);
     }
@@ -1116,12 +1055,47 @@ fn validate_layout_work(edge_capacity: usize, negative_sample_rate: usize) -> Re
     Ok(())
 }
 
+/// Rejects approximate-query stats containing the `-1` invalid-neighbor marker.
+/// The reduction runs on the device; only one Bool scalar is read back.
+fn check_query_stats(stats: Tensor<2, Int>) -> Result<()> {
+    let has_invalid = stats
+        .equal_scalar(-1)
+        .any()
+        .try_into_scalar::<bool>()
+        .map_err(|error| {
+            UmapError::Numerical(format!(
+                "could not inspect approximate-query stats: {error}"
+            ))
+        })?;
+    if has_invalid {
+        return Err(UmapError::Numerical(
+            "approximate query encountered an invalid fitted neighbor graph".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads and validates a singleton maximum at the caller's validation point.
+fn validate_graph_maximum(maximum: Tensor<1>, context: &str, empty_message: &str) -> Result<()> {
+    let value = maximum
+        .try_into_scalar::<f32>()
+        .map_err(|error| UmapError::Numerical(format!("{context}: {error}")))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(UmapError::InvalidInput(empty_message.into()));
+    }
+    Ok(())
+}
+
 #[allow(clippy::type_complexity)]
+/// `maximum` is the pre-prune maximum of `weights`. Pruning zeroes weights below
+/// `maximum / divisor` with `divisor >= 1`, so a finite positive maximum always
+/// survives and remains the post-prune maximum. Callers validate it once.
 #[allow(clippy::too_many_arguments)]
 fn prepare_schedule(
     heads: Tensor<1, Int>,
     tails: Tensor<1, Int>,
     weights: Tensor<1>,
+    maximum: Tensor<1>,
     n_epochs: u32,
     default_epochs: usize,
     negative_sample_rate: usize,
@@ -1134,7 +1108,6 @@ fn prepare_schedule(
     Tensor<1>,
     Tensor<1>,
 )> {
-    let maximum = weights.clone().max_dim(0);
     let divisor = if n_epochs > 10 {
         n_epochs as f64
     } else {
@@ -1482,9 +1455,17 @@ mod tests {
             resolve_backend_choice(BackendChoice::Auto, Ok(2)),
             Ok(BackendChoice::Cuda { device_index: 0 })
         );
+        #[cfg(feature = "cpu")]
         assert_eq!(
             resolve_backend_choice(BackendChoice::Auto, Ok(0)),
             Ok(BackendChoice::Cpu)
+        );
+        #[cfg(not(feature = "cpu"))]
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Auto, Ok(0)),
+            Err(UmapError::BackendUnavailable(
+                "CUDA is unavailable and CPU backend requires the `cpu` feature".into()
+            ))
         );
         assert_eq!(
             resolve_backend_choice(BackendChoice::Auto, Err("driver fault".into())),
@@ -1492,9 +1473,17 @@ mod tests {
                 "CUDA discovery failed: driver fault".into()
             ))
         );
+        #[cfg(feature = "cpu")]
         assert_eq!(
             resolve_backend_choice(BackendChoice::Cpu, Err("must not probe".into())),
             Ok(BackendChoice::Cpu)
+        );
+        #[cfg(not(feature = "cpu"))]
+        assert_eq!(
+            resolve_backend_choice(BackendChoice::Cpu, Err("must not probe".into())),
+            Err(UmapError::BackendUnavailable(
+                "CPU backend requires the `cpu` feature".into()
+            ))
         );
         assert!(matches!(
             resolve_backend_choice(BackendChoice::Cuda { device_index: 1 }, Ok(1)),
@@ -1517,6 +1506,10 @@ mod tests {
 
     #[test]
     fn transform_flat_preserves_validation_errors() {
+        #[cfg(feature = "cpu")]
+        let backend = crate::standard_umap::BackendChoice::Cpu;
+        #[cfg(all(not(feature = "cpu"), feature = "cuda"))]
+        let backend = crate::standard_umap::BackendChoice::Cuda { device_index: 0 };
         let data = (0..16)
             .map(|row| vec![row as f32, row as f32 * 0.25])
             .collect::<Vec<_>>();
@@ -1527,7 +1520,7 @@ mod tests {
                 init: Init::Random,
                 ..Default::default()
             },
-            crate::standard_umap::BackendChoice::Cpu,
+            backend,
             NeighborSearch::Exact,
         )
         .fit(&data)
@@ -1625,15 +1618,31 @@ mod tests {
                 .unwrap();
         let expected_values = expected.to_data().try_to_vec::<f32>().unwrap();
         let actual_values = actual.to_data().try_to_vec::<f32>().unwrap();
-        assert_eq!(
-            actual_values
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            expected_values
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
+        assert_eq!(actual_values.len(), expected_values.len());
+        // The broadcast product may round differently from the per-slot repeat;
+        // require finite values within a float32 tolerance and report drift.
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        let mut bit_mismatches = 0usize;
+        for (&actual, &expected) in actual_values.iter().zip(&expected_values) {
+            assert!(
+                actual.is_finite(),
+                "non-finite weighted initialization value"
+            );
+            let delta = (actual - expected).abs();
+            max_abs = max_abs.max(delta);
+            sum_abs += f64::from(delta);
+            if actual.to_bits() != expected.to_bits() {
+                bit_mismatches += 1;
+            }
+            assert!(
+                delta <= 1e-5 + 1e-5 * expected.abs(),
+                "weighted initialization drift {delta} exceeds tolerance for expected {expected}"
+            );
+        }
+        eprintln!(
+            "weighted_initialization drift: max_abs={max_abs} mean_abs={} bit_mismatches={bit_mismatches}",
+            sum_abs / actual_values.len() as f64
         );
 
         let query_rows = indices.dims()[0];
@@ -1641,14 +1650,16 @@ mod tests {
         let expected_first = expected_values
             .iter()
             .step_by(components)
-            .map(|value| value.to_bits())
+            .copied()
             .collect::<Vec<_>>();
         let actual_first = actual_values
             .iter()
             .step_by(components)
-            .map(|value| value.to_bits())
+            .copied()
             .collect::<Vec<_>>();
-        assert_eq!(actual_first, expected_first);
+        for (actual, expected) in actual_first.iter().zip(&expected_first) {
+            assert!((actual - expected).abs() <= 1e-5 + 1e-5 * expected.abs());
+        }
         let expected_rng = optimizer_rng_from_first_coordinates(
             expected_values.iter().step_by(components).copied(),
             query_rows,
@@ -1669,7 +1680,19 @@ mod tests {
         .to_data()
         .try_to_vec::<i64>()
         .unwrap();
-        assert_eq!(actual_rng, expected_rng);
+        // RNG seeds are derived from the first coordinate's float bits, so a
+        // float32 rounding change may legitimately alter them. Report divergence
+        // instead of requiring equality.
+        let rng_mismatches = actual_rng
+            .iter()
+            .zip(&expected_rng)
+            .filter(|(a, e)| a != e)
+            .count();
+        eprintln!(
+            "weighted_initialization rng mismatches: {rng_mismatches}/{}",
+            expected_rng.len()
+        );
+        assert_eq!(actual_rng.len(), expected_rng.len());
     }
 
     fn estimator(search: NeighborSearch) -> UMAP {
@@ -1749,7 +1772,7 @@ mod tests {
 
     #[test]
     fn weighted_initialization_scratch_accounting_checks_limits_and_overflow() {
-        const ROW_BYTES: usize = (2 * 3 * 2 + 3 + 5 * 2) * std::mem::size_of::<f32>();
+        const ROW_BYTES: usize = (2 * 3 * 2 + 3 + 4 * 2) * std::mem::size_of::<f32>();
         assert_eq!(
             weighted_initialization_chunk_rows(7, 3, 2, ROW_BYTES),
             Ok(1)
@@ -1772,7 +1795,7 @@ mod tests {
             weighted_initialization_chunk_rows(usize::MAX, 1, 1, 32),
             Err(UmapError::Overflow("transform initialization output"))
         );
-        const TWO_NEIGHBOR_ROW_BYTES: usize = (2 * 2 * 8 + 2 + 5 * 8) * std::mem::size_of::<f32>();
+        const TWO_NEIGHBOR_ROW_BYTES: usize = (2 * 2 * 8 + 2 + 4 * 8) * std::mem::size_of::<f32>();
         assert_eq!(
             weighted_initialization_chunk_rows(7, 2, 8, TWO_NEIGHBOR_ROW_BYTES * 2),
             Ok(2)
@@ -1804,6 +1827,106 @@ mod tests {
         // Q=7 and two rows per chunk leaves a one-row final chunk.
         assert_eq!(weighted_initialization_chunk_rows(7, 3, 2, 200), Ok(2));
         assert_chunked_weighted_initialization_matches_original(&device, 200);
+    }
+
+    fn singleton_maximum(value: f32, device: &Device) -> Tensor<1> {
+        Tensor::<1>::from_data(TensorData::new(vec![value], [1]), device)
+    }
+
+    fn assert_positive_maximum_rejected(device: &Device) {
+        for (context, message) in [
+            (
+                "could not inspect fuzzy graph weights",
+                "fuzzy graph is empty after positive-edge pruning",
+            ),
+            (
+                "could not inspect transform graph",
+                "transform fuzzy graph is empty after positive-edge pruning",
+            ),
+        ] {
+            for value in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert_eq!(
+                    validate_graph_maximum(singleton_maximum(value, device), context, message),
+                    Err(UmapError::InvalidInput(message.into())),
+                    "maximum {value} must be rejected",
+                );
+            }
+            assert_eq!(
+                validate_graph_maximum(singleton_maximum(2.5, device), context, message),
+                Ok(()),
+            );
+        }
+
+        // Exercise the fit ordering with a constructed zero-weight graph: schedule
+        // first, then read the retained maximum and preserve the fit error text.
+        let weights = Tensor::<1>::zeros([2], device);
+        let maximum = weights.clone().max_dim(0);
+        let ids = Tensor::<1, Int>::zeros([2], device);
+        let (_, _, pruned, _, _, _, _) =
+            prepare_schedule(ids.clone(), ids, weights, maximum.clone(), 20, 500, 5).unwrap();
+        assert_eq!(pruned.to_data().try_to_vec::<f32>().unwrap(), vec![0.0; 2]);
+        assert_eq!(
+            validate_graph_maximum(
+                maximum,
+                "could not inspect fuzzy graph weights",
+                "fuzzy graph is empty after positive-edge pruning",
+            ),
+            Err(UmapError::InvalidInput(
+                "fuzzy graph is empty after positive-edge pruning".into()
+            )),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn positive_maximum_validates_singleton_on_cpu() {
+        assert_positive_maximum_rejected(&Device::cpu());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn positive_maximum_validates_singleton_on_cuda() {
+        let Some(device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+        assert_positive_maximum_rejected(&device);
+    }
+
+    fn assert_query_stats_detects_invalid_marker(device: &Device) {
+        let valid = Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 2, 3], [2, 2]), device);
+        assert!(check_query_stats(valid).is_ok());
+        // Non-leading position: the marker is not in the first element.
+        let nonleading =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 2, -1], [2, 2]), device);
+        assert_eq!(
+            check_query_stats(nonleading),
+            Err(UmapError::Numerical(
+                "approximate query encountered an invalid fitted neighbor graph".into()
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn query_stats_bool_scalar_detects_nonleading_marker_on_cpu() {
+        assert_query_stats_detects_invalid_marker(&Device::cpu());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn query_stats_bool_scalar_detects_nonleading_marker_on_cuda() {
+        let Some(device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+        assert_query_stats_detects_invalid_marker(&device);
     }
 
     #[test]

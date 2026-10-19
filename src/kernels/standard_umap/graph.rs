@@ -2,14 +2,13 @@ use burn::{
     backend::{
         TensorMetadata,
         cubecl::dtype_to_storage_type,
+        ops::FloatTensorOps,
         tensor::{FloatTensor, IntTensor},
     },
     cubecl::prelude::*,
     tensor::{DType, Shape},
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
-
-const GLOBAL_SUM_CHUNK_SIZE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SmoothThresholds {
@@ -224,44 +223,6 @@ fn smooth_row<F: Float>(
         mid = sigma_floor;
     }
     (rho, mid)
-}
-
-#[cube(launch)]
-fn fuzzy_graph_global_sum_partial_kernel<F: Float>(
-    distances: &Tensor<F>,
-    partials: &mut Tensor<F>,
-    element_count: u32,
-    #[define(F)] _dtype: ElemType,
-) {
-    let chunk = ABSOLUTE_POS_X as usize;
-    if chunk < partials.shape(0) {
-        let start = chunk * GLOBAL_SUM_CHUNK_SIZE;
-        let mut end = start + GLOBAL_SUM_CHUNK_SIZE;
-        if end > element_count as usize {
-            end = element_count as usize;
-        }
-        let mut sum = F::new(0.0f32);
-        for index in start..end {
-            sum += distances[index];
-        }
-        partials[chunk] = sum;
-    }
-}
-
-#[cube(launch)]
-fn fuzzy_graph_global_mean_finalize_kernel<F: Float>(
-    partials: &Tensor<F>,
-    mean: &mut Tensor<F>,
-    element_count: u32,
-    #[define(F)] _dtype: ElemType,
-) {
-    if ABSOLUTE_POS_X == 0u32 {
-        let mut sum = F::new(0.0f32);
-        for index in 0..partials.shape(0) {
-            sum += partials[index];
-        }
-        mean[0] = sum / F::cast_from(element_count);
-    }
 }
 
 /// Evaluate the edge contribution of `indices[row, slot]` against the already
@@ -655,11 +616,6 @@ pub(crate) fn fuzzy_graph(
     let element_count = n
         .checked_mul(k)
         .expect("fuzzy graph distance count overflows usize");
-    let element_count_u32 =
-        u32::try_from(element_count).expect("fuzzy graph distance count exceeds CubeCL range");
-    let partial_count = element_count.div_ceil(GLOBAL_SUM_CHUNK_SIZE).max(1);
-    let partial_count_u32 =
-        u32::try_from(partial_count).expect("global reduction partial count exceeds CubeCL range");
     let node_u32 = u32::try_from(node_count).expect("graph node count exceeds CubeCL range");
     let index_bytes = capacity
         .checked_mul(DType::I32.size())
@@ -674,10 +630,6 @@ pub(crate) fn fuzzy_graph(
         .checked_mul(k)
         .and_then(|value| value.checked_mul(distances.dtype.size()))
         .expect("directed membership allocation overflows usize");
-    let partial_bytes = partial_count
-        .checked_mul(DType::F32.size())
-        .expect("global reduction partial allocation overflows usize");
-    let mean_bytes = DType::F32.size();
     let node_index_bytes = node_count
         .checked_mul(DType::I32.size())
         .expect("graph node scratch allocation overflows usize");
@@ -731,20 +683,6 @@ pub(crate) fn fuzzy_graph(
         client.empty(directed_bytes),
         distances.dtype,
     );
-    let partials = CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::new([partial_count]),
-        client.empty(partial_bytes),
-        DType::F32,
-    );
-    let global_mean = CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::new([1]),
-        client.empty(mean_bytes),
-        DType::F32,
-    );
     let counts = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -786,25 +724,13 @@ pub(crate) fn fuzzy_graph(
         invalid_flag.clone().into_tensor_arg(),
         dtypes,
     );
-    let reduction_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
-    fuzzy_graph_global_sum_partial_kernel::launch(
-        &client,
-        CubeCount::Static(partial_count_u32.div_ceil(reduction_dim.x), 1, 1),
-        reduction_dim,
-        distances.clone().into_tensor_arg(),
-        partials.clone().into_tensor_arg(),
-        element_count_u32,
-        dtype_to_storage_type(distances.dtype),
+    // Backend mean over the flattened contiguous distances. Only the f32
+    // summation order changes; the mean feeds the `1e-3 * mean` sigma floor.
+    let flat_distances = <CubeBackend as FloatTensorOps<CubeBackend>>::float_reshape(
+        distances.clone(),
+        Shape::new([element_count]),
     );
-    fuzzy_graph_global_mean_finalize_kernel::launch(
-        &client,
-        CubeCount::Static(1, 1, 1),
-        CubeDim::new_1d(1),
-        partials.into_tensor_arg(),
-        global_mean.clone().into_tensor_arg(),
-        element_count_u32,
-        dtype_to_storage_type(distances.dtype),
-    );
+    let global_mean = <CubeBackend as FloatTensorOps<CubeBackend>>::float_mean(flat_distances);
     let thresholds = smooth_thresholds(local_connectivity, k);
     fuzzy_graph_row_kernel::launch(
         &client,

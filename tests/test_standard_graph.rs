@@ -470,6 +470,8 @@ fn verify_global_mean_oracle_cases(device: &Device) {
             }
         })
         .collect();
+    // Irregular flattened length: the mean must be correct when `n * k` is not a
+    // multiple of 1024, independent of any reduction chunking.
     assert_ne!((n * k) % 1024, 0);
     verify_f64_mean_case(device, indices, distances, [n, k], 0.5, false, n);
 }

@@ -176,7 +176,15 @@ fn queue_control_is_exact_compatible_only_at_its_default() {
 
 #[test]
 fn backend_selection_never_falls_back_from_cuda() {
+    #[cfg(feature = "cpu")]
     assert!(validate_backend_choice(BackendChoice::Cpu).is_ok());
+    #[cfg(not(feature = "cpu"))]
+    assert_eq!(
+        validate_backend_choice(BackendChoice::Cpu),
+        Err(fast_umap::UmapError::BackendUnavailable(
+            "CPU backend requires the `cpu` feature".into()
+        ))
+    );
     let error = validate_backend_choice(BackendChoice::Cuda {
         device_index: usize::MAX,
     });
