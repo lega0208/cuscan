@@ -46,7 +46,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", required=True, type=Path, help="row-major float32 input file")
     parser.add_argument("--rows", required=True, type=int)
     parser.add_argument("--features", required=True, type=int)
-    parser.add_argument("--device", choices=("cpu", "cuda", "wgpu"), default="cpu")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--seeds", type=_parse_seeds, default=[EVALUATION_SEED])
     parser.add_argument("--representatives", type=int, default=N_REPRESENTATIVES)
     parser.add_argument(
@@ -124,8 +124,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--representatives exceeds the number of distinct input rows")
     reps = representative_indices(distinct.shape[0], count=args.representatives)
     selected_methods = list(args.methods)
-    if args.device == "wgpu":
-        raise ValueError("the standard Rust UMAP API supports cpu and cuda, not wgpu")
 
     run_results: dict[str, list[dict[str, Any]]] = {method: [] for method in selected_methods}
     embeddings: dict[str, list[dict[str, Any]]] = {method: [] for method in selected_methods}

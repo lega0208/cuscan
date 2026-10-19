@@ -11,8 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- Renamed the active Rust and Python estimator APIs to `ParametricUMAP`, `FittedParametricUMAP`, and `ParametricUMAPConfig`; neural types are `ParametricUMAPModel*`, `ParametricUMAPOptimizationParams`, `ParametricUMAPLossReduction`, and `ParametricUMAPEpochProgress`. Shared `Metric`, `GraphParams`, and `ManifoldParams` remain graph APIs. The estimator/model/private trainer/weight persistence now belong to `src/parametric_umap/`, while shared graph math belongs to `src/graph/`. Removed the deprecated dense API and compatibility aliases. The `fast-umap` package/crate identity is unchanged.
-- The model type/module relocation preserves the Burn weight payload structure; inputs remain caller-provided raw values and no scaler state is introduced.
+- Removed parametric UMAP from the Rust crate and Python package: `ParametricUMAP`, `FittedParametricUMAP`, `ParametricUMAPConfig`, the neural model, sparse trainer, weight persistence, `fit_parametric_umap`, and `fast_umap.ParametricUMAP`/`NotFittedError`. Also removed the parametric-only infrastructure: the differentiable `UmapOps` extension and its Euclidean/k-NN kernels, `autodiff_ops`, `distances`, `graph` (`Metric`, `GraphParams`, `ManifoldParams`), `nn_descent`, `pca`, `chart`, `normalizer`, `utils`, `macros`, `prelude`, the `bench_report` binary, the `umap_bench` benchmark, the parametric examples, and the `gpu`, `parametric`, `pca`, `nn-descent`, `plotters`, `umap-rs`, and `verbose` features. The crate now provides only Standard UMAP on the `cpu` and `cuda` features.
 
 ### Added
 

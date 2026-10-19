@@ -50,7 +50,7 @@ pub(super) fn forest_seed(
 > {
     let trees = tree_count(n)?;
     let leaf_size = 10usize.max(heap_width.saturating_mul(2)).min(n);
-    let plan = plan_workspace(n, heap_width, max_candidates, features, trees)?;
+    plan_workspace(n, heap_width, max_candidates, features, trees)?;
     let input_bytes = data.client.read_one_unchecked(data.handle.clone());
     let expected_bytes = n
         .checked_mul(features)

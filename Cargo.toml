@@ -10,7 +10,7 @@ homepage = "https://github.com/eugenehp/fast-map"
 documentation = "https://docs.rs/fast-umap/latest/fast_umap/"
 license = "MIT"
 edition = "2024"
-exclude = ["figures/*", "references/"]
+exclude = ["references/"]
 
 [workspace]
 members = [".", "bindings/python"]
@@ -30,22 +30,17 @@ debug = "line-tables-only"
 #                          are included in the rendered output.
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["cuda", "parametric", "pca", "nn-descent"]
+features = ["cuda"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 burn = { version = "0.22.0", default-features = false, features = [
   "std",
   "autotune",
-  "autodiff",
   "extension",
-  "linalg",
-  "store",
 ] }
 # Enable CubeCL with a concrete CPU or GPU runtime.
 burn-cubecl = { version = "0.22.0", default-features = false, optional = true }
-crossbeam-channel = "0.5.17"
-ctrlc = "3.5.2"
 cubecl = { version = "0.11.0", default-features = false, optional = true }
 cubecl-cpu = { version = "0.11.0", default-features = false, optional = true }
 cudarc = { version = "0.19.10", features = [
@@ -57,32 +52,15 @@ cudarc = { version = "0.19.10", features = [
   "fallback-latest",
 ], default-features = false, optional = true }
 faer = { version = "=0.24.4", features = ["npy", "perf-warn", "nightly"] }
-hsl = { version = "0.1.1", optional = true }
-indicatif = "0.18.6"
-ndarray = "0.17.2"
-num = "0.4.3"
-num-traits = "0.2.19"
-plotters = { version = "0.3.7", optional = true }
-prettytable = "0.10.0"
 rand = "0.10.3"
 rayon = "1.12.0"
-serde = "1.0.229"
 tracing = { version = "0.1", optional = true }
-umap-rs = { version = "0.4.5", optional = true }
 
 [dev-dependencies]
-burn = { version = "0.22.0", default-features = false, features = [
-  "std",
-  "extension",
-  "store",
-] }
+serde = "1.0.229"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-mnist = { version = "0.6.0", git = "https://github.com/eugenehp/mnist.git", features = [
-  "download",
-] }
 serde_json = "1.0.151"
-chrono = "0.4.45"
 zip = "=0.6.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = "0.7"
@@ -101,16 +79,8 @@ log = "0.4"
 # Every backend feature enables CubeCL persistence so autotune, throughput calibration and
 # GPU compilation results are cached on disk across processes. Without it, each process
 # repeats CPU throughput calibration (~7 s) and recompiles every CUDA kernel.
-default = ["cuda", "cpu", "verbose"]
+default = ["cuda", "cpu"]
 # Core backend features
-gpu = [
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "cubecl/persistence",
-  "burn/cubecl",
-  "burn/wgpu",
-  "burn/fusion",
-] # GPU backend with WGPU support
 # CUDA requires an NVIDIA runtime; CPU remains independently selectable.
 cuda = [
   "dep:burn-cubecl",
@@ -133,23 +103,6 @@ cubecl-ir-dump = ["dep:cubecl-cpu", "cubecl-cpu/pliron-dump"]
 
 tracing = ["dep:tracing", "burn/tracing", "cubecl?/tracing"]
 
-parametric = ["burn/optim"] # Parametric UMAP support
-
-# Optional features
-pca = []                               # PCA warm-start for initial embedding
-nn-descent = []                        # Approximate KNN via NN-Descent for large datasets
-verbose = []                           # Verbose output and progress bars
-plotters = ["dep:plotters", "dep:hsl"] # Plotting support
-
-
-# Crate comparison
-umap-rs = ["dep:umap-rs"]
-
-[[bench]]
-name = "umap_bench"
-required-features = ["parametric"]
-harness = false
-
 [[bench]]
 name = "standard_umap_cpu"
 required-features = ["cpu"]
@@ -159,70 +112,6 @@ harness = false
 name = "standard_umap_cuda"
 required-features = ["cuda"]
 harness = false
-
-[[example]]
-name = "serialization_demo"
-required-features = ["gpu"]
-
-[[example]]
-name = "benchmark_serialization"
-required-features = ["gpu"]
-
-[[example]]
-name = "benchmark_scalability"
-required-features = ["gpu"]
-
-[[example]]
-name = "bench_mnist"
-required-features = ["gpu", "plotters"]
-
-[[example]]
-name = "mnist_benchmark"
-required-features = ["gpu", "plotters"]
-
-[[example]]
-name = "crate_comparison"
-required-features = ["umap-rs", "plotters"]
-
-[[example]]
-name = "advanced"
-required-features = ["gpu"]
-
-[[example]]
-name = "backend_choice"
-required-features = ["parametric"]
-
-[[example]]
-name = "cpu_training_demo"
-required-features = ["parametric"]
-
-[[example]]
-name = "simple"
-required-features = ["gpu"]
-
-[[example]]
-name = "mnist"
-required-features = ["gpu", "plotters"]
-
-[[example]]
-name = "fallback_demo"
-required-features = ["gpu", "cpu"]
-
-[[example]]
-name = "backend_benchmark"
-required-features = ["parametric"]
-
-[[example]]
-name = "pca_comparison"
-required-features = ["pca"]
-
-[[example]]
-name = "large_scale"
-required-features = ["nn-descent"]
-
-[[example]]
-name = "cuda"
-required-features = ["cuda", "parametric"]
 
 [[example]]
 name = "profile_standard_cuda"
@@ -247,7 +136,3 @@ required-features = ["cpu"]
 [[example]]
 name = "ann_phase0_replay"
 required-features = ["cpu"]
-
-[[bin]]
-name = "bench_report"
-required-features = ["gpu"]
