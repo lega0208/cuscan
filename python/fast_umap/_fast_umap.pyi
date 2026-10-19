@@ -9,6 +9,7 @@ class FittedUMAP:
     @property
     def embedding(self) -> NDArray[np.float32]: ...
     def transform(self, x: NDArray[np.float32]) -> NDArray[np.float32]: ...
+    def export_state(self) -> tuple[dict[str, NDArray[np.generic] | None], dict[str, object]]: ...
 
 def fit_umap(
     x: NDArray[np.float32],
@@ -31,4 +32,10 @@ def fit_umap(
     device_index: int = 0,
     neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
     unique: bool = False,
+) -> FittedUMAP: ...
+def load(
+    arrays: dict[str, NDArray[np.generic] | None],
+    metadata: dict[str, object],
+    backend: Literal["auto", "cpu", "cuda"] = "auto",
+    device_index: int = 0,
 ) -> FittedUMAP: ...

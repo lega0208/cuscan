@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Python fitted-model serialization:** `fast_umap.UMAP.save(path, overwrite=False)` and `UMAP.load(path, backend="auto", device_index=0)` persist fitted numeric state in versioned HDF5 schema v1 using the optional `serialization` extra (`h5py` and `hdf5plugin`). Compression uses lossless Blosc2 Zstandard level 1 with byte shuffle in 32768-row chunks; backend/device remain load-time choices, and Rust does not link HDF5.
 - **Standard (non-parametric) UMAP:** Rust `UMAP`/`FittedUMAP` with `UMAPConfig`, `BackendChoice` (Flex or CUDA) and `NeighborSearch` (`Exact`, `Approximate`, `Auto`), plus Python `fast_umap.UMAP`. Follows umap-learn 0.5.12 (smooth-kNN fuzzy graph, bounded Lanczos spectral initialization, reference SGD schedule and Tausworthe sampling); fit and transform run neighbor search, graph construction and layout on the selected backend through the forward-only `StandardUmapOps` extension.
 - Added an optional CUDA backend that reuses the CubeCL kernels; enable it with the `cuda` feature. Runtime requires an NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`); `nvcc`/CUDA toolkit are optional at build time.
 - **Python bindings** — Installable `fast_umap` package with a scikit-learn-style `ParametricUMAP` estimator, selectable GPU (WGPU) or CPU (Flex) backend via `device=`.

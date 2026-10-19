@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from os import PathLike
 from typing import Literal
 
 import numpy as np
@@ -94,10 +95,51 @@ class UMAP:
             neighbor_search=self.neighbor_search,
             unique=self.unique,
         )
+        snapshot = {
+            name: getattr(self, name)
+            for name in (
+                "n_components",
+                "n_neighbors",
+                "min_dist",
+                "spread",
+                "local_connectivity",
+                "set_op_mix_ratio",
+                "n_epochs",
+                "learning_rate",
+                "negative_sample_rate",
+                "repulsion_strength",
+                "init",
+                "random_state",
+                "transform_seed",
+                "transform_queue_size",
+                "neighbor_search",
+                "unique",
+            )
+        }
         self.embedding_ = model.embedding
         self.n_features_in_ = x.shape[1]
         self._model = model
+        self._fit_config = snapshot
         return self
+
+    def save(self, path: str | PathLike[str], overwrite: bool = False) -> None:
+        if not hasattr(self, "_model"):
+            raise ValueError("This UMAP instance is not fitted yet")
+        from ._serialization_v1 import save_model
+
+        arrays, metadata = self._model.export_state()
+        save_model(path, arrays, metadata, self._fit_config, overwrite=overwrite)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | PathLike[str],
+        backend: Literal["auto", "cpu", "cuda"] = "auto",
+        device_index: int = 0,
+    ) -> UMAP:
+        from ._serialization_v1 import load_model
+
+        return load_model(cls, path, backend=backend, device_index=device_index)
 
     def fit_transform(self, X: ArrayLike) -> NDArray[np.float32]:
         return self.fit(X).embedding_

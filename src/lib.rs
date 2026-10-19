@@ -14,5 +14,6 @@ pub mod kernels;
 pub mod standard_umap;
 
 pub use standard_umap::{
-    BackendChoice, Embedding, FittedUMAP, Init, NeighborSearch, Result, UMAP, UMAPConfig, UmapError,
+    BackendChoice, Embedding, FittedUMAP, Init, ModelState, NeighborSearch, Result, UMAP,
+    UMAPConfig, UmapError,
 };

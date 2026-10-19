@@ -8,6 +8,9 @@ dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
+[project.optional-dependencies]
+serialization = ["h5py>=3.11", "hdf5plugin>=5.0"]
+
 [dependency-groups]
 dev = [
     "maturin",

@@ -140,6 +140,7 @@ impl UMAP {
             return Ok(FittedUMAP {
                 config: self.config.clone(),
                 backend,
+                requested_search: self.search,
                 search,
                 n_features: features,
                 training_data,
@@ -360,6 +361,7 @@ impl UMAP {
         Ok(FittedUMAP {
             config: self.config.clone(),
             backend,
+            requested_search: self.search,
             search,
             n_features: features,
             training_data,
@@ -404,6 +406,7 @@ impl UMAP {
 pub struct FittedUMAP {
     config: UMAPConfig,
     backend: crate::standard_umap::BackendChoice,
+    requested_search: NeighborSearch,
     search: NeighborSearch,
     n_features: usize,
     training_data: Tensor<2>,
@@ -440,6 +443,264 @@ struct OriginalFitState {
 }
 
 impl FittedUMAP {
+    /// Export an exact, storage-independent snapshot of fitted state.
+    pub fn export_state(&self) -> Result<super::ModelState> {
+        let [training_rows, n_features] = self.training_data.dims();
+        let [embedding_rows, n_components] = self.embedding_tensor.dims();
+        let training_features = self
+            .training_data
+            .to_data()
+            .try_to_vec::<f32>()
+            .map_err(|e| UmapError::Numerical(format!("could not read training features: {e}")))?;
+        // Exact transforms search the retained features directly; only approximate
+        // transforms consume the fitted neighbor graph.
+        let query_graph = (self.search == NeighborSearch::Approximate)
+            .then(|| self.fit_graph.as_ref())
+            .flatten()
+            .map(|graph| {
+                graph
+                    .0
+                    .to_data()
+                    .try_to_vec::<i32>()
+                    .map_err(|e| UmapError::Numerical(format!("could not read fit graph: {e}")))
+            })
+            .transpose()?;
+        Ok(super::ModelState {
+            config: self.config.clone(),
+            requested_search: self.requested_search,
+            resolved_search: self.search,
+            a: self.a,
+            b: self.b,
+            training_features,
+            training_rows,
+            n_features,
+            embedding: self
+                .embedding_tensor
+                .to_data()
+                .try_to_vec::<f32>()
+                .map_err(|e| {
+                    UmapError::Numerical(format!("could not read fitted embedding: {e}"))
+                })?,
+            embedding_rows,
+            n_components,
+            query_graph,
+            query_graph_width: if self.search == NeighborSearch::Approximate {
+                self.fit_graph.as_ref().map_or(0, |graph| graph.0.dims()[1])
+            } else {
+                0
+            },
+            original_to_training: self.original_to_training.clone(),
+        })
+    }
+
+    /// Validate and reconstruct a fitted model on the requested execution backend.
+    pub fn from_state(
+        state: super::ModelState,
+        backend: crate::standard_umap::BackendChoice,
+    ) -> Result<Self> {
+        state.config.validate()?;
+        if state.training_rows == 0
+            || state.n_features == 0
+            || state.embedding_rows != state.training_rows
+            || state.n_components == 0
+            || state.n_components != state.config.n_components
+        {
+            return Err(UmapError::InvalidInput(
+                "model state dimensions are inconsistent".into(),
+            ));
+        }
+        let feature_count = state
+            .training_rows
+            .checked_mul(state.n_features)
+            .ok_or(UmapError::Overflow("training feature shape"))?;
+        let embedding_count = state
+            .embedding_rows
+            .checked_mul(state.n_components)
+            .ok_or(UmapError::Overflow("embedding shape"))?;
+        if state.training_features.len() != feature_count
+            || state.embedding.len() != embedding_count
+        {
+            return Err(UmapError::InvalidInput(
+                "model state array lengths do not match dimensions".into(),
+            ));
+        }
+        if state.training_rows > i32::MAX as usize {
+            return Err(UmapError::Overflow("neighbor row indices"));
+        }
+        if state
+            .training_features
+            .iter()
+            .chain(&state.embedding)
+            .any(|v| !v.is_finite())
+            || !state.a.is_finite()
+            || !state.b.is_finite()
+        {
+            return Err(UmapError::InvalidInput(
+                "model state contains non-finite values".into(),
+            ));
+        }
+        if state.requested_search == NeighborSearch::Auto {
+            let expected = if state.training_rows <= AUTO_EXACT_MAX_ROWS {
+                NeighborSearch::Exact
+            } else {
+                NeighborSearch::Approximate
+            };
+            if state.resolved_search != expected {
+                return Err(UmapError::InvalidConfig(
+                    "Auto search resolution is inconsistent with retained row count".into(),
+                ));
+            }
+        } else if state.requested_search != state.resolved_search {
+            return Err(UmapError::InvalidConfig(
+                "requested and resolved search modes are inconsistent".into(),
+            ));
+        }
+        state
+            .config
+            .validate_search(state.requested_search, Some(state.resolved_search))?;
+        if state.training_rows == 1 {
+            if state.query_graph.is_some()
+                || state.query_graph_width != 0
+                || state.a != 0.0
+                || state.b != 0.0
+            {
+                return Err(UmapError::InvalidInput(
+                    "singleton model state must have no graph and a zero curve".into(),
+                ));
+            }
+        } else {
+            if state.a <= 0.0 || state.b <= 0.0 {
+                return Err(UmapError::InvalidInput(
+                    "nonsingleton model state requires positive curve coefficients".into(),
+                ));
+            }
+            if state.resolved_search == NeighborSearch::Approximate {
+                let expected_width =
+                    fit_neighbor_widths(state.training_rows, state.config.n_neighbors)?.nonself;
+                if expected_width == 0 {
+                    return Err(UmapError::InvalidInput(
+                        "approximate fit graph width must be greater than zero".into(),
+                    ));
+                }
+                let graph = state.query_graph.as_ref().ok_or_else(|| {
+                    UmapError::InvalidInput(
+                        "fit query graph is required for multiple training rows".into(),
+                    )
+                })?;
+                if state.query_graph_width != expected_width
+                    || graph.len()
+                        != state
+                            .training_rows
+                            .checked_mul(expected_width)
+                            .ok_or(UmapError::Overflow("fit graph shape"))?
+                {
+                    return Err(UmapError::InvalidInput(
+                        "fit query graph dimensions are inconsistent".into(),
+                    ));
+                }
+                for (row, chunk) in graph.chunks_exact(expected_width).enumerate() {
+                    if chunk
+                        .iter()
+                        .any(|&i| i < 0 || i as usize >= state.training_rows || i as usize == row)
+                    {
+                        return Err(UmapError::InvalidInput(
+                            "fit query graph contains an invalid neighbor index".into(),
+                        ));
+                    }
+                    let mut neighbors = std::collections::HashSet::with_capacity(expected_width);
+                    if chunk.iter().any(|&i| !neighbors.insert(i)) {
+                        return Err(UmapError::InvalidInput(
+                            "fit query graph contains duplicate neighbors".into(),
+                        ));
+                    }
+                }
+            } else if state.query_graph.is_some() || state.query_graph_width != 0 {
+                return Err(UmapError::InvalidInput(
+                    "exact-search model state must not contain an approximate query graph".into(),
+                ));
+            }
+        }
+        match (&state.original_to_training, state.config.unique) {
+            (Some(mapping), true) => {
+                if mapping.len() < state.training_rows
+                    || mapping.iter().any(|&i| i >= state.training_rows)
+                {
+                    return Err(UmapError::InvalidInput(
+                        "inverse mapping length or index is invalid".into(),
+                    ));
+                }
+                let mut seen = vec![false; state.training_rows];
+                for &i in mapping {
+                    seen[i] = true;
+                }
+                if seen.iter().any(|v| !v) {
+                    return Err(UmapError::InvalidInput(
+                        "inverse mapping does not cover every retained row".into(),
+                    ));
+                }
+                let mut unique = std::collections::HashSet::with_capacity(state.training_rows);
+                for row in state.training_features.chunks_exact(state.n_features) {
+                    let key: Vec<u32> = row
+                        .iter()
+                        .map(|v| if *v == 0.0 { 0 } else { v.to_bits() })
+                        .collect();
+                    if !unique.insert(key) {
+                        return Err(UmapError::InvalidInput(
+                            "unique model contains duplicate retained rows".into(),
+                        ));
+                    }
+                }
+            }
+            (None, false) => {}
+            _ => {
+                return Err(UmapError::InvalidInput(
+                    "inverse mapping presence disagrees with unique configuration".into(),
+                ));
+            }
+        }
+        let (device, selected_backend) = selected_device(backend)?;
+        let training_data = Tensor::<2>::from_data(
+            TensorData::new(
+                state.training_features.clone(),
+                [state.training_rows, state.n_features],
+            ),
+            &device,
+        );
+        let embedding_tensor = Tensor::<2>::from_data(
+            TensorData::new(
+                state.embedding.clone(),
+                [state.embedding_rows, state.n_components],
+            ),
+            &device,
+        );
+        let embedding = state
+            .embedding
+            .chunks_exact(state.n_components)
+            .map(<[f32]>::to_vec)
+            .collect();
+        let fit_graph = state.query_graph.map(|indices| {
+            ValidatedFitGraph(Tensor::<2, Int>::from_data(
+                TensorData::new(indices, [state.training_rows, state.query_graph_width]),
+                &device,
+            ))
+        });
+        Ok(Self {
+            config: state.config,
+            backend: selected_backend,
+            requested_search: state.requested_search,
+            search: state.resolved_search,
+            n_features: state.n_features,
+            training_data,
+            fit_graph,
+            embedding,
+            original_to_training: state.original_to_training,
+            expanded_embedding: OnceLock::new(),
+            embedding_tensor,
+            a: state.a,
+            b: state.b,
+        })
+    }
+
     pub fn embedding(&self) -> &Embedding {
         match &self.original_to_training {
             Some(inverse) => self.expanded_embedding.get_or_init(|| {

@@ -3,6 +3,7 @@
 pub(crate) mod ann;
 mod config;
 mod estimator;
+mod state;
 
 pub mod init;
 
@@ -11,6 +12,7 @@ pub(crate) mod query;
 
 pub use estimator::{FittedUMAP, UMAP};
 pub use init::initialize;
+pub use state::ModelState;
 
 pub use config::{
     BackendChoice, FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig,

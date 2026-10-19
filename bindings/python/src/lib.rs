@@ -2,10 +2,10 @@ use fast_umap::{
     BackendChoice, FittedUMAP as RustFittedUMAP, Init, NeighborSearch, UMAP, UMAPConfig, UmapError,
 };
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyDict, PyModule};
 
 #[pyclass(frozen, unsendable)]
 struct FittedUMAP {
@@ -14,6 +14,75 @@ struct FittedUMAP {
 
 #[pymethods]
 impl FittedUMAP {
+    /// Return `(arrays, metadata)` containing independent NumPy snapshots.
+    fn export_state<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+        let state = py
+            .detach(|| self.inner.export_state())
+            .map_err(map_umap_error)?;
+        let arrays = PyDict::new(py);
+        let features = Array2::from_shape_vec(
+            (state.training_rows, state.n_features),
+            state.training_features,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let embedding =
+            Array2::from_shape_vec((state.embedding_rows, state.n_components), state.embedding)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        arrays.set_item("training_features", features.into_pyarray(py))?;
+        arrays.set_item("embedding", embedding.into_pyarray(py))?;
+        arrays.set_item(
+            "query_graph",
+            state.query_graph.map(|v| {
+                Array2::from_shape_vec((state.training_rows, state.query_graph_width), v)
+                    .expect("validated graph shape")
+                    .into_pyarray(py)
+            }),
+        )?;
+        arrays.set_item(
+            "original_to_training",
+            state.original_to_training.map(|v| {
+                v.into_iter()
+                    .map(|i| i as u64)
+                    .collect::<Vec<_>>()
+                    .into_pyarray(py)
+            }),
+        )?;
+        let metadata = PyDict::new(py);
+        let c = state.config;
+        metadata.set_item("n_components", c.n_components)?;
+        metadata.set_item("n_neighbors", c.n_neighbors)?;
+        metadata.set_item("min_dist", c.min_dist)?;
+        metadata.set_item("spread", c.spread)?;
+        metadata.set_item("local_connectivity", c.local_connectivity)?;
+        metadata.set_item("set_op_mix_ratio", c.set_op_mix_ratio)?;
+        metadata.set_item("n_epochs", c.n_epochs)?;
+        metadata.set_item("learning_rate", c.learning_rate)?;
+        metadata.set_item("negative_sample_rate", c.negative_sample_rate)?;
+        metadata.set_item("repulsion_strength", c.repulsion_strength)?;
+        metadata.set_item(
+            "init",
+            match c.init {
+                Init::Random => "random",
+                Init::Spectral => "spectral",
+            },
+        )?;
+        metadata.set_item("random_state", c.random_state)?;
+        metadata.set_item("transform_seed", c.transform_seed)?;
+        metadata.set_item("transform_queue_size", c.transform_queue_size)?;
+        metadata.set_item("unique", c.unique)?;
+        metadata.set_item("requested_search", search_name(state.requested_search))?;
+        metadata.set_item("resolved_search", search_name(state.resolved_search))?;
+        metadata.set_item("a", state.a)?;
+        metadata.set_item("b", state.b)?;
+        metadata.set_item("training_rows", state.training_rows)?;
+        metadata.set_item("n_features", state.n_features)?;
+        metadata.set_item("query_graph_width", state.query_graph_width)?;
+        Ok((arrays, metadata))
+    }
+
     #[getter]
     fn embedding<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
         let embedding = self.inner.embedding();
@@ -135,6 +204,150 @@ fn map_umap_error(error: UmapError) -> PyErr {
     }
 }
 
+fn search_name(search: NeighborSearch) -> &'static str {
+    match search {
+        NeighborSearch::Auto => "auto",
+        NeighborSearch::Exact => "exact",
+        NeighborSearch::Approximate => "approximate",
+    }
+}
+
+fn parse_search(value: &str) -> PyResult<NeighborSearch> {
+    match value {
+        "auto" => Ok(NeighborSearch::Auto),
+        "exact" => Ok(NeighborSearch::Exact),
+        "approximate" => Ok(NeighborSearch::Approximate),
+        _ => Err(PyValueError::new_err("invalid neighbor search mode")),
+    }
+}
+
+#[pyfunction(signature = (arrays, metadata, backend="auto", device_index=0))]
+#[allow(clippy::too_many_arguments)]
+fn load(
+    py: Python<'_>,
+    arrays: &Bound<'_, PyDict>,
+    metadata: &Bound<'_, PyDict>,
+    backend: &str,
+    device_index: usize,
+) -> PyResult<FittedUMAP> {
+    macro_rules! get {
+        ($key:literal) => {
+            metadata
+                .get_item($key)?
+                .ok_or_else(|| PyValueError::new_err(concat!("missing metadata key: ", $key)))?
+        };
+    }
+    let training_features: PyReadonlyArray2<'_, f32> = arrays
+        .get_item("training_features")?
+        .ok_or_else(|| PyValueError::new_err("missing array: training_features"))?
+        .extract()?;
+    let embedding: PyReadonlyArray2<'_, f32> = arrays
+        .get_item("embedding")?
+        .ok_or_else(|| PyValueError::new_err("missing array: embedding"))?
+        .extract()?;
+    let query_graph: Option<PyReadonlyArray2<'_, i32>> = arrays
+        .get_item("query_graph")?
+        .ok_or_else(|| PyValueError::new_err("missing array: query_graph"))?
+        .extract()?;
+    let mapping: Option<PyReadonlyArray1<'_, u64>> = arrays
+        .get_item("original_to_training")?
+        .ok_or_else(|| PyValueError::new_err("missing array: original_to_training"))?
+        .extract()?;
+    let original_to_training = mapping
+        .map(|values| {
+            values
+                .as_array()
+                .iter()
+                .map(|&v| {
+                    usize::try_from(v)
+                        .map_err(|_| PyValueError::new_err("inverse mapping value exceeds usize"))
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()?;
+    let init = match get!("init").extract::<String>()?.as_str() {
+        "random" => Init::Random,
+        "spectral" => Init::Spectral,
+        _ => return Err(PyValueError::new_err("invalid init")),
+    };
+    let requested_search = parse_search(&get!("requested_search").extract::<String>()?)?;
+    let resolved_search = parse_search(&get!("resolved_search").extract::<String>()?)?;
+    let config = UMAPConfig {
+        n_components: get!("n_components").extract()?,
+        n_neighbors: get!("n_neighbors").extract()?,
+        min_dist: get!("min_dist").extract()?,
+        spread: get!("spread").extract()?,
+        local_connectivity: get!("local_connectivity").extract()?,
+        set_op_mix_ratio: get!("set_op_mix_ratio").extract()?,
+        n_epochs: get!("n_epochs").extract()?,
+        learning_rate: get!("learning_rate").extract()?,
+        negative_sample_rate: get!("negative_sample_rate").extract()?,
+        repulsion_strength: get!("repulsion_strength").extract()?,
+        init,
+        random_state: get!("random_state").extract()?,
+        transform_seed: get!("transform_seed").extract()?,
+        transform_queue_size: get!("transform_queue_size").extract()?,
+        unique: get!("unique").extract()?,
+    };
+    let fshape = training_features.shape();
+    let eshape = embedding.shape();
+    if get!("training_rows").extract::<usize>()? != fshape[0]
+        || get!("n_features").extract::<usize>()? != fshape[1]
+        || get!("n_components").extract::<usize>()? != eshape[1]
+        || eshape[0] != fshape[0]
+    {
+        return Err(PyValueError::new_err(
+            "metadata dimensions do not match fitted arrays",
+        ));
+    }
+    let features = training_features.as_array().iter().copied().collect();
+    let embedding_values = embedding.as_array().iter().copied().collect();
+    let (graph_values, graph_width) = if let Some(graph) = query_graph {
+        if graph.shape()[0] != fshape[0]
+            || get!("query_graph_width").extract::<usize>()? != graph.shape()[1]
+        {
+            return Err(PyValueError::new_err(
+                "metadata dimensions do not match query graph",
+            ));
+        }
+        (
+            Some(graph.as_array().iter().copied().collect()),
+            graph.shape()[1],
+        )
+    } else {
+        (None, 0)
+    };
+    let state = fast_umap::standard_umap::ModelState {
+        config,
+        requested_search,
+        resolved_search,
+        a: get!("a").extract()?,
+        b: get!("b").extract()?,
+        training_features: features,
+        training_rows: fshape[0],
+        n_features: fshape[1],
+        embedding: embedding_values,
+        embedding_rows: eshape[0],
+        n_components: eshape[1],
+        query_graph: graph_values,
+        query_graph_width: graph_width,
+        original_to_training,
+    };
+    let backend = match backend {
+        "auto" => BackendChoice::Auto,
+        "cpu" => BackendChoice::Cpu,
+        "cuda" => BackendChoice::Cuda { device_index },
+        _ => {
+            return Err(PyValueError::new_err(
+                "backend must be 'auto', 'cpu' or 'cuda'",
+            ));
+        }
+    };
+    py.detach(move || RustFittedUMAP::from_state(state, backend))
+        .map(|inner| FittedUMAP { inner })
+        .map_err(map_umap_error)
+}
+
 #[pyfunction(signature = (
   x, *, n_components=2, n_neighbors=15, min_dist=0.1, spread=1.0,
   local_connectivity=1.0, set_op_mix_ratio=1.0, n_epochs=None,
@@ -223,5 +436,6 @@ fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<FittedUMAP>()?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
+    module.add_function(wrap_pyfunction!(load, module)?)?;
     Ok(())
 }

@@ -69,6 +69,78 @@ embedding = model.fit_transform(X)
 new_embedding = model.transform(X[:5])
 ```
 
+### Fitted model serialization
+
+HDF5 persistence is an optional Python feature; install it with
+`uv sync --extra serialization` or `pip install 'fast-umap[serialization]'`.
+The extra provides `h5py` and `hdf5plugin`; normal fit/transform use does not
+import either dependency.
+
+```python
+model = fast_umap.UMAP(random_state=42).fit(X)
+model.save("fitted-model.h5")  # refuses to replace an existing path
+restored = fast_umap.UMAP.load("fitted-model.h5", backend="auto")
+restored.transform(X_new)
+```
+
+`save(path, overwrite=False)` writes schema v1 to one HDF5 file. Passing
+`overwrite=True` explicitly replaces an existing destination. Publication uses
+a same-directory temporary file and atomic no-clobber hard-link commit by
+default (`os.replace` when overwriting); on the documented Linux target the
+directory is synced after commit. A failure syncing after commit reports
+uncertain durability and does not roll back the published file.
+
+The versioned schema stores typed numeric fitted state (training data,
+embedding, approximate-search query graph when applicable, and optional
+deduplication row mapping), configuration and curve coefficients. It uses
+lossless Blosc2 Zstandard compression (level 1) with byte shuffle in
+32768-row chunks, not pickle or lossy
+quantization. Exact serialized array/curve numeric state is retained; this does
+not promise identical execution across backend, hardware, or software versions.
+Bitwise transform equivalence is intended only for the same backend; cross-
+backend behavior follows the existing numerical tolerances. The backend and
+device are deliberately not persisted. `load(path, backend="auto",
+device_index=0)` selects the runtime: `auto` uses the normal CUDA-then-CPU
+selection policy, while explicit `cpu`/`cuda` is strict and explicit CUDA uses
+the caller's `device_index` (default 0).
+
+Files contain training data and derived model state and may expose sensitive
+information. Protect them with the same access controls as the original data.
+External readers need the Blosc2 HDF5 filter plugin (filter ID 32026), such as
+`hdf5plugin`, registered with their HDF5 library. The Rust crate and extension
+do not link HDF5 and provide no Rust HDF5 save/load API.
+
+The storage benchmark compares compression levels and chunk row sizes for
+continuous and integer-valued f32 features, embeddings, graphs, and a
+deduplicated-model state. It reports file size, isolated save/load latency and
+peak host-process RSS; it does not measure device memory. One quick run on
+Linux x86-64/WSL2 with Python 3.14, using synthetic 4,096-row, 32-feature data,
+gave the following results at 1,024-row chunks (latency in milliseconds, RSS
+in MiB):
+
+| Synthetic case | Blosc2 level | File bytes | Save ms | Load ms | Save RSS MiB | Load RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| Continuous f32 features | 1 | 474,450 | 29.25 | 5.55 | 61.1 | 55.5 |
+| Continuous f32 features | 9 | 457,808 | 94.22 | 5.91 | 62.8 | 55.8 |
+| Deduplicated model state | 1 | 305,631 | 33.88 | 8.90 | 60.3 | 55.0 |
+| Deduplicated model state | 9 | 298,053 | 113.92 | 2.16 | 62.9 | 55.2 |
+
+In these single-trial quick measurements, level 9 reduced file size by about
+2.9–3.0% versus level 1, but took about 3.3–3.4× as long to save and used up to
+1.7 MiB more peak RSS. A 1,024-row chunk was the smallest of the tested chunk
+sizes in both rows. This supports level 1 with 1,024-row chunks as the
+size/save-time tradeoff; production settings should still be evaluated on the
+target workload. These measurements are synthetic and single-trial, and
+latency (especially load latency) is noisy; RSS includes interpreter and
+dependency baseline. Device memory was unavailable because the benchmark uses
+host-side NumPy and h5py only. Run the full sweep and retain its JSON output
+before drawing workload-specific conclusions.
+
+```shell
+uv run --no-sync python scripts/benchmark_serialization.py --quick
+uv run --no-sync python scripts/benchmark_serialization.py --output serialization-benchmark.json
+```
+
 ### Python development
 
 ```shell

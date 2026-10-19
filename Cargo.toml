@@ -124,15 +124,3 @@ required-features = ["tracing"]
 [[example]]
 name = "ann_construction_worker"
 required-features = ["cuda"]
-
-[[example]]
-name = "ann_phase0_dump"
-required-features = ["cpu"]
-
-[[example]]
-name = "ann_codegen_microbench"
-required-features = ["cpu"]
-
-[[example]]
-name = "ann_phase0_replay"
-required-features = ["cpu"]
