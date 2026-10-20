@@ -19,14 +19,15 @@ fast-cubecl-common = { path = "crates/fast-cubecl-common", default-features = fa
 fast-hdbscan-core = { path = "crates/fast-hdbscan-core", default-features = false }
 fast-hdbscan = { path = "crates/fast-hdbscan", default-features = false }
 fast-umap = { path = "crates/fast-umap", default-features = false }
-burn = { version = "0.22.0", default-features = false, features = [
+burn = { version = "0.22.1", default-features = false, features = [
   "std",
   "autotune",
   "extension",
+  "persistence",
 ] }
-burn-cubecl = { version = "0.22.0", default-features = false }
-cubecl = { version = "0.11.0", default-features = false }
-cubecl-cpu = { version = "0.11.0", default-features = false }
+burn-cubecl = { version = "0.22.1", default-features = false }
+cubecl = { version = "0.11.1", default-features = false }
+cubecl-cpu = { version = "0.11.1", default-features = false }
 cudarc = { version = "0.19.10", features = [
   "std",
   "driver",
@@ -48,11 +49,11 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 zip = "=0.6.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = "0.7"
-cubecl-environment = { version = "=0.11.0", default-features = false, features = [
+cubecl-environment = { version = "=0.11.1", default-features = false, features = [
   "std",
   "persistence",
 ] }
-cubecl-server = { version = "=0.11.0", default-features = false, features = [
+cubecl-server = { version = "=0.11.1", default-features = false, features = [
   "std",
   "persistence",
 ] }
