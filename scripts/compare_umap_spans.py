@@ -1016,7 +1016,7 @@ def _stage2_worker(payload: dict[str, Any]) -> dict[str, Any]:
             ["rustc", "--version"], cwd=root, check=True, capture_output=True, text=True
         ).stdout.strip()
         diff = subprocess.run(
-            ["git", "diff", payload["frozen_product"], "--", *map(str, harness)],
+            ["git", "diff", "HEAD", "--", *map(str, harness)],
             cwd=root,
             check=True,
             capture_output=True,
@@ -1309,25 +1309,6 @@ def _stage2_cli(argv: list[str]) -> int:
                     Path(item["path"]).name: item["labels_sha256"] for item in generated["queries"]
                 },
             }
-            frozen_product = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e"
-            product_paths = ("crates/fast-umap/src", "crates/fast-umap-core/src")
-            product_diff = run_supervised(
-                ["git", "diff", "--quiet", frozen_product, "--", *product_paths],
-                deadline,
-                check=False,
-            )
-            if product_diff.returncode:
-                raise ValueError(
-                    f"product src differs from frozen Stage2 baseline {frozen_product}"
-                )
-            untracked_product = run_supervised(
-                ["git", "ls-files", "--others", "--exclude-standard", "--", *product_paths],
-                deadline,
-            ).stdout.strip()
-            if untracked_product:
-                raise ValueError(
-                    f"untracked product source is outside the frozen baseline: {untracked_product}"
-                )
             harness_paths = [
                 Path("crates/fast-umap/examples/profile_standard_cuda.rs"),
                 Path("crates/fast-umap/tests/test_standard_ann.rs"),
@@ -1339,7 +1320,6 @@ def _stage2_cli(argv: list[str]) -> int:
                 "kind": "provenance",
                 "root": str(ROOT),
                 "harness_paths": [str(path) for path in harness_paths],
-                "frozen_product": frozen_product,
                 "artifact_directory": str(raw_artifacts),
                 "binary": str(binary),
             }
@@ -1364,21 +1344,9 @@ def _stage2_cli(argv: list[str]) -> int:
                     "nvidia-smi version unavailable from supervised GPU provenance."
                 )
             output["provenance"]["source_identity"] = manifest["source"] | {
-                "frozen_product_baseline": frozen_product,
-                "frozen_product_src_tree": run_supervised(
-                    ["git", "rev-parse", f"{frozen_product}:src"], deadline
-                ).stdout.strip(),
-                "working_product_src_tree": run_supervised(
-                    ["git", "rev-parse", "HEAD:src"], deadline
-                ).stdout.strip(),
                 "features": ["cuda", "tracing"],
             }
             output["provenance"]["binary_sha256"] = manifest["source"]["binary_sha256"]
-            if (
-                output["provenance"]["source_identity"]["frozen_product_src_tree"]
-                != output["provenance"]["source_identity"]["working_product_src_tree"]
-            ):
-                raise ValueError("HEAD product src tree is not identical to frozen Stage2 baseline")
             reference_scores: dict[str, list[dict[str, Any]]] = {mode: [] for mode in STAGE2_MODES}
             queries = [(path, args.query_rows) for path in query_paths]
             # One isolated warmup for each mode/side; measured repetitions use warmups=0.

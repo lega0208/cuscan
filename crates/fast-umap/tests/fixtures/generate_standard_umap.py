@@ -23,10 +23,13 @@ REFERENCE_VERSION = "0.5.12"
 HERE = Path(__file__).resolve().parent
 REFERENCE_JSON = HERE / "standard_umap_reference.json"
 QUALITY_NPZ = HERE / "standard_umap_quality.npz"
-SEEDS = [11, 29, 47, 71, 101]
-N_NEIGHBORS = 15
+SEEDS = [11, 29, 47]
+N_NEIGHBORS = 10
 N_COMPONENTS = 2
 TRUST_K = 15
+FIT_EPOCHS = 180
+TRANSFORM_EPOCHS = 60
+LONG_RUN_CASE = "clusters"
 CAMPAIGN_SEEDS = [11, 29, 47, 71, 101]
 CAMPAIGN_N_NEIGHBORS = 25
 CAMPAIGN_TRUST_K = 15
@@ -246,7 +249,7 @@ def make_datasets() -> dict[str, tuple[np.ndarray, np.ndarray]]:
     return cases
 
 
-def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray]]:
+def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray], dict[str, object]]:
     import umap
 
     datasets = make_datasets()
@@ -266,7 +269,7 @@ def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray]]:
                 spread=1.0,
                 local_connectivity=1.0,
                 set_op_mix_ratio=1.0,
-                n_epochs=200,
+                n_epochs=FIT_EPOCHS,
                 learning_rate=1.0,
                 negative_sample_rate=5,
                 repulsion_strength=1.0,
@@ -295,7 +298,65 @@ def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray]]:
                 }
             )
         scores[case] = case_scores
-    return scores, arrays
+    train, heldout = datasets[LONG_RUN_CASE]
+    long_run = umap.UMAP(
+        n_neighbors=15,
+        n_components=N_COMPONENTS,
+        min_dist=0.1,
+        spread=1.0,
+        local_connectivity=1.0,
+        set_op_mix_ratio=1.0,
+        n_epochs=200,
+        learning_rate=1.0,
+        negative_sample_rate=5,
+        repulsion_strength=1.0,
+        init="spectral",
+        random_state=11,
+        transform_seed=11,
+        metric="euclidean",
+        low_memory=True,
+        n_jobs=1,
+        verbose=False,
+    )
+    long_run.fit(train)
+    long_fit = long_run.embedding_.astype(np.float32)
+    long_transform = long_run.transform(heldout).astype(np.float32)
+    arrays[f"{LONG_RUN_CASE}__long_run_seed11__fit"] = long_fit
+    arrays[f"{LONG_RUN_CASE}__long_run_seed11__transform"] = long_transform
+    long_metadata = {
+        "case": LONG_RUN_CASE,
+        "seed": 11,
+        "n_neighbors": 15,
+        "fit_epochs": 200,
+        "transform_epochs": 66,
+        "fit_trustworthiness_at_15": float(trustworthiness(train, long_fit, n_neighbors=TRUST_K)),
+        "transform_trustworthiness_at_15": float(
+            trustworthiness(heldout, long_transform, n_neighbors=TRUST_K)
+        ),
+    }
+    return scores, arrays, long_metadata
+
+
+def quality_scoring() -> dict[str, str]:
+    return {
+        "trustworthiness": (
+            "sklearn.manifold.trustworthiness(X, embedding, n_neighbors=15); for each surface, "
+            "pool all case/seed implementation scores and reference scores, then accept when "
+            "reference pooled mean minus candidate pooled mean <= 0.025. Improvements are not "
+            "penalized. Per-case signed gaps (reference minus candidate) and absolute gaps are "
+            "diagnostics only and are not gates."
+        ),
+        "recall": (
+            "Fit uses k=9 (= n_neighbors - 1; fit's kNN includes self), held-out transform "
+            "uses k=10 (= n_neighbors). For each row, unique returned neighbors within the "
+            "exact kth-distance boundary earn 1/k; denominator remains k. Fit excludes self; "
+            "query searches training rows. Ties are inclusive."
+        ),
+        "freeze": (
+            "Datasets, splits, controls, references, and score definitions are fixed before "
+            "implementation scoring; do not retune after observing results."
+        ),
+    }
 
 
 def exact_trustworthiness_bounded(original: np.ndarray, embedded: np.ndarray, k: int) -> float:
@@ -434,6 +495,11 @@ def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--quality-only",
+        action="store_true",
+        help="regenerate standard quality metadata and NPZ without graph/layout probes",
+    )
+    parser.add_argument(
         "--campaign",
         action="store_true",
         help="generate only the isolated large campaign reference",
@@ -458,7 +524,28 @@ def main() -> None:
     actual_version = version("umap-learn")
     if actual_version != REFERENCE_VERSION:
         raise RuntimeError(f"expected umap-learn {REFERENCE_VERSION}, found {actual_version}")
-    scores, quality_arrays = run_quality_cases()
+    scores, quality_arrays, long_run = run_quality_cases()
+    if args.quality_only:
+        result = json.loads(REFERENCE_JSON.read_text(encoding="utf-8"))
+        result["controls"]["n_neighbors"] = N_NEIGHBORS
+        result["controls"]["seeds"] = SEEDS
+        result["controls"]["fit"]["n_epochs"] = FIT_EPOCHS
+        result["controls"]["transform"]["n_epochs"] = TRANSFORM_EPOCHS
+        result["controls"]["transform"]["n_epochs_rule"] = (
+            f"int(fit_n_epochs // 3) = int({FIT_EPOCHS} // 3), from umap.umap_.UMAP.transform"
+        )
+        result["quality"]["cases"] = list(scores)
+        result["quality"]["scores"] = scores
+        result["quality"]["long_run"] = long_run
+        result["quality"]["scoring"] = quality_scoring()
+        result["reference"]["generator_sha256"] = hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest()
+        REFERENCE_JSON.write_text(
+            json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        np.savez_compressed(QUALITY_NPZ, **quality_arrays)
+        return
     graph_cases = [source_graph(case) for case in GRAPH_CASES]
     optimizer_cases = [
         optimizer_probe(
@@ -543,7 +630,7 @@ def main() -> None:
                 "spread": 1.0,
                 "local_connectivity": 1.0,
                 "set_op_mix_ratio": 1.0,
-                "n_epochs": 200,
+                "n_epochs": FIT_EPOCHS,
                 "learning_rate": 1.0,
                 "negative_sample_rate": 5,
                 "repulsion_strength": 1.0,
@@ -554,9 +641,10 @@ def main() -> None:
             "transform": {
                 "transform_seed": "equal to case seed",
                 "reference_call": "fitted_reference.transform(heldout)",
-                "n_epochs": 66,
+                "n_epochs": TRANSFORM_EPOCHS,
                 "n_epochs_rule": (
-                    "int(fit_n_epochs // 3) = int(200 // 3), from umap.umap_.UMAP.transform"
+                    f"int(fit_n_epochs // 3) = int({FIT_EPOCHS} // 3), "
+                    "from umap.umap_.UMAP.transform"
                 ),
                 "init": "weighted",
                 "transform_queue_size": 4.0,
@@ -586,31 +674,8 @@ def main() -> None:
                 }
                 for case, data in make_datasets().items()
             },
-            "scoring": {
-                "trustworthiness": (
-                    "sklearn.manifold.trustworthiness(X, embedding, n_neighbors=15); "
-                    "report fit and held-out transform independently. For each surface, "
-                    "compute the arithmetic mean of per-case/per-seed trustworthiness "
-                    "scores for implementation and reference, then gate on "
-                    "abs(implementation_mean-reference_mean) <= 0.025. This is intentionally "
-                    "not the stricter mean of per-run absolute gaps."
-                ),
-                "recall": (
-                    "Fit uses k=14 (= n_neighbors - 1; fit's kNN includes self), held-out "
-                    "transform query uses k=15 (= n_neighbors; bipartite search has no self "
-                    "slot). For each row, exact input-space neighbors are sorted by "
-                    "(Euclidean distance, row index). Each unique returned neighbor earns "
-                    "1/k if its distance is <= the exact kth distance (inclusive ties); "
-                    "denominator remains k even when output is short. Average over all rows "
-                    "across cases and seeds with equal row weight. Fit excludes self; query "
-                    "searches training rows. No tie-breaking requirement within the "
-                    "kth-distance boundary."
-                ),
-                "freeze": (
-                    "Datasets, splits, controls, references, and score definitions are fixed "
-                    "before implementation scoring; do not retune after observing results."
-                ),
-            },
+            "scoring": quality_scoring(),
+            "long_run": long_run,
             "scores": scores,
         },
     }

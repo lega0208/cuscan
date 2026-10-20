@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -111,7 +112,7 @@ def test_supervisor_kills_tree_on_unexpected_telemetry_error(tmp_path: Path) -> 
     assert not Path(f"/proc/{child_pid}").exists()
 
 
-def test_stage2_cuda_command_matches_rust_positional_contract(tmp_path: Path) -> None:
+def test_cuda_command_matches_rust_positional_contract(tmp_path: Path) -> None:
     binary, train, out, query = (
         tmp_path / name for name in ("binary", "train.f32le", "out", "query.f32le")
     )
@@ -129,7 +130,7 @@ def test_stage2_cuda_command_matches_rust_positional_contract(tmp_path: Path) ->
         "--neighbors",
         "25",
         "--min-dist",
-        "0.1",
+        "0.0",
         "--init",
         "spectral",
         "--seed",
@@ -142,7 +143,7 @@ def test_stage2_cuda_command_matches_rust_positional_contract(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("failure_mode", ["none", "truncated", "subprocess"])
-def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
+def test_benchmark_cli_mocked_campaign_exercises_complete_orchestration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
 ) -> None:
     binary = tmp_path / "cuda-binary"
@@ -158,10 +159,6 @@ def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
         if command[0] == "git":
             if command[1:3] == ["rev-parse", "HEAD"]:
                 stdout = "test-head\n"
-            elif command[1:3] == ["rev-parse", "HEAD:src"]:
-                stdout = "same-src-tree\n"
-            elif command[1] == "rev-parse":
-                stdout = "same-src-tree\n"
             else:
                 stdout = ""
             return subprocess.CompletedProcess(command, 0, stdout, "")
@@ -307,6 +304,7 @@ def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
         assert report["incomplete_reason"] == "simulated evaluator deadline"
         assert report["reverse_graph_diagnostics"][0]["recovery_error"]
         assert report["coverage"]["profiles"] == "not requested"
+        assert not any(command[0] == "git" for command in calls)
         return
     if failure_mode == "subprocess":
         assert report["completed_references"][0]["mode"] in module.STAGE2_MODES
@@ -315,6 +313,7 @@ def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
         assert details["returncode"] == 17
         assert "distinctive stderr marker" in details["stderr"]
         assert details["stdout"] == "captured stdout"
+        assert not any(command[0] == "git" for command in calls)
         return
     assert len(cuda_calls) == 16  # Four warmups and twelve timed baseline repetitions.
     assert sum("1" == call[call.index("--warmups") + 1] for call in cuda_calls) == 4
@@ -336,6 +335,9 @@ def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
     assert report["coverage"]["completed_baseline_repetitions"] == 12
     assert report["coverage"]["baseline_repetitions_required_per_mode"] == 6
     assert report["coverage"]["full_baseline_pair_coverage"] is True
+    assert not any(command[0] == "git" for command in calls)
+    assert "frozen_product_baseline" not in report["provenance"]["source_identity"]
+    assert "frozen_product_src_tree" not in report["provenance"]["source_identity"]
     assert report["coverage"]["profiles"]["status"] == "captured"
     assert report["quality"]["exact"]["all_runs_pass"] is True
     assert report["quality"]["approximate"]["all_runs_pass"] is True
@@ -357,7 +359,7 @@ def test_stage2_cli_mocked_campaign_exercises_complete_orchestration(
         assert profile["memory_evidence"]["status"] == "pass"
 
 
-def test_stage2_generation_is_deterministic_and_balanced(tmp_path: Path) -> None:
+def test_input_generation_is_deterministic_and_balanced(tmp_path: Path) -> None:
     def generate(folder: Path):
         folder.mkdir()
         return module._stage2_worker(
@@ -381,7 +383,7 @@ def test_stage2_generation_is_deterministic_and_balanced(tmp_path: Path) -> None
     assert all(max(row["label_counts"]) - min(row["label_counts"]) <= 1 for row in first["queries"])
 
 
-def test_stage2_resource_telemetry_unavailable_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resource_telemetry_unavailable_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(*args, **kwargs):
         raise FileNotFoundError("nvidia-smi missing in WSL")
 
@@ -393,7 +395,7 @@ def test_stage2_resource_telemetry_unavailable_is_null(monkeypatch: pytest.Monke
     assert "nvidia-smi missing in WSL" in telemetry.evidence["explanation"]
 
 
-def test_stage2_resource_telemetry_timeout_skips_sample_without_disabling(
+def test_resource_telemetry_timeout_skips_sample_without_disabling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = [0]
@@ -521,7 +523,7 @@ def test_nsys_memory_evidence_missing_table_is_incomplete(tmp_path: Path) -> Non
     assert "No CUDA allocation events" in empty["explanation"]
 
 
-def test_stage2_resource_sample_unattributed_process_is_null(
+def test_resource_sample_unattributed_process_is_null(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -544,7 +546,7 @@ def test_stage2_resource_sample_unattributed_process_is_null(
     assert telemetry.evidence["readings"][0]["timestamp_utc"].endswith("+00:00")
 
 
-def test_stage2_gpu_provenance_distinguishes_driver_compatibility_from_runtime(
+def test_gpu_provenance_distinguishes_driver_compatibility_from_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def query(args, **kwargs):
@@ -564,7 +566,7 @@ def test_stage2_gpu_provenance_distinguishes_driver_compatibility_from_runtime(
     assert gpu["devices"][0]["cuda_runtime_version"] is None
 
 
-def test_stage2_over_cap_sample_kills_supervised_worker(
+def test_over_cap_sample_kills_supervised_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = [None]
@@ -617,14 +619,14 @@ def test_stage2_over_cap_sample_kills_supervised_worker(
     assert not Path(f"/proc/{child_pid}").exists()
 
 
-def test_stage2_profile_worker_timeout_is_interruptible() -> None:
+def test_profile_worker_timeout_is_interruptible() -> None:
     with pytest.raises(module.DeadlineExceeded):
         module.run_supervised(
             [sys.executable, "-c", "import time; time.sleep(30)"], module.Deadline(0.1)
         )
 
 
-def test_stage2_aggregation_checks_full_run_batch_coverage_without_speed_gate() -> None:
+def test_aggregation_checks_full_run_batch_coverage_without_speed_gate() -> None:
     references = {
         mode: [
             {
@@ -672,7 +674,7 @@ def test_stage2_aggregation_checks_full_run_batch_coverage_without_speed_gate() 
     assert missing["full_coverage"] is False
 
 
-def test_stage2_fit_and_query_recall_thresholds_are_distinct() -> None:
+def test_fit_and_query_recall_thresholds_are_distinct() -> None:
     references = {
         mode: [
             {
@@ -757,7 +759,7 @@ def test_reverse_graph_diagnostics_reject_invalid_id() -> None:
         module.reverse_graph_diagnostics(np.array([[0, 3]], dtype=np.int32), rows=3)
 
 
-def test_stage2_query_recall_uses_training_ids_and_full_denominator() -> None:
+def test_query_recall_uses_training_ids_and_full_denominator() -> None:
     query = np.array([[0.0], [10.0]])
     train = np.array([[0.0], [1.0], [9.0], [11.0]])
     # Duplicate IDs count once; missing slots remain in the fixed denominator.
@@ -818,7 +820,7 @@ def test_cuda_quality_worker_validates_raw_ids_and_pads_short_fit_graph(
         module._stage2_worker(payload)
 
 
-def test_stage2_recall_rejects_invalid_ids() -> None:
+def test_recall_rejects_invalid_ids() -> None:
     with pytest.raises(ValueError, match="invalid IDs"):
         module.stage2_recall(np.zeros((3, 2)), np.array([[3], [0], [1]]), 1)
 
@@ -955,7 +957,16 @@ def test_reference_rejects_incomplete_or_missing_metadata(tmp_path: Path, refere
             module.load_quality_reference(path)
 
 
-def test_pinned_umap_exact_reference_index_transforms_and_missing_index_fails() -> None:
+# Run when upgrading umap-learn/pynndescent or changing reference-index construction:
+# FAST_UMAP_TEST_REFERENCE_COMPAT=1 uv run --no-sync pytest \
+#     python/tests/test_compare_umap_spans.py \
+#     -k test_umap_exact_reference_index_transforms_and_missing_index_fails
+# This checks upstream assumptions used by our reference helper, not native UMAP correctness.
+@pytest.mark.skipif(
+    os.environ.get("FAST_UMAP_TEST_REFERENCE_COMPAT") != "1",
+    reason="upstream reference compatibility check; set FAST_UMAP_TEST_REFERENCE_COMPAT=1 to run",
+)
+def test_umap_exact_reference_index_transforms_and_missing_index_fails() -> None:
     import umap
     from pynndescent import NNDescent
     from sklearn.neighbors import NearestNeighbors
@@ -967,7 +978,7 @@ def test_pinned_umap_exact_reference_index_transforms_and_missing_index_fails() 
     estimator = module._stage2_reference_fit(training, "exact", seed=5, epochs=20, neighbors=25)
     assert estimator.n_neighbors == 25
     assert estimator.init == "spectral"
-    assert estimator.min_dist == 0.1
+    assert estimator.min_dist == 0.0
     assert estimator.metric == "euclidean"
     assert estimator.random_state == 5
     assert estimator.transform_seed == 5

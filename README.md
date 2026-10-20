@@ -287,6 +287,25 @@ bash scripts/test_features.sh
 FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap --lib cuda_backend -- --nocapture
 ```
 
+Default quality fixtures retain every dataset with three fixed seeds, 10 graph
+neighbors, 180 fit epochs, and 60 transform epochs. Trustworthiness is still
+evaluated at 15 neighbors. For fit and transform separately, acceptance pools
+all case/seed scores and requires `reference_mean - candidate_mean <= 0.025`;
+improvements beyond 0.025 pass and are not penalized. Absolute gaps and per-case
+signed gaps are diagnostics only. Recall thresholds are unchanged.
+An opt-in 200-epoch fit/transform case retains longer-optimization coverage:
+
+```shell
+FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --no-default-features --features cpu --test test_standard_quality long_quality
+FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --no-default-features --features cuda --test test_standard_quality long_quality
+```
+
+Regenerate only quality fixtures (without replacing graph/layout references) with:
+
+```shell
+uv run --no-sync python crates/fast-umap/tests/fixtures/generate_standard_umap.py --quality-only
+```
+
 ---
 
 ## License

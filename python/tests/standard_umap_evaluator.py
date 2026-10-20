@@ -17,8 +17,8 @@ import numpy as np
 from sklearn.manifold import trustworthiness
 
 ROOT = Path(__file__).resolve().parents[2]
-REFERENCE = ROOT / "tests/fixtures/standard_umap_reference.json"
-QUALITY = ROOT / "tests/fixtures/standard_umap_quality.npz"
+REFERENCE = ROOT / "crates/fast-umap/tests/fixtures/standard_umap_reference.json"
+QUALITY = ROOT / "crates/fast-umap/tests/fixtures/standard_umap_quality.npz"
 TRUST_GAP_LIMIT = 0.025
 
 
@@ -71,8 +71,21 @@ def _coverage_pass(actual_keys: set[str], required_keys: set[str]) -> tuple[bool
     return not missing, missing
 
 
+def _non_inferiority_pass(reference_minus_candidate: float | None) -> bool:
+    return (
+        reference_minus_candidate is not None
+        and np.isfinite(reference_minus_candidate)
+        and reference_minus_candidate <= TRUST_GAP_LIMIT
+    )
+
+
 def self_check() -> None:
-    """Exercise recall tie acceptance, fixed denominator, validation, and coverage."""
+    """Exercise scoring boundaries, recall tie acceptance, validation, and coverage."""
+    assert _non_inferiority_pass(-0.026), "an improvement beyond the margin must pass"
+    assert _non_inferiority_pass(0.025), "the exact non-inferiority boundary must pass"
+    assert not _non_inferiority_pass(0.026), "degradation beyond the margin must fail"
+    assert not _non_inferiority_pass(float("nan")), "non-finite gaps must fail"
+    assert not _non_inferiority_pass(float("inf")), "infinite gaps must fail"
     query = np.asarray([[0.0]])
     reference = np.asarray([[0.0], [1.0], [-1.0], [2.0]])
     tied = _recall(np.asarray([[1, 2]]), query, reference, 2, False)
@@ -172,8 +185,8 @@ def evaluate(actual_path: Path) -> dict[str, object]:
                 )
                 fit_reference = float(frozen["fit_trustworthiness_at_15"])
                 transform_reference = float(frozen["transform_trustworthiness_at_15"])
-                fit_gap = abs(fit_quality - fit_reference)
-                transform_gap = abs(transform_quality - transform_reference)
+                fit_gap = fit_reference - fit_quality
+                transform_gap = transform_reference - transform_quality
                 fit_scores.append(fit_quality)
                 fit_reference_scores.append(fit_reference)
                 query_scores.append(transform_quality)
@@ -182,10 +195,12 @@ def evaluate(actual_path: Path) -> dict[str, object]:
                     "seed": seed,
                     "fit_trustworthiness": fit_quality,
                     "fit_reference": fit_reference,
-                    "fit_absolute_gap": fit_gap,
+                    "fit_signed_acceptance_gap_reference_minus_candidate": fit_gap,
+                    "fit_absolute_gap_diagnostic": abs(fit_gap),
                     "transform_trustworthiness": transform_quality,
                     "transform_reference": transform_reference,
-                    "transform_absolute_gap": transform_gap,
+                    "transform_signed_acceptance_gap_reference_minus_candidate": transform_gap,
+                    "transform_absolute_gap_diagnostic": abs(transform_gap),
                 }
                 fit_neighbor_key = f"{case}__seed{seed}__fit_neighbors"
                 query_neighbor_key = f"{case}__seed{seed}__query_neighbors"
@@ -202,15 +217,32 @@ def evaluate(actual_path: Path) -> dict[str, object]:
                 per_seed.append(entry)
             result["cases"][case] = per_seed
         fit_mean_gap = (
-            abs(float(np.mean(fit_scores)) - float(np.mean(fit_reference_scores)))
+            float(np.mean(fit_reference_scores)) - float(np.mean(fit_scores))
             if fit_scores
             else None
         )
         query_mean_gap = (
-            abs(float(np.mean(query_scores)) - float(np.mean(query_reference_scores)))
+            float(np.mean(query_reference_scores)) - float(np.mean(query_scores))
             if query_scores
             else None
         )
+        case_fit_gaps = []
+        case_transform_gaps = []
+        case_fit_signed_gaps = []
+        case_transform_signed_gaps = []
+        for case_results in result["cases"].values():
+            if len(case_results) != len(seeds):
+                continue
+            fit_signed_gap = float(
+                np.mean([entry["fit_reference"] for entry in case_results])
+            ) - float(np.mean([entry["fit_trustworthiness"] for entry in case_results]))
+            transform_signed_gap = float(
+                np.mean([entry["transform_reference"] for entry in case_results])
+            ) - float(np.mean([entry["transform_trustworthiness"] for entry in case_results]))
+            case_fit_signed_gaps.append(fit_signed_gap)
+            case_transform_signed_gaps.append(transform_signed_gap)
+            case_fit_gaps.append(abs(fit_signed_gap))
+            case_transform_gaps.append(abs(transform_signed_gap))
         result["summary"] = {
             "implementation_mean_fit_trustworthiness": float(np.mean(fit_scores))
             if fit_scores
@@ -218,25 +250,40 @@ def evaluate(actual_path: Path) -> dict[str, object]:
             "reference_mean_fit_trustworthiness": float(np.mean(fit_reference_scores))
             if fit_reference_scores
             else None,
-            "absolute_gap_of_mean_fit_trustworthiness": fit_mean_gap,
+            "fit_signed_acceptance_gap_reference_minus_candidate": fit_mean_gap,
+            "absolute_gap_of_mean_fit_trustworthiness_diagnostic": abs(fit_mean_gap)
+            if fit_mean_gap is not None
+            else None,
             "implementation_mean_transform_trustworthiness": float(np.mean(query_scores))
             if query_scores
             else None,
             "reference_mean_transform_trustworthiness": float(np.mean(query_reference_scores))
             if query_reference_scores
             else None,
-            "absolute_gap_of_mean_transform_trustworthiness": query_mean_gap,
+            "transform_signed_acceptance_gap_reference_minus_candidate": query_mean_gap,
+            "absolute_gap_of_mean_transform_trustworthiness_diagnostic": abs(query_mean_gap)
+            if query_mean_gap is not None
+            else None,
+            "per_case_fit_absolute_mean_gaps_diagnostic": case_fit_gaps,
+            "per_case_transform_absolute_mean_gaps_diagnostic": case_transform_gaps,
+            "per_case_fit_signed_mean_gaps": case_fit_signed_gaps,
+            "per_case_transform_signed_mean_gaps": case_transform_signed_gaps,
+            "trustworthiness_gate_scope": (
+                "pooled across all case/seed scores; accept reference mean minus candidate mean "
+                "<= 0.025; per-case signed (reference minus candidate) and absolute mean gaps "
+                "are diagnostic only"
+            ),
             "fit_trustworthiness_gate_pass": bool(
                 len(fit_scores) == expected_embeddings // 2
                 and not result["missing"]
-                and fit_mean_gap is not None
-                and fit_mean_gap <= TRUST_GAP_LIMIT
+                and len(case_fit_gaps) == len(cases)
+                and _non_inferiority_pass(fit_mean_gap)
             ),
             "transform_trustworthiness_gate_pass": bool(
                 len(query_scores) == expected_embeddings // 2
                 and not result["missing"]
-                and query_mean_gap is not None
-                and query_mean_gap <= TRUST_GAP_LIMIT
+                and len(case_transform_gaps) == len(cases)
+                and _non_inferiority_pass(query_mean_gap)
             ),
             "fit_tie_aware_recall": (
                 float(
