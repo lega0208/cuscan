@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/fast-umap-core", "crates/fast-umap", "crates/fast-umap-python", "crates/fast-cubecl-common", "crates/fast-hdbscan-core", "crates/fast-hdbscan"]
+members = [
+  "crates/fast-umap-core",
+  "crates/fast-umap",
+  "crates/fast-umap-python",
+  "crates/fast-cubecl-common",
+  "crates/fast-hdbscan-core",
+  "crates/fast-hdbscan",
+]
 default-members = ["crates/fast-umap"]
 exclude = ["references"]
 
