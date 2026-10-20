@@ -1,6 +1,6 @@
 use burn::backend::Dispatch;
 use burn::tensor::{Device, Tensor, TensorData};
-use fast_umap::backend::StandardUmapOps;
+use fast_cubecl_common::backend::NeighborOps;
 
 fn run_exact_neighbors(
     query: Tensor<2>,
@@ -9,12 +9,13 @@ fn run_exact_neighbors(
     exclude_self: bool,
     query_offset: u32,
 ) -> (Vec<i32>, Vec<f32>) {
-    let (indices, distances) = <Dispatch as StandardUmapOps>::exact_neighbors(
+    let (indices, distances) = <Dispatch as NeighborOps>::exact_neighbors(
         query.into_dispatch(),
         reference.into_dispatch(),
         k,
         exclude_self,
         query_offset,
+        false,
     );
     let indices: Tensor<2, burn::tensor::Int> = Tensor::from_dispatch(indices);
     let distances: Tensor<2> = Tensor::from_dispatch(distances);
@@ -31,12 +32,11 @@ fn run_distance_block(device: &Device) -> Vec<f32> {
         TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 3.0, 0.0], [3, 2]),
         device,
     );
-    let squared_distances: Tensor<2> = Tensor::from_dispatch(
-        <Dispatch as StandardUmapOps>::squared_euclidean_distance_block(
+    let squared_distances: Tensor<2> =
+        Tensor::from_dispatch(<Dispatch as NeighborOps>::squared_euclidean_distance_block(
             query.into_dispatch(),
             reference.into_dispatch(),
-        ),
-    );
+        ));
     assert_eq!(squared_distances.dims(), [2, 3]);
     squared_distances.to_data().try_to_vec::<f32>().unwrap()
 }
@@ -47,12 +47,11 @@ fn run_large_offset_distance_case(device: &Device) {
         TensorData::new(vec![1_000_000.0f32, 1_000_001.0, 1_000_002.0], [3, 1]),
         device,
     );
-    let distances = Tensor::<2>::from_dispatch(
-        <Dispatch as StandardUmapOps>::squared_euclidean_distance_block(
+    let distances =
+        Tensor::<2>::from_dispatch(<Dispatch as NeighborOps>::squared_euclidean_distance_block(
             query.clone().into_dispatch(),
             reference.clone().into_dispatch(),
-        ),
-    );
+        ));
     assert_eq!(
         distances.to_data().try_to_vec::<f32>().unwrap(),
         [4.0, 1.0, 0.0]

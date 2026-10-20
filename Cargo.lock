@@ -2874,6 +2874,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
+name = "fast-cubecl-common"
+version = "1.6.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "cubecl",
+ "cubecl-cpu",
+ "cudarc",
+]
+
+[[package]]
+name = "fast-hdbscan"
+version = "1.6.0"
+dependencies = [
+ "fast-cubecl-common",
+ "fast-hdbscan-core",
+]
+
+[[package]]
+name = "fast-hdbscan-core"
+version = "1.6.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "fast-umap"
 version = "1.6.0"
 dependencies = [
@@ -2885,7 +2914,7 @@ dependencies = [
  "cubecl-cpu",
  "cubecl-environment",
  "cubecl-server",
- "cudarc",
+ "fast-cubecl-common",
  "fast-umap-core",
  "log",
  "rand 0.10.3",
@@ -2915,6 +2944,7 @@ dependencies = [
 name = "fast-umap-python"
 version = "1.6.0"
 dependencies = [
+ "fast-hdbscan",
  "fast-umap",
  "numpy",
  "pyo3",

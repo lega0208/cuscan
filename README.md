@@ -182,6 +182,9 @@ projected = model.transform(X_new)
   prefers discovered usable CUDA and selects CPU only when CUDA is unavailable.
   Unexpected discovery errors propagate; explicit selections are strict, and
   construction or execution failures never cause backend substitution. Spectral initialization is host-side.
+  `BackendChoice::validate()` returns the shared `BackendError` and validates
+  common-crate capabilities. UMAP operations enforce their own enabled backend
+  features and map backend failures to `UmapError::BackendUnavailable`.
 - **Neighbor search:** `Exact` (blocked exact search, no N x N matrix),
   `Approximate` (NN-Descent for fit, bounded graph search for transform), or
   `Auto` (`Exact` up to `AUTO_EXACT_MAX_ROWS` rows, `Approximate` above).
@@ -284,7 +287,7 @@ The Standard CPU test lane uses CubeCL LLVM and does not require a GPU.
 cargo test -p fast-umap-core
 cargo test -p fast-umap --no-default-features --features cpu
 bash scripts/test_features.sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap --lib cuda_backend -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common --no-default-features --features cuda -- --nocapture
 ```
 
 Default quality fixtures retain every dataset with three fixed seeds, 10 graph
@@ -305,6 +308,21 @@ Regenerate only quality fixtures (without replacing graph/layout references) wit
 ```shell
 uv run --no-sync python crates/fast-umap/tests/fixtures/generate_standard_umap.py --quality-only
 ```
+
+HDBSCAN infrastructure fixtures use the published `fast_hdbscan==0.3.2` release,
+not a later source checkout. Verify their provenance and semantic regeneration with:
+
+```shell
+uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --verify-provenance
+uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --check
+cargo test -p fast-hdbscan-core --test test_fixtures
+```
+
+The reference remains unpatched: upstream [PR #72](https://github.com/TutteInstitute/fast_hdbscan/pull/72)
+fixes leaf traversal in `segments_in_branch` after 0.3.2, preventing unrelated
+clusters from being dropped during epsilon selection. The fixture catalogue
+records that release behavior separately from the post-release correction.
+These fixtures do not expose an HDBSCAN estimator or Python API.
 
 ---
 

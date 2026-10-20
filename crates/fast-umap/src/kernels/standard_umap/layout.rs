@@ -353,7 +353,7 @@ pub(crate) fn optimize_epoch(
     let edge_u32 = u32::try_from(edge_count).expect("layout edge count exceeds CubeCL range");
 
     let client = head_embedding.client.clone();
-    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(64));
+    let cube_dim = fast_cubecl_common::legal_cube_dim(&client, CubeDim::new_1d(64));
     let mask = empty(&head_embedding, Shape::new([edge_count]), DType::I32);
     layout_clock_kernel::launch(
         &client,

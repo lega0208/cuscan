@@ -120,38 +120,6 @@ pub trait StandardUmapOps: Backend {
         FloatTensor<Self>,
     );
 
-    #[fusion(meta = |query, reference, k, exclude_self, query_offset| {
-        let shape = [query.shape[0], *k as usize];
-        (
-            burn::backend::fusion::custom::TensorSpec::new(
-                shape.into(),
-                burn::tensor::DType::I32,
-            ),
-            burn::backend::fusion::custom::TensorSpec::new(shape.into(), query.dtype),
-        )
-    })]
-    /// Select exact nearest reference rows for a bounded query block.
-    /// Results are sorted by `(Euclidean distance, reference index)`.
-    fn exact_neighbors(
-        query: FloatTensor<Self>,
-        reference: FloatTensor<Self>,
-        k: u32,
-        exclude_self: bool,
-        query_offset: u32,
-    ) -> (IntTensor<Self>, FloatTensor<Self>);
-
-    /// Compute squared Euclidean distances from a query block `[B, D]` to
-    /// reference rows `[N, D]`, returning only the bounded `[B, N]` block.
-    #[fusion(dtype = query, shape = {
-        let mut shape = query.clone();
-        shape[1] = reference[0];
-        shape
-    })]
-    fn squared_euclidean_distance_block(
-        query: FloatTensor<Self>,
-        reference: FloatTensor<Self>,
-    ) -> FloatTensor<Self>;
-
     #[fusion(meta = |heads, weights, head_rows| {
         let offsets_len = usize::try_from(*head_rows)
             .expect("layout head rows exceed usize")

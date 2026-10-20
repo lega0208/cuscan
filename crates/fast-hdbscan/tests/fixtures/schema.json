@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "index_convention": {
+    "mst_linkage_condensed_neighbors": "finite-row-local-zero-based; upstream neighbors use -1 for missing slots, distinct from common's raw device n sentinel",
+    "remapped_trees": "raw-row indices using upstream remapping",
+    "finite_index": "raw-row indices in original order",
+    "outlier_order": "raw-row indices in upstream set-difference order",
+    "labels": "raw-row order; -1 is noise"
+  },
+  "case_statuses": {
+    "reference": {
+      "required": [
+        "input",
+        "mst_weights",
+        "linkage",
+        "condensed_tree",
+        "labels",
+        "probabilities",
+        "neighbors",
+        "core_distances",
+        "finite_index",
+        "dbscan_labels",
+        "remapped_linkage",
+        "remapped_condensed_tree",
+        "remapped_dbscan_labels",
+        "outlier_order"
+      ],
+      "forbidden": [],
+      "reason_required": false
+    },
+    "validation_failure": {
+      "required": [
+        "input",
+        "finite_index"
+      ],
+      "forbidden": [
+        "mst_weights",
+        "linkage",
+        "condensed_tree",
+        "labels",
+        "probabilities",
+        "neighbors",
+        "core_distances",
+        "dbscan_labels",
+        "remapped_linkage",
+        "remapped_condensed_tree",
+        "remapped_dbscan_labels"
+      ],
+      "reason_required": true
+    },
+    "port_contract": {
+      "required": [
+        "input",
+        "finite_index",
+        "outlier_order",
+        "mst_weights",
+        "linkage",
+        "condensed_tree",
+        "labels",
+        "probabilities",
+        "neighbors",
+        "core_distances",
+        "dbscan_labels"
+      ],
+      "forbidden": [
+        "remapped_linkage",
+        "remapped_condensed_tree"
+      ],
+      "reason_required": true
+    },
+    "upstream_failure": {
+      "required": [
+        "input",
+        "finite_index",
+        "outlier_order"
+      ],
+      "forbidden": [
+        "mst_weights",
+        "linkage",
+        "condensed_tree"
+      ],
+      "reason_required": true
+    }
+  },
+  "arrays": {
+    "input": {
+      "dtype": "<f4",
+      "rank": 2
+    },
+    "mst_weights": {
+      "dtype": "<f8",
+      "rank": 1
+    },
+    "linkage": {
+      "dtype": "<f8",
+      "rank": 2
+    },
+    "condensed_tree": {
+      "dtype": [
+        {
+          "name": "parent",
+          "dtype": "<i8"
+        },
+        {
+          "name": "child",
+          "dtype": "<i8"
+        },
+        {
+          "name": "lambda_val",
+          "dtype": "<f8"
+        },
+        {
+          "name": "child_size",
+          "dtype": "<f4"
+        }
+      ],
+      "rank": 1
+    },
+    "remapped_condensed_tree": {
+      "dtype_options": [
+        [
+          {
+            "name": "parent",
+            "dtype": "<i8"
+          },
+          {
+            "name": "child",
+            "dtype": "<i8"
+          },
+          {
+            "name": "lambda_val",
+            "dtype": "<f8"
+          },
+          {
+            "name": "child_size",
+            "dtype": "<f4"
+          }
+        ],
+        [
+          {
+            "name": "parent",
+            "dtype": "<i8"
+          },
+          {
+            "name": "child",
+            "dtype": "<i8"
+          },
+          {
+            "name": "lambda_val",
+            "dtype": "<f8"
+          },
+          {
+            "name": "child_size",
+            "dtype": "<f8"
+          }
+        ]
+      ],
+      "rank": 1
+    },
+    "labels": {
+      "dtype": "<i8",
+      "rank": 1
+    },
+    "probabilities": {
+      "dtype": "<f4",
+      "rank": 1
+    },
+    "neighbors": {
+      "dtype": "<i8",
+      "rank": 2
+    },
+    "core_distances": {
+      "dtype": "<f4",
+      "rank": 1
+    },
+    "finite_index": {
+      "dtype": "<i8",
+      "rank": 1
+    },
+    "dbscan_labels": {
+      "dtype": "<i8",
+      "rank": 1
+    },
+    "remapped_linkage": {
+      "dtype": "<f8",
+      "rank": 2
+    },
+    "remapped_dbscan_labels": {
+      "dtype": "<i8",
+      "rank": 1
+    },
+    "outlier_order": {
+      "dtype": "<i8",
+      "rank": 1
+    },
+    "overflow_probe_input": {
+      "dtype": "<f4",
+      "rank": 2
+    },
+    "overflow_probe_squared_distances": {
+      "dtype": "<f4",
+      "rank": 2
+    },
+    "overflow_probe_neighbors": {
+      "dtype": "<i4",
+      "rank": 2
+    },
+    "boundary_input": {
+      "dtype": [
+        {
+          "name": "parent",
+          "dtype": "<i8"
+        },
+        {
+          "name": "child",
+          "dtype": "<i8"
+        },
+        {
+          "name": "lambda_val",
+          "dtype": "<f8"
+        },
+        {
+          "name": "child_size",
+          "dtype": "<f4"
+        }
+      ],
+      "rank": 1
+    },
+    "boundary_below": {
+      "dtype": [
+        {
+          "name": "parent",
+          "dtype": "<i8"
+        },
+        {
+          "name": "child",
+          "dtype": "<i8"
+        },
+        {
+          "name": "lambda_val",
+          "dtype": "<f8"
+        },
+        {
+          "name": "child_size",
+          "dtype": "<f4"
+        }
+      ],
+      "rank": 1
+    },
+    "boundary_equal": {
+      "dtype": [
+        {
+          "name": "parent",
+          "dtype": "<i8"
+        },
+        {
+          "name": "child",
+          "dtype": "<i8"
+        },
+        {
+          "name": "lambda_val",
+          "dtype": "<f8"
+        },
+        {
+          "name": "child_size",
+          "dtype": "<f4"
+        }
+      ],
+      "rank": 1
+    },
+    "boundary_above": {
+      "dtype": [
+        {
+          "name": "parent",
+          "dtype": "<i8"
+        },
+        {
+          "name": "child",
+          "dtype": "<i8"
+        },
+        {
+          "name": "lambda_val",
+          "dtype": "<f8"
+        },
+        {
+          "name": "child_size",
+          "dtype": "<f4"
+        }
+      ],
+      "rank": 1
+    }
+  },
+  "metadata_required": [
+    "schema_version",
+    "case_id",
+    "status",
+    "reason",
+    "reference",
+    "parameters",
+    "input_shape",
+    "finite_index",
+    "tie_classification",
+    "tie_evidence",
+    "divergence_classification",
+    "arrays"
+  ],
+  "metadata_reference_required": [
+    "package",
+    "version",
+    "repository",
+    "comparison_commit",
+    "release_source_evidence",
+    "release_source_blobs",
+    "comparison_commit_blob_ids",
+    "entrypoint",
+    "reproducible",
+    "dimensions",
+    "artifact_hashes",
+    "signatures"
+  ],
+  "manifest_reference_required": [
+    "package",
+    "version",
+    "repository",
+    "comparison_commit",
+    "release_source_evidence",
+    "entrypoint",
+    "reproducible",
+    "artifact_hashes",
+    "release_source_blobs",
+    "comparison_commit_blob_ids",
+    "signatures"
+  ],
+  "cross_array_contracts": [
+    "MST has max(finite_n-1,0) weights",
+    "internal linkage rows equal MST edge count",
+    "remapped linkage rows equal max(raw_n-1,0)",
+    "neighbor and core-distance row count equals finite_n",
+    "finite_index strictly increasing, unique and in range",
+    "finite_index exactly maps fully finite inputs",
+    "neighbors use finite-local indices or upstream -1 padding",
+    "raw labels/probabilities/dbscan lengths equal raw_n",
+    "probabilities finite in [0,1]",
+    "outlier_order is a permutation of non-finite raw indices"
+  ]
+}

@@ -1,0 +1,19 @@
+[package]
+name = "fast-hdbscan"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["cuda", "cpu"]
+cpu = ["fast-cubecl-common/cpu"]
+cuda = ["fast-cubecl-common/cuda"]
+tracing = ["fast-cubecl-common/tracing", "fast-hdbscan-core/tracing"]
+
+[dependencies]
+fast-cubecl-common = { workspace = true }
+fast-hdbscan-core = { workspace = true }

@@ -38,6 +38,23 @@ wheels = [
 ]
 
 [[package]]
+name = "fast-hdbscan"
+version = "0.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numba" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.9.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2b/3b/235c47dd8282610522f9fa6869ad8b896c2d5927f82039f66d547229fc07/fast_hdbscan-0.3.2.tar.gz", hash = "sha256:248e09202eda04da4b84dd819de3cc714469912205bb447ad4c7136db580f205", size = 59800, upload-time = "2026-04-07T16:43:33.12Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/92/34dac2dff0877d637535bd8852bc68323f155799521c9ee94c27c548426f/fast_hdbscan-0.3.2-py3-none-any.whl", hash = "sha256:619b42963935e6c3ab1e51de7895dd35260f3ef9ebe4627ff4317073fe51a667", size = 62642, upload-time = "2026-04-07T16:43:31.918Z" },
+]
+
+[[package]]
 name = "fast-umap"
 source = { editable = "." }
 dependencies = [
@@ -54,6 +71,7 @@ serialization = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "fast-hdbscan" },
     { name = "maturin" },
     { name = "plotly" },
     { name = "polars" },
@@ -73,6 +91,7 @@ provides-extras = ["serialization"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "fast-hdbscan", specifier = "==0.3.2" },
     { name = "maturin" },
     { name = "plotly", specifier = ">=7.1.0" },
     { name = "polars", specifier = ">=1.44.2" },

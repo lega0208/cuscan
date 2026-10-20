@@ -91,7 +91,7 @@ fn validate_cooperative_ann_launch(
 }
 
 fn ann_independent_launch(client: &cubecl::client::Client, units: u32) -> (CubeCount, CubeDim) {
-    let dim = crate::kernels::legal_cube_dim(client, CubeDim::new_1d(ANN_CUBE_DIM.x));
+    let dim = fast_cubecl_common::legal_cube_dim(client, CubeDim::new_1d(ANN_CUBE_DIM.x));
     let count =
         ann_independent_cube_count(units, dim.x, client.properties().hardware.max_cube_count.0);
     (CubeCount::Static(count, 1, 1), dim)

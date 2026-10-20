@@ -1,10 +1,9 @@
 //! Bounded selected-backend neighbor search orchestration.
 
-use burn::backend::Dispatch;
 use burn::tensor::{Int, Tensor};
 
 use super::{Result, UmapError};
-use crate::backend::StandardUmapOps;
+use fast_cubecl_common::neighbors as common_neighbors;
 
 /// Neighbor IDs and Euclidean distances, ordered by (distance, row index).
 #[derive(Debug, Clone)]
@@ -60,15 +59,16 @@ pub fn exact_neighbors(
         let end = start.saturating_add(block_rows).min(query_rows);
         let offset = u32::try_from(start).map_err(|_| UmapError::Overflow("query row offset"))?;
         let block = query.clone().slice([start..end, 0..features]);
-        let (block_indices, block_distances) = <Dispatch as StandardUmapOps>::exact_neighbors(
-            block.into_dispatch(),
-            reference.clone().into_dispatch(),
+        let (block_indices, block_distances) = common_neighbors::exact_neighbors(
+            block,
+            reference.clone(),
             width,
             exclude_self,
             offset,
+            false,
         );
-        indices.push(Tensor::<2, Int>::from_dispatch(block_indices));
-        distances.push(Tensor::<2>::from_dispatch(block_distances));
+        indices.push(block_indices);
+        distances.push(block_distances);
     }
     Ok(NeighborList {
         indices: Tensor::cat(indices, 0),

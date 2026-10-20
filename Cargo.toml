@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fast-umap-core", "crates/fast-umap", "crates/fast-umap-python"]
+members = ["crates/fast-umap-core", "crates/fast-umap", "crates/fast-umap-python", "crates/fast-cubecl-common", "crates/fast-hdbscan-core", "crates/fast-hdbscan"]
 default-members = ["crates/fast-umap"]
 exclude = ["references"]
 
@@ -14,7 +14,10 @@ repository = "https://github.com/eugenehp/fast-map"
 homepage = "https://github.com/eugenehp/fast-map"
 
 [workspace.dependencies]
-fast-umap-core = { path = "crates/fast-umap-core" }
+fast-umap-core = { path = "crates/fast-umap-core", default-features = false }
+fast-cubecl-common = { path = "crates/fast-cubecl-common", default-features = false }
+fast-hdbscan-core = { path = "crates/fast-hdbscan-core", default-features = false }
+fast-hdbscan = { path = "crates/fast-hdbscan", default-features = false }
 fast-umap = { path = "crates/fast-umap", default-features = false }
 burn = { version = "0.22.0", default-features = false, features = [
   "std",

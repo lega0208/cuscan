@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "package": "fast_hdbscan",
+    "version": "0.3.2",
+    "repository": "https://github.com/TutteInstitute/fast_hdbscan",
+    "comparison_commit": "43c573ba61043a6ad6f10b396656bfaa7aaeead8",
+    "release_source_evidence": "Installed source files match the published 0.3.2 release Git blob IDs; uv.lock pins release wheel and sdist SHA-256 hashes.",
+    "entrypoint": "fast_hdbscan.boruvka.parallel_boruvka",
+    "reproducible": true,
+    "artifact_hashes": {
+      "sdist": "sha256:248e09202eda04da4b84dd819de3cc714469912205bb447ad4c7136db580f205",
+      "wheel": "sha256:619b42963935e6c3ab1e51de7895dd35260f3ef9ebe4627ff4317073fe51a667"
+    },
+    "release_source_blobs": {
+      "boruvka.py": "747d89e477e715ac9afabe56379f8782dc97bca0",
+      "cluster_trees.py": "0455190d04ec2ac6db6a51798d1a5fbdbe0522c7",
+      "hdbscan.py": "9c5e42a8982133081fcb1e9673bc4ade0c69dba9",
+      "numba_kdtree.py": "d6c9f57706345dc538948edc2eb824b54f861187"
+    },
+    "comparison_commit_blob_ids": {
+      "boruvka.py": "747d89e477e715ac9afabe56379f8782dc97bca0",
+      "cluster_trees.py": "66adcdb6424db913c918d52756bb7065f85e66a5",
+      "hdbscan.py": "4483f870ef092004b416376e7f5935127b1c434c",
+      "numba_kdtree.py": "414553a5e98b033c0daaf37c5efc421fba13d0f7"
+    },
+    "signatures": {
+      "condense_tree": "(hierarchy, min_cluster_size=10, max_cluster_size=inf, sample_weights=None, lambda_method='hdbscan')",
+      "get_cluster_labelling_at_cut": "(linkage_tree, cut, min_cluster_size)",
+      "mst_to_linkage_tree": "(sorted_mst)",
+      "parallel_boruvka": "(tree, n_threads, min_samples=10, sample_weights=array([0.], dtype=float32), reproducible=False)",
+      "simplify_hierarchy": "(condensed_tree, persistence_threshold)"
+    }
+  },
+  "cases": [
+    {
+      "id": "blobs_d2",
+      "dataset": "blobs",
+      "n": 48,
+      "dimensions": 2,
+      "seed": 1101,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "blobs_d10",
+      "dataset": "blobs",
+      "n": 48,
+      "dimensions": 10,
+      "seed": 1102,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "blobs_d50",
+      "dataset": "blobs",
+      "n": 48,
+      "dimensions": 50,
+      "seed": 1103,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "moons_leaf",
+      "dataset": "moons",
+      "n": 40,
+      "dimensions": 2,
+      "seed": 1201,
+      "params": {
+        "min_samples": 4,
+        "min_cluster_size": 5,
+        "selection": "leaf",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "varying_density",
+      "dataset": "varying_density",
+      "n": 48,
+      "dimensions": 10,
+      "seed": 1301,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 6,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.05,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "duplicates_ties",
+      "dataset": "duplicates",
+      "n": 20,
+      "dimensions": 2,
+      "seed": 1401,
+      "params": {
+        "min_samples": 3,
+        "min_cluster_size": 3,
+        "selection": "eom",
+        "allow_single_cluster": true,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "upstream_traversal_order_ties"
+    },
+    {
+      "id": "single_cluster",
+      "dataset": "single_cluster",
+      "n": 24,
+      "dimensions": 2,
+      "seed": 1501,
+      "params": {
+        "min_samples": 4,
+        "min_cluster_size": 4,
+        "selection": "eom",
+        "allow_single_cluster": true,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "all_noise",
+      "dataset": "all_noise",
+      "n": 12,
+      "dimensions": 2,
+      "seed": 1601,
+      "params": {
+        "min_samples": 3,
+        "min_cluster_size": 8,
+        "selection": "leaf",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": 2
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "n_below_min_samples",
+      "dataset": "blobs",
+      "n": 3,
+      "dimensions": 2,
+      "seed": 1701,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "two_finite",
+      "dataset": "two_points",
+      "n": 2,
+      "dimensions": 2,
+      "seed": 1801,
+      "params": {
+        "min_samples": 1,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "n_one",
+      "dataset": "one_point",
+      "n": 1,
+      "dimensions": 2,
+      "seed": 1851,
+      "params": {
+        "min_samples": 2,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "port_contract",
+      "divergence": "degenerate_single_finite_row"
+    },
+    {
+      "id": "mixed_nonfinite",
+      "dataset": "mixed_nonfinite",
+      "n": 12,
+      "dimensions": 2,
+      "seed": 1901,
+      "params": {
+        "min_samples": 3,
+        "min_cluster_size": 3,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "release_nonfinite_remap_behavior_recorded"
+    },
+    {
+      "id": "all_nonfinite",
+      "dataset": "all_nonfinite",
+      "n": 8,
+      "dimensions": 2,
+      "seed": 2001,
+      "params": {
+        "min_samples": 2,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "validation_failure",
+      "divergence": "zero_finite_rejected_before_mst"
+    },
+    {
+      "id": "one_finite",
+      "dataset": "one_finite",
+      "n": 6,
+      "dimensions": 2,
+      "seed": 2101,
+      "params": {
+        "min_samples": 2,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "port_contract",
+      "divergence": "upstream_remap_crash_one_finite_plus_outliers"
+    },
+    {
+      "id": "overflow_finite",
+      "dataset": "overflow",
+      "n": 8,
+      "dimensions": 2,
+      "seed": 2201,
+      "params": {
+        "min_samples": 2,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "overflow_neighbor_divergence"
+    },
+    {
+      "id": "padding",
+      "dataset": "two_points",
+      "n": 2,
+      "dimensions": 50,
+      "seed": 2301,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 2,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "neighbor_padding"
+    },
+    {
+      "id": "persistence_equal",
+      "dataset": "hierarchical_blobs",
+      "n": 48,
+      "dimensions": 2,
+      "seed": 2401,
+      "params": {
+        "min_samples": 3,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": "measured_boundary",
+        "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "persistence_equality_boundary"
+    },
+    {
+      "id": "selection_interactions",
+      "dataset": "hierarchical_blobs",
+      "n": 48,
+      "dimensions": 2,
+      "seed": 2401,
+      "params": {
+        "min_samples": 3,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": true,
+        "epsilon": 0.2,
+        "persistence": 0.0,
+        "max_cluster_size": 12
+      },
+      "status": "reference",
+      "divergence": "none"
+    }
+  ],
+  "coverage": {
+    "datasets": [
+      "blobs",
+      "moons",
+      "varying_density",
+      "hierarchical_blobs",
+      "duplicates",
+      "single_cluster",
+      "all_noise",
+      "two_points",
+      "one_point",
+      "mixed_nonfinite",
+      "all_nonfinite",
+      "one_finite",
+      "overflow"
+    ],
+    "dimensions": [
+      2,
+      10,
+      50
+    ],
+    "options": [
+      "min_samples",
+      "min_cluster_size",
+      "leaf",
+      "eom",
+      "allow_single_cluster",
+      "epsilon",
+      "persistence",
+      "max_cluster_size"
+    ],
+    "boundaries": [
+      "n_lt_min_samples",
+      "n_eq_1",
+      "n_eq_2",
+      "mixed_nonfinite",
+      "all_nonfinite",
+      "finite_squared_overflow",
+      "neighbor_padding",
+      "persistence_equality"
+    ],
+    "tie_comparisons": [
+      "candidate",
+      "merge",
+      "cluster_selection"
+    ],
+    "tie_policy": "Measure candidate, merge and selection comparisons for each reference case; non-reference cases explicitly report unavailable comparisons."
+  },
+  "upstream_issue_repros": [
+    {
+      "id": "pr72_segments_in_branch_leaf",
+      "source": "fast_hdbscan.cluster_trees.segments_in_branch",
+      "parents": [
+        5,
+        5,
+        7,
+        7
+      ],
+      "children": [
+        6,
+        7,
+        8,
+        9
+      ],
+      "segment": 6,
+      "release_observed": [
+        6,
+        8,
+        9
+      ],
+      "post_release_fix_expected": [
+        6
+      ],
+      "issue": "https://github.com/TutteInstitute/fast_hdbscan/pull/72",
+      "oracle": "published 0.3.2 release only; expected result is separately documented post-release fix behavior"
+    }
+  ]
+}

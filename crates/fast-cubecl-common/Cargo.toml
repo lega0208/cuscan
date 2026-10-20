@@ -1,0 +1,23 @@
+[package]
+name = "fast-cubecl-common"
+description = "Backend-neutral CubeCL device and neighbor operations"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+burn = { workspace = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true }
+cubecl-cpu = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+cpu = ["dep:burn-cubecl", "dep:cubecl", "dep:cubecl-cpu", "burn/cubecl", "burn/cpu", "burn/fusion", "burn-cubecl/cpu", "cubecl/cpu", "cubecl/persistence"]
+cuda = ["dep:burn-cubecl", "dep:cubecl", "dep:cudarc", "burn/cubecl", "burn/cuda", "burn/fusion", "burn-cubecl/cuda", "cubecl/cuda", "cubecl/persistence"]
+tracing = ["burn/tracing", "burn-cubecl?/tracing", "cubecl?/tracing"]

@@ -1,0 +1,16 @@
+//! Backend-neutral CubeCL discovery and exact-neighbor operations.
+pub mod backend;
+mod backend_choice;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
+mod device;
+mod error;
+#[cfg(any(feature = "cpu", feature = "cuda"))]
+mod kernels;
+pub mod neighbors;
+
+pub use backend_choice::{BackendChoice, validate_backend_choice};
+pub use device::{construct_cpu_device, selected_device};
+pub use error::BackendError;
+#[cfg(any(feature = "cpu", feature = "cuda"))]
+pub use kernels::legal_cube_dim;

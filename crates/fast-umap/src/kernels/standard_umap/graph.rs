@@ -634,7 +634,7 @@ pub(crate) fn fuzzy_graph(
         .checked_mul(DType::I32.size())
         .expect("graph node scratch allocation overflows usize");
     let client = indices.client.clone();
-    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
+    let cube_dim = fast_cubecl_common::legal_cube_dim(&client, CubeDim::new_1d(32));
     let device = indices.device.clone();
     let dtypes = [
         dtype_to_storage_type(distances.dtype),
@@ -1007,7 +1007,7 @@ pub(crate) fn head_csr(
     );
 
     let client = heads.client.clone();
-    let cube_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
+    let cube_dim = fast_cubecl_common::legal_cube_dim(&client, CubeDim::new_1d(32));
     let device = heads.device.clone();
     let index_dtype = dtype_to_storage_type(heads.dtype);
     let weight_dtype = dtype_to_storage_type(weights.dtype);

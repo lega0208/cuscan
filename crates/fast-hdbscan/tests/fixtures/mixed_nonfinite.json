@@ -1,0 +1,224 @@
+{
+  "arrays": {
+    "condensed_tree": {
+      "dtype": [
+        {
+          "dtype": "<i8",
+          "name": "parent"
+        },
+        {
+          "dtype": "<i8",
+          "name": "child"
+        },
+        {
+          "dtype": "<f8",
+          "name": "lambda_val"
+        },
+        {
+          "dtype": "<f4",
+          "name": "child_size"
+        }
+      ],
+      "shape": [
+        9
+      ]
+    },
+    "core_distances": {
+      "dtype": "<f4",
+      "shape": [
+        9
+      ]
+    },
+    "dbscan_labels": {
+      "dtype": "<i8",
+      "shape": [
+        12
+      ]
+    },
+    "finite_index": {
+      "dtype": "<i8",
+      "shape": [
+        9
+      ]
+    },
+    "input": {
+      "dtype": "<f4",
+      "shape": [
+        12,
+        2
+      ]
+    },
+    "labels": {
+      "dtype": "<i8",
+      "shape": [
+        12
+      ]
+    },
+    "linkage": {
+      "dtype": "<f8",
+      "shape": [
+        8,
+        4
+      ]
+    },
+    "mst_weights": {
+      "dtype": "<f8",
+      "shape": [
+        8
+      ]
+    },
+    "neighbors": {
+      "dtype": "<i8",
+      "shape": [
+        9,
+        3
+      ]
+    },
+    "outlier_order": {
+      "dtype": "<i8",
+      "shape": [
+        3
+      ]
+    },
+    "probabilities": {
+      "dtype": "<f4",
+      "shape": [
+        12
+      ]
+    },
+    "remapped_condensed_tree": {
+      "dtype": [
+        {
+          "dtype": "<i8",
+          "name": "parent"
+        },
+        {
+          "dtype": "<i8",
+          "name": "child"
+        },
+        {
+          "dtype": "<f8",
+          "name": "lambda_val"
+        },
+        {
+          "dtype": "<f8",
+          "name": "child_size"
+        }
+      ],
+      "shape": [
+        12
+      ]
+    },
+    "remapped_dbscan_labels": {
+      "dtype": "<i8",
+      "shape": [
+        12
+      ]
+    },
+    "remapped_linkage": {
+      "dtype": "<f8",
+      "shape": [
+        11,
+        4
+      ]
+    }
+  },
+  "case_id": "mixed_nonfinite",
+  "divergence_classification": "release_nonfinite_remap_behavior_recorded",
+  "finite_index": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "input_shape": [
+    12,
+    2
+  ],
+  "parameters": {
+    "allow_single_cluster": false,
+    "epsilon": 0.0,
+    "max_cluster_size": null,
+    "min_cluster_size": 3,
+    "min_samples": 3,
+    "persistence": 0.0,
+    "selection": "eom"
+  },
+  "reason": null,
+  "reference": {
+    "artifact_hashes": {
+      "sdist": "sha256:248e09202eda04da4b84dd819de3cc714469912205bb447ad4c7136db580f205",
+      "wheel": "sha256:619b42963935e6c3ab1e51de7895dd35260f3ef9ebe4627ff4317073fe51a667"
+    },
+    "comparison_commit": "43c573ba61043a6ad6f10b396656bfaa7aaeead8",
+    "comparison_commit_blob_ids": {
+      "boruvka.py": "747d89e477e715ac9afabe56379f8782dc97bca0",
+      "cluster_trees.py": "66adcdb6424db913c918d52756bb7065f85e66a5",
+      "hdbscan.py": "4483f870ef092004b416376e7f5935127b1c434c",
+      "numba_kdtree.py": "414553a5e98b033c0daaf37c5efc421fba13d0f7"
+    },
+    "dimensions": 2,
+    "entrypoint": "fast_hdbscan.boruvka.parallel_boruvka",
+    "known_issue_repros": [
+      {
+        "id": "pr72_segments_in_branch_leaf",
+        "issue": "https://github.com/TutteInstitute/fast_hdbscan/pull/72",
+        "post_release_fix_expected": [
+          6
+        ],
+        "release_observed": [
+          6,
+          8,
+          9
+        ]
+      }
+    ],
+    "modules": {
+      "boruvka": "boruvka.py",
+      "cluster_trees": "cluster_trees.py",
+      "hdbscan": "hdbscan.py"
+    },
+    "package": "fast_hdbscan",
+    "release_source_blobs": {
+      "boruvka.py": "747d89e477e715ac9afabe56379f8782dc97bca0",
+      "cluster_trees.py": "0455190d04ec2ac6db6a51798d1a5fbdbe0522c7",
+      "hdbscan.py": "9c5e42a8982133081fcb1e9673bc4ade0c69dba9",
+      "numba_kdtree.py": "d6c9f57706345dc538948edc2eb824b54f861187"
+    },
+    "release_source_evidence": "Installed source files match the published 0.3.2 release Git blob IDs; uv.lock pins release wheel and sdist SHA-256 hashes.",
+    "repository": "https://github.com/TutteInstitute/fast_hdbscan",
+    "reproducible": true,
+    "shape": [
+      12,
+      2
+    ],
+    "signatures": {
+      "condense_tree": "(hierarchy, min_cluster_size=10, max_cluster_size=inf, sample_weights=None, lambda_method='hdbscan')",
+      "get_cluster_labelling_at_cut": "(linkage_tree, cut, min_cluster_size)",
+      "mst_to_linkage_tree": "(sorted_mst)",
+      "parallel_boruvka": "(tree, n_threads, min_samples=10, sample_weights=array([0.], dtype=float32), reproducible=False)",
+      "simplify_hierarchy": "(condensed_tree, persistence_threshold)"
+    },
+    "version": "0.3.2"
+  },
+  "schema_version": 1,
+  "status": "reference",
+  "tie_classification": [
+    "candidate"
+  ],
+  "tie_evidence": {
+    "candidate": "exact",
+    "cluster_selection": {
+      "comparison": "none",
+      "leaf_selection_is_categorical": false,
+      "method": "eom",
+      "numeric_comparison_count": 0
+    },
+    "merge": "none"
+  }
+}

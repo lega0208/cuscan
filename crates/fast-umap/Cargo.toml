@@ -13,12 +13,12 @@ homepage.workspace = true
 
 [dependencies]
 fast-umap-core = { workspace = true }
+fast-cubecl-common = { workspace = true }
 burn = { workspace = true }
 # Enable CubeCL with a concrete CPU or GPU runtime.
 burn-cubecl = { workspace = true, optional = true }
 cubecl = { workspace = true, optional = true }
 cubecl-cpu = { workspace = true, optional = true }
-cudarc = { workspace = true, optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true, optional = true }
@@ -45,19 +45,12 @@ default = ["cuda", "cpu"]
 cuda = [
   "dep:burn-cubecl",
   "dep:cubecl",
-  "cubecl/persistence",
-  "burn/cubecl",
-  "burn/cuda",
-  "burn/fusion",
-  "dep:cudarc",
+  "fast-cubecl-common/cuda",
 ] # NVIDIA CUDA backend
 cpu = [
   "dep:burn-cubecl",
   "dep:cubecl",
-  "cubecl/persistence",
-  "burn/cubecl",
-  "burn/cpu",
-  "burn/fusion",
+  "fast-cubecl-common/cpu",
 ] # CubeCL LLVM CPU runtime
 cubecl-ir-dump = ["dep:cubecl-cpu", "cubecl-cpu/pliron-dump"]
 
@@ -66,6 +59,7 @@ tracing = [
   "burn/tracing",
   "cubecl?/tracing",
   "fast-umap-core/tracing",
+  "fast-cubecl-common/tracing",
 ]
 
 [[bench]]

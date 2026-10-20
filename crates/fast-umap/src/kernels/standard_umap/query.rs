@@ -513,7 +513,7 @@ fn approximate_query_impl(
         None
     };
     if checked {
-        let validation_dim = crate::kernels::legal_cube_dim(&client, CubeDim::new_1d(32));
+        let validation_dim = fast_cubecl_common::legal_cube_dim(&client, CubeDim::new_1d(32));
         let validation_rows_per_cube = usize::try_from(validation_dim.num_elems())
             .expect("validation cube size exceeds usize");
         let max_validation_cubes = usize::try_from(client.properties().hardware.max_cube_count.0)

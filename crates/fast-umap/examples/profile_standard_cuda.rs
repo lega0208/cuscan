@@ -14,6 +14,7 @@ use burn::{
     tensor::{Tensor, TensorData},
 };
 use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+use fast_cubecl_common::backend::NeighborOps;
 use fast_umap::{
     BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, backend::StandardUmapOps,
     standard_umap::approximate_query_budget,
@@ -104,12 +105,13 @@ fn query_graph(
             Tensor::<2>::from_data(TensorData::new(values, [end - start, features]), &device);
         let ids = match search {
             NeighborSearch::Exact => {
-                let (ids, _) = <Dispatch as StandardUmapOps>::exact_neighbors(
+                let (ids, _) = <Dispatch as NeighborOps>::exact_neighbors(
                     block.into_dispatch(),
                     reference.clone().into_dispatch(),
                     k as u32,
                     false,
                     u32::try_from(start)?,
+                    false,
                 );
                 ids
             }

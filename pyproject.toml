@@ -13,6 +13,7 @@ serialization = ["h5py>=3.11", "hdf5plugin>=5.0"]
 
 [dependency-groups]
 dev = [
+    "fast-hdbscan==0.3.2",
     "maturin",
     "plotly>=7.1.0",
     "polars>=1.44.2",
@@ -40,6 +41,7 @@ cache-keys = [
 [tool.ruff]
 line-length = 100
 src = ["python", "comparison"]
+exclude = ["references"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "NPY", "RUF"]
