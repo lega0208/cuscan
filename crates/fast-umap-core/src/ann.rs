@@ -4,6 +4,7 @@
 // (213/240 hits). A four-edge margin preserves alternative paths for refinement.
 const HEAP_MARGIN: usize = 4;
 
-pub(crate) fn candidate_width(n: usize, k: usize) -> usize {
+#[inline]
+pub fn candidate_width(n: usize, k: usize) -> usize {
     k.saturating_add(HEAP_MARGIN).min(n - 1)
 }

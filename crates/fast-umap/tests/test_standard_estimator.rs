@@ -762,6 +762,7 @@ mod seeded_drift {
             .and_then(|parent| parent.canonicalize().ok())
             .expect("FAST_UMAP_DRIFT_OUT parent directory must exist");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .canonicalize()
             .unwrap();
         assert!(

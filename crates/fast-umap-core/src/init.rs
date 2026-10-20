@@ -1,4 +1,4 @@
-use super::{Init, Result, UMAPConfig, UmapError};
+use crate::{Init, Result, UMAPConfig, UmapError};
 use faer::dyn_stack::MemStack;
 use faer::linalg::evd::{self, ComputeEigenvectors, self_adjoint_evd, self_adjoint_evd_scratch};
 use faer::{Mat, Par, Spec};
@@ -39,7 +39,7 @@ pub fn initialize(
     seed: u64,
 ) -> Result<Vec<f32>> {
     config.validate()?;
-    let (n, _) = super::validate_input(data, None)?;
+    let (n, _) = crate::validate_input(data, None)?;
     n.checked_mul(config.n_components)
         .ok_or(UmapError::Overflow("embedding shape"))?;
     if heads.len() != tails.len() || heads.len() != weights.len() {

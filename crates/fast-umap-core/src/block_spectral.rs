@@ -1037,8 +1037,8 @@ pub(super) fn solve(
 
 #[cfg(test)]
 mod tests {
+    use super::super::SparseGraph;
     use super::*;
-    use crate::standard_umap::init::SparseGraph;
     use rand::SeedableRng;
 
     fn trivial(graph: &SparseGraph) -> Vec<f64> {

@@ -1,26 +1,26 @@
 //! Bounded best-first search over a retained training proximity graph.
 
-pub(crate) const TRANSFORM_SCRATCH_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const TRANSFORM_SCRATCH_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueryScratchLayout {
-    pub(crate) per_row_bytes: usize,
-    pub(crate) max_chunk_rows: usize,
+pub struct QueryScratchLayout {
+    pub per_row_bytes: usize,
+    pub max_chunk_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueryOutputAllocation {
-    pub(crate) output_indices_bytes: usize,
-    pub(crate) output_distances_bytes: usize,
-    pub(crate) stats_bytes: usize,
+pub struct QueryOutputAllocation {
+    pub output_indices_bytes: usize,
+    pub output_distances_bytes: usize,
+    pub stats_bytes: usize,
 }
 
-pub(crate) fn approximate_query_scratch_layout(
+pub fn approximate_query_scratch_layout(
     query_rows: usize,
     candidate_capacity: usize,
     visit_capacity: usize,
     graph_width: usize,
-) -> crate::standard_umap::Result<QueryScratchLayout> {
+) -> crate::Result<QueryScratchLayout> {
     approximate_query_scratch_layout_with_limit(
         query_rows,
         candidate_capacity,
@@ -36,8 +36,8 @@ fn approximate_query_scratch_layout_with_limit(
     visit_capacity: usize,
     graph_width: usize,
     scratch_limit_bytes: usize,
-) -> crate::standard_umap::Result<QueryScratchLayout> {
-    use crate::standard_umap::UmapError;
+) -> crate::Result<QueryScratchLayout> {
+    use crate::UmapError;
 
     if query_rows == 0 || candidate_capacity == 0 || visit_capacity == 0 || graph_width == 0 {
         return Err(UmapError::InvalidInput(
@@ -104,11 +104,11 @@ fn approximate_query_scratch_layout_with_limit(
     })
 }
 
-pub(crate) fn query_output_allocation(
+pub fn query_output_allocation(
     query_rows: usize,
     k: usize,
-) -> crate::standard_umap::Result<QueryOutputAllocation> {
-    use crate::standard_umap::UmapError;
+) -> crate::Result<QueryOutputAllocation> {
+    use crate::UmapError;
 
     let output_elements = query_rows
         .checked_mul(k)
@@ -139,12 +139,8 @@ pub(crate) fn query_output_allocation(
     })
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda", test))]
-pub(crate) fn query_chunk_rows(
-    query_rows: usize,
-    row_start: usize,
-    max_chunk_rows: usize,
-) -> usize {
+#[inline]
+pub fn query_chunk_rows(query_rows: usize, row_start: usize, max_chunk_rows: usize) -> usize {
     assert!(row_start < query_rows && max_chunk_rows > 0);
     (query_rows - row_start).min(max_chunk_rows)
 }
@@ -154,7 +150,7 @@ mod scratch_tests {
     use super::{
         approximate_query_scratch_layout_with_limit, query_chunk_rows, query_output_allocation,
     };
-    use crate::standard_umap::UmapError;
+    use crate::UmapError;
 
     #[test]
     fn approximate_query_scratch_budget_checks_overflow() {

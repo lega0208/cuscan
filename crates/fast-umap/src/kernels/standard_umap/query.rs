@@ -1,6 +1,3 @@
-use crate::standard_umap::query::{
-    approximate_query_scratch_layout, query_chunk_rows, query_output_allocation,
-};
 use burn::{
     backend::{
         TensorMetadata,
@@ -11,6 +8,9 @@ use burn::{
     tensor::{DType, Shape},
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
+use fast_umap_core::query::{
+    approximate_query_scratch_layout, query_chunk_rows, query_output_allocation,
+};
 
 const QUERY_CUBE_DIM: CubeDim = CubeDim::new_1d(1);
 

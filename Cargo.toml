@@ -1,48 +1,29 @@
-[package]
-name = "fast-umap"
+[workspace]
+resolver = "3"
+members = ["crates/fast-umap-core", "crates/fast-umap", "crates/fast-umap-python"]
+default-members = ["crates/fast-umap"]
+exclude = ["references"]
+
+[workspace.package]
 version = "1.6.0"
-description = "Configurable UMAP (Uniform Manifold Approximation and Projection) in Rust"
-keywords = ["UMAP", "dimensionality", "manifold", "machine-learning", "GPU"]
-categories = ["science", "mathematics", "visualization"]
+publish = false
+edition = "2024"
+license = "MIT"
 authors = ["Eugene Hauptmann"]
 repository = "https://github.com/eugenehp/fast-map"
 homepage = "https://github.com/eugenehp/fast-map"
-documentation = "https://docs.rs/fast-umap/latest/fast_umap/"
-license = "MIT"
-edition = "2024"
-exclude = ["references/"]
 
-[workspace]
-members = [".", "bindings/python"]
-default-members = ["."]
-exclude = ["references"]
-resolver = "2"
-
-[profile.dev]
-opt-level = 1
-debug = "line-tables-only"
-
-# docs.rs build configuration.
-# CPU builds require a native LLVM bundle; docs.rs must not fetch/link that
-# network-dependent runtime. This documentation build uses CUDA instead.
-# `rustdoc-args`         — pass --cfg docsrs so that doc-only items gated with
-#                          #[cfg(docsrs)] (e.g. nightly doc_cfg annotations)
-#                          are included in the rendered output.
-[package.metadata.docs.rs]
-no-default-features = true
-features = ["cuda"]
-rustdoc-args = ["--cfg", "docsrs"]
-
-[dependencies]
+[workspace.dependencies]
+fast-umap-core = { path = "crates/fast-umap-core" }
+fast-umap = { path = "crates/fast-umap", default-features = false }
 burn = { version = "0.22.0", default-features = false, features = [
   "std",
   "autotune",
   "extension",
 ] }
-# Enable CubeCL with a concrete CPU or GPU runtime.
-burn-cubecl = { version = "0.22.0", default-features = false, optional = true }
-cubecl = { version = "0.11.0", default-features = false, optional = true }
-cubecl-cpu = { version = "0.11.0", default-features = false, optional = true }
+burn-cubecl = { version = "0.22.0", default-features = false }
+cubecl = { version = "0.11.0", default-features = false }
+cubecl-cpu = { version = "0.11.0", default-features = false }
 cudarc = { version = "0.19.10", features = [
   "std",
   "driver",
@@ -50,17 +31,17 @@ cudarc = { version = "0.19.10", features = [
   "dynamic-loading",
   "cuda-version-from-build-system",
   "fallback-latest",
-], default-features = false, optional = true }
+], default-features = false }
 faer = { version = "=0.24.4", features = ["npy", "perf-warn", "nightly"] }
 rand = "0.10.3"
 rayon = "1.12.0"
-tracing = { version = "0.1", optional = true }
-
-[dev-dependencies]
+tracing = "0.1"
+pyo3 = { version = "0.29.3", features = ["abi3-py310"] }
+numpy = "0.29.0"
 serde = "1.0.229"
+serde_json = "1.0.151"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-serde_json = "1.0.151"
 zip = "=0.6.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = "0.7"
@@ -75,52 +56,6 @@ cubecl-server = { version = "=0.11.0", default-features = false, features = [
 ciborium = "0.2.2"
 log = "0.4"
 
-[features]
-# Every backend feature enables CubeCL persistence so autotune, throughput calibration and
-# GPU compilation results are cached on disk across processes. Without it, each process
-# repeats CPU throughput calibration (~7 s) and recompiles every CUDA kernel.
-default = ["cuda", "cpu"]
-# Core backend features
-# CUDA requires an NVIDIA runtime; CPU remains independently selectable.
-cuda = [
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "cubecl/persistence",
-  "burn/cubecl",
-  "burn/cuda",
-  "burn/fusion",
-  "dep:cudarc",
-] # NVIDIA CUDA backend
-cpu = [
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "cubecl/persistence",
-  "burn/cubecl",
-  "burn/cpu",
-  "burn/fusion",
-] # CubeCL LLVM CPU runtime
-cubecl-ir-dump = ["dep:cubecl-cpu", "cubecl-cpu/pliron-dump"]
-
-tracing = ["dep:tracing", "burn/tracing", "cubecl?/tracing"]
-
-[[bench]]
-name = "standard_umap_cpu"
-required-features = ["cpu"]
-harness = false
-
-[[bench]]
-name = "standard_umap_cuda"
-required-features = ["cuda"]
-harness = false
-
-[[example]]
-name = "profile_standard_cuda"
-required-features = ["cuda", "tracing"]
-
-[[example]]
-name = "profile_standard_stages"
-required-features = ["tracing"]
-
-[[example]]
-name = "ann_construction_worker"
-required-features = ["cuda"]
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"

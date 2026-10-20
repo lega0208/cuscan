@@ -216,17 +216,17 @@ Burn/CubeCL tracing. The library does not install a subscriber. Profiling benche
 install one only when `FAST_UMAP_TRACE` is set; leave it unset for timing runs.
 
 ```sh
-cargo bench --no-default-features --features cpu --bench standard_umap_cpu
-cargo bench --no-default-features --features cuda --bench standard_umap_cuda
+cargo bench -p fast-umap --no-default-features --features cpu --bench standard_umap_cpu
+cargo bench -p fast-umap --no-default-features --features cuda --bench standard_umap_cuda
 
 # Chrome/Perfetto trace (import the JSON file into ui.perfetto.dev)
-FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace cargo bench \
+FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace cargo bench -p fast-umap \
   --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
-FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench \
+FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench -p fast-umap \
   --no-default-features --features cuda,tracing --bench standard_umap_cuda -- --test
 
 # Console span timings instead of a trace file
-FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench \
+FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench -p fast-umap \
   --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
 ```
 
@@ -239,7 +239,7 @@ embedding readback, with deterministic inputs prepared outside the timed loop.
 Compare standard UMAP with **umap-learn 0.5.12**, using CUDA only:
 
 ```sh
-cargo build --release --no-default-features --features cuda,tracing --example profile_standard_cuda
+cargo build -p fast-umap --release --no-default-features --features cuda,tracing --example profile_standard_cuda
 uv run --no-sync python scripts/compare_umap_spans.py --output comparison.json --trace cuda-trace.json
 ```
 
@@ -281,9 +281,10 @@ the reference on its exact-search branch. Missing CUDA fails without CPU fallbac
 The Standard CPU test lane uses CubeCL LLVM and does not require a GPU.
 
 ```shell
-cargo test --no-default-features --features cpu
+cargo test -p fast-umap-core
+cargo test -p fast-umap --no-default-features --features cpu
 bash scripts/test_features.sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test --lib cuda_backend -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap --lib cuda_backend -- --nocapture
 ```
 
 ---

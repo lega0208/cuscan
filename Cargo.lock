@@ -2886,7 +2886,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-server",
  "cudarc",
- "faer",
+ "fast-umap-core",
  "log",
  "rand 0.10.3",
  "rayon",
@@ -2897,6 +2897,18 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "fast-umap-core"
+version = "1.6.0"
+dependencies = [
+ "faer",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

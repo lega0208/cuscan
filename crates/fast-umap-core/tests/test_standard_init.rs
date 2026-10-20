@@ -1,4 +1,4 @@
-use fast_umap::standard_umap::{Init, UMAPConfig, UmapError, initialize};
+use fast_umap_core::{Init, UMAPConfig, UmapError, initialize};
 
 fn spectral_config(dimensions: usize) -> UMAPConfig {
     UMAPConfig {

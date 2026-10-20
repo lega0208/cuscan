@@ -1,24 +1,18 @@
-//! Standard (nonparametric) UMAP estimator and selected-backend primitives.
+//! Backend-free host code for Standard UMAP: configuration, validation, errors, model state,
+//! host-side query/ANN sizing math, and spectral initialization.
 
-pub(crate) mod ann;
+pub mod ann;
 mod config;
-mod estimator;
+pub mod init;
+pub mod query;
 mod state;
 
-pub mod init;
-
-pub mod neighbors;
-pub(crate) mod query;
-
-pub use estimator::{FittedUMAP, UMAP};
+pub use config::{
+    FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig, approximate_query_budget,
+    fit_curve, fit_neighbor_widths, query_neighbor_width, validate_input, validate_search_settings,
+};
 pub use init::initialize;
 pub use state::ModelState;
-
-pub use config::{
-    BackendChoice, FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig,
-    approximate_query_budget, fit_curve, fit_neighbor_widths, query_neighbor_width,
-    validate_backend_choice, validate_input, validate_search_settings,
-};
 
 /// Embedding shape used by the standard UMAP pipeline.
 pub type Embedding = Vec<Vec<f32>>;

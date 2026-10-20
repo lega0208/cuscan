@@ -1,3 +1,6 @@
+// Every case fits and restores on the explicit CPU backend.
+#![cfg(feature = "cpu")]
+
 use fast_umap::{
     BackendChoice, FittedUMAP, NeighborSearch, UMAP, UMAPConfig, standard_umap::ModelState,
 };

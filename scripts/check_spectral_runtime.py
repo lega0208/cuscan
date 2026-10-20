@@ -536,8 +536,9 @@ def _run_harness(args):
     source_paths = (
         "Cargo.toml",
         "Cargo.lock",
-        "src/standard_umap/init.rs",
-        "src/standard_umap/block_spectral.rs",
+        "crates/fast-umap-core/Cargo.toml",
+        "crates/fast-umap-core/src/init.rs",
+        "crates/fast-umap-core/src/block_spectral.rs",
         "scripts/check_spectral.py",
     )
     report = {

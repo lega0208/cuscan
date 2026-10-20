@@ -6,31 +6,34 @@
 
 ## Architecture & Data Flow
 
-- `src/standard_umap/` owns the `UMAP`/`FittedUMAP` estimator. Neighbor search, fuzzy graph and layout use the forward-only `StandardUmapOps` extension (`src/backend.rs`) and the CubeCL kernels in `src/kernels/`. Spectral initialization is host-side. The CUDA layout kernel updates its embedding/clock/RNG operands in place, so callers must pass unaliased buffers. Fit/transform use caller-provided feature values as-is; there is no feature scaling.
-- `src/cuda_backend.rs` provides CUDA device discovery used by backend selection.
+- Cargo workspace with three crates: `crates/fast-umap-core` (backend-free host code: `UMAPConfig`, `UmapError`, validation, curve/width/budget math, `ModelState`, ANN/query sizing helpers, host spectral initialization), `crates/fast-umap` (facade: `StandardUmapOps`, kernels, CUDA discovery, `BackendChoice`, estimator, neighbors; re-exports every core item at its existing path) and `crates/fast-umap-python` (PyO3 extension). Dependency graph: python → fast-umap → fast-umap-core. `StandardUmapOps` and its only `impl` for `CubeBackend` must stay in the same crate (orphan rule).
+- `crates/fast-umap/src/standard_umap/` owns the `UMAP`/`FittedUMAP` estimator. Neighbor search, fuzzy graph and layout use the forward-only `StandardUmapOps` extension (`crates/fast-umap/src/backend.rs`) and the CubeCL kernels in `crates/fast-umap/src/kernels/`. Kernels import host helpers from `fast_umap_core`, never from `crate::standard_umap`. Spectral initialization is host-side (`crates/fast-umap-core/src/init.rs`). The CUDA layout kernel updates its embedding/clock/RNG operands in place, so callers must pass unaliased buffers. Fit/transform use caller-provided feature values as-is; there is no feature scaling.
+- `crates/fast-umap/src/cuda_backend.rs` provides CUDA device discovery used by backend selection (`standard_umap/backend_choice.rs`).
 
 
 Trace actual consumers before documenting or changing configuration behavior.
 
 ## Key Directories
 
-- `src/`: Rust API, estimator, and backend implementations.
-- `bindings/python/`: PyO3 extension crate; `python/fast_umap/`: Python package; `python/tests/`: Python tests.
-- `tests/`: Rust integration tests for Standard UMAP neighbors, graph, init, layout, query, dispatch, estimator and quality.
-- `examples/`: Standard UMAP profiling and ANN investigation programs.
-- `benches/`: Criterion benchmarks; `scripts/`: feature checks and comparison helpers.
+- `crates/fast-umap-core/`: backend-free host crate and its tests (`test_standard_init`).
+- `crates/fast-umap/src/`: Rust API, estimator, and backend implementations.
+- `crates/fast-umap-python/`: PyO3 extension crate; `python/fast_umap/`: Python package; `python/tests/`: Python tests.
+- `crates/fast-umap/tests/`: Rust integration tests for Standard UMAP neighbors, graph, serialization, layout, query, dispatch, estimator and quality.
+- `crates/fast-umap/examples/`: Standard UMAP profiling and ANN investigation programs.
+- `crates/fast-umap/benches/`: Criterion benchmarks; `scripts/`: feature checks and comparison helpers.
 
 ## Development Commands
 
 Run from the repository root. Specify features explicitly:
 
 ```sh
-cargo build --release --no-default-features --features cpu
-cargo test --no-default-features --features cpu
+cargo build -p fast-umap --release --no-default-features --features cpu
+cargo test -p fast-umap-core
+cargo test -p fast-umap --no-default-features --features cpu
 cargo fmt --all -- --check
-cargo clippy --no-default-features --features cpu --all-targets
-cargo test --no-default-features --features cuda
-cargo bench --no-default-features --features cpu --bench standard_umap_cpu
+cargo clippy --workspace --all-targets --no-default-features --features fast-umap/cpu
+cargo test -p fast-umap --no-default-features --features cuda
+cargo bench -p fast-umap --no-default-features --features cpu --bench standard_umap_cpu
 bash scripts/test_features.sh
 ```
 
@@ -63,17 +66,18 @@ uv run maturin develop --release --no-default-features --features cpu && uv run 
 
 ## Important Files
 
-- `Cargo.toml` / `Cargo.lock`: workspace, dependencies, features, and example prerequisites.
-- `src/standard_umap/`: estimator, configuration, initialization, neighbors, and query.
+- `Cargo.toml` / `Cargo.lock`: virtual workspace manifest and single lockfile; member manifests in `crates/*/Cargo.toml` own features and example prerequisites; shared requirements live in `[workspace.dependencies]` and members use `{ workspace = true }`.
+- `crates/fast-umap-core/src/`: configuration, errors, model state, query/ANN sizing, spectral initialization.
+- `crates/fast-umap/src/standard_umap/`: estimator, backend choice, neighbors.
 - `pyproject.toml` / `uv.lock`: Maturin packaging and Python QA tooling.
 
 ## Runtime/Tooling Preferences
 
 Use Cargo for Rust (edition 2024) and uv for Python (3.10+). Maturin builds the native Python module. No Rust toolchain pin or CI configuration is present.
 
-The manifest defaults are `cuda,cpu`. The `cpu` feature selects CubeCL's LLVM CPU runtime; a CPU-only Standard build uses `--no-default-features --features cpu`. The local LLVM bundle/build/JIT path can require network access, cache space, and LLVM support. The documented deployment target is Linux x86-64 including WSL2; do not claim wheels or other platform support. `cuda` needs NVIDIA runtime support. Standard backend selection is Auto/Cpu/Cuda: Auto prefers discovered usable CUDA and uses CPU only when discovery confirms CUDA unavailable; explicit selections are strict, with no execution fallback.
+The `fast-umap` and `fast-umap-python` defaults are `cuda,cpu`; `fast-umap-core` has no backend features. The `cpu` feature selects CubeCL's LLVM CPU runtime; a CPU-only Standard build uses `-p fast-umap --no-default-features --features cpu`. The local LLVM bundle/build/JIT path can require network access, cache space, and LLVM support. The documented deployment target is Linux x86-64 including WSL2; do not claim wheels or other platform support. `cuda` needs NVIDIA runtime support. Standard backend selection is Auto/Cpu/Cuda: Auto prefers discovered usable CUDA and uses CPU only when discovery confirms CUDA unavailable; explicit selections are strict, with no execution fallback.
 
-Burn/CubeCL dependencies use exact prerelease pins; keep related versions aligned across root and binding manifests.
+Burn/CubeCL requirements are declared once in `[workspace.dependencies]`; keep them aligned there.
 
 ## Testing & QA
 
@@ -82,7 +86,7 @@ Rust uses `#[test]` integration/unit tests and Criterion benchmarks; Python uses
 For required CUDA coverage rather than silent hardware skips:
 
 ```sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test --lib cuda_backend -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap --lib cuda_backend -- --nocapture
 ```
 
 Test observable shape, finite outputs, numerical tolerances, deterministic seeds, and validation failures. New backend operations should share assertions across CPU and CUDA. Use `tempfile` for new filesystem tests.

@@ -197,7 +197,7 @@ pub(super) fn approximate_neighbors(
     assert!(n >= 2 && features > 0 && k > 0 && k < n);
     assert_eq!(data.dtype, DType::F32);
     assert!(n <= i32::MAX as usize);
-    let width = crate::standard_umap::ann::candidate_width(n, k);
+    let width = fast_umap_core::ann::candidate_width(n, k);
     let capacity = MAX_CANDIDATES.min(n - 1);
     let trees = tree_count(n).expect("ANN forest tree count overflow");
     let plan = plan_workspace(n, width, capacity, features, trees)

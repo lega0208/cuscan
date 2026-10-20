@@ -1310,25 +1310,29 @@ def _stage2_cli(argv: list[str]) -> int:
                 },
             }
             frozen_product = "84b84ca7bbaece2aa92a9b01dd7bbc64d3fe987e"
+            product_paths = ("crates/fast-umap/src", "crates/fast-umap-core/src")
             product_diff = run_supervised(
-                ["git", "diff", "--quiet", frozen_product, "--", "src"], deadline, check=False
+                ["git", "diff", "--quiet", frozen_product, "--", *product_paths],
+                deadline,
+                check=False,
             )
             if product_diff.returncode:
                 raise ValueError(
                     f"product src differs from frozen Stage2 baseline {frozen_product}"
                 )
             untracked_product = run_supervised(
-                ["git", "ls-files", "--others", "--exclude-standard", "--", "src"], deadline
+                ["git", "ls-files", "--others", "--exclude-standard", "--", *product_paths],
+                deadline,
             ).stdout.strip()
             if untracked_product:
                 raise ValueError(
                     f"untracked product source is outside the frozen baseline: {untracked_product}"
                 )
             harness_paths = [
-                Path("examples/profile_standard_cuda.rs"),
-                Path("tests/test_standard_ann.rs"),
-                Path("tests/test_standard_graph.rs"),
-                Path("tests/test_standard_quality.rs"),
+                Path("crates/fast-umap/examples/profile_standard_cuda.rs"),
+                Path("crates/fast-umap/tests/test_standard_ann.rs"),
+                Path("crates/fast-umap/tests/test_standard_graph.rs"),
+                Path("crates/fast-umap/tests/test_standard_quality.rs"),
                 Path("python/tests/test_compare_umap_spans.py"),
             ]
             manifest_payload = {

@@ -37,7 +37,7 @@ def main():
     if candidate["interface"] == "legacy_csr":
         # The interface patch includes the diagnostic accessor, but not the CLI example.
         shutil.copyfile(
-            ROOT / "examples/profile_standard_cuda.rs",
+            ROOT / "crates/fast-umap/examples/profile_standard_cuda.rs",
             workspace / "examples/profile_standard_cuda.rs",
         )
     if candidate.get("estimator"):

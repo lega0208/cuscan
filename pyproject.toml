@@ -23,7 +23,7 @@ dev = [
 ]
 
 [tool.maturin]
-manifest-path = "bindings/python/Cargo.toml"
+manifest-path = "crates/fast-umap-python/Cargo.toml"
 python-source = "python"
 module-name = "fast_umap._fast_umap"
 features = ["pyo3/extension-module"]
@@ -33,9 +33,8 @@ cache-keys = [
     "pyproject.toml",
     "Cargo.toml",
     "Cargo.lock",
-    "bindings/python/Cargo.toml",
-    { file = "bindings/python/src/**/*.rs" },
-    { file = "src/**/*.rs" },
+    { file = "crates/*/Cargo.toml" },
+    { file = "crates/**/*.rs" },
 ]
 
 [tool.ruff]

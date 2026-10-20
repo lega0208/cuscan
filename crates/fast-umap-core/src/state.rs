@@ -1,4 +1,4 @@
-use super::{NeighborSearch, UMAPConfig};
+use crate::{NeighborSearch, UMAPConfig};
 
 /// Storage-independent snapshot of a fitted model. All fields are untrusted on import.
 #[derive(Debug, Clone, PartialEq)]
