@@ -437,6 +437,8 @@ impl HDBSCAN {
     }
 
     pub fn fit(&self, input: &[Vec<f32>]) -> Result<FittedHDBSCAN> {
+        #[cfg(feature = "tracing")]
+        let _input_validation_span = tracing::info_span!("input_validation").entered();
         self.config.validate()?;
         if input.is_empty() {
             return Err(HdbscanError::InvalidInput(
@@ -458,7 +460,11 @@ impl HDBSCAN {
         let (raw, raw_n, features) = flatten_input(input)?;
         let split = split_finite(&raw, features)?;
         let n = split.finite_index.len();
+        #[cfg(feature = "tracing")]
+        drop(_input_validation_span);
         let min_samples = self.config.resolved_min_samples();
+        #[cfg(feature = "tracing")]
+        let _backend_setup_span = tracing::info_span!("backend_setup").entered();
         let (device, actual_backend) =
             selected_device(self.backend, cfg!(feature = "cpu"), cfg!(feature = "cuda"))
                 .map_err(map_backend_error)?;
@@ -467,6 +473,12 @@ impl HDBSCAN {
             .search
             .resolve(n, features, min_samples, actual_backend);
         let cuda_row_pitch = matches!(actual_backend, BackendChoice::Cuda { .. });
+        #[cfg(feature = "tracing")]
+        profile_sync(&device)?;
+        #[cfg(feature = "tracing")]
+        drop(_backend_setup_span);
+        #[cfg(feature = "tracing")]
+        let _input_preparation_span = tracing::info_span!("input_preparation", rows = n).entered();
         let mut neighbors = Vec::new();
         let mut core_values = vec![f32::INFINITY; n];
         let mut mst = Vec::new();
@@ -474,6 +486,8 @@ impl HDBSCAN {
         let mut condensed = CondensedTree::default();
         let mut labels = vec![-1; raw_n];
         let mut probabilities = vec![0.0; raw_n];
+        #[cfg(feature = "tracing")]
+        let result_finalization_span;
 
         if n > 1 {
             let finite_values = if split.outliers.is_empty() {
@@ -547,16 +561,10 @@ impl HDBSCAN {
                 "Boruvka candidate index output allocation",
             )?;
             #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
+            drop(_input_preparation_span);
+
             #[cfg(feature = "tracing")]
-            let _mst_span = tracing::info_span!(
-                "minimum_spanning_tree",
-                rows = n,
-                features,
-                min_samples,
-                search = ?resolved_search,
-            )
-            .entered();
+            let _tree_build_span = tracing::info_span!("tree_build", rows = n).entered();
             let host_tree = if resolved_search == HdbscanSearch::KdTree {
                 Some(fast_hdbscan_core::KdTree::build(
                     &finite_values,
@@ -597,11 +605,31 @@ impl HDBSCAN {
                     "KD-tree node-component allocation",
                 )?;
             }
+            #[cfg(feature = "tracing")]
+            drop(_tree_build_span);
+
+            #[cfg(feature = "tracing")]
+            let _input_upload_span = tracing::info_span!("input_upload", rows = n).entered();
             let data = tensor_f32(finite_values, [n, features], &device);
             let device_tree = host_tree.as_ref().map(|tree| upload_kd_tree(tree, &device));
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            drop(_input_upload_span);
+
+            #[cfg(feature = "tracing")]
+            let _core_distances_span = tracing::info_span!("core_distances", rows = n).entered();
             let core = core_distances(&data, min_samples, resolved_search, device_tree.as_ref())?;
             core_values = core.core_sq.iter().map(|value| value.sqrt()).collect();
             neighbors = core.neighbors.clone();
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            drop(_core_distances_span);
+
+            #[cfg(feature = "tracing")]
+            let _mst_span =
+                tracing::info_span!("mst", rows = n, search = ?resolved_search).entered();
             let sorted_mst = spanning_tree(
                 &data,
                 &core,
@@ -614,14 +642,15 @@ impl HDBSCAN {
             #[cfg(feature = "tracing")]
             drop(_mst_span);
             #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
-            #[cfg(feature = "tracing")]
             let _cluster_span = tracing::info_span!("cluster_extraction", rows = n).entered();
             let host = fast_hdbscan_core::clusters_from_spanning_tree(&sorted_mst, &self.config)?;
             #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
-            #[cfg(feature = "tracing")]
             drop(_cluster_span);
+            #[cfg(feature = "tracing")]
+            {
+                result_finalization_span =
+                    tracing::info_span!("result_finalization", rows = n).entered();
+            }
             linkage = if split.outliers.is_empty() {
                 host.linkage.clone()
             } else {
@@ -636,12 +665,19 @@ impl HDBSCAN {
             };
             mst = host.sorted_mst;
         } else {
+            #[cfg(feature = "tracing")]
+            drop(_input_preparation_span);
+            #[cfg(feature = "tracing")]
+            {
+                result_finalization_span =
+                    tracing::info_span!("result_finalization", rows = n).entered();
+            }
             let host = HostClustering::one_finite();
             labels = scatter_labels(&host.labels, &split.finite_index, raw_n)?;
             probabilities = scatter_probabilities(&host.probabilities, &split.finite_index, raw_n)?;
         }
 
-        Ok(FittedHDBSCAN {
+        let fitted = FittedHDBSCAN {
             config: self.config.clone(),
             backend: actual_backend,
             labels,
@@ -655,7 +691,10 @@ impl HDBSCAN {
             n_features: features,
             raw_n,
             search: resolved_search,
-        })
+        };
+        #[cfg(feature = "tracing")]
+        drop(result_finalization_span);
+        Ok(fitted)
     }
 }
 

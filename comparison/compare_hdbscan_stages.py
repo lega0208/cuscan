@@ -10,13 +10,13 @@ Then run, for example:
 
     uv run --no-sync python comparison/compare_hdbscan_stages.py --html hdbscan-stages.html
 
-Input generation/loading and subprocess startup are outside fit timing. Rust stage spans
-include host tree build/upload, core distances and MST in minimum_spanning_tree, then host
-clustering in cluster_extraction. Python wraps the module functions called by HDBSCAN.fit.
-For Euclidean inputs with more than 30 features, fast_hdbscan switches its MST path to
-pynndescent approximate neighbors; otherwise it uses its KD-tree/Boruvka path. These are
-not algorithmically equivalent to the native --search choice. One run is cold; when runs
-are at least two, each implementation's comparison is the median of its warmed fits.
+Input generation/loading and estimator construction are outside fit timing. Native and
+reference stage spans are exclusive. fast_hdbscan 0.3.2 fuses reference core distances
+and MST in one Numba Boruvka call; above 30 features its pynndescent stage is reported as
+one inclusive approximate-neighbors-and-MST span. These paths are not algorithmically
+equivalent to native --search. Unattributed is fit minus measured spans (timer/bookkeeping
+and uncaptured overhead), not measured work. One run is cold; for >=2 runs summaries use
+the median of each implementation's warmed fits.
 """
 
 from __future__ import annotations
@@ -25,21 +25,160 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "target" / "release" / "examples" / "profile_hdbscan_stages"
-STAGES = ("minimum_spanning_tree", "cluster_extraction")
-PYTHON_STAGE_FUNCTIONS = {
-    "compute_minimum_spanning_tree": "minimum_spanning_tree",
-    "clusters_from_spanning_tree": "cluster_extraction",
+NATIVE_STAGES = (
+    "input_validation",
+    "backend_setup",
+    "input_preparation",
+    "tree_build",
+    "input_upload",
+    "core_distances",
+    "mst",
+    "cluster_extraction",
+    "result_finalization",
+)
+REFERENCE_STAGES = (
+    "input_validation",
+    "mst_setup",
+    "tree_build",
+    "core_distances_and_mst",
+    "approximate_neighbors_and_mst",
+    "cluster_extraction",
+    "result_finalization",
+)
+STAGES = (
+    "input_validation",
+    "backend_setup",
+    "input_preparation",
+    "mst_setup",
+    "tree_build",
+    "input_upload",
+    "core_distances",
+    "core_distances_and_mst",
+    "mst",
+    "approximate_neighbors_and_mst",
+    "cluster_extraction",
+    "result_finalization",
+)
+STAGE_DEFINITIONS = {
+    "input_validation": (
+        "Native validation; reference estimator-fit prefix and fast_hdbscan parameter validation, "
+        "excluding measured children."
+    ),
+    "backend_setup": "Native backend initialization/setup.",
+    "input_preparation": "Native host-side input preparation.",
+    "mst_setup": (
+        "Reference compute_minimum_spanning_tree dispatch and checks, exclusive of its children."
+    ),
+    "tree_build": "KD-tree construction (native or reference).",
+    "input_upload": "Native host-to-backend input upload.",
+    "core_distances": (
+        "Native core-distance calculation; reference Boruvka fuses this with MST "
+        "and is not separately measurable."
+    ),
+    "mst": "Native minimum spanning tree work; reference Boruvka fuses this with core distances.",
+    "core_distances_and_mst": (
+        "Reference parallel_boruvka fused Numba operation; "
+        "not separable into core-distance and MST timings."
+    ),
+    "approximate_neighbors_and_mst": (
+        "Reference compute_mst_from_knn_graph inclusive operation for >30 features."
+    ),
+    "cluster_extraction": "Cluster extraction from the spanning tree.",
+    "result_finalization": (
+        "Reference fit suffix after fast_hdbscan returns, including to_numpy_rec_array; "
+        "native result finalization."
+    ),
+    "unattributed": (
+        "Fit minus measured exclusive spans: timer/bookkeeping and uncaptured overhead, "
+        "not measured work."
+    ),
 }
+
+
+class ExclusiveTimer:
+    """Accumulate exclusive named intervals; nested measures pause their parent."""
+
+    def __init__(self, clock: Any = None):
+        self.clock = clock or time.perf_counter
+        self.seconds: dict[str, float] = {}
+        self.calls: dict[str, int] = {}
+        self._stack: list[tuple[str, float]] = []
+
+    def _pause(self) -> None:
+        if self._stack:
+            stage, started = self._stack[-1]
+            now = self.clock()
+            self.seconds[stage] = self.seconds.get(stage, 0.0) + now - started
+            self._stack[-1] = (stage, now)
+
+    def switch(self, stage: str | None) -> None:
+        self._pause()
+        if self._stack:
+            self._stack.pop()
+        if stage is not None:
+            self._stack.append((stage, self.clock()))
+            self.calls[stage] = self.calls.get(stage, 0) + 1
+
+    @contextmanager
+    def measure(self, stage: str) -> Iterator[None]:
+        self._pause()
+        self._stack.append((stage, self.clock()))
+        self.calls[stage] = self.calls.get(stage, 0) + 1
+        try:
+            yield
+        finally:
+            self._pause()
+            self._stack.pop()
+            if self._stack:
+                name, _ = self._stack[-1]
+                self._stack[-1] = (name, self.clock())
+
+
+@contextmanager
+def measure_reference(
+    module: Any, approximate_module: Any, timer: ExclusiveTimer
+) -> Iterator[None]:
+    """Instrument fast_hdbscan 0.3.2 callsites, restoring all patched hooks on exit."""
+    originals: list[tuple[Any, str, Any]] = []
+
+    def patch(target: Any, name: str, stage: str, *, required: bool = True) -> None:
+        if not hasattr(target, name):
+            if required:
+                raise RuntimeError(f"required fast_hdbscan timing hook missing: {name}")
+            return
+        original = getattr(target, name)
+        originals.append((target, name, original))
+
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            with timer.measure(stage):
+                return original(*args, **kwargs)
+
+        setattr(target, name, timed)
+
+    try:
+        patch(module, "build_kdtree", "tree_build")
+        patch(module, "parallel_boruvka", "core_distances_and_mst")
+        patch(approximate_module, "compute_mst_from_knn_graph", "approximate_neighbors_and_mst")
+        patch(module, "clusters_from_spanning_tree", "cluster_extraction")
+        # Instrument the complete compute function as an exclusive outer dispatch frame.
+        patch(module, "compute_minimum_spanning_tree", "mst_setup")
+        yield
+    finally:
+        for target, name, original in reversed(originals):
+            setattr(target, name, original)
 
 
 def positive_int(value: str) -> int:
@@ -112,49 +251,72 @@ def _python_worker(args: argparse.Namespace) -> None:
         raise SystemExit("fast-hdbscan==0.3.2 is required in this Python environment") from error
     if version != "0.3.2":
         raise SystemExit(f"requires fast-hdbscan==0.3.2, got {version}")
+    import fast_hdbscan.nndescent as approximate_module
+
     matrix = np.fromfile(args.worker_input, dtype="<f4").reshape(args.rows, args.features)
-    current: dict[str, float] = {}
-    originals: dict[str, Any] = {}
-
-    def wrap(stage: str, function: Any) -> Any:
-        def timed(*call_args: Any, **kwargs: Any) -> Any:
-            start = time.perf_counter()
-            try:
-                return function(*call_args, **kwargs)
-            finally:
-                current[stage] = current.get(stage, 0.0) + time.perf_counter() - start
-
-        return timed
-
-    for name, stage in PYTHON_STAGE_FUNCTIONS.items():
-        originals[name] = getattr(hdbscan_module, name)
-        setattr(hdbscan_module, name, wrap(stage, originals[name]))
-
+    timer = ExclusiveTimer()
     fit_seconds: list[float] = []
-    stage_seconds = {stage: [] for stage in STAGES}
+    stage_seconds: dict[str, list[float | None]] = {stage: [] for stage in STAGES}
     cluster_counts: list[int] = []
     noise_counts: list[int] = []
+    original_fast_hdbscan = hdbscan_module.fast_hdbscan
+    original_fit = fast_hdbscan.HDBSCAN.fit
+
+    def timed_fast_hdbscan(*call_args: Any, **kwargs: Any) -> Any:
+        timer.switch("input_validation")
+        try:
+            return original_fast_hdbscan(*call_args, **kwargs)
+        finally:
+            timer.switch("result_finalization")
+
+    def timed_fit(estimator: Any, *call_args: Any, **kwargs: Any) -> Any:
+        timer.switch("input_validation")
+        try:
+            return original_fit(estimator, *call_args, **kwargs)
+        finally:
+            timer.switch(None)
+
+    hdbscan_module.fast_hdbscan = timed_fast_hdbscan
+    fast_hdbscan.HDBSCAN.fit = timed_fit
     try:
-        for _ in range(args.runs):
-            current.clear()
-            start = time.perf_counter()
-            estimator = fast_hdbscan.HDBSCAN(
-                min_cluster_size=args.min_cluster_size,
-                min_samples=args.min_samples,
-                cluster_selection_method=args.cluster_selection_method,
-                allow_single_cluster=args.allow_single_cluster,
-            ).fit(matrix)
-            fit_seconds.append(time.perf_counter() - start)
-            for stage in STAGES:
-                if stage not in current:
-                    raise RuntimeError(f"reference fit did not execute measured stage {stage}")
-                stage_seconds[stage].append(current[stage])
-            labels = estimator.labels_
-            cluster_counts.append(len(set(labels.tolist()) - {-1}))
-            noise_counts.append(int(np.count_nonzero(labels == -1)))
+        with measure_reference(hdbscan_module, approximate_module, timer):
+            for _ in range(args.runs):
+                timer.seconds.clear()
+                timer.calls.clear()
+                estimator = fast_hdbscan.HDBSCAN(
+                    min_cluster_size=args.min_cluster_size,
+                    min_samples=args.min_samples,
+                    cluster_selection_method=args.cluster_selection_method,
+                    allow_single_cluster=args.allow_single_cluster,
+                )
+                start = time.perf_counter()
+                estimator.fit(matrix)
+                fit_seconds.append(time.perf_counter() - start)
+                high_dimensional = matrix.shape[1] > 30
+                required = [
+                    "input_validation",
+                    "mst_setup",
+                    "cluster_extraction",
+                    "result_finalization",
+                ]
+                required += (
+                    ["approximate_neighbors_and_mst"]
+                    if high_dimensional
+                    else ["tree_build", "core_distances_and_mst"]
+                )
+                for stage in required:
+                    if not timer.calls.get(stage):
+                        raise RuntimeError(f"reference fit did not execute measured stage {stage}")
+                for stage in STAGES:
+                    stage_seconds[stage].append(
+                        timer.seconds.get(stage) if timer.calls.get(stage) else None
+                    )
+                labels = estimator.labels_
+                cluster_counts.append(len(set(labels.tolist()) - {-1}))
+                noise_counts.append(int(np.count_nonzero(labels == -1)))
     finally:
-        for name, function in originals.items():
-            setattr(hdbscan_module, name, function)
+        hdbscan_module.fast_hdbscan = original_fast_hdbscan
+        fast_hdbscan.HDBSCAN.fit = original_fit
     print(
         json.dumps(
             {
@@ -182,21 +344,68 @@ def run(command: list[str], label: str) -> dict[str, Any]:
     raise SystemExit(f"{label} did not emit a JSON object on its final output line")
 
 
+def validate_native_stages(result: dict[str, Any]) -> None:
+    stage_values = result.get("stage_seconds")
+    if not isinstance(stage_values, dict):
+        raise SystemExit(
+            "native profiler output is missing stage_seconds; rebuild the native companion "
+            "with tracing enabled"
+        )
+    missing = set(NATIVE_STAGES) - stage_values.keys()
+    if missing:
+        raise SystemExit(
+            "native profiler output is missing required stages "
+            f"{', '.join(sorted(missing))}; rebuild the native companion with tracing enabled"
+        )
+
+
 def summarize(result: dict[str, Any], indices: range) -> dict[str, float | None]:
     fit = result["fit_seconds"]
     if not indices:
         raise ValueError("no fits selected for summary")
-    row: dict[str, float | None] = {"total": statistics.median(fit[i] for i in indices) * 1000}
-    residuals = [fit[i] for i in indices]
+    if not isinstance(fit, list) or not fit:
+        raise ValueError("fit_seconds must be a non-empty list")
+    for value in fit:
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("fit_seconds contains a malformed, nonfinite, or negative duration")
+    selected = list(indices)
+    if any(index < 0 or index >= len(fit) for index in selected):
+        raise ValueError("fit summary index is out of range")
+    residuals = [float(fit[i]) for i in selected]
+    stage_values: dict[str, list[float | None]] = result.get("stage_seconds", {})
+    if not isinstance(stage_values, dict):
+        raise ValueError("stage_seconds must be an object")
+    unknown = stage_values.keys() - set(STAGES)
+    if unknown:
+        raise ValueError(
+            f"stage_seconds contains unrecognized stages: {', '.join(sorted(unknown))}"
+        )
+    totals = [0.0 for _ in selected]
+    row: dict[str, float | None] = {"total": statistics.median(residuals) * 1000}
     for stage in STAGES:
-        values = result.get("stage_seconds", {}).get(stage)
+        values = stage_values.get(stage)
         if values is None:
             row[stage] = None
             continue
-        for position, index in enumerate(indices):
-            residuals[position] -= values[index]
-        row[stage] = statistics.median(values[i] for i in indices) * 1000
-    row["other"] = statistics.median(residuals) * 1000
+        if not isinstance(values, list) or len(values) != len(fit):
+            raise ValueError(f"stage_seconds[{stage!r}] must align with fit_seconds")
+        present = []
+        for position, index in enumerate(selected):
+            value = values[index]
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"stage {stage!r} contains a malformed duration")
+            duration = float(value)
+            totals[position] += duration
+            present.append(duration)
+        row[stage] = statistics.median(present) * 1000 if present else None
+    for position, fit_seconds in enumerate(residuals):
+        tolerance = max(1e-9, fit_seconds * 1e-6)
+        if totals[position] > fit_seconds + tolerance:
+            raise ValueError("exclusive stage durations exceed fit duration")
+        residuals[position] = fit_seconds - totals[position]
+    row["unattributed"] = statistics.median(residuals) * 1000
     return row
 
 
@@ -204,7 +413,7 @@ def comparison_rows(
     native: dict[str, float | None], reference: dict[str, float | None]
 ) -> list[dict[str, Any]]:
     rows = []
-    for stage in (*STAGES, "other", "total"):
+    for stage in (*STAGES, "unattributed", "total"):
         value, other = native[stage], reference[stage]
         rows.append(
             {
@@ -215,7 +424,13 @@ def comparison_rows(
                 else value / native["total"] * 100,
                 "python_ms": other,
                 "speedup": None
-                if value is None or other is None or other <= 0
+                if (
+                    stage != "total"
+                    and (stage not in NATIVE_STAGES or stage not in REFERENCE_STAGES)
+                )
+                or value is None
+                or other is None
+                or other <= 0
                 else (1 - value / other) * 100,
             }
         )
@@ -289,7 +504,28 @@ def write_html(path: Path, rows: list[dict[str, Any]], title: str) -> None:
     figure.update_yaxes(title_text="%", row=1, col=1)
     figure.update_yaxes(title_text="%", row=2, col=1)
     figure.update_yaxes(title_text="ms", row=3, col=1)
-    figure.update_layout(title=title, barmode="group", height=1100)
+    figure.update_layout(
+        title=title,
+        barmode="group",
+        height=1100,
+        margin={"b": 250},
+    )
+    figure.add_annotation(
+        text=(
+            "Stages are exclusive. Reference Boruvka fuses core distances and MST; "
+            ">30D uses approximate-neighbors+MST.<br>"
+            "n/a means not separately applicable. Unattributed is timer/bookkeeping/uncaptured "
+            "overhead, not measured work.<br>"
+            "Native/reference stages differ; unmatched stages have no speedup."
+        ),
+        xref="paper",
+        yref="paper",
+        x=0,
+        y=-0.22,
+        showarrow=False,
+        xanchor="left",
+        align="left",
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.write_html(path, include_plotlyjs=True, full_html=True)
     print(f"wrote {path}")
@@ -387,6 +623,7 @@ def main() -> int:
         if args.allow_single_cluster:
             native_cmd.append("--allow-single-cluster")
         native = run(native_cmd, "native")
+        validate_native_stages(native)
         py_cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -444,6 +681,13 @@ def main() -> int:
             "python_runs": args.python_runs,
             "warm_semantics": (
                 "run 0 cold; when runs >= 2 compare median of runs 1..N-1; per implementation"
+            ),
+            "stage_definitions": STAGE_DEFINITIONS,
+            "timing_limitations": (
+                "Exclusive spans; reference core_distances_and_mst is a fused Numba call; "
+                "reference >30-feature approximate_neighbors_and_mst is inclusive; "
+                "unattributed is timer/bookkeeping and uncaptured overhead, not measured work. "
+                "n/a marks stages not separately applicable, and unmatched stages have no speedup."
             ),
         }
         args.json.parent.mkdir(parents=True, exist_ok=True)

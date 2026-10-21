@@ -7,7 +7,17 @@ use fast_hdbscan::{BackendChoice, ClusterSelectionMethod, HDBSCAN, HdbscanConfig
 use std::{collections::BTreeMap, error::Error, path::Path, time::Instant};
 use tracing_subscriber::layer::SubscriberExt;
 
-const STAGES: [&str; 2] = ["minimum_spanning_tree", "cluster_extraction"];
+const STAGES: [&str; 9] = [
+    "input_validation",
+    "backend_setup",
+    "input_preparation",
+    "tree_build",
+    "input_upload",
+    "core_distances",
+    "mst",
+    "cluster_extraction",
+    "result_finalization",
+];
 
 fn read_matrix(path: &Path, rows: usize, features: usize) -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
     let bytes = std::fs::read(path)?;
@@ -65,6 +75,43 @@ fn stage_seconds(
         return Err("unclosed stage trace span".into());
     }
     Ok(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STAGES, stage_seconds};
+    use serde_json::json;
+
+    #[test]
+    fn parses_each_granular_stage_and_ignores_unrelated_spans() {
+        let mut events = Vec::new();
+        for (index, name) in STAGES.iter().enumerate() {
+            let begin = index as f64 * 10.0;
+            events.push(json!({"name": name, "tid": 1, "ph": "B", "ts": begin}));
+            events.push(json!({"name": name, "tid": 1, "ph": "E", "ts": begin + 2.0}));
+        }
+        events.push(json!({"name": "fit", "tid": 1, "ph": "B", "ts": 0.0}));
+        events.push(json!({"name": "fit", "tid": 1, "ph": "E", "ts": 100.0}));
+
+        let stages = stage_seconds(&events).expect("valid stage trace");
+        assert_eq!(stages.len(), STAGES.len());
+        for name in STAGES {
+            assert_eq!(stages[name], [2e-6]);
+        }
+        assert!(!stages.contains_key("minimum_spanning_tree"));
+    }
+
+    #[test]
+    fn rejects_unmatched_and_invalid_duration_events() {
+        let unmatched = [json!({"name": "mst", "tid": 7, "ph": "E", "ts": 2.0})];
+        assert!(stage_seconds(&unmatched).is_err());
+
+        let invalid_duration = [
+            json!({"name": "mst", "tid": 7, "ph": "B", "ts": 3.0}),
+            json!({"name": "mst", "tid": 7, "ph": "E", "ts": 2.0}),
+        ];
+        assert!(stage_seconds(&invalid_duration).is_err());
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -152,6 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         allow_single_cluster,
         ..HdbscanConfig::default()
     };
+    let estimator = HDBSCAN::new(config, backend).with_search(search);
     let mut fit_seconds = Vec::with_capacity(runs);
     let mut cluster_counts = Vec::with_capacity(runs);
     let mut noise_counts = Vec::with_capacity(runs);
@@ -163,9 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .as_nanos()
         );
         let start = Instant::now();
-        let fitted = HDBSCAN::new(config.clone(), backend)
-            .with_search(search)
-            .fit(&data)?;
+        let fitted = estimator.fit(&data)?;
         fit_seconds.push(start.elapsed().as_secs_f64());
         eprintln!(
             "profile_run_end run={run} unix_ns={}",

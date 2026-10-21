@@ -228,15 +228,38 @@ run 0; the UMAP reference still runs once. HDBSCAN also supports `--python-runs 
 with the same cold/warmed rule for the reference.
 
 UMAP reports neighbor search, fuzzy graph, schedule, spectral graph export,
-initialization, and optimization. HDBSCAN reports minimum spanning tree
-(including tree setup, neighbor search, and core distances) and cluster
-extraction. `other` is fit time outside measured stages. Native stage boundaries
-synchronize the device; these are host wall timings, not individual GPU kernel
-timings. HDBSCAN's `--search auto|brute-force|kd-tree` selects only the native
-search route. Above 30 input features, fast_hdbscan uses approximate pynndescent
-neighbors instead of its KD-tree/Borůvka path; the script warns about this
-algorithm mismatch. Timing results alone do not establish clustering or
-embedding quality. Each script's `--help` lists its full options.
+initialization, and optimization; its `other` row is fit time outside measured
+stages. HDBSCAN instead reports exclusive, non-overlapping stages:
+
+| HDBSCAN stage | Measured work |
+| --- | --- |
+| `input_validation` | Configuration/input checks, flattening and finite-row detection in native; estimator/input/parameter validation in the reference |
+| `backend_setup` | Native backend/device resolution, runtime initialization, allocation properties and search-route selection |
+| `input_preparation` | Native result-buffer allocation, finite-row compaction and device allocation-size checks |
+| `tree_build` | Host KD-tree construction and native tree allocation checks (only a branch check for native brute force) |
+| `input_upload` | Native input/tree tensor uploads, including synchronization |
+| `core_distances` | Native neighbor search, readback, core distances and retained neighbor/core output copies |
+| `mst` | Native Borůvka spanning tree construction and finalization |
+| `mst_setup` | Reference MST dispatch/validation outside the measured tree/Borůvka calls |
+| `core_distances_and_mst` | Reference fused Numba Borůvka call, which cannot expose separate core-distance and MST timings through Python wrappers |
+| `approximate_neighbors_and_mst` | Reference approximate-neighbor/MST path above 30 features, instead of its KD-tree/Borůvka stages |
+| `cluster_extraction` | Linkage, condensation, cluster selection, labels and membership strengths |
+| `result_finalization` | Native result remapping/scattering and fitted-state assembly; reference fitted-attribute/record-array conversion |
+
+HDBSCAN estimator construction is outside fit timing. `unattributed` retains
+only the per-fit difference between total time and measured exclusive stages;
+it is timing/bookkeeping or uncaptured overhead, not a measured algorithm phase.
+Missing or inapplicable stages show `n/a`, not zero, and do not receive a speedup
+ratio. Warmed summaries take medians independently, so displayed stage medians
+need not sum to the median total. Raw JSON retains the per-run measurements.
+
+Native device-work stages include synchronization; these are host wall timings,
+not individual GPU kernel timings. HDBSCAN's
+`--search auto|brute-force|kd-tree` selects only the native search route. Above
+30 input features, fast_hdbscan uses approximate pynndescent neighbors instead
+of its KD-tree/Borůvka path; the script warns about this algorithm mismatch.
+Timing results alone do not establish clustering or embedding quality. Each
+script's `--help` lists its full options.
 
 ---
 
