@@ -41,44 +41,13 @@ Completed scope, contracts, deliverables and exit gate: see [Phase 2 in the comp
 
 Phase 3 remains unimplemented.
 
-### Phase 3 — facade, brute-force device Borůvka, estimator (S3, S5–S7)
+### Phase 3 — facade, brute-force device Borůvka, estimator (S3, S5–S7) — completed
 
-**Scope and order**
-1. Create `crates/fast-hdbscan` facade and `HdbscanOps` in `backend.rs` with its CubeBackend implementation/kernels in `src/kernels/`; add explicit local backend error conversions. Add required `HdbscanConfig`/estimator-facing Rust API and exports.
-2. Implement S3 `core_distances` via common exact-neighbor squared mode with self excluded and `k=min(min_samples,n-1)`. Core is zero for min_samples=1, +inf when `n<=min_samples`, otherwise last requested neighbor squared distance; output core distances sqrt f32. Pad neighbor ids with -1 and distances +inf. Do not claim neighbor-list identity with upstream on duplicate points: our self-exclusion contract differs there while core radii match.
-3. Implement S5 initialization and S6a point components; phase 3 has no KD node vectors/tree.
-4. Implement tiled brute-force S6b MRD squared candidates, deterministic `(weight,index)` tie break, device-limit row blocking, and tile reduction. Infinity candidates must be selected by tie arm against sentinel `n`; validate CubeCL infinity literal on CPU and CUDA, passing scalar infinity if needed.
-5. Implement S6c host per-component winners in first appearance order, strict `<` preserving first source row ties, union in that order, and zero-progress `Numerical` error. S7 converts/sorts MST. Then S8–S13 estimator orchestration using phase-1 core functions.
-6. Implement strict `BackendChoice` behavior, CPU and CUDA, and backend-specific feature forwarding without adding these operations to `StandardUmapOps`.
+Completed scope, contracts, deliverables and exit gate: see [Phase 3 in the completed phases document](hdbscan_plan_phases_completed.md#phase-3--facade-bruteforce-device-boruvka-estimator-s3-s5s7).
 
-**Device API and orchestration contract**
-- Freeze `HdbscanOps::boruvka_candidates(data, core_sq, point_components, tree)` before implementing kernels. Inputs are immutable tensors; outputs are `[n]` f32 squared weights and `[n]` i32 destinations. `tree=None` selects brute force. Plan `DeviceKdTree` as a real fusion input with `ExtensionType` and metadata, not an opaque host struct; the populated tree path lands in phase 4.
-- One tiled launch computes winners for `(query row, reference tile)`; a second reduces tiles. Check `rows_in_block * ceil(n/tile)` scratch sizing and all padded `n * min_samples` outputs with checked arithmetic and device allocation limits. Shared launch limits apply to both runtimes.
-- Preserve the distinction between every-row exact candidates in brute force and only per-component exact minima when KD pruning is enabled. Ignore individual missing candidates, but error if any unfinished component has no outgoing candidate. Verify component-count reduction and exactly `m-1` final MST edges.
-- Initialize from kNN in point order: first nonmissing neighbor with `core_i >= core_j`, weight `max(core_i, knn_sq)`. With minimum samples 1, cores are zero but the chosen edge retains its squared pair distance. Skip the round loop if initialization already connects every point.
-- Allocate/upload only after validation and finite/degenerate handling. Upload a compact matrix only when rows were excluded; retain the caller's finite feature values unchanged. Expose typed config, fitted arrays, finite-index mapping, backend and fallible DBSCAN-cut accessors from the facade.
+### Phase 4 — host-built KD tree and KD Borůvka fast path (S4, optimized S6) — completed
 
-**Deliverables and focused tests**
-`crates/fast-hdbscan/src/{lib.rs,backend.rs,estimator.rs,kernels/{mod.rs,boruvka.rs}}`; fixture end-to-end tests on CPU; core-distance host brute-force comparisons for min_samples `{1,n-1,n,n+5}`; squared overflow and all-infinite core tests; S5 acyclic forest; per-component candidate minima and host MST parity; no-progress path; explicit backend failure mapping. CUDA tests run only when usable hardware exists and are required with `FAST_UMAP_REQUIRE_CUDA=1` in CUDA lane. Near-tie tests use documented ARI and tolerance rules.
-
-**Exit gate**
-CPU end-to-end fixture labels/probabilities/trees pass (exact host stage, MST weights relative tolerance 1e-5, probabilities 1e-5; labels equal up to permutation/ARI=1 only where relevant decisions are separated from ties). CUDA parity uses the same rules; unavailable CUDA is reported unverified, never a passing skip. Exact MST works at all dimensions.
-
-### Phase 4 — host-built KD tree and KD Borůvka fast path (S4, optimized S6)
-
-**Scope and order**
-1. Add backend-free `kdtree.rs`: leaf size 40, implicit heap, flat indices/ranges/leaf flags/bounds, iterative build, deterministic `(feature value, original index)` partition, validated nonempty leaf ranges and max depth.
-2. Upload the tree and implement `box_lower_bound` and device traversal with fixed `MAX_KD_LEVELS+1` stack; near-first order, left-first on equal bound. Prune only on strict `>`; prune homogeneous own-component nodes. Test each bound against brute-force point-box calculations.
-3. Add component-bound pruning only as a separately tested optional kernel policy, with implementation-owned scratch reset to +inf before every launch/round. It is disabled unless runtime-specific benchmarks demonstrate value; stale bounds are correctness failures. A missing candidate for an entire component is `Numerical`.
-4. Add KD-tree exact kNN using the same traversal skeleton with a k-heap, replacing the phase-3 quadratic S3 path in the low-dimensional dispatch. Reuse the existing kNN-initialized first round; verify identical core radii, padding and MST invariants. Retain brute force as the exact high-dimensional path and test oracle, not as a retry after kernel errors. Select a low-dimensional cutoff through measured benchmarks, starting investigation at 30 dimensions; it is a performance dispatch only and cannot alter non-tie MST semantics.
-5. Refresh point roots and bottom-up homogeneous-node component labels every round; upload the tree once and update component buffers. Check nonempty leaves, `MAX_KD_LEVELS=32` and `n_levels+1 <= STACK_LEN` before launch. Strict equality must remain visitable even when every candidate weight is infinite.
-6. Treat device component-winner reduction and reduced host readback as optional, separately benchmarked work, not a prerequisite. If implemented, preserve first-source tie ordering and check atomic capabilities on each runtime. Do not add packed-u64 atomics or point reordering without their own evidence and invariant tests.
-
-**Deliverables and focused tests**
-Tree invariants: every row exactly once in leaves, bounds contain all points, depth within fixed stack, deterministic repeated build. KD vs brute-force per-component minima, CPU/CUDA parity away from ties, traversal tie cases, pruning equality, multiple Borůvka rounds with increasing winning weights (scratch reset). Criterion targets `hdbscan_cpu`/`hdbscan_cuda` are planned future targets; compare with upstream only after correctness. Benchmark tile sizes 128/256/512 as targeted investigation, not a performance promise.
-
-**Exit gate**
-KD path matches phase-3 brute-force MST weight multiset and downstream results under the same tie/tolerance policy on fixtures and adversarial tree cases. Any enabled optimization passes exact component-minimum checks. Benchmark data supports chosen cutoff; absent data, retain conservative exact brute-force selection.
+Completed scope, contracts, deliverables and exit gate: see [Phase 4 in the completed phases document](hdbscan_plan_phases_completed.md#phase-4--hostbuilt-kd-tree-and-kd-boruvka-fast-path-s4-optimized-s6).
 
 ### Phase 5 — PyO3 API and estimator (Python surface)
 
@@ -115,13 +84,13 @@ Commands below are grounded in current repository conventions. **Existing comman
 - Existing CPU benchmark command pattern is documented in `AGENTS.md`: `cargo bench -p fast-umap --no-default-features --features cpu --bench standard_umap_cpu` (baseline and post-refactor comparison only).
 - Existing Python UMAP pattern: `uv run maturin develop --release --no-default-features --features cpu && uv run --no-sync pytest python/tests/test_standard_*.py`.
 
-### Planned future focused commands (after corresponding phases)
+### Focused phase commands (Phase 5 remains future work)
 
 - Phase 0: `cargo check -p fast-cubecl-common --no-default-features` for backend-free feature compilation, and `cargo test -p fast-cubecl-common --no-default-features --features cpu` for shared CPU operations; existing UMAP CPU suite and `bash scripts/test_features.sh` after script update; compare UMAP CPU benchmark above.
-- Phase 0.5/1: `cargo test -p fast-hdbscan-core` and `cargo test -p fast-hdbscan-core --test test_fixtures` (fixture-loader target name is proposed).
-- Phase 2: `cargo test -p fast-hdbscan-core --test test_mst_oracle` (proposed target).
-- Phase 3: `cargo test -p fast-hdbscan --no-default-features --features cpu`; CUDA lane `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda` (proposed crate/test target; run only with usable CUDA).
-- Phase 4: `cargo test -p fast-hdbscan --no-default-features --features cpu --test test_kdtree` and `cargo bench -p fast-hdbscan --no-default-features --features cpu --bench hdbscan_cpu` (proposed targets); corresponding CUDA bench is proposed and requires CUDA.
+- Phase 0.5/1: `cargo test -p fast-hdbscan-core` and `cargo test -p fast-hdbscan-core --test test_fixtures`.
+- Phase 2: `cargo test -p fast-hdbscan-core --features test-support --test mst_oracle`.
+- Phase 3: `cargo test -p fast-hdbscan --no-default-features --features cpu`; CUDA lane `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda` (run only with usable CUDA).
+- Phase 4: host invariants `cargo test -p fast-hdbscan-core --test kdtree`; device search `cargo test -p fast-hdbscan --no-default-features --features cpu --test test_kdtree_search`; full estimator parity is included in the Phase 3 facade commands. Benchmarks: `cargo bench -p fast-hdbscan --no-default-features --features cpu --bench hdbscan_cpu` and required CUDA `FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --no-default-features --features cuda --bench hdbscan_cuda`. The README records the measured grid and conservative dispatch policy; the durable ledger retains command/output evidence.
 - Phase 5: `uv run maturin develop --release --no-default-features --features cpu && uv run --no-sync pytest python/tests/test_hdbscan.py` (proposed test file).
 
 ## Cross-phase risk and release gates

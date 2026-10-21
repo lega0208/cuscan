@@ -2916,8 +2916,14 @@ dependencies = [
 name = "fast-hdbscan"
 version = "1.6.0"
 dependencies = [
+ "burn",
+ "burn-cubecl",
+ "criterion",
+ "cubecl",
  "fast-cubecl-common",
  "fast-hdbscan-core",
+ "serde_json",
+ "zip",
 ]
 
 [[package]]

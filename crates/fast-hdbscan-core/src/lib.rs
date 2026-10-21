@@ -8,6 +8,7 @@ pub mod config;
 pub mod dsu;
 pub mod error;
 pub mod finite;
+pub mod kdtree;
 pub mod labels;
 pub mod linkage;
 pub mod mst;
@@ -18,6 +19,7 @@ pub mod select;
 pub use condense::CondensedTree;
 pub use config::{ClusterSelectionMethod, HdbscanConfig};
 pub use error::HdbscanError;
+pub use kdtree::KdTree;
 pub use linkage::{LinkageRow, SortedMstEdge};
 
 /// Finite-row-indexed host extraction results, before raw-row remapping.

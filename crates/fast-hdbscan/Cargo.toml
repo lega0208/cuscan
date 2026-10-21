@@ -10,10 +10,29 @@ homepage.workspace = true
 
 [features]
 default = ["cuda", "cpu"]
-cpu = ["fast-cubecl-common/cpu"]
-cuda = ["fast-cubecl-common/cuda"]
+cpu = ["dep:burn-cubecl", "dep:cubecl", "fast-cubecl-common/cpu"]
+cuda = ["dep:burn-cubecl", "dep:cubecl", "fast-cubecl-common/cuda"]
 tracing = ["fast-cubecl-common/tracing", "fast-hdbscan-core/tracing"]
 
 [dependencies]
 fast-cubecl-common = { workspace = true }
 fast-hdbscan-core = { workspace = true }
+burn = { workspace = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true }
+
+[dev-dependencies]
+fast-hdbscan-core = { workspace = true, features = ["test-support"] }
+criterion = { workspace = true }
+serde_json = { workspace = true }
+zip = { workspace = true }
+
+[[bench]]
+name = "hdbscan_cpu"
+harness = false
+required-features = ["cpu"]
+
+[[bench]]
+name = "hdbscan_cuda"
+harness = false
+required-features = ["cuda"]

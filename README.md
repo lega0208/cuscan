@@ -309,7 +309,7 @@ Regenerate only quality fixtures (without replacing graph/layout references) wit
 uv run --no-sync python crates/fast-umap/tests/fixtures/generate_standard_umap.py --quality-only
 ```
 
-HDBSCAN infrastructure fixtures use the published `fast_hdbscan==0.3.2` release,
+HDBSCAN reference fixtures use the published `fast_hdbscan==0.3.2` release,
 not a later source checkout. Verify their provenance and semantic regeneration with:
 
 ```shell
@@ -326,7 +326,68 @@ records that release behavior separately from the post-release correction.
 The backend-free core implements host extraction from supplied MSTs and finite-row
 remapping. Its independent brute-force MST oracle is available only with the
 non-default `test-support` feature, not as a production execution fallback.
-There is no HDBSCAN estimator or Python API yet.
+The `fast-hdbscan` crate exposes the Rust `HDBSCAN` estimator; there is no Python
+HDBSCAN API yet. For example, with its `cpu` feature enabled:
+
+```rust
+use fast_hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};
+
+let data = vec![vec![0.0, 0.0], vec![0.1, 0.0], vec![5.0, 5.0]];
+let fitted = HDBSCAN::new(
+    HdbscanConfig { min_cluster_size: 2, min_samples: Some(1), ..Default::default() },
+    BackendChoice::Cpu,
+)
+.with_search(HdbscanSearch::BruteForce)
+.fit(&data)?;
+let labels = fitted.labels();
+# Ok::<(), fast_hdbscan::HdbscanError>(())
+```
+
+| `BruteForce` and `KdTree` select exact Euclidean search at every dimension;
+neither is an approximate mode or a fallback after execution errors. On CPU and
+CUDA, `Auto` selects KD search for 256–2048 finite rows with at most 30 features,
+or 2049–4096 rows with at most 10 features, when resolved `min_samples <= 32`;
+otherwise it selects brute force. The low-dimensional/intermediate-size region
+is a conservative policy: the 2049–4096-row, at-most-10-feature extension is
+low-dimensional/`min_samples` interpolation, not a separately measured guarantee
+for every size or data distribution.
+Backend selection is independent: `BackendChoice::Auto` prefers usable CUDA,
+while explicit CPU/CUDA choices are strict. Input features are not rescaled.
+Nonfinite rows become noise in labels/probabilities and are remapped into the
+trees; neighbors, core distances and MST endpoints remain finite-row indexed,
+with the original-row mapping available through `finite_index()`. Neighbors
+exclude self, use `-1` padding, and core distances include infinite padding.
+`dbscan_clustering(epsilon)` returns a `Result` and rejects NaN.
+
+```shell
+cargo test -p fast-hdbscan --no-default-features --features cpu
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda
+cargo bench -p fast-hdbscan --no-default-features --features cpu --bench hdbscan_cpu
+FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --no-default-features --features cuda --bench hdbscan_cuda
+```
+
+Criterion benchmarks compare forced routes on the same fixtures and seeded
+synthetic data, with separate host tree-build timings. Use
+`FAST_HDBSCAN_BENCH_CASES` with comma-separated case-name substrings to select
+cases; full-fit timings include upload, device execution and host readback.
+Set `FAST_HDBSCAN_BENCH_STAGES=1` for isolated neighbor, single candidate-round
+and synchronized tree-upload timings. Candidate-stage cases use singleton
+components, not total MST construction; upload timings include readback.
+Component-bound pruning and device winner reduction are not enabled.
+
+Local Phase 4 measurements on Ryzen 7 9800X3D CPU and RTX 3080 CUDA used 100
+samples, 95% confidence intervals, three separate processes per runtime, two
+pinned fixtures and the full seeded synthetic grid: 64/256/1024/2048 rows,
+2/10/30/50 features, `min_samples` 5/32, plus 4096 rows at 2/10 features.
+For every measured case with at least 256 rows and at most 30 features, the KD
+mean's upper confidence limit was below the brute-force mean's lower limit in
+all three runs. Small CUDA inputs were inconsistent, so they remain brute force.
+The synthetic data is clustered; this does not establish distribution-independent
+performance or extrapolate a speed claim to unmeasured hardware/dimensions.
+Runs used `--warm-up-time 0.1 --measurement-time 0.2 --noplot`; Criterion extended
+collection when necessary to retain all 100 samples. Reference tile widths
+128/256/512 were investigated separately on both runtimes; the production
+default remains 256, without a runtime-specific tile tuning claim.
 
 ---
 

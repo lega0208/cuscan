@@ -53,6 +53,7 @@ All fixtures regenerate with complete provenance, including direct internal MST 
 ### Phase 1 — backend-free host pipeline (S1, S2, S8–S14)
 
 **Scope and order**
+
 1. Create `crates/fast-hdbscan-core/src/{lib.rs,config.rs,error.rs,finite.rs}`. Implement config validation and resolution, flatten/input checks, finite split, zero-finite error, one-finite degenerate result, raw-row remapping. Define errors `InvalidConfig`, `InvalidInput`, `BackendUnavailable`, `Numerical`, `Overflow` without backend dependency.
 2. Implement `dsu.rs` rank union with first-argument root on rank ties and path compression; test representative behavior and argument order.
 3. Implement `linkage.rs` S8 from externally supplied sorted MST; preserve larger component id first, f64 distance, sizes and exact row order.
@@ -62,6 +63,7 @@ All fixtures regenerate with complete provenance, including direct internal MST 
 7. Use a test-only hook taking upstream `SortedMstEdge` fixtures to exercise S8–S12 without depending on a Rust MST implementation. Remap output trees with recorded upstream outlier ordering; separately test deterministic ascending Rust outlier ordering.
 
 **Host implementation details to pin before phase 2**
+
 - Define shared `SortedMstEdge`, `LinkageRow` and `CondensedTree` data types in phase 1 so fixture-driven linkage builds without a later MST implementation. Phase 2 adds squared working edges and producers of the existing finalized edge type. Condensed tree stores SoA `parent`, `child`, `lambda` and `child_size` arrays; integer counts are converted to f32 where upstream arithmetic requires it.
 - Config defaults: minimum cluster size 5; minimum samples `None` resolves to that size; EOM; single cluster false; maximum size `None`; epsilon/persistence 0.0. Require positive minimum sizes and finite nonnegative selection thresholds. Keep backend choice outside the backend-free config.
 - Linkage uses new node ids starting at `n` over `2n-1` slots, with the larger root id first. Condensation uses BFS, root id `n`, and consecutive sibling cluster pairs; `max_cluster_size` is a selection constraint, not a condensation constraint.
@@ -81,6 +83,7 @@ Every host tree/label/probability result is exact versus fixtures when supplied 
 ### Phase 2 — independent host exact MST oracle (S5–S7 reference)
 
 **Scope and order**
+
 1. Add host `mst.rs` helpers for squared `MstEdge`, candidate order and finalization into the phase-1 sorted f64 edge type; exact all-pairs mutual-reachability Borůvka using brute-force candidates and DSU. Compute core distances independently by host exact kNN. This is a test/reference implementation, not a production fallback; reusable merge/finalization helpers are production host code.
 2. Implement/validate kNN initialization semantics against core and neighbor data; apply in point order, skip absent neighbors, preserve rank union and deterministic tie ordering.
 3. Finalize squared f32 edge weights by f64 sqrt and sort by `(weight, src, dst)`. Validate exactly `m-1` edges for `m>=2` and valid acyclic spanning structure.
@@ -93,3 +96,45 @@ Host oracle independently reproduces oracle MST weight multiset and feeds phase-
 
 **Verification receipt**
 Core no-default and `test-support,tracing` suites pass; focused core Clippy with `-D warnings`, workspace CPU Clippy and `scripts/test_features.sh` pass. Generator `uv run --no-sync ... --check` verified 18 cases with the expected overflow `RuntimeWarning`. CUDA runtime is unverified. Implemented algorithms are backend-free host algorithms only; the oracle is non-default test support, not a fallback. No facade estimator or Python surface is implemented.
+
+### Phase 3 — facade, brute-force device Borůvka, estimator (S3, S5–S7)
+
+**Scope and order**
+
+1. Create `crates/fast-hdbscan` facade and `HdbscanOps` in `backend.rs` with its CubeBackend implementation/kernels in `src/kernels/`; add explicit local backend error conversions. Add required `HdbscanConfig`/estimator-facing Rust API and exports.
+2. Implement S3 `core_distances` via common exact-neighbor squared mode with self excluded and `k=min(min_samples,n-1)`. Core is zero for min_samples=1, +inf when `n<=min_samples`, otherwise last requested neighbor squared distance; output core distances sqrt f32. Pad neighbor ids with -1 and distances +inf. Do not claim neighbor-list identity with upstream on duplicate points: our self-exclusion contract differs there while core radii match.
+3. Implement S5 initialization and S6a point components; phase 3 has no KD node vectors/tree.
+4. Implement tiled brute-force S6b MRD squared candidates, deterministic `(weight,index)` tie break, device-limit row blocking, and tile reduction. Infinity candidates must be selected by tie arm against sentinel `n`; validate CubeCL infinity literal on CPU and CUDA, passing scalar infinity if needed.
+5. Implement S6c host per-component winners in first appearance order, strict `<` preserving first source row ties, union in that order, and zero-progress `Numerical` error. S7 converts/sorts MST. Then S8–S13 estimator orchestration using phase-1 core functions.
+6. Implement strict `BackendChoice` behavior, CPU and CUDA, and backend-specific feature forwarding without adding these operations to `StandardUmapOps`.
+
+**Device API and orchestration contract**
+
+- Freeze `HdbscanOps::boruvka_candidates(data, core_sq, point_components, tree)` before implementing kernels. Inputs are immutable tensors; outputs are `[n]` f32 squared weights and `[n]` i32 destinations. `tree=None` selects brute force. Plan `DeviceKdTree` as a real fusion input with `ExtensionType` and metadata, not an opaque host struct; the populated tree path lands in phase 4.
+- One tiled launch computes winners for `(query row, reference tile)`; a second reduces tiles. Check `rows_in_block * ceil(n/tile)` scratch sizing and all padded `n * min_samples` outputs with checked arithmetic and device allocation limits. Shared launch limits apply to both runtimes.
+- Preserve the distinction between every-row exact candidates in brute force and only per-component exact minima when KD pruning is enabled. Ignore individual missing candidates, but error if any unfinished component has no outgoing candidate. Verify component-count reduction and exactly `m-1` final MST edges.
+- Initialize from kNN in point order: first nonmissing neighbor with `core_i >= core_j`, weight `max(core_i, knn_sq)`. With minimum samples 1, cores are zero but the chosen edge retains its squared pair distance. Skip the round loop if initialization already connects every point.
+- Allocate/upload only after validation and finite/degenerate handling. Upload a compact matrix only when rows were excluded; retain the caller's finite feature values unchanged. Expose typed config, fitted arrays, finite-index mapping, backend and fallible DBSCAN-cut accessors from the facade.
+
+**Deliverables and focused tests**
+`crates/fast-hdbscan/src/{lib.rs,backend.rs,estimator.rs,kernels/{mod.rs,boruvka.rs}}`; fixture end-to-end tests on CPU; core-distance host brute-force comparisons for min_samples `{1,n-1,n,n+5}`; squared overflow and all-infinite core tests; S5 acyclic forest; per-component candidate minima and host MST parity; no-progress path; explicit backend failure mapping. CUDA tests run only when usable hardware exists and are required with `FAST_UMAP_REQUIRE_CUDA=1` in CUDA lane. Near-tie tests use documented ARI and tolerance rules.
+
+**Exit gate**
+CPU end-to-end fixture labels/probabilities/trees pass (exact host stage, MST weights relative tolerance 1e-5, probabilities 1e-5; labels equal up to permutation/ARI=1 only where relevant decisions are separated from ties). CUDA parity uses the same rules; unavailable CUDA is reported unverified, never a passing skip. Exact MST works at all dimensions.
+
+### Phase 4 — host-built KD tree and KD Borůvka fast path (S4, optimized S6)
+
+**Scope and order**
+
+1. Add backend-free `kdtree.rs`: leaf size 40, implicit heap, flat indices/ranges/leaf flags/bounds, iterative build, deterministic `(feature value, original index)` partition, validated nonempty leaf ranges and max depth.
+2. Upload the tree and implement `box_lower_bound` and device traversal with fixed `MAX_KD_LEVELS+1` stack; near-first order, left-first on equal bound. Prune only on strict `>`; prune homogeneous own-component nodes. Test each bound against brute-force point-box calculations.
+3. Add component-bound pruning only as a separately tested optional kernel policy, with implementation-owned scratch reset to +inf before every launch/round. It is disabled unless runtime-specific benchmarks demonstrate value; stale bounds are correctness failures. A missing candidate for an entire component is `Numerical`.
+4. Add KD-tree exact kNN using the same traversal skeleton with a k-heap, replacing the phase-3 quadratic S3 path in the low-dimensional dispatch. Reuse the existing kNN-initialized first round; verify identical core radii, padding and MST invariants. Retain brute force as the exact high-dimensional path and test oracle, not as a retry after kernel errors. Select a low-dimensional cutoff through measured benchmarks, starting investigation at 30 dimensions; it is a performance dispatch only and cannot alter non-tie MST semantics.
+5. Refresh point roots and bottom-up homogeneous-node component labels every round; upload the tree once and update component buffers. Check nonempty leaves, `MAX_KD_LEVELS=32` and `n_levels+1 <= STACK_LEN` before launch. Strict equality must remain visitable even when every candidate weight is infinite.
+6. Treat device component-winner reduction and reduced host readback as optional, separately benchmarked work, not a prerequisite. If implemented, preserve first-source tie ordering and check atomic capabilities on each runtime. Do not add packed-u64 atomics or point reordering without their own evidence and invariant tests.
+
+**Deliverables and focused tests**
+Tree invariants: every row exactly once in leaves, bounds contain all points, depth within fixed stack, deterministic repeated build. KD vs brute-force per-component minima, CPU/CUDA parity away from ties, traversal tie cases, pruning equality, multiple Borůvka rounds with increasing winning weights (scratch reset). Criterion targets `hdbscan_cpu`/`hdbscan_cuda` compare forced exact routes on pinned fixtures and seeded synthetic inputs; `FAST_HDBSCAN_BENCH_STAGES=1` additionally measures search stages and synchronized tree upload. Compare with upstream only after correctness. Benchmark tile sizes 128/256/512 as targeted investigation, not a performance promise. Component-bound scratch pruning remains disabled, so there is no persisted bound scratch to reset in the delivered kernels.
+
+**Exit gate**
+KD path matches phase-3 brute-force MST weight multiset and downstream results under the same tie/tolerance policy on fixtures and adversarial tree cases. Any enabled optimization passes exact component-minimum checks. Benchmark data supports chosen cutoff; absent data, retain conservative exact brute-force selection.
