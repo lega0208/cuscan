@@ -49,25 +49,9 @@ Completed scope, contracts, deliverables and exit gate: see [Phase 3 in the comp
 
 Completed scope, contracts, deliverables and exit gate: see [Phase 4 in the completed phases document](hdbscan_plan_phases_completed.md#phase-4--hostbuilt-kd-tree-and-kd-boruvka-fast-path-s4-optimized-s6).
 
-### Phase 5 — PyO3 API and estimator (Python surface)
+### Phase 5 — PyO3 API and estimator (Python surface) — completed
 
-**Scope and order**
-1. Extend `crates/fast-umap-python/src/lib.rs`, add `src/hdbscan.rs`; keep a single native module. Add `fit_hdbscan` and frozen fitted result accessors, translating Rust errors to specified Python classes.
-2. Add `python/fast_umap/hdbscan.py` estimator and export `HDBSCAN` in `python/fast_umap/__init__.py`. Match only in-scope upstream parameters plus `backend="auto"` and `device_index=0`. Expose `labels_`, `probabilities_`, structured condensed tree dtype, linkage/MST arrays, and `dbscan_clustering(eps)`.
-3. Reject unsupported parameters explicitly with `NotImplementedError` (including sample weights, non-Euclidean metric, Kruskal/knn_k, cannot-link, semi-supervised); do not accept-and-ignore. Match Python numeric type checks and f64→f32 overflow behavior. Preserve UMAP Python API and error mapping.
-4. Add Python parity and integration tests, including `HDBSCAN(...).fit_predict(UMAP(...).fit_transform(X))`, nonfinite rows, output dtypes/shapes, error mapping, unsupported args and backend choice.
-
-**Binding details**
-- Split the existing UMAP binding source into `src/umap.rs` as needed, with registration in `lib.rs` and new HDBSCAN code in `src/hdbscan.rs`; avoid changing existing UMAP behavior or introducing a second extension module.
-- Implement `fit`, `fit_predict`, fitted-state checks and native fitted-result lifetime/ownership. Accept `reproducible` but document that it has no effect because the port is always deterministic; this is the sole explicitly permitted ignored option.
-- Labels expose NumPy `intp`; Rust probabilities remain f32, while Python mirrors upstream's f64 probability widening when non-finite rows are remapped. Preserve upstream structured condensed-tree field names/dtypes; expose raw linkage/MST arrays rather than plot wrapper objects. Expose neighbors/core distances and `finite_index` with their finite-row indexing documented.
-- Parameterize unsupported-option tests over sample weights, non-Euclidean metric, Kruskal, `knn_k`, cannot-link options and semi-supervised mode. Distinguish upstream floating scalar type validation from nonnegative/finite value validation; integer epsilon is invalid even when zero.
-
-**Deliverables and focused tests**
-Future test target `python/tests/test_hdbscan.py` and Rust binding tests are planned; existing Python command patterns apply. Tests assert labels up to permutation/ARI according to tie classification, probabilities 1e-5, structured tree fields/dtypes, and Python exceptions for every invalid/unsupported input category.
-
-**Exit gate**
-CPU pytest parity, UMAP→HDBSCAN and error/dtype tests pass; CUDA Python parity is required only in a configured CUDA lane and must not be represented as verified otherwise. Existing UMAP Python tests remain unchanged and green.
+Completed scope, contracts, deliverables and exit gate: see [Phase 5 in the completed phases document](hdbscan_plan_phases_completed.md#phase-5--pyO3-api-and-estimator-python-surface).
 
 ### Phase 6+ — separate plans only
 
@@ -91,7 +75,7 @@ Commands below are grounded in current repository conventions. **Existing comman
 - Phase 2: `cargo test -p fast-hdbscan-core --features test-support --test mst_oracle`.
 - Phase 3: `cargo test -p fast-hdbscan --no-default-features --features cpu`; CUDA lane `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda` (run only with usable CUDA).
 - Phase 4: host invariants `cargo test -p fast-hdbscan-core --test kdtree`; device search `cargo test -p fast-hdbscan --no-default-features --features cpu --test test_kdtree_search`; full estimator parity is included in the Phase 3 facade commands. Benchmarks: `cargo bench -p fast-hdbscan --no-default-features --features cpu --bench hdbscan_cpu` and required CUDA `FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --no-default-features --features cuda --bench hdbscan_cuda`. The README records the measured grid and conservative dispatch policy; the durable ledger retains command/output evidence.
-- Phase 5: `uv run maturin develop --release --no-default-features --features cpu && uv run --no-sync pytest python/tests/test_hdbscan.py` (proposed test file).
+- Phase 5 CPU-only: `uv run maturin develop --release --no-default-features --features cpu && uv run --no-sync pytest python/tests/test_hdbscan.py python/tests/test_standard_*.py`. Combined build: `uv run maturin develop --release --no-default-features --features cpu,cuda`, then `FAST_UMAP_TEST_BACKEND=cpu uv run --no-sync pytest python/tests/test_hdbscan.py python/tests/test_standard_*.py` and, without rebuilding, `FAST_UMAP_TEST_BACKEND=cuda FAST_UMAP_REQUIRE_CUDA=1 uv run --no-sync pytest python/tests/test_hdbscan.py`.
 
 ## Cross-phase risk and release gates
 

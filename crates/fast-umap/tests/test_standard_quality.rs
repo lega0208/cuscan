@@ -345,11 +345,10 @@ fn assert_approximate_fit_quality(
     name: &str,
     train: &Matrix,
     seeds: &[u64],
-    n_neighbors: usize,
-    trust_k: usize,
-    fit_epochs: usize,
+    quality_config: (usize, usize, usize),
     reference_trust: &[f64],
 ) {
+    let (n_neighbors, trust_k, fit_epochs) = quality_config;
     assert_eq!(
         reference_trust.len(),
         seeds.len(),
@@ -776,9 +775,7 @@ fn run_approximate_fit_quality_per_frozen_fixture_case(device: &Device) {
             &name,
             &train,
             &seeds,
-            n_neighbors,
-            trust_k,
-            fit_epochs,
+            (n_neighbors, trust_k, fit_epochs),
             &reference_trust,
         );
     }
@@ -950,9 +947,7 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
         "campaign",
         &train,
         &seeds,
-        25,
-        15,
-        200,
+        (25, 15, 200),
         &reference_trust,
     );
     // This additional Phase2 gate does not replace the frozen campaign's

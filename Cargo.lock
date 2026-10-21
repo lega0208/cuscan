@@ -2923,6 +2923,9 @@ dependencies = [
  "fast-cubecl-common",
  "fast-hdbscan-core",
  "serde_json",
+ "tracing",
+ "tracing-chrome",
+ "tracing-subscriber",
  "zip",
 ]
 

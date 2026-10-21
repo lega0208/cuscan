@@ -60,8 +60,10 @@ pub(super) fn forest_seed(
         return Err(WorkspaceError::InvalidDimensions);
     }
     let features_host = input_bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte feature")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect::<Vec<_>>();
     drop(input_bytes);
     let forest = build_forest(&features_host, n, features, seed, trees, leaf_size)?;
@@ -1295,8 +1297,9 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int>(
             }
         } else if old_count > 0 {
             let cross = local - triangle;
-            left = sampled_ids[base + cross / old_count];
-            right = sampled_ids[base + capacity + cross % old_count];
+            let safe_old_count = old_count.max(1);
+            left = sampled_ids[base + cross / safe_old_count];
+            right = sampled_ids[base + capacity + cross % safe_old_count];
         }
         let left_id = u32::cast_from(left) as usize;
         let right_id = u32::cast_from(right) as usize;

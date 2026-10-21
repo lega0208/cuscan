@@ -138,3 +138,95 @@ Tree invariants: every row exactly once in leaves, bounds contain all points, de
 
 **Exit gate**
 KD path matches phase-3 brute-force MST weight multiset and downstream results under the same tie/tolerance policy on fixtures and adversarial tree cases. Any enabled optimization passes exact component-minimum checks. Benchmark data supports chosen cutoff; absent data, retain conservative exact brute-force selection.
+
+### Phase 5 — Python bindings and estimator
+
+Implemented the separate PyO3 HDBSCAN module, package export and estimator,
+native snapshots, atomic refits, finite-row indexing, dtype/error validation,
+and Python acceptance tests. UMAP algorithms and its Python tests are unchanged;
+the approved scope includes narrow behavior-preserving baseline lint fixes.
+Pinned `fast_hdbscan==0.3.2` source declares condensed-tree `lambda_val` as
+Python `float` (NumPy float64), overriding the plan's anticipated float32;
+native lambda storage remains float32. Singleton DBSCAN components are filtered
+by resolved `min_samples`, matching the existing Rust and upstream behavior;
+the singleton-label test therefore uses `min_samples=1` and separately checks
+default noise filtering.
+
+Initial execution evidence before acceptance amendments (2026-10-21):
+
+- `cargo test -p fast-umap-python --no-default-features --features cpu`: passed
+  the five-variant error-mapping unit test after explicit interpreter initialization.
+- CPU-only release extension build succeeded. Final CPU-only Python lane:
+  **65 passed, 12 skipped, 2 failed**. UMAP regression tests passed unchanged;
+  HDBSCAN ownership, failed-refit preservation and composed execution passed.
+- Combined CPU/CUDA extension build and actual required CUDA execution on
+  **NVIDIA GeForce RTX 3080 (10 GiB)** succeeded in exercising the backend;
+  combined CPU lane: **64 passed, 13 skipped, 2 failed**; required CUDA lane:
+  **54 passed, 1 skipped, 2 failed**. Acceptance is not green (the parity
+  blockers below occur in both lanes).
+- Rust formatting and Python Ruff lint/format and ty checks passed.
+  Workspace rustfmt also removed trailing whitespace from one blank line in
+  `fast-hdbscan/src/kernels/boruvka.rs`; no kernel logic changed.
+- Required strict workspace Clippy failed on pre-existing untouched code:
+  `fast-umap-core/src/config.rs` (`collapsible_if`) and
+  `fast-cubecl-common/src/neighbors.rs` test (`vec_init_then_push`). No lint
+  suppressions were added. Focused binding Clippy also exposes pre-existing
+  UMAP binding `type_complexity` in `src/lib.rs`; newly added native lint
+  findings were fixed. Missing `patchelf` build tooling was installed;
+  dependency future-incompatibility warnings remain in Burn/CubeCL.
+
+Initial acceptance-contract conflicts (subsequently resolved by user approval):
+
+1. `blobs_d50`: public upstream uses approximate graph MST above 30 dimensions,
+   with two infinite bridges; the exact native result has finite bridges and
+   matches the stored exact reference. Requiring both exact semantics and the
+   public upstream infinity mask is contradictory.
+2. `moons_leaf`: native matches stored labels (ARI 1), probabilities and MST
+   weights exactly. Public upstream has ARI **0.9091063180643247**, despite
+   identical core distances and MST weights, with different equal-weight edge
+   endpoints. The approved plan permits tie-sensitive exceptions only for
+   already-annotated fixtures; this fixture is not annotated as tie-sensitive.
+
+The user approved exact stored-oracle gating above 30 dimensions with public
+approximate comparisons retained as diagnostics, a measured fixture-specific
+`moons_leaf` tie assessment, and narrow baseline Clippy fixes without
+suppressions. The original failure evidence is retained above, not relabeled
+as passing. Approximate MST implementation and general clustering-quality
+metrics are deferred to another session.
+
+Additional measured `moons_leaf` evidence: all 28 distinct MST threshold
+partitions match upstream after equal-weight merges are grouped; core distances
+and sorted MST weights are exactly equal. Noise masks agree, with one
+cluster-matched membership difference (row 22) and maximum probability delta
+0.06672919. Strict comparison against the stored exact fixture remains intact.
+Fresh verification under the approved amendments (same RTX 3080):
+
+- CPU-only release extension: **69 passed, 12 skipped** across HDBSCAN and
+  unchanged UMAP Python tests; explicit unavailable CUDA rejection passed.
+- Combined release extension, with no rebuild between lanes: CPU **68 passed,
+  13 skipped** across HDBSCAN/UMAP; required CUDA **58 passed, 1 skipped**
+  across HDBSCAN, including CPU/CUDA comparisons for both divergence fixtures.
+  Two informational upstream comparison warnings per lane remain visible;
+  all strict stored-oracle and scoped tie-assessment assertions passed.
+- The first frozen review found missing explicit unsupported-option coverage
+  for `ss_algorithm="bc_simple"` and `validate_cannot_link=False`. Both cases
+  were added and all three lanes rerun; a focused required-CUDA adversarial
+  rerun passed **30 tests**, including these regressions.
+- Native error-mapping unit test, UMAP core tests, common CPU tests, affected
+  UMAP Rust library and ANN/query/quality integration suites all passed.
+  Required CUDA sampled-kernel fixtures passed, as did common combined
+  CPU/CUDA tests (15 tests). The approved CubeCL lint fix retains the original
+  nonzero-old-pool guard and uses an equal positive denominator inside it;
+  CPU/CUDA pair-slot fixtures exercise this path.
+- Strict workspace CPU Clippy (`--all-targets -- -D warnings`), Rust format
+  check, Ruff lint/format checks, and ty all passed without added suppressions.
+  Baseline changes are limited to equivalent fixed-size chunk iteration,
+  eager side-effect-free option borrowing, a conditional collapse, feature-
+  specific test device collection, and small related-argument/type aliases.
+  Burn/CubeCL dependency future-incompatibility warnings remain visible.
+- No Cargo features changed; the feature matrix script was therefore not
+  required by the approved plan. Existing Python UMAP source/tests remain
+  unchanged. Approximate MST and generic quality metrics were not implemented.
+
+The durable Ultragoal ledger records frozen boundary reviews and the terminal
+completion receipt separately from these execution results.

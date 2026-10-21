@@ -7,6 +7,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
+pub(crate) mod hdbscan;
+
 #[pyclass(frozen, unsendable)]
 struct FittedUMAP {
     inner: RustFittedUMAP,
@@ -147,13 +149,15 @@ impl FittedUMAP {
     }
 }
 
+type TransformOutput<'py> = (Bound<'py, PyArray2<f32>>, Option<(u64, u64)>);
+
 impl FittedUMAP {
     fn transform_owned<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f32>,
         timed: bool,
-    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Option<(u64, u64)>)> {
+    ) -> PyResult<TransformOutput<'py>> {
         let shape = x.shape();
         let (n_rows, n_features) = (shape[0], shape[1]);
         let data = if x.is_c_contiguous() {
@@ -435,7 +439,10 @@ fn fit_umap(
 fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<FittedUMAP>()?;
+    module.add_class::<hdbscan::FittedHDBSCAN>()?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
+    module.add_function(wrap_pyfunction!(hdbscan::fit_hdbscan, module)?)?;
+    module.add_function(wrap_pyfunction!(hdbscan::hdbscan_cuda_available, module)?)?;
     module.add_function(wrap_pyfunction!(load, module)?)?;
     Ok(())
 }

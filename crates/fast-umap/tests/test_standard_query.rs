@@ -652,7 +652,9 @@ fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
     assert!(
         actual
             .2
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .all(|stats| stats[0] == 15 && stats[1] == 15)
     );
 

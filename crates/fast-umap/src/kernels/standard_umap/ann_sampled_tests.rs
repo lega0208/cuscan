@@ -35,8 +35,10 @@ fn read_i32(tensor: &CubeTensor) -> Vec<i32> {
     tensor
         .client
         .read_one_unchecked(tensor.handle.clone())
-        .chunks_exact(4)
-        .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| i32::from_ne_bytes(*bytes))
         .collect()
 }
 
@@ -44,8 +46,10 @@ fn read_f32(tensor: &CubeTensor) -> Vec<f32> {
     tensor
         .client
         .read_one_unchecked(tensor.handle.clone())
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect()
 }
 

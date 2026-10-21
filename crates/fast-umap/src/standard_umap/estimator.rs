@@ -455,7 +455,7 @@ impl FittedUMAP {
         // Exact transforms search the retained features directly; only approximate
         // transforms consume the fitted neighbor graph.
         let query_graph = (self.search == NeighborSearch::Approximate)
-            .then(|| self.fit_graph.as_ref())
+            .then_some(self.fit_graph.as_ref())
             .flatten()
             .map(|graph| {
                 graph
@@ -1853,7 +1853,7 @@ mod tests {
                 .try_to_vec::<i64>()
                 .unwrap();
             let reduced = optimizer_rng_from_first_coordinates(
-                values.chunks_exact(2).map(|row| row[0]),
+                values.as_chunks::<2>().0.iter().map(|row| row[0]),
                 3,
                 seed,
                 &device,

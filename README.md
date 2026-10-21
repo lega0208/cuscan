@@ -152,6 +152,92 @@ uv run ruff format --check
 uv run ty check
 ```
 
+### UMAP and HDBSCAN comparison scripts
+
+Run these scripts from the repository root after `uv sync` and a release
+`maturin develop` build as above. Use `uv run --no-sync` to retain the locally
+built extension. The reference implementations are **umap-learn 0.5.12** and
+**fast-hdbscan 0.3.2**, respectively.
+
+#### Side-by-side point plots
+
+- `comparison/plot_comparison.py` fits reference and local UMAP on the same
+  sampled `embedding` rows from `comparison/feedback_clustered.parquet`.
+  Points are colored by the input `topic_global` column. The default output is
+  `comparison/umap_comparison.html`.
+- `comparison/save_2d_embeddings.py` reads that same input file, computes local
+  UMAP coordinates, and writes `comparison/embeddings_2d.parquet`, preserving
+  the original columns and adding `embedding_2d`. It processes the entire file
+  and has no CLI options.
+- `comparison/plot_hdbscan_comparison.py` reads the saved parquet and compares
+  reference and local HDBSCAN labels. `--cluster-on 2d` (default) clusters
+  `embedding_2d`; `--cluster-on full` clusters `embedding`. Both panels always
+  use the saved `embedding_2d` coordinates for visualization. Colors and legends
+  are estimator-specific cluster labels, not matched clusters across panels;
+  gray indicates noise (`-1`). The default output is
+  `comparison/hdbscan_comparison.html`.
+
+```sh
+uv run --no-sync python comparison/plot_comparison.py --device cpu --sample-size 10000
+uv run --no-sync python comparison/save_2d_embeddings.py
+uv run --no-sync python comparison/plot_hdbscan_comparison.py \
+  --device cpu --cluster-on 2d --sample-size 10000
+uv run --no-sync python comparison/plot_hdbscan_comparison.py \
+  --device cpu --cluster-on full --sample-size 10000 \
+  --output comparison/hdbscan_full_comparison.html
+```
+
+Both plot scripts support `--input`, `--output`, `--sample-size` (default
+1,000,000), and `--device auto|cpu|cuda`. Sampling uses seed 42 and preserves
+row alignment; this does not make unseeded estimator fits deterministic.
+Outputs are standalone Plotly HTML files, and fit wall times are printed.
+UMAP also accepts `--n-epochs`. HDBSCAN accepts `--min-cluster-size` (default 5),
+`--min-samples`, `--cluster-selection-method eom|leaf`, and
+`--allow-single-cluster`.
+
+#### Per-stage timing reports
+
+`comparison/compare_stages.py` compares native UMAP with umap-learn on identical
+generated float32 data (default 50,000 rows, 32 features, 200 epochs).
+`comparison/compare_hdbscan_stages.py` compares native HDBSCAN with fast_hdbscan
+on generated data (default 5,000 rows, 16 features), or on parquet supplied with
+`--input` and `--cluster-on 2d|full`. The latter needs only the selected column;
+it does not generate point plots. Both scripts print timing tables and accept
+`--html` for stage charts and `--json` for raw measurements and metadata.
+
+Build their native companions separately so build time is not measured:
+
+```sh
+cargo build -p fast-umap --release --no-default-features \
+  --features cpu,tracing --example profile_standard_stages
+cargo build -p fast-hdbscan --release --no-default-features \
+  --features cpu,tracing --example profile_hdbscan_stages
+
+uv run --no-sync python comparison/compare_stages.py --backend cpu \
+  --html comparison/umap_stages.html --json comparison/umap_stages.json
+uv run --no-sync python comparison/compare_hdbscan_stages.py --backend cpu \
+  --input comparison/embeddings_2d.parquet --cluster-on 2d --sample-size 10000 \
+  --html comparison/hdbscan_stages.html --json comparison/hdbscan_stages.json
+```
+
+Stage scripts default to CPU; for CUDA, build the corresponding companion with
+`cuda,tracing` and pass `--backend cuda`. Each implementation runs in a separate
+subprocess. One fit is process-cold (persistent caches may still apply).
+`--rust-runs N` with N >= 2 compares the median of warmed native runs, excluding
+run 0; the UMAP reference still runs once. HDBSCAN also supports `--python-runs N`
+with the same cold/warmed rule for the reference.
+
+UMAP reports neighbor search, fuzzy graph, schedule, spectral graph export,
+initialization, and optimization. HDBSCAN reports minimum spanning tree
+(including tree setup, neighbor search, and core distances) and cluster
+extraction. `other` is fit time outside measured stages. Native stage boundaries
+synchronize the device; these are host wall timings, not individual GPU kernel
+timings. HDBSCAN's `--search auto|brute-force|kd-tree` selects only the native
+search route. Above 30 input features, fast_hdbscan uses approximate pynndescent
+neighbors instead of its KD-tree/Borůvka path; the script warns about this
+algorithm mismatch. Timing results alone do not establish clustering or
+embedding quality. Each script's `--help` lists its full options.
+
 ---
 
 ## Standard UMAP
@@ -326,8 +412,41 @@ records that release behavior separately from the post-release correction.
 The backend-free core implements host extraction from supplied MSTs and finite-row
 remapping. Its independent brute-force MST oracle is available only with the
 non-default `test-support` feature, not as a production execution fallback.
-The `fast-hdbscan` crate exposes the Rust `HDBSCAN` estimator; there is no Python
-HDBSCAN API yet. For example, with its `cpu` feature enabled:
+The Python package exposes `HDBSCAN` alongside `UMAP`:
+
+```python
+from fast_umap import HDBSCAN
+
+model = HDBSCAN(min_cluster_size=5, backend="cpu").fit(X)
+labels = model.labels_
+cut_labels = model.dbscan_clustering(0.5)
+```
+
+`backend="auto"` chooses usable CUDA when available, otherwise CPU; explicit
+`"cpu"` and `"cuda"` selections never fall back after an execution error.
+`reproducible` is accepted but has no effect: the port is always deterministic.
+Only exact Euclidean, unweighted Borůvka clustering is supported. Non-default
+metric, algorithm/Kruskal, knn_k, sample-weight, cannot-link and semi-supervised
+options raise `NotImplementedError`.
+
+This release uses exact MST construction at every dimension. Upstream 0.3.2's
+public estimator switches to an approximate graph above 30 dimensions; that
+path is deferred to a separate implementation. D>30 correctness is checked
+against the pinned exact reference, not the approximate estimator's MST.
+Equal-distance edges use deterministic port-side ordering, so tied-data cluster
+memberships can differ from upstream even when the threshold connectivity
+hierarchy is identical; upstream traversal-order parity is not promised.
+
+Labels, probabilities, linkage and condensed trees use original-row indexing;
+nonfinite rows become noise. `neighbors_`, `core_distances_` and
+`minimum_spanning_tree_` use finite-row indices, mapped by `finite_index_`.
+Arrays are independent copies of the Rust-owned fitted snapshot. Probabilities
+are float32 for finite input and float64 when nonfinite rows are remapped,
+matching upstream. Trees are raw NumPy arrays, not plotting wrapper objects.
+Failed refits preserve the previous fitted snapshot and its DBSCAN cuts.
+
+The `fast-hdbscan` crate also exposes the Rust `HDBSCAN` estimator. For example,
+with its `cpu` feature enabled:
 
 ```rust
 use fast_hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};

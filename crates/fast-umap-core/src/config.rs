@@ -308,12 +308,12 @@ pub fn validate_input(
             "input must contain at least one feature".into(),
         ));
     }
-    if let Some(expected) = expected_features {
-        if n_features != expected {
-            return Err(UmapError::InvalidInput(format!(
-                "input has {n_features} features; expected {expected}"
-            )));
-        }
+    if let Some(expected) = expected_features
+        && n_features != expected
+    {
+        return Err(UmapError::InvalidInput(format!(
+            "input has {n_features} features; expected {expected}"
+        )));
     }
     for (row_index, row) in data.iter().enumerate() {
         if row.len() != n_features {

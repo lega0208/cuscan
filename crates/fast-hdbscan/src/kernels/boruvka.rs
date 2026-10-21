@@ -90,7 +90,7 @@ fn tile_candidates<F: Float, I: Int>(
         let mut best = F::new(f32::INFINITY);
         let mut best_index = n;
         let start = tile * tile_width as usize;
-        
+
         for offset in 0..tile_width as usize {
             let candidate = start + offset;
             if candidate < n && components[candidate] != component {

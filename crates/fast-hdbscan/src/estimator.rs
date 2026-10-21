@@ -21,6 +21,13 @@ use fast_hdbscan_core::{
 
 use crate::backend::{DeviceKdTree, HdbscanOps};
 
+#[cfg(feature = "tracing")]
+fn profile_sync(device: &Device) -> Result<()> {
+    device.sync().map_err(|error| {
+        HdbscanError::Numerical(format!("profiling synchronization failed: {error}"))
+    })
+}
+
 /// Search algorithm used by the estimator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HdbscanSearch {
@@ -539,6 +546,17 @@ impl HDBSCAN {
                 allocation_limit,
                 "Boruvka candidate index output allocation",
             )?;
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            let _mst_span = tracing::info_span!(
+                "minimum_spanning_tree",
+                rows = n,
+                features,
+                min_samples,
+                search = ?resolved_search,
+            )
+            .entered();
             let host_tree = if resolved_search == HdbscanSearch::KdTree {
                 Some(fast_hdbscan_core::KdTree::build(
                     &finite_values,
@@ -591,7 +609,19 @@ impl HDBSCAN {
                 host_tree.as_ref(),
                 device_tree.as_ref(),
             )?;
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            drop(_mst_span);
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            let _cluster_span = tracing::info_span!("cluster_extraction", rows = n).entered();
             let host = fast_hdbscan_core::clusters_from_spanning_tree(&sorted_mst, &self.config)?;
+            #[cfg(feature = "tracing")]
+            profile_sync(&device)?;
+            #[cfg(feature = "tracing")]
+            drop(_cluster_span);
             linkage = if split.outliers.is_empty() {
                 host.linkage.clone()
             } else {

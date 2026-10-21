@@ -39,11 +39,9 @@ mod tests {
     use burn::tensor::{Device, TensorData};
 
     fn devices() -> Vec<Device> {
-        let mut devices = Vec::new();
-        #[cfg(feature = "cpu")]
-        devices.push(Device::cpu());
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cpu", feature = "cuda"))]
         {
+            let mut devices = vec![Device::cpu()];
             let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
             if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
                 assert!(count > 0, "required CUDA execution has no usable device");
@@ -51,8 +49,24 @@ mod tests {
             if count > 0 {
                 devices.push(Device::cuda(0));
             }
+            devices
         }
-        devices
+        #[cfg(all(feature = "cpu", not(feature = "cuda")))]
+        {
+            vec![Device::cpu()]
+        }
+        #[cfg(all(feature = "cuda", not(feature = "cpu")))]
+        {
+            let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
+            if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
+                assert!(count > 0, "required CUDA execution has no usable device");
+            }
+            if count > 0 {
+                vec![Device::cuda(0)]
+            } else {
+                Vec::new()
+            }
+        }
     }
 
     fn tensor(values: Vec<f32>, rows: usize, device: &Device) -> Tensor<2> {

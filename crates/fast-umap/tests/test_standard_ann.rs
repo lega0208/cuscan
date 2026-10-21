@@ -516,7 +516,7 @@ fn check_finite_input_distance_overflow(device: &Device) {
     let (ids, distances) = approximate(device, values.clone(), 4, 1, 2, 991, 0);
     assert_eq!(ids.len(), 8);
     assert_eq!(distances.len(), 8);
-    for (row, neighbors) in ids.chunks_exact(2).enumerate() {
+    for (row, neighbors) in ids.as_chunks::<2>().0.iter().enumerate() {
         let mut unique = std::collections::HashSet::new();
         for slot in 0..2 {
             let id = neighbors[slot];
