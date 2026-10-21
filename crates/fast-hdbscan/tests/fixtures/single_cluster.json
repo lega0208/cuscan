@@ -61,6 +61,13 @@
         4
       ]
     },
+    "mst": {
+      "dtype": "<f8",
+      "shape": [
+        23,
+        3
+      ]
+    },
     "mst_weights": {
       "dtype": "<f8",
       "shape": [

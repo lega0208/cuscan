@@ -3,85 +3,13 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use zip::ZipArchive;
-
-const FIXTURES: &str = "../fast-hdbscan/tests/fixtures";
-
-#[derive(Debug, PartialEq)]
-struct NpyHeader {
-    descr: String,
-    fortran: bool,
-    shape: Vec<usize>,
-    payload: Vec<u8>,
-}
-
-fn parse_npy(bytes: &[u8]) -> Result<NpyHeader, String> {
-    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
-        return Err("invalid NPY magic/header".into());
-    }
-    let major = bytes[6];
-    let (header_len, start): (usize, usize) = match major {
-        1 => (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10),
-        2 | 3 if bytes.len() >= 12 => (
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
-            12,
-        ),
-        _ => return Err(format!("unsupported NPY version {major}.{}", bytes[7])),
-    };
-    let end = start
-        .checked_add(header_len)
-        .ok_or("NPY header length overflow")?;
-    if end > bytes.len() {
-        return Err("truncated NPY header".into());
-    }
-    let header = std::str::from_utf8(&bytes[start..end]).map_err(|_| "NPY header is not UTF-8")?;
-    let descr = header_value(header, "descr")?;
-    let fortran_value = header_value(header, "fortran_order")?;
-    let fortran = match fortran_value.as_str() {
-        "True" => true,
-        "False" => false,
-        _ => return Err("invalid NPY fortran_order value".into()),
-    };
-    let shape_text = header_value(header, "shape")?;
-    let shape = parse_shape(&shape_text)?;
-    Ok(NpyHeader {
-        descr,
-        fortran,
-        shape,
-        payload: bytes[end..].to_vec(),
-    })
-}
-
-fn parse_shape(text: &str) -> Result<Vec<usize>, String> {
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    let tokens: Vec<_> = text.split(',').collect();
-    if tokens.last().is_some_and(|token| token.trim().is_empty()) {
-        if tokens.len() == 1 {
-            return Err("malformed NPY shape".into());
-        }
-    }
-    let dimensions = if tokens.last().is_some_and(|token| token.trim().is_empty()) {
-        &tokens[..tokens.len() - 1]
-    } else {
-        &tokens[..]
-    };
-    dimensions
-        .iter()
-        .map(|token| {
-            let token = token.trim();
-            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(format!("invalid NPY shape dimension {token:?}"));
-            }
-            token
-                .parse::<usize>()
-                .map_err(|_| "NPY shape dimension overflow".to_owned())
-        })
-        .collect()
-}
+mod support;
+use support::{
+    NpyHeader, fixture_root, load_npz, parse_npy, parse_shape, read_f32s, read_i64s, read_json,
+};
 
 fn dtype_width(dtype: &str) -> Option<usize> {
     match dtype {
@@ -98,33 +26,11 @@ fn json_usize(value: &Value, label: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("{label} must be a nonnegative integer"))
 }
 
-fn read_i64s(header: &NpyHeader) -> Result<Vec<i64>, String> {
-    if header.descr != "<i8" || header.payload.len() % 8 != 0 {
-        return Err("expected contiguous little-endian i64 payload".into());
-    }
-    Ok(header
-        .payload
-        .chunks_exact(8)
-        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
-        .collect())
-}
-
-fn read_f32s(header: &NpyHeader) -> Result<Vec<f32>, String> {
-    if header.descr != "<f4" || header.payload.len() % 4 != 0 {
-        return Err("expected contiguous little-endian f32 payload".into());
-    }
-    Ok(header
-        .payload
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect())
-}
-
 fn matrix_index_check(header: &NpyHeader, leaves: usize, label: &str) -> Result<(), String> {
     if header.shape.len() != 2 || header.shape[1] != 4 || header.descr != "<f8" {
         return Err(format!("{label} must be an f64 four-column linkage matrix"));
     }
-    for (row, values) in header.payload.chunks_exact(32).enumerate() {
+    for (row, values) in header.payload.as_chunks::<32>().0.iter().enumerate() {
         let left = f64::from_le_bytes(values[0..8].try_into().unwrap());
         let right = f64::from_le_bytes(values[8..16].try_into().unwrap());
         let parent = leaves
@@ -208,108 +114,12 @@ fn structured_condensed_check(
     Ok(())
 }
 
-fn header_value(header: &str, key: &str) -> Result<String, String> {
-    let marker = format!("'{key}'");
-    let start = header
-        .find(&marker)
-        .ok_or_else(|| format!("NPY header missing {key}"))?
-        + marker.len();
-    let tail = header[start..].trim_start();
-    let tail = tail
-        .strip_prefix(':')
-        .ok_or_else(|| format!("malformed NPY {key}"))?
-        .trim_start();
-    if tail.starts_with('[') {
-        let mut depth = 0usize;
-        let mut end = None;
-        for (index, byte) in tail.bytes().enumerate() {
-            if byte == b'[' {
-                depth += 1;
-            }
-            if byte == b']' {
-                depth = depth.checked_sub(1).ok_or("malformed NPY list")?;
-                if depth == 0 {
-                    end = Some(index + 1);
-                    break;
-                }
-            }
-        }
-        Ok(tail[..end.ok_or("unterminated NPY list")?].to_owned())
-    } else if tail.starts_with('\'') || tail.starts_with('"') {
-        let quote = tail.chars().next().unwrap();
-        let rest = &tail[1..];
-        let end = rest
-            .find(quote)
-            .ok_or_else(|| format!("unterminated NPY {key}"))?;
-        Ok(rest[..end].to_owned())
-    } else if key == "shape" {
-        let end = tail.find(')').ok_or("malformed NPY shape")?;
-        Ok(tail[..=end]
-            .trim_matches(|c| c == '(' || c == ')')
-            .to_owned())
-    } else {
-        let end = tail.find([',', '}']).unwrap_or(tail.len());
-        Ok(tail[..end].trim().to_owned())
-    }
-}
-
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES)
-}
-fn read_json(path: &Path) -> Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
 fn assert_error_contains(result: Result<(), String>, expected: &str) {
     let error = result.expect_err("mutation unexpectedly validated");
     assert!(
         error.contains(expected),
         "expected error containing {expected:?}, got {error:?}"
     );
-}
-
-fn load_npz(path: &Path) -> Result<std::collections::BTreeMap<String, NpyHeader>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mut zip = ZipArchive::new(file).map_err(|e| format!("invalid NPZ: {e}"))?;
-    let mut arrays = std::collections::BTreeMap::new();
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry
-            .name()
-            .strip_suffix(".npy")
-            .ok_or("NPZ entry is not an NPY array")?
-            .to_owned();
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        let header = parse_npy(&bytes)?;
-        if header.fortran {
-            return Err(format!("{name} uses unsupported Fortran layout"));
-        }
-        let count = header
-            .shape
-            .iter()
-            .try_fold(1usize, |n, dim| n.checked_mul(*dim))
-            .ok_or("array size overflow")?;
-        let width = if header.descr.ends_with("i8") || header.descr.ends_with("f8") {
-            8
-        } else if header.descr.ends_with("i4") || header.descr.ends_with("f4") {
-            4
-        } else {
-            0
-        };
-        if !header.descr.starts_with('[')
-            && width > 0
-            && count.checked_mul(width) != Some(header.payload.len())
-        {
-            return Err(format!(
-                "{name} payload length does not match shape and dtype"
-            ));
-        }
-        if arrays.insert(name.clone(), header).is_some() {
-            return Err(format!("duplicate array {name}"));
-        }
-    }
-    Ok(arrays)
 }
 
 fn replace_npz_entry(path: &Path, entry_name: &str, mut mutate: impl FnMut(&mut Vec<u8>)) {
@@ -570,8 +380,10 @@ fn validate_case(
     }
     let indices: Vec<usize> = finite
         .payload
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&b| i64::from_le_bytes(b))
         .map(|i| usize::try_from(i).map_err(|_| "finite_index contains negative value"))
         .collect::<Result<_, _>>()?;
     let leaf_count = indices.len();
@@ -602,8 +414,10 @@ fn validate_case(
     let finite_set: HashSet<usize> = indices.iter().copied().collect();
     for row in 0..raw_n {
         let row_is_finite = input.payload[row * input.shape[1] * 4..(row + 1) * input.shape[1] * 4]
-            .chunks_exact(4)
-            .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite());
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&b| f32::from_le_bytes(b).is_finite());
         if row_is_finite != finite_set.contains(&row) {
             return Err("finite_index does not match input finite rows".into());
         }
@@ -616,8 +430,8 @@ fn validate_case(
             return Err("neighbors shape/index contract violation".into());
         }
         let n = indices.len() as i64;
-        if neighbors.payload.chunks_exact(8).any(|b| {
-            let index = i64::from_le_bytes(b.try_into().unwrap());
+        if neighbors.payload.as_chunks::<8>().0.iter().any(|b| {
+            let index = i64::from_le_bytes(*b);
             index < -1 || index >= n
         }) {
             return Err("neighbor index outside finite-local range or upstream -1 padding".into());
@@ -645,37 +459,35 @@ fn validate_case(
         ("probabilities", "<f4", raw_n),
         ("core_distances", "<f4", indices.len()),
     ] {
-        if let Some(array) = arrays.get(name) {
-            if array.descr != dtype || array.shape != [length] {
-                return Err(format!("{name} dtype/shape contract violation"));
-            }
+        if let Some(array) = arrays.get(name)
+            && (array.descr != dtype || array.shape != [length])
+        {
+            return Err(format!("{name} dtype/shape contract violation"));
         }
     }
-    if let Some(probabilities) = arrays.get("probabilities") {
-        if probabilities.payload.chunks_exact(4).any(|b| {
-            let v = f32::from_le_bytes(b.try_into().unwrap());
+    if let Some(probabilities) = arrays.get("probabilities")
+        && probabilities.payload.as_chunks::<4>().0.iter().any(|b| {
+            let v = f32::from_le_bytes(*b);
             !v.is_finite() || !(0.0..=1.0).contains(&v)
-        }) {
-            return Err("probability outside finite [0,1] range".into());
-        }
+        })
+    {
+        return Err("probability outside finite [0,1] range".into());
     }
     for name in ["labels", "dbscan_labels", "remapped_dbscan_labels"] {
-        if let Some(labels) = arrays.get(name) {
-            if read_i64s(labels)?
+        if let Some(labels) = arrays.get(name)
+            && read_i64s(labels)?
                 .iter()
                 .any(|&label| label < -1 || label >= raw_n as i64)
-            {
-                return Err(format!("{name} contains invalid label index"));
-            }
+        {
+            return Err(format!("{name} contains invalid label index"));
         }
     }
-    if let Some(core) = arrays.get("core_distances") {
-        if read_f32s(core)?
+    if let Some(core) = arrays.get("core_distances")
+        && read_f32s(core)?
             .iter()
             .any(|&distance| distance.is_nan() || distance < 0.0)
-        {
-            return Err("core distances must be nonnegative and not NaN".into());
-        }
+    {
+        return Err("core distances must be nonnegative and not NaN".into());
     }
     if status == "reference"
         && (arrays["mst_weights"].shape != [indices.len().saturating_sub(1)]
@@ -685,14 +497,43 @@ fn validate_case(
     {
         return Err("MST/internal/remapped linkage cardinality contract violation".into());
     }
+    if let Some(mst) = arrays.get("mst") {
+        let weights = &arrays["mst_weights"];
+        if mst.descr != "<f8" || mst.shape != [weights.shape[0], 3] {
+            return Err("mst must be float64 (edges, 3) matching mst_weights".into());
+        }
+        let values: Vec<f64> = mst
+            .payload
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| f64::from_le_bytes(b))
+            .collect();
+        let expected: Vec<f64> = weights
+            .payload
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| f64::from_le_bytes(b))
+            .collect();
+        for (row, weight) in values.as_chunks::<3>().0.iter().zip(&expected) {
+            let endpoint_ok = |v: f64| v.fract() == 0.0 && v >= 0.0 && (v as usize) < indices.len();
+            if !endpoint_ok(row[0]) || !endpoint_ok(row[1]) || row[2].to_bits() != weight.to_bits()
+            {
+                return Err("mst endpoints out of range or weights differ from mst_weights".into());
+            }
+        }
+    }
     if let Some(outliers) = arrays.get("outlier_order") {
         if outliers.descr != "<i8" || outliers.shape.len() != 1 {
             return Err("outlier_order must be rank-1 int64".into());
         }
         let order: Vec<usize> = outliers
             .payload
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| i64::from_le_bytes(b))
             .map(|i| usize::try_from(i).map_err(|_| "outlier index is negative"))
             .collect::<Result<_, _>>()?;
         let expected: HashSet<usize> = (0..raw_n).filter(|i| !finite_set.contains(i)).collect();
@@ -785,8 +626,10 @@ fn validate_case(
         }
         let observed: Vec<i32> = neighbors
             .payload
-            .chunks_exact(4)
-            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| i32::from_le_bytes(bytes))
             .collect();
         if observed != [0, -1, 1, -1] {
             return Err("overflow neighbor observations differ from release contract".into());

@@ -318,8 +318,11 @@ def tie_evidence(x: np.ndarray, core: np.ndarray, mst: np.ndarray, condensed, pa
 
 def create_case(case: dict, reference: dict) -> tuple[dict, dict]:
     from fast_hdbscan import boruvka, hdbscan
-    from numba import get_num_threads
+    from numba import get_num_threads, set_num_threads
 
+    # Exact-tie MST endpoints depend on Numba thread scheduling; one thread keeps the stored
+    # sorted MST (src, dst, weight) reproducible.
+    set_num_threads(1)
     x = input_for(case)
     finite_index = np.flatnonzero(np.isfinite(x).all(axis=1)).astype(np.int64)
     clean = np.ascontiguousarray(x[finite_index], dtype=np.float32)
@@ -371,6 +374,7 @@ def create_case(case: dict, reference: dict) -> tuple[dict, dict]:
             arrays.update(
                 {
                     "mst_weights": np.empty(0, dtype=np.float64),
+                    "mst": np.empty((0, 3), dtype=np.float64),
                     "linkage": empty_linkage,
                     "condensed_tree": np.empty(
                         0,
@@ -484,6 +488,7 @@ def create_case(case: dict, reference: dict) -> tuple[dict, dict]:
         arrays.update(
             {
                 "mst_weights": np.asarray(sorted_mst[:, 2], dtype=np.float64),
+                "mst": np.asarray(sorted_mst, dtype=np.float64),
                 "linkage": np.asarray(linkage, dtype=np.float64),
                 "condensed_tree": np.asarray(hdbscan.to_numpy_rec_array(condensed)),
                 "remapped_condensed_tree": np.asarray(remapped_condensed),

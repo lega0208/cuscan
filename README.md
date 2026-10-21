@@ -316,13 +316,17 @@ not a later source checkout. Verify their provenance and semantic regeneration w
 uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --verify-provenance
 uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --check
 cargo test -p fast-hdbscan-core --test test_fixtures
+cargo test -p fast-hdbscan-core --features test-support
 ```
 
 The reference remains unpatched: upstream [PR #72](https://github.com/TutteInstitute/fast_hdbscan/pull/72)
 fixes leaf traversal in `segments_in_branch` after 0.3.2, preventing unrelated
 clusters from being dropped during epsilon selection. The fixture catalogue
 records that release behavior separately from the post-release correction.
-These fixtures do not expose an HDBSCAN estimator or Python API.
+The backend-free core implements host extraction from supplied MSTs and finite-row
+remapping. Its independent brute-force MST oracle is available only with the
+non-default `test-support` feature, not as a production execution fallback.
+There is no HDBSCAN estimator or Python API yet.
 
 ---
 
