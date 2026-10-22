@@ -337,6 +337,8 @@ fn spanning_tree(
 ) -> Result<Vec<SortedMstEdge>> {
     let n = data.dims()[0];
     let mut dsu = RankDsu::new(n);
+    #[cfg(feature = "tracing")]
+    let _boruvka_span = tracing::info_span!("boruvka_total").entered();
     let mut edges = init_from_knn(
         &core.core_sq,
         &core.neighbors,
@@ -348,16 +350,27 @@ fn spanning_tree(
         .map(|point| dsu.find(point))
         .collect::<std::collections::HashSet<_>>()
         .len();
+    let core_tensor = (component_count > 1).then(|| {
+        Tensor::<1>::from_data(TensorData::new(core.core_sq.clone(), [n]), &data.device())
+    });
     while component_count > 1 {
+        #[cfg(feature = "tracing")]
+        let _round_span = tracing::info_span!("boruvka_round", component_count).entered();
         let point_components: Vec<i32> = (0..n)
             .map(|point| i32::try_from(dsu.find(point)).expect("validated row count fits i32"))
             .collect();
-        let core_tensor =
-            Tensor::<1>::from_data(TensorData::new(core.core_sq.clone(), [n]), &data.device());
+        let core_tensor = core_tensor
+            .as_ref()
+            .expect("multiple components upload core distances")
+            .clone();
         let component_tensor = Tensor::<1, Int>::from_data(
             TensorData::new(point_components.clone(), [n]),
             &data.device(),
         );
+        #[cfg(feature = "tracing")]
+        profile_sync(&data.device())?;
+        #[cfg(feature = "tracing")]
+        let _candidate_span = tracing::info_span!("boruvka_candidates_readback").entered();
         let (candidate_distances, candidate_indices) = match search {
             HdbscanSearch::KdTree => {
                 let host_tree =
@@ -370,12 +383,18 @@ fn spanning_tree(
                 device_tree.node_components =
                     tensor_i32(node_components, [host_tree.starts.len()], &data.device())
                         .into_dispatch();
+                #[cfg(feature = "tracing")]
+                profile_sync(&data.device())?;
+                #[cfg(feature = "tracing")]
+                let _kernel_span = tracing::info_span!("boruvka_kernel").entered();
                 let (weights, destinations) = <Dispatch as HdbscanOps>::boruvka_candidates_kd(
                     data.clone().into_dispatch(),
                     core_tensor.into_dispatch(),
                     component_tensor.into_dispatch(),
                     device_tree,
                 );
+                #[cfg(feature = "tracing")]
+                profile_sync(&data.device())?;
                 (weights, destinations)
             }
             HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
@@ -394,6 +413,8 @@ fn spanning_tree(
             .to_data()
             .try_to_vec::<i32>()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
+        #[cfg(feature = "tracing")]
+        drop(_candidate_span);
         merge_components(
             &mut dsu,
             &point_components,

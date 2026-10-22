@@ -1,3 +1,4 @@
+//! Set `FAST_HDBSCAN_KD_DIAGNOSTICS=1` to emit counters when built with `tracing`.
 use crate::backend::DeviceKdTree;
 use burn::{
     backend::{
@@ -9,6 +10,8 @@ use burn::{
     tensor::{DType, Shape},
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
+
+use burn_cubecl::ops::into_data_sync;
 
 const KD_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 const KD_STACK_LEN: usize = 33;
@@ -65,77 +68,107 @@ fn kd_candidates_kernel<F: Float, I: Int>(
     bounds_min: &Tensor<F>,
     bounds_max: &Tensor<F>,
     node_components: &Tensor<I>,
-    levels: u32,
-    row_offset: u32,
     row_count: u32,
+    #[comptime] diagnostics_enabled: bool,
     out_weights: &mut Tensor<F>,
     out_indices: &mut Tensor<I>,
+    diagnostics: &mut Tensor<I>,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
-    let local_row = ABSOLUTE_POS_X as usize;
-    let row = local_row + row_offset as usize;
-    if local_row < row_count as usize && row < data.shape(0) {
-        let n = data.shape(0);
-        let component = components[row];
-        let core = core_sq[row];
-        let mut best = F::new(f32::INFINITY);
-        let mut best_index = n;
-        let mut stack = Array::<u32>::new(KD_STACK_LEN);
-        stack[0] = 0;
-        let mut stack_len = 1usize;
-        while stack_len > 0 {
-            stack_len -= 1;
-            let node = stack[stack_len] as usize;
-            let lower = F::max(
-                box_lower_bound(data, bounds_min, bounds_max, row, node),
-                core,
-            );
-            if lower <= best && node_components[node] != component {
-                if is_leaf[node] != I::cast_from(0) {
-                    let start = u32::cast_from(starts[node]) as usize;
-                    let end = u32::cast_from(ends[node]) as usize;
-                    for position in start..end {
-                        let candidate = u32::cast_from(indices[position]) as usize;
-                        if components[candidate] != component {
-                            let d = data.shape(1);
-                            let mut distance = F::new(0.0f32);
-                            for feature in 0..d {
-                                let delta = data[row * d + feature] - data[candidate * d + feature];
-                                distance += delta * delta;
+    let mut local_row = ABSOLUTE_POS_X as usize;
+    let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
+    while local_row < row_count as usize {
+        if local_row < data.shape(0) {
+            let row = local_row;
+            let n = data.shape(0);
+            let component = components[row];
+            let core = core_sq[row];
+            let mut best = F::new(f32::INFINITY);
+            let mut best_index = n;
+            let mut stack = Array::<u32>::new(KD_STACK_LEN);
+            let mut bound_stack = Array::<F>::new(KD_STACK_LEN);
+            stack[0] = 0;
+            bound_stack[0] = F::max(box_lower_bound(data, bounds_min, bounds_max, row, 0), core);
+            let mut stack_len = 1usize;
+            let mut nodes_popped = 0i32;
+            let mut leaf_positions_scanned = 0i32;
+            while stack_len > 0 {
+                stack_len -= 1;
+                if comptime![diagnostics_enabled] {
+                    nodes_popped += 1i32;
+                }
+                let node = stack[stack_len] as usize;
+                let lower = bound_stack[stack_len];
+                if lower <= best && node_components[node] != component {
+                    if is_leaf[node] != I::cast_from(0) {
+                        let start = u32::cast_from(starts[node]) as usize;
+                        let end = u32::cast_from(ends[node]) as usize;
+                        for position in start..end {
+                            if comptime![diagnostics_enabled] {
+                                leaf_positions_scanned += 1i32;
                             }
-                            let weight = F::max(F::max(distance, core), core_sq[candidate]);
-                            if weight < best || (weight == best && candidate < best_index) {
-                                best = weight;
-                                best_index = candidate;
+                            let candidate = u32::cast_from(indices[position]) as usize;
+                            if components[candidate] != component {
+                                let d = data.shape(1);
+                                let mut distance = F::new(0.0f32);
+                                for feature in 0..d {
+                                    let delta =
+                                        data[row * d + feature] - data[candidate * d + feature];
+                                    distance += delta * delta;
+                                }
+                                let weight = F::max(F::max(distance, core), core_sq[candidate]);
+                                if weight < best || (weight == best && candidate < best_index) {
+                                    best = weight;
+                                    best_index = candidate;
+                                }
+                            }
+                        }
+                    } else {
+                        let left = 2 * node + 1;
+                        let right = left + 1;
+                        let left_bound = F::max(
+                            box_lower_bound(data, bounds_min, bounds_max, row, left),
+                            core,
+                        );
+                        let right_bound = F::max(
+                            box_lower_bound(data, bounds_min, bounds_max, row, right),
+                            core,
+                        );
+                        // Push farther first so the nearer child is popped first; left wins equal bounds.
+                        if left_bound <= right_bound {
+                            if right_bound <= best {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
+                            }
+                            if left_bound <= best {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                        } else {
+                            if left_bound <= best {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                            if right_bound <= best {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
                             }
                         }
                     }
-                } else {
-                    let left = 2 * node + 1;
-                    let right = left + 1;
-                    let left_bound = F::max(
-                        box_lower_bound(data, bounds_min, bounds_max, row, left),
-                        core,
-                    );
-                    let right_bound = F::max(
-                        box_lower_bound(data, bounds_min, bounds_max, row, right),
-                        core,
-                    );
-                    // Push farther first so the nearer child is popped first; left wins equal bounds.
-                    if left_bound <= right_bound {
-                        stack[stack_len] = right as u32;
-                        stack[stack_len + 1] = left as u32;
-                    } else {
-                        stack[stack_len] = left as u32;
-                        stack[stack_len + 1] = right as u32;
-                    }
-                    stack_len += 2;
                 }
             }
+            out_weights[row] = best;
+            out_indices[row] = I::cast_from(best_index);
+            if comptime![diagnostics_enabled] {
+                diagnostics[row * 2] = I::cast_from(nodes_popped);
+                diagnostics[row * 2 + 1] = I::cast_from(leaf_positions_scanned);
+            }
         }
-        out_weights[row] = best;
-        out_indices[row] = I::cast_from(best_index);
-        let _ = levels;
+        local_row += row_stride;
     }
 }
 
@@ -148,162 +181,197 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
     is_leaf: &Tensor<I>,
     bounds_min: &Tensor<F>,
     bounds_max: &Tensor<F>,
-    levels: u32,
-    row_offset: u32,
     row_count: u32,
     k: u32,
+    #[comptime] diagnostics_enabled: bool,
     out_indices: &mut Tensor<I>,
     out_distances: &mut Tensor<F>,
+    diagnostics: &mut Tensor<I>,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
-    let local_row = ABSOLUTE_POS_X as usize;
-    let row = local_row + row_offset as usize;
-    if local_row < row_count as usize && row < data.shape(0) {
-        let n = data.shape(0);
-        let width = k as usize;
-        for slot in 0..width {
-            out_indices[row * width + slot] = I::cast_from(n);
-            out_distances[row * width + slot] = F::new(f32::INFINITY);
-        }
-        let mut stack = Array::<u32>::new(KD_STACK_LEN);
-        stack[0] = 0;
-        let mut stack_len = 1usize;
-        while stack_len > 0 {
-            stack_len -= 1;
-            let node = stack[stack_len] as usize;
-            let worst = out_distances[row * width];
-            if box_lower_bound(data, bounds_min, bounds_max, row, node) <= worst {
-                if is_leaf[node] != I::cast_from(0) {
-                    let start = u32::cast_from(starts[node]) as usize;
-                    let end = u32::cast_from(ends[node]) as usize;
-                    for position in start..end {
-                        let candidate = u32::cast_from(indices[position]) as usize;
-                        if candidate != row {
-                            let d = data.shape(1);
-                            let mut distance = F::new(0.0f32);
-                            for feature in 0..d {
-                                let delta = data[row * d + feature] - data[candidate * d + feature];
-                                distance += delta * delta;
+    let mut local_row = ABSOLUTE_POS_X as usize;
+    let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
+    while local_row < row_count as usize {
+        if local_row < data.shape(0) {
+            let row = local_row;
+            let n = data.shape(0);
+            let width = k as usize;
+            for slot in 0..width {
+                out_indices[row * width + slot] = I::cast_from(n);
+                out_distances[row * width + slot] = F::new(f32::INFINITY);
+            }
+            let mut stack = Array::<u32>::new(KD_STACK_LEN);
+            let mut bound_stack = Array::<F>::new(KD_STACK_LEN);
+            stack[0] = 0;
+            bound_stack[0] = box_lower_bound(data, bounds_min, bounds_max, row, 0);
+            let mut stack_len = 1usize;
+            let mut nodes_popped = 0i32;
+            let mut leaf_positions_scanned = 0i32;
+            while stack_len > 0 {
+                stack_len -= 1;
+                if comptime![diagnostics_enabled] {
+                    nodes_popped += 1i32;
+                }
+                let node = stack[stack_len] as usize;
+                let worst = out_distances[row * width];
+                let lower = bound_stack[stack_len];
+                if lower <= worst {
+                    if is_leaf[node] != I::cast_from(0) {
+                        let start = u32::cast_from(starts[node]) as usize;
+                        let end = u32::cast_from(ends[node]) as usize;
+                        for position in start..end {
+                            if comptime![diagnostics_enabled] {
+                                leaf_positions_scanned += 1i32;
                             }
-                            let root = row * width;
-                            let worst_index = u32::cast_from(out_indices[root]) as usize;
-                            if distance < out_distances[root]
-                                || (distance == out_distances[root] && candidate < worst_index)
-                            {
-                                out_distances[root] = distance;
-                                out_indices[root] = I::cast_from(candidate);
-                                let mut parent = 0usize;
-                                let mut heap = true;
-                                while heap && parent < width / 2 {
-                                    let left = parent * 2 + 1;
-                                    let right = left + 1;
-                                    let mut largest = left;
-                                    if right < width {
-                                        let left_at = row * width + left;
-                                        let right_at = row * width + right;
-                                        let left_index =
-                                            u32::cast_from(out_indices[left_at]) as usize;
-                                        let right_index =
-                                            u32::cast_from(out_indices[right_at]) as usize;
-                                        if out_distances[right_at] > out_distances[left_at]
-                                            || (out_distances[right_at] == out_distances[left_at]
-                                                && right_index > left_index)
-                                        {
-                                            largest = right;
+                            let candidate = u32::cast_from(indices[position]) as usize;
+                            if candidate != row {
+                                let d = data.shape(1);
+                                let mut distance = F::new(0.0f32);
+                                for feature in 0..d {
+                                    let delta =
+                                        data[row * d + feature] - data[candidate * d + feature];
+                                    distance += delta * delta;
+                                }
+                                let root = row * width;
+                                let worst_index = u32::cast_from(out_indices[root]) as usize;
+                                if distance < out_distances[root]
+                                    || (distance == out_distances[root] && candidate < worst_index)
+                                {
+                                    out_distances[root] = distance;
+                                    out_indices[root] = I::cast_from(candidate);
+                                    let mut parent = 0usize;
+                                    let mut heap = true;
+                                    while heap && parent < width / 2 {
+                                        let left = parent * 2 + 1;
+                                        let right = left + 1;
+                                        let mut largest = left;
+                                        if right < width {
+                                            let left_at = row * width + left;
+                                            let right_at = row * width + right;
+                                            let left_index =
+                                                u32::cast_from(out_indices[left_at]) as usize;
+                                            let right_index =
+                                                u32::cast_from(out_indices[right_at]) as usize;
+                                            if out_distances[right_at] > out_distances[left_at]
+                                                || (out_distances[right_at]
+                                                    == out_distances[left_at]
+                                                    && right_index > left_index)
+                                            {
+                                                largest = right;
+                                            }
                                         }
-                                    }
-                                    let parent_at = row * width + parent;
-                                    let child_at = row * width + largest;
-                                    let parent_index =
-                                        u32::cast_from(out_indices[parent_at]) as usize;
-                                    let child_index =
-                                        u32::cast_from(out_indices[child_at]) as usize;
-                                    if out_distances[parent_at] > out_distances[child_at]
-                                        || (out_distances[parent_at] == out_distances[child_at]
-                                            && parent_index >= child_index)
-                                    {
-                                        heap = false;
-                                    } else {
-                                        let parent_distance = out_distances[parent_at];
-                                        let parent_index = out_indices[parent_at];
-                                        out_distances[parent_at] = out_distances[child_at];
-                                        out_indices[parent_at] = out_indices[child_at];
-                                        out_distances[child_at] = parent_distance;
-                                        out_indices[child_at] = parent_index;
-                                        parent = largest;
+                                        let parent_at = row * width + parent;
+                                        let child_at = row * width + largest;
+                                        let parent_index =
+                                            u32::cast_from(out_indices[parent_at]) as usize;
+                                        let child_index =
+                                            u32::cast_from(out_indices[child_at]) as usize;
+                                        if out_distances[parent_at] > out_distances[child_at]
+                                            || (out_distances[parent_at] == out_distances[child_at]
+                                                && parent_index >= child_index)
+                                        {
+                                            heap = false;
+                                        } else {
+                                            let parent_distance = out_distances[parent_at];
+                                            let parent_index = out_indices[parent_at];
+                                            out_distances[parent_at] = out_distances[child_at];
+                                            out_indices[parent_at] = out_indices[child_at];
+                                            out_distances[child_at] = parent_distance;
+                                            out_indices[child_at] = parent_index;
+                                            parent = largest;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                } else {
-                    let left = 2 * node + 1;
-                    let right = left + 1;
-                    let left_bound = box_lower_bound(data, bounds_min, bounds_max, row, left);
-                    let right_bound = box_lower_bound(data, bounds_min, bounds_max, row, right);
-                    if left_bound <= right_bound {
-                        stack[stack_len] = right as u32;
-                        stack[stack_len + 1] = left as u32;
                     } else {
-                        stack[stack_len] = left as u32;
-                        stack[stack_len + 1] = right as u32;
+                        let left = 2 * node + 1;
+                        let right = left + 1;
+                        let left_bound = box_lower_bound(data, bounds_min, bounds_max, row, left);
+                        let right_bound = box_lower_bound(data, bounds_min, bounds_max, row, right);
+                        if left_bound <= right_bound {
+                            if right_bound <= out_distances[row * width] {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
+                            }
+                            if left_bound <= out_distances[row * width] {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                        } else {
+                            if left_bound <= out_distances[row * width] {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                            if right_bound <= out_distances[row * width] {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
+                            }
+                        }
                     }
-                    stack_len += 2;
                 }
             }
-        }
-        // In-place heapsort turns the output-backed max-heap into ascending order.
-        let mut heap_len = width;
-        while heap_len > 1 {
-            let root = row * width;
-            let last = row * width + heap_len - 1;
-            let root_distance = out_distances[root];
-            let root_index = out_indices[root];
-            out_distances[root] = out_distances[last];
-            out_indices[root] = out_indices[last];
-            out_distances[last] = root_distance;
-            out_indices[last] = root_index;
-            heap_len -= 1;
+            if comptime![diagnostics_enabled] {
+                diagnostics[row * 2] = I::cast_from(nodes_popped);
+                diagnostics[row * 2 + 1] = I::cast_from(leaf_positions_scanned);
+            }
+            // In-place heapsort turns the output-backed max-heap into ascending order.
+            let mut heap_len = width;
+            while heap_len > 1 {
+                let root = row * width;
+                let last = row * width + heap_len - 1;
+                let root_distance = out_distances[root];
+                let root_index = out_indices[root];
+                out_distances[root] = out_distances[last];
+                out_indices[root] = out_indices[last];
+                out_distances[last] = root_distance;
+                out_indices[last] = root_index;
+                heap_len -= 1;
 
-            let mut parent = 0usize;
-            let mut heap = true;
-            while heap && parent < heap_len / 2 {
-                let left = parent * 2 + 1;
-                let right = left + 1;
-                let mut largest = left;
-                if right < heap_len {
-                    let left_at = row * width + left;
-                    let right_at = row * width + right;
-                    let left_index = u32::cast_from(out_indices[left_at]) as usize;
-                    let right_index = u32::cast_from(out_indices[right_at]) as usize;
-                    if out_distances[right_at] > out_distances[left_at]
-                        || (out_distances[right_at] == out_distances[left_at]
-                            && right_index > left_index)
-                    {
-                        largest = right;
+                let mut parent = 0usize;
+                let mut heap = true;
+                while heap && parent < heap_len / 2 {
+                    let left = parent * 2 + 1;
+                    let right = left + 1;
+                    let mut largest = left;
+                    if right < heap_len {
+                        let left_at = row * width + left;
+                        let right_at = row * width + right;
+                        let left_index = u32::cast_from(out_indices[left_at]) as usize;
+                        let right_index = u32::cast_from(out_indices[right_at]) as usize;
+                        if out_distances[right_at] > out_distances[left_at]
+                            || (out_distances[right_at] == out_distances[left_at]
+                                && right_index > left_index)
+                        {
+                            largest = right;
+                        }
                     }
-                }
-                let parent_at = row * width + parent;
-                let child_at = row * width + largest;
-                let parent_index = u32::cast_from(out_indices[parent_at]) as usize;
-                let child_index = u32::cast_from(out_indices[child_at]) as usize;
-                if out_distances[parent_at] > out_distances[child_at]
-                    || (out_distances[parent_at] == out_distances[child_at]
-                        && parent_index >= child_index)
-                {
-                    heap = false;
-                } else {
-                    let parent_distance = out_distances[parent_at];
-                    let parent_index = out_indices[parent_at];
-                    out_distances[parent_at] = out_distances[child_at];
-                    out_indices[parent_at] = out_indices[child_at];
-                    out_distances[child_at] = parent_distance;
-                    out_indices[child_at] = parent_index;
-                    parent = largest;
+                    let parent_at = row * width + parent;
+                    let child_at = row * width + largest;
+                    let parent_index = u32::cast_from(out_indices[parent_at]) as usize;
+                    let child_index = u32::cast_from(out_indices[child_at]) as usize;
+                    if out_distances[parent_at] > out_distances[child_at]
+                        || (out_distances[parent_at] == out_distances[child_at]
+                            && parent_index >= child_index)
+                    {
+                        heap = false;
+                    } else {
+                        let parent_distance = out_distances[parent_at];
+                        let parent_index = out_indices[parent_at];
+                        out_distances[parent_at] = out_distances[child_at];
+                        out_indices[parent_at] = out_indices[child_at];
+                        out_distances[child_at] = parent_distance;
+                        out_indices[child_at] = parent_index;
+                        parent = largest;
+                    }
                 }
             }
         }
-        let _ = levels;
+        local_row += row_stride;
     }
 }
 
@@ -312,12 +380,33 @@ fn launch_count(rows: usize, dim: u32, max_cubes: u32) -> u32 {
         .expect("bounded KD launch count")
 }
 
+fn kd_launch_geometry(client: &cubecl::client::Client, rows: usize) -> (CubeCount, CubeDim) {
+    let hardware = &client.properties().hardware;
+    let (dim, max_cubes) = if let Some(cores) = hardware.num_cpu_cores {
+        (
+            fast_cubecl_common::legal_cube_dim(client, CubeDim::new_1d(cores.max(1))),
+            1,
+        )
+    } else {
+        (
+            fast_cubecl_common::legal_cube_dim(client, KD_CUBE_DIM),
+            hardware.max_cube_count.0,
+        )
+    };
+    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
+    (
+        CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
+        dim,
+    )
+}
+
 fn validate_tree(data: &FloatTensor<CubeBackend>, tree: &DeviceKdTree<CubeBackend>) {
     let [rows, features] = data.shape().dims::<2>();
     let [index_count] = tree.indices.shape().dims::<1>();
     let [nodes] = tree.starts.shape().dims::<1>();
     assert!(rows > 0 && features > 0, "KD input data must be non-empty");
     i32::try_from(rows).expect("KD row count must fit destination indices");
+    i32::try_from(nodes).expect("KD node count must fit diagnostic counters");
     assert_eq!(data.dtype, DType::F32, "KD data must be f32");
     assert_eq!(
         tree.indices.dtype,
@@ -389,40 +478,42 @@ pub(super) fn boruvka_candidates_kd(
         DType::I32,
         "KD component labels must be i32"
     );
+    let diagnostics_enabled = kd_diagnostics_enabled();
     let weights = allocate_float(&data, n);
     let destinations = allocate_int(&data, n);
+    let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
     let client = data.client.clone();
-    let dim = fast_cubecl_common::legal_cube_dim(&client, KD_CUBE_DIM);
-    let max_cubes = client.properties().hardware.max_cube_count.0;
-    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
-    let rows_per_launch = (dim.x as usize)
-        .checked_mul(max_cubes as usize)
-        .expect("KD launch capacity fits usize");
-    for row_offset in (0..n).step_by(rows_per_launch) {
-        let rows = rows_per_launch.min(n - row_offset);
-        kd_candidates_kernel::launch(
-            &client,
-            CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
-            dim,
-            data.clone().into_tensor_arg(),
-            core_sq.clone().into_tensor_arg(),
-            point_components.clone().into_tensor_arg(),
-            tree.indices.clone().into_tensor_arg(),
-            tree.starts.clone().into_tensor_arg(),
-            tree.ends.clone().into_tensor_arg(),
-            tree.is_leaf.clone().into_tensor_arg(),
-            tree.bounds_min.clone().into_tensor_arg(),
-            tree.bounds_max.clone().into_tensor_arg(),
-            tree.node_components.clone().into_tensor_arg(),
-            u32::try_from(tree.n_levels).expect("validated KD tree level count"),
-            u32::try_from(row_offset).expect("validated KD row offset"),
-            u32::try_from(rows).expect("validated KD launch row count"),
-            weights.clone().into_tensor_arg(),
-            destinations.clone().into_tensor_arg(),
-            [
-                dtype_to_storage_type(DType::F32),
-                dtype_to_storage_type(DType::I32),
-            ],
+    let (cube_count, dim) = kd_launch_geometry(&client, n);
+    kd_candidates_kernel::launch(
+        &client,
+        cube_count,
+        dim,
+        data.clone().into_tensor_arg(),
+        core_sq.clone().into_tensor_arg(),
+        point_components.clone().into_tensor_arg(),
+        tree.indices.clone().into_tensor_arg(),
+        tree.starts.clone().into_tensor_arg(),
+        tree.ends.clone().into_tensor_arg(),
+        tree.is_leaf.clone().into_tensor_arg(),
+        tree.bounds_min.clone().into_tensor_arg(),
+        tree.bounds_max.clone().into_tensor_arg(),
+        tree.node_components.clone().into_tensor_arg(),
+        u32::try_from(n).expect("validated KD row count"),
+        diagnostics_enabled,
+        weights.clone().into_tensor_arg(),
+        destinations.clone().into_tensor_arg(),
+        diagnostics.clone().into_tensor_arg(),
+        [
+            dtype_to_storage_type(DType::F32),
+            dtype_to_storage_type(DType::I32),
+        ],
+    );
+    if diagnostics_enabled {
+        emit_kd_diagnostics(
+            "kd_candidates",
+            diagnostics,
+            n,
+            tree.starts.shape().dims::<1>()[0],
         );
     }
     (weights, destinations)
@@ -443,39 +534,139 @@ pub(super) fn exact_neighbors_kd(
         .expect("KD neighbor output size overflow");
     let output_indices = allocate_int_2d(&data, n, k as usize, output_len);
     let output_distances = allocate_float_2d(&data, n, k as usize, output_len);
+    let diagnostics_enabled = kd_diagnostics_enabled();
+    let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
     let client = data.client.clone();
-    let dim = fast_cubecl_common::legal_cube_dim(&client, KD_CUBE_DIM);
-    let max_cubes = client.properties().hardware.max_cube_count.0;
-    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
-    let rows_per_launch = (dim.x as usize)
-        .checked_mul(max_cubes as usize)
-        .expect("KD launch capacity fits usize");
-    for row_offset in (0..n).step_by(rows_per_launch) {
-        let rows = rows_per_launch.min(n - row_offset);
-        kd_neighbors_kernel::launch(
-            &client,
-            CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
-            dim,
-            data.clone().into_tensor_arg(),
-            tree.indices.clone().into_tensor_arg(),
-            tree.starts.clone().into_tensor_arg(),
-            tree.ends.clone().into_tensor_arg(),
-            tree.is_leaf.clone().into_tensor_arg(),
-            tree.bounds_min.clone().into_tensor_arg(),
-            tree.bounds_max.clone().into_tensor_arg(),
-            u32::try_from(tree.n_levels).expect("validated KD tree level count"),
-            u32::try_from(row_offset).expect("validated KD row offset"),
-            u32::try_from(rows).expect("validated KD launch row count"),
-            k,
-            output_indices.clone().into_tensor_arg(),
-            output_distances.clone().into_tensor_arg(),
-            [
-                dtype_to_storage_type(DType::F32),
-                dtype_to_storage_type(DType::I32),
-            ],
+    let (cube_count, dim) = kd_launch_geometry(&client, n);
+    kd_neighbors_kernel::launch(
+        &client,
+        cube_count,
+        dim,
+        data.clone().into_tensor_arg(),
+        tree.indices.clone().into_tensor_arg(),
+        tree.starts.clone().into_tensor_arg(),
+        tree.ends.clone().into_tensor_arg(),
+        tree.is_leaf.clone().into_tensor_arg(),
+        tree.bounds_min.clone().into_tensor_arg(),
+        tree.bounds_max.clone().into_tensor_arg(),
+        u32::try_from(n).expect("validated KD row count"),
+        k,
+        diagnostics_enabled,
+        output_indices.clone().into_tensor_arg(),
+        output_distances.clone().into_tensor_arg(),
+        diagnostics.clone().into_tensor_arg(),
+        [
+            dtype_to_storage_type(DType::F32),
+            dtype_to_storage_type(DType::I32),
+        ],
+    );
+    if diagnostics_enabled {
+        emit_kd_diagnostics(
+            "kd_neighbors",
+            diagnostics,
+            n,
+            tree.starts.shape().dims::<1>()[0],
         );
     }
     (output_indices, output_distances)
+}
+
+fn kd_diagnostics_enabled() -> bool {
+    cfg!(feature = "tracing")
+        && std::env::var_os("FAST_HDBSCAN_KD_DIAGNOSTICS")
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|value| value == "1")
+}
+
+fn allocate_diagnostics(
+    data: &FloatTensor<CubeBackend>,
+    rows: usize,
+    enabled: bool,
+) -> IntTensor<CubeBackend> {
+    let elements = if enabled {
+        rows.checked_mul(2)
+            .expect("KD diagnostic element count overflow")
+    } else {
+        1
+    };
+    CubeTensor::new_contiguous(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([elements]),
+        data.client.empty(
+            elements
+                .checked_mul(DType::I32.size())
+                .expect("KD diagnostic allocation overflow"),
+        ),
+        DType::I32,
+    )
+}
+
+fn emit_kd_diagnostics(
+    operation: &str,
+    tensor: IntTensor<CubeBackend>,
+    rows: usize,
+    node_count: usize,
+) {
+    let counts = into_data_sync(tensor)
+        .try_to_vec::<i32>()
+        .expect("KD diagnostic output must be a contiguous i32 buffer");
+    assert_eq!(
+        counts.len(),
+        rows.checked_mul(2).expect("KD diagnostic size overflow")
+    );
+    let mut nodes_popped = Vec::with_capacity(rows);
+    let mut leaf_positions_scanned = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let popped = u32::try_from(counts[row * 2]).expect("KD node pop count must fit u32");
+        let scanned = u32::try_from(counts[row * 2 + 1]).expect("KD leaf scan count must fit u32");
+        assert!(
+            popped as usize <= node_count,
+            "KD node pop count exceeds tree size"
+        );
+        assert!(
+            scanned as usize <= rows,
+            "KD leaf scan count exceeds point count"
+        );
+        nodes_popped.push(popped);
+        leaf_positions_scanned.push(scanned);
+    }
+    let popped = summarize_counts(&nodes_popped);
+    let scanned = summarize_counts(&leaf_positions_scanned);
+    eprintln!(
+        "{{\"operation\":\"{operation}\",\"rows\":{rows},\"nodes_popped\":{{\"total\":{},\"min\":{},\"max\":{},\"per_row\":{:?}}},\"leaf_positions_scanned\":{{\"total\":{},\"min\":{},\"max\":{},\"per_row\":{:?}}}}}",
+        popped.total,
+        popped.min,
+        popped.max,
+        nodes_popped,
+        scanned.total,
+        scanned.min,
+        scanned.max,
+        leaf_positions_scanned,
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CountSummary {
+    total: u64,
+    min: u32,
+    max: u32,
+}
+
+fn summarize_counts(counts: &[u32]) -> CountSummary {
+    assert!(
+        !counts.is_empty(),
+        "KD diagnostics require at least one row"
+    );
+    let total = counts
+        .iter()
+        .try_fold(0u64, |total, &count| total.checked_add(u64::from(count)))
+        .expect("KD diagnostic total overflow");
+    CountSummary {
+        total,
+        min: *counts.iter().min().expect("non-empty counts"),
+        max: *counts.iter().max().expect("non-empty counts"),
+    }
 }
 
 fn allocate_float(data: &FloatTensor<CubeBackend>, rows: usize) -> FloatTensor<CubeBackend> {
@@ -543,9 +734,238 @@ fn allocate_int_2d(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::ops::FloatTensorOps;
+    use burn::backend::ops::{FloatTensorOps, IntTensorOps};
     use burn::tensor::TensorData;
     use burn_cubecl::{CubeDevice, ops::into_data_sync};
+
+    #[test]
+    fn kd_diagnostic_distribution_reports_totals_and_bounds() {
+        assert_eq!(
+            summarize_counts(&[0, 3, 7, 3]),
+            CountSummary {
+                total: 13,
+                min: 0,
+                max: 7,
+            }
+        );
+        assert_eq!(
+            summarize_counts(&[i32::MAX as u32, 0]),
+            CountSummary {
+                total: i32::MAX as u64,
+                min: 0,
+                max: i32::MAX as u32,
+            }
+        );
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn kd_neighbors_enabled_diagnostics_match_disabled_launch() {
+        let device = CubeDevice::Cpu(Default::default());
+        let rows = 9usize;
+        let features = 2usize;
+        let values = (0..rows)
+            .flat_map(|row| [row as f32, (row % 3) as f32])
+            .collect::<Vec<_>>();
+        let host_tree = fast_hdbscan_core::kdtree::KdTree::build(&values, rows, features).unwrap();
+        let input = into_contiguous(CubeBackend::float_from_data(
+            TensorData::new(values, [rows, features]),
+            &device,
+        ));
+        let tree = |values: Vec<i32>, shape: [usize; 1]| {
+            into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(values, shape),
+                &device,
+            ))
+        };
+        let indices = tree(host_tree.indices.clone(), [rows]);
+        let starts = tree(host_tree.starts.clone(), [host_tree.starts.len()]);
+        let ends = tree(host_tree.ends.clone(), [host_tree.ends.len()]);
+        let leaves = tree(host_tree.is_leaf.clone(), [host_tree.is_leaf.len()]);
+        let bounds_min = into_contiguous(CubeBackend::float_from_data(
+            TensorData::new(
+                host_tree.bounds_min.clone(),
+                [host_tree.starts.len(), features],
+            ),
+            &device,
+        ));
+        let bounds_max = into_contiguous(CubeBackend::float_from_data(
+            TensorData::new(
+                host_tree.bounds_max.clone(),
+                [host_tree.starts.len(), features],
+            ),
+            &device,
+        ));
+        let k = 3usize;
+        let make_output = || {
+            CubeTensor::new_contiguous(
+                input.client.clone(),
+                input.device.clone(),
+                Shape::new([rows, k]),
+                input.client.empty(rows * k * DType::I32.size()),
+                DType::I32,
+            )
+        };
+        let make_distances = || {
+            CubeTensor::new_contiguous(
+                input.client.clone(),
+                input.device.clone(),
+                Shape::new([rows, k]),
+                input.client.empty(rows * k * DType::F32.size()),
+                DType::F32,
+            )
+        };
+        let enabled_indices = make_output();
+        let enabled_distances = make_distances();
+        let enabled_counts = allocate_diagnostics(&input, rows, true);
+        let client = input.client.clone();
+        let (cube_count, dim) = kd_launch_geometry(&client, rows);
+        let launch = |diagnostics_enabled,
+                      output_indices: &CubeTensor,
+                      output_distances: &CubeTensor,
+                      diagnostics: &CubeTensor| {
+            kd_neighbors_kernel::launch(
+                &client,
+                cube_count.clone(),
+                dim,
+                input.clone().into_tensor_arg(),
+                indices.clone().into_tensor_arg(),
+                starts.clone().into_tensor_arg(),
+                ends.clone().into_tensor_arg(),
+                leaves.clone().into_tensor_arg(),
+                bounds_min.clone().into_tensor_arg(),
+                bounds_max.clone().into_tensor_arg(),
+                rows as u32,
+                k as u32,
+                diagnostics_enabled,
+                output_indices.clone().into_tensor_arg(),
+                output_distances.clone().into_tensor_arg(),
+                diagnostics.clone().into_tensor_arg(),
+                [
+                    dtype_to_storage_type(DType::F32),
+                    dtype_to_storage_type(DType::I32),
+                ],
+            );
+        };
+        launch(true, &enabled_indices, &enabled_distances, &enabled_counts);
+        let disabled_indices = make_output();
+        let disabled_distances = make_distances();
+        let disabled_counts = allocate_diagnostics(&input, rows, false);
+        launch(
+            false,
+            &disabled_indices,
+            &disabled_distances,
+            &disabled_counts,
+        );
+
+        assert_eq!(
+            into_data_sync(enabled_indices).try_to_vec::<i32>().unwrap(),
+            into_data_sync(disabled_indices)
+                .try_to_vec::<i32>()
+                .unwrap()
+        );
+        assert_eq!(
+            into_data_sync(enabled_distances)
+                .try_to_vec::<f32>()
+                .unwrap(),
+            into_data_sync(disabled_distances)
+                .try_to_vec::<f32>()
+                .unwrap()
+        );
+        let counts = into_data_sync(enabled_counts).try_to_vec::<i32>().unwrap();
+        assert_eq!(counts.len(), rows * 2);
+        for pair in counts.chunks_exact(2) {
+            assert!(pair[0] > 0 && pair[0] as usize <= host_tree.starts.len());
+            assert!(pair[1] >= 0 && pair[1] as usize <= rows);
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn validate_tree_rejects_levels_and_malformed_shapes() {
+        let device = CubeDevice::Cpu(Default::default());
+        let rows = 4usize;
+        let features = 2usize;
+        let host = fast_hdbscan_core::kdtree::KdTree::build(
+            &[0., 0., 1., 0., 0., 1., 1., 1.],
+            rows,
+            features,
+        )
+        .unwrap();
+        let data = into_contiguous(CubeBackend::float_from_data(
+            TensorData::new(vec![0.0f32, 0., 1., 0., 0., 1., 1., 1.], [rows, features]),
+            &device,
+        ));
+        let make_tree = || DeviceKdTree {
+            indices: CubeBackend::int_from_data(
+                TensorData::new(host.indices.clone(), [rows]),
+                &device,
+            ),
+            starts: CubeBackend::int_from_data(
+                TensorData::new(host.starts.clone(), [host.starts.len()]),
+                &device,
+            ),
+            ends: CubeBackend::int_from_data(
+                TensorData::new(host.ends.clone(), [host.ends.len()]),
+                &device,
+            ),
+            is_leaf: CubeBackend::int_from_data(
+                TensorData::new(host.is_leaf.clone(), [host.is_leaf.len()]),
+                &device,
+            ),
+            bounds_min: CubeBackend::float_from_data(
+                TensorData::new(host.bounds_min.clone(), [host.starts.len(), features]),
+                &device,
+            ),
+            bounds_max: CubeBackend::float_from_data(
+                TensorData::new(host.bounds_max.clone(), [host.starts.len(), features]),
+                &device,
+            ),
+            node_components: CubeBackend::int_from_data(
+                TensorData::new(vec![-1; host.starts.len()], [host.starts.len()]),
+                &device,
+            ),
+            n_levels: 32,
+            n_features: features,
+        };
+        let base = make_tree();
+        validate_tree(&data, &base);
+        for invalid_levels in [33, usize::MAX] {
+            let mut malformed = make_tree();
+            malformed.n_levels = invalid_levels;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validate_tree(
+                    &data, &malformed
+                )))
+                .is_err()
+            );
+        }
+        let mut bad_bounds = make_tree();
+        bad_bounds.bounds_min = CubeBackend::float_from_data(
+            TensorData::new(
+                vec![0.0f32; host.starts.len() * (features - 1)],
+                [host.starts.len(), features - 1],
+            ),
+            &device,
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validate_tree(
+                &data,
+                &bad_bounds
+            )))
+            .is_err()
+        );
+        let mut bad_indices = make_tree();
+        bad_indices.indices =
+            CubeBackend::int_from_data(TensorData::new(vec![0; rows - 1], [rows - 1]), &device);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validate_tree(
+                &data,
+                &bad_indices
+            )))
+            .is_err()
+        );
+    }
 
     fn verify_box_bounds(device: &CubeDevice) {
         let rows = 81usize;

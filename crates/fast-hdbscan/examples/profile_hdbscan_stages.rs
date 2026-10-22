@@ -1,6 +1,6 @@
 //! Per-stage HDBSCAN fit timing companion to comparison/compare_hdbscan_stages.py.
 //!
-//! Runs without warmup; the first fit includes process-cold kernel compilation.
+//! Performs one excluded warmup before the requested measured fits.
 //! Prints one JSON line with fit and native stage durations in seconds.
 
 use fast_hdbscan::{BackendChoice, ClusterSelectionMethod, HDBSCAN, HdbscanConfig, HdbscanSearch};
@@ -40,10 +40,25 @@ fn read_matrix(path: &Path, rows: usize, features: usize) -> Result<Vec<Vec<f32>
 fn stage_seconds(
     events: &[serde_json::Value],
 ) -> Result<BTreeMap<String, Vec<f64>>, Box<dyn Error>> {
+    named_seconds(events, &STAGES)
+}
+
+fn exclude_warmup<T>(samples: &mut Vec<T>, runs: usize) -> Result<(), Box<dyn Error>> {
+    if runs == 0 || Some(samples.len()) != runs.checked_add(1) {
+        return Err("sample count must equal one warmup plus measured runs".into());
+    }
+    samples.remove(0);
+    Ok(())
+}
+
+fn named_seconds(
+    events: &[serde_json::Value],
+    names: &[&str],
+) -> Result<BTreeMap<String, Vec<f64>>, Box<dyn Error>> {
     let mut starts = std::collections::HashMap::<(u64, String), Vec<f64>>::new();
     let mut seconds = BTreeMap::<String, Vec<f64>>::new();
     for event in events {
-        let Some(name) = event["name"].as_str().filter(|name| STAGES.contains(name)) else {
+        let Some(name) = event["name"].as_str().filter(|name| names.contains(name)) else {
             continue;
         };
         let key = (event["tid"].as_u64().unwrap_or(0), name.to_string());
@@ -77,9 +92,59 @@ fn stage_seconds(
     Ok(seconds)
 }
 
+fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let mut samples = Vec::new();
+    let mut start = None;
+    for (index, event) in events.iter().enumerate() {
+        if event["name"] != "boruvka_total" {
+            continue;
+        }
+        if event["ph"] == "B" {
+            if start.replace(index).is_some() {
+                return Err("nested Boruvka totals".into());
+            }
+        } else if event["ph"] == "E" {
+            let begin = start.take().ok_or("unbalanced Boruvka total")?;
+            let durations = named_seconds(
+                &events[begin..=index],
+                &[
+                    "boruvka_total",
+                    "boruvka_round",
+                    "boruvka_candidates_readback",
+                    "boruvka_kernel",
+                ],
+            )?;
+            let total = durations["boruvka_total"][0];
+            let rounds = durations.get("boruvka_round").cloned().unwrap_or_default();
+            let candidates = durations
+                .get("boruvka_candidates_readback")
+                .cloned()
+                .unwrap_or_default();
+            if rounds.len() != candidates.len() {
+                return Err("Boruvka candidate and round count mismatch".into());
+            }
+            let candidate_total: f64 = candidates.iter().sum();
+            let kernels = durations.get("boruvka_kernel").cloned().unwrap_or_default();
+            samples.push(serde_json::json!({
+                "total_seconds": total,
+                "round_count": rounds.len(),
+                "round_seconds": rounds,
+                "candidates_readback_seconds": candidates,
+                "kd_kernel_seconds": kernels,
+                "driver_and_seed_seconds": total - candidate_total,
+                "scope": "Nested inclusive timings; candidates include node-label generation/upload, kernel and readbacks. Driver residual includes kNN seeding, labels, synchronization and host merges; not isolated kernel time."
+            }));
+        }
+    }
+    if start.is_some() {
+        return Err("unclosed Boruvka total".into());
+    }
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{STAGES, stage_seconds};
+    use super::{STAGES, boruvka_samples, exclude_warmup, stage_seconds};
     use serde_json::json;
 
     #[test]
@@ -112,6 +177,37 @@ mod tests {
         ];
         assert!(stage_seconds(&invalid_duration).is_err());
     }
+
+    #[test]
+    fn excludes_exactly_one_warmup_and_rejects_wrong_counts() {
+        for runs in [1, 3] {
+            let mut samples: Vec<usize> = (0..=runs).collect();
+            exclude_warmup(&mut samples, runs).unwrap();
+            assert_eq!(samples, (1..=runs).collect::<Vec<_>>());
+            assert!(exclude_warmup(&mut samples, runs).is_err());
+        }
+        assert!(exclude_warmup(&mut vec![0], 0).is_err());
+        assert!(exclude_warmup(&mut vec![0], usize::MAX).is_err());
+    }
+
+    #[test]
+    fn separates_round_samples_and_accounts_for_driver_work() {
+        let events = [
+            json!({"name":"boruvka_total", "ph":"B", "ts":0.0}),
+            json!({"name":"boruvka_round", "ph":"B", "ts":1.0}),
+            json!({"name":"boruvka_candidates_readback", "ph":"B", "ts":2.0}),
+            json!({"name":"boruvka_candidates_readback", "ph":"E", "ts":5.0}),
+            json!({"name":"boruvka_round", "ph":"E", "ts":7.0}),
+            json!({"name":"boruvka_total", "ph":"E", "ts":10.0}),
+        ];
+        let samples = boruvka_samples(&events).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["round_count"], 1);
+        assert_eq!(samples[0]["round_seconds"], json!([6e-6]));
+        assert!((samples[0]["driver_and_seed_seconds"].as_f64().unwrap() - 7e-6).abs() < 1e-15);
+        assert!(boruvka_samples(&events[..5]).is_err());
+        assert!(boruvka_samples(&events[5..]).is_err());
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -128,6 +224,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut selection = ClusterSelectionMethod::Eom;
     let mut allow_single_cluster = false;
     let mut search = HdbscanSearch::Auto;
+    let mut labels_output = None;
     let mut i = 4;
     while i < args.len() {
         let flag = &args[i];
@@ -148,6 +245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--runs" => runs = value.parse()?,
             "--min-cluster-size" => min_cluster_size = value.parse()?,
             "--min-samples" => min_samples = Some(value.parse()?),
+            "--labels-output" => labels_output = Some(value.clone()),
             "--cluster-selection-method" => {
                 selection = match value.as_str() {
                     "eom" => ClusterSelectionMethod::Eom,
@@ -200,6 +298,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..HdbscanConfig::default()
     };
     let estimator = HDBSCAN::new(config, backend).with_search(search);
+    let warmup_start = Instant::now();
+    estimator.fit(&data)?;
+    let warmup_seconds = warmup_start.elapsed().as_secs_f64();
     let mut fit_seconds = Vec::with_capacity(runs);
     let mut cluster_counts = Vec::with_capacity(runs);
     let mut noise_counts = Vec::with_capacity(runs);
@@ -213,6 +314,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let start = Instant::now();
         let fitted = estimator.fit(&data)?;
         fit_seconds.push(start.elapsed().as_secs_f64());
+        if run + 1 == runs
+            && let Some(path) = &labels_output
+        {
+            std::fs::write(path, serde_json::to_vec(fitted.labels())?)?;
+        }
         eprintln!(
             "profile_run_end run={run} unix_ns={}",
             std::time::SystemTime::now()
@@ -233,19 +339,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     drop(guard);
     let events: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&trace_path)?)?;
-    let stages = stage_seconds(&events)?;
+    let mut stages = stage_seconds(&events)?;
+    let mut boruvka = boruvka_samples(&events)?;
+    exclude_warmup(&mut boruvka, runs)?;
     if stages.len() != STAGES.len()
-        || STAGES
-            .iter()
-            .any(|stage| stages.get(*stage).is_none_or(|values| values.len() != runs))
+        || STAGES.iter().any(|stage| {
+            stages
+                .get(*stage)
+                .is_none_or(|values| values.len() != runs + 1)
+        })
     {
         return Err("stage span count does not match run count".into());
+    }
+    for values in stages.values_mut() {
+        exclude_warmup(values, runs)?;
     }
     std::fs::remove_file(&trace_path)?;
     println!(
         "{}",
         serde_json::json!({
             "fit_seconds": fit_seconds,
+            "warmup_seconds": warmup_seconds,
+            "boruvka_samples": boruvka,
             "stage_seconds": stages,
             "cluster_counts": cluster_counts,
             "noise_counts": noise_counts,

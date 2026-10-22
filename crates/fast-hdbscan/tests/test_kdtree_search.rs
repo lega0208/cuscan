@@ -49,12 +49,18 @@ fn make_device_tree(tree: &KdTree, components: &[i32], device: &Device) -> Devic
         )
         .into_dispatch(),
         bounds_min: Tensor::<2>::from_data(
-            TensorData::new(tree.bounds_min.clone(), [tree.starts.len(), D]),
+            TensorData::new(
+                tree.bounds_min.clone(),
+                [tree.starts.len(), tree.n_features],
+            ),
             device,
         )
         .into_dispatch(),
         bounds_max: Tensor::<2>::from_data(
-            TensorData::new(tree.bounds_max.clone(), [tree.starts.len(), D]),
+            TensorData::new(
+                tree.bounds_max.clone(),
+                [tree.starts.len(), tree.n_features],
+            ),
             device,
         )
         .into_dispatch(),
@@ -228,6 +234,104 @@ fn check_kd_oracle(device: &Device) {
     }
 }
 
+fn check_permuted_tree_row_oracles(device: &Device) {
+    let n = 163usize;
+    let d = 3usize;
+    let mut values = (0..n)
+        .flat_map(|row| {
+            [
+                (row % 9) as f32,
+                ((row * 5 + row / 4) % 13) as f32,
+                ((row * 3 + row / 7) % 11) as f32,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let duplicate = values[0..d].to_vec();
+    values[3 * d..4 * d].copy_from_slice(&duplicate);
+    let mut components = vec![0; n];
+    components[n - 1] = 1;
+    let tree = KdTree::build(&values, n, d).unwrap();
+    assert_ne!(tree.indices, (0..n as i32).collect::<Vec<_>>());
+    let data = Tensor::<2>::from_data(TensorData::new(values.clone(), [n, d]), device);
+
+    for k in [1usize, n + 2] {
+        let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
+            data.clone().into_dispatch(),
+            make_device_tree(&tree, &components, device),
+            k as u32,
+        );
+        let ids = Tensor::<2, Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let distances = Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let mut expected_ids = vec![n as i32; n * k];
+        let mut expected_distances = vec![f32::INFINITY; n * k];
+        for row in 0..n {
+            let mut candidates = (0..n)
+                .filter(|&candidate| candidate != row)
+                .map(|candidate| {
+                    let distance = (0..d).fold(0.0f32, |sum, feature| {
+                        let delta = values[row * d + feature] - values[candidate * d + feature];
+                        sum + delta * delta
+                    });
+                    (distance, candidate as i32)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (slot, &(distance, candidate)) in candidates.iter().take(k).enumerate() {
+                expected_ids[row * k + slot] = candidate;
+                expected_distances[row * k + slot] = distance;
+            }
+        }
+        assert_eq!(ids, expected_ids);
+        assert_eq!(distances, expected_distances);
+    }
+
+    let core = (0..n)
+        .map(|row| (row % 5) as f32 * 0.25)
+        .collect::<Vec<_>>();
+    let (weights, destinations) = <Dispatch as HdbscanOps>::boruvka_candidates_kd(
+        data.into_dispatch(),
+        Tensor::<1>::from_data(TensorData::new(core.clone(), [n]), device).into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(components.clone(), [n]), device)
+            .into_dispatch(),
+        make_device_tree(&tree, &components, device),
+    );
+    let weights = Tensor::<1>::from_dispatch(weights)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    let destinations = Tensor::<1, Int>::from_dispatch(destinations)
+        .to_data()
+        .try_to_vec::<i32>()
+        .unwrap();
+    for row in 0..n {
+        let mut expected = (0..n)
+            .filter(|&candidate| components[candidate] != components[row])
+            .map(|candidate| {
+                let distance = (0..d).fold(0.0f32, |sum, feature| {
+                    let delta = values[row * d + feature] - values[candidate * d + feature];
+                    sum + delta * delta
+                });
+                (
+                    distance.max(core[row]).max(core[candidate]),
+                    candidate as i32,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(weights[row], expected[0].0, "candidate weight at row {row}");
+        assert_eq!(
+            destinations[row], expected[0].1,
+            "candidate index at row {row}"
+        );
+    }
+}
+
 #[cfg(feature = "cpu")]
 #[test]
 fn test_device_kdtree_extension_roundtrip_cpu() {
@@ -247,6 +351,7 @@ fn test_device_kdtree_extension_roundtrip_cuda() {
 #[test]
 fn kd_traversals_match_exact_host_oracles_cpu() {
     check_kd_oracle(&Device::cpu());
+    check_permuted_tree_row_oracles(&Device::cpu());
     check_overflow_distances(&Device::cpu(), fast_hdbscan::BackendChoice::Cpu);
 }
 
@@ -256,6 +361,7 @@ fn kd_traversals_match_exact_host_oracles_cuda() {
     let device = cuda_device();
     if let Some(device) = device {
         check_kd_oracle(&device);
+        check_permuted_tree_row_oracles(&device);
         check_overflow_distances(&device, BackendChoice::Cuda { device_index: 0 });
     }
 }

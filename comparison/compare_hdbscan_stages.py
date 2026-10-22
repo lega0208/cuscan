@@ -15,8 +15,8 @@ reference stage spans are exclusive. fast_hdbscan 0.3.2 fuses reference core dis
 and MST in one Numba Boruvka call; above 30 features its pynndescent stage is reported as
 one inclusive approximate-neighbors-and-MST span. These paths are not algorithmically
 equivalent to native --search. Unattributed is fit minus measured spans (timer/bookkeeping
-and uncaptured overhead), not measured work. One run is cold; for >=2 runs summaries use
-the median of each implementation's warmed fits.
+and uncaptured overhead), not measured work. Each implementation performs one excluded
+warmup followed by the requested number of measured fits.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -240,9 +241,19 @@ def validate_matrix(matrix: Any) -> Any:
     return np.asarray(matrix, dtype="<f4", order="C")
 
 
+def write_labels(path: Path, labels: Any) -> dict[str, str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([int(label) for label in labels]))
+    return {
+        "labels_path": str(path),
+        "labels_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def _python_worker(args: argparse.Namespace) -> None:
     import fast_hdbscan
-    import fast_hdbscan.hdbscan as hdbscan_module
+    import fast_hdbscan.hdbscan as reference_module
+    import numba
     import numpy as np
 
     try:
@@ -253,12 +264,17 @@ def _python_worker(args: argparse.Namespace) -> None:
         raise SystemExit(f"requires fast-hdbscan==0.3.2, got {version}")
     import fast_hdbscan.nndescent as approximate_module
 
+    hdbscan_module: Any = reference_module
+
     matrix = np.fromfile(args.worker_input, dtype="<f4").reshape(args.rows, args.features)
     timer = ExclusiveTimer()
     fit_seconds: list[float] = []
+    warmup_seconds: float | None = None
     stage_seconds: dict[str, list[float | None]] = {stage: [] for stage in STAGES}
     cluster_counts: list[int] = []
     noise_counts: list[int] = []
+    numba_threads: int | None = None
+    numba_threading_layer: str | None = None
     original_fast_hdbscan = hdbscan_module.fast_hdbscan
     original_fit = fast_hdbscan.HDBSCAN.fit
 
@@ -280,7 +296,7 @@ def _python_worker(args: argparse.Namespace) -> None:
     fast_hdbscan.HDBSCAN.fit = timed_fit
     try:
         with measure_reference(hdbscan_module, approximate_module, timer):
-            for _ in range(args.runs):
+            for iteration in range(args.runs + 1):
                 timer.seconds.clear()
                 timer.calls.clear()
                 estimator = fast_hdbscan.HDBSCAN(
@@ -291,7 +307,7 @@ def _python_worker(args: argparse.Namespace) -> None:
                 )
                 start = time.perf_counter()
                 estimator.fit(matrix)
-                fit_seconds.append(time.perf_counter() - start)
+                elapsed = time.perf_counter() - start
                 high_dimensional = matrix.shape[1] > 30
                 required = [
                     "input_validation",
@@ -307,26 +323,35 @@ def _python_worker(args: argparse.Namespace) -> None:
                 for stage in required:
                     if not timer.calls.get(stage):
                         raise RuntimeError(f"reference fit did not execute measured stage {stage}")
+                labels = estimator.labels_
+                if iteration == 0:
+                    warmup_seconds = elapsed
+                    numba_threads = numba.get_num_threads()
+                    numba_threading_layer = numba.threading_layer()
+                    continue
+                fit_seconds.append(elapsed)
                 for stage in STAGES:
                     stage_seconds[stage].append(
                         timer.seconds.get(stage) if timer.calls.get(stage) else None
                     )
-                labels = estimator.labels_
                 cluster_counts.append(len(set(labels.tolist()) - {-1}))
                 noise_counts.append(int(np.count_nonzero(labels == -1)))
+                last_labels = labels
     finally:
         hdbscan_module.fast_hdbscan = original_fast_hdbscan
         fast_hdbscan.HDBSCAN.fit = original_fit
-    print(
-        json.dumps(
-            {
-                "fit_seconds": fit_seconds,
-                "stage_seconds": stage_seconds,
-                "cluster_counts": cluster_counts,
-                "noise_counts": noise_counts,
-            }
-        )
-    )
+    output = {
+        "warmup_seconds": warmup_seconds,
+        "fit_seconds": fit_seconds,
+        "stage_seconds": stage_seconds,
+        "cluster_counts": cluster_counts,
+        "noise_counts": noise_counts,
+        "numba_threads": numba_threads,
+        "numba_threading_layer": numba_threading_layer,
+    }
+    if args.worker_labels_output:
+        output.update(write_labels(args.worker_labels_output, last_labels))
+    print(json.dumps(output))
 
 
 def run(command: list[str], label: str) -> dict[str, Any]:
@@ -556,10 +581,17 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
     parser.add_argument("--html", type=Path)
     parser.add_argument("--json", type=Path)
+    parser.add_argument("--labels-dir", type=Path)
     parser.add_argument("--_python-worker", dest="worker_input", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-rows", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-features", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--_worker-runs", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--_worker-labels-output",
+        dest="worker_labels_output",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     if args.worker_input:
         args.rows, args.features, args.runs = (
@@ -602,6 +634,9 @@ def main() -> int:
                 "native search is not equivalent",
                 file=sys.stderr,
             )
+        resolved_min_samples = (
+            args.min_samples if args.min_samples is not None else args.min_cluster_size
+        )
         native_cmd = [
             str(args.binary),
             str(input_path),
@@ -618,11 +653,17 @@ def main() -> int:
             "--search",
             args.search,
         ]
-        if args.min_samples is not None:
-            native_cmd += ["--min-samples", str(args.min_samples)]
+        native_cmd += ["--min-samples", str(resolved_min_samples)]
+        if args.labels_dir:
+            args.labels_dir.mkdir(parents=True, exist_ok=True)
+            native_labels_path = args.labels_dir / "native-labels.json"
+            native_cmd += ["--labels-output", str(native_labels_path)]
         if args.allow_single_cluster:
             native_cmd.append("--allow-single-cluster")
         native = run(native_cmd, "native")
+        if args.labels_dir:
+            native["labels_path"] = str(native_labels_path)
+            native["labels_sha256"] = hashlib.sha256(native_labels_path.read_bytes()).hexdigest()
         validate_native_stages(native)
         py_cmd = [
             sys.executable,
@@ -640,13 +681,16 @@ def main() -> int:
             "--cluster-selection-method",
             args.cluster_selection_method,
         ]
-        if args.min_samples is not None:
-            py_cmd += ["--min-samples", str(args.min_samples)]
+        py_cmd += ["--min-samples", str(resolved_min_samples)]
+        python_labels_path = None
+        if args.labels_dir:
+            python_labels_path = args.labels_dir / "python-labels.json"
+            py_cmd += ["--_worker-labels-output", str(python_labels_path)]
         if args.allow_single_cluster:
             py_cmd.append("--allow-single-cluster")
         reference = run(py_cmd, "fast_hdbscan")
-    native_indices = range(1, args.rust_runs) if args.rust_runs >= 2 else range(1)
-    python_indices = range(1, args.python_runs) if args.python_runs >= 2 else range(1)
+    native_indices = range(args.rust_runs)
+    python_indices = range(args.python_runs)
     comparison = comparison_rows(
         summarize(native, native_indices), summarize(reference, python_indices)
     )
@@ -656,9 +700,7 @@ def main() -> int:
         f"{args.cluster_selection_method}, native {args.search}, reference {search_ref}"
     )
     print(title)
-    native_mode = "median warmed fits" if args.rust_runs >= 2 else "cold fit"
-    python_mode = "median warmed fits" if args.python_runs >= 2 else "cold fit"
-    print_table(f"Native: {native_mode}; Python: {python_mode}", comparison)
+    print_table("Native and Python: measured fits after one excluded warmup", comparison)
     if args.json:
         metadata = {
             "input_sha256": digest,
@@ -671,7 +713,7 @@ def main() -> int:
             "center_scale": args.center_scale,
             "noise": args.noise,
             "min_cluster_size": args.min_cluster_size,
-            "min_samples": args.min_samples,
+            "min_samples": resolved_min_samples,
             "cluster_selection_method": args.cluster_selection_method,
             "allow_single_cluster": args.allow_single_cluster,
             "backend": args.backend,
@@ -680,14 +722,46 @@ def main() -> int:
             "rust_runs": args.rust_runs,
             "python_runs": args.python_runs,
             "warm_semantics": (
-                "run 0 cold; when runs >= 2 compare median of runs 1..N-1; per implementation"
+                "one excluded warmup followed by exactly runs measured fits per implementation"
+            ),
+            "timing_scope": (
+                "fit_seconds and stage_seconds are measured-only; warmup_seconds is separate"
+            ),
+            "versions": {
+                "python": sys.version.split()[0],
+                "fast_hdbscan": importlib.metadata.version("fast-hdbscan"),
+                "numba": importlib.metadata.version("numba"),
+            },
+            "thread_metadata": {
+                "numba_threads": reference["numba_threads"],
+                "numba_threading_layer": reference["numba_threading_layer"],
+                "native_cpu_count": os.cpu_count(),
+                "available_affinity_count": (
+                    len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+                ),
+            },
+            "labels": (
+                {
+                    "native_path": str(native_labels_path),
+                    "native_sha256": native["labels_sha256"],
+                    "python_path": str(python_labels_path),
+                    "python_sha256": reference["labels_sha256"],
+                    "scope": (
+                        "labels exported from each implementation's last measured fit; "
+                        "warmup excluded"
+                    ),
+                }
+                if args.labels_dir
+                else None
             ),
             "stage_definitions": STAGE_DEFINITIONS,
             "timing_limitations": (
                 "Exclusive spans; reference core_distances_and_mst is a fused Numba call; "
                 "reference >30-feature approximate_neighbors_and_mst is inclusive; "
                 "unattributed is timer/bookkeeping and uncaptured overhead, not measured work. "
-                "n/a marks stages not separately applicable, and unmatched stages have no speedup."
+                "n/a marks stages not separately applicable, and unmatched stages have no speedup. "
+                "Tracing fit measurements include profiling synchronization overhead; they are "
+                "not equivalent to uninstrumented fit times."
             ),
         }
         args.json.parent.mkdir(parents=True, exist_ok=True)
