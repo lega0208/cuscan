@@ -2,7 +2,7 @@
 
 use burn::{
     backend::{Dispatch, DispatchDevice},
-    tensor::{Device, Int, Tensor, TensorData},
+    tensor::{Device, Int, Tensor, TensorData, Transaction},
 };
 use fast_cubecl_common::{BackendChoice, neighbors as common_neighbors, selected_device};
 use fast_hdbscan_core::{
@@ -20,6 +20,8 @@ use fast_hdbscan_core::{
 };
 
 use crate::backend::{DeviceKdTree, HdbscanOps};
+
+const NEIGHBOR_BATCH_ROWS: usize = 256;
 
 #[cfg(feature = "tracing")]
 fn profile_sync(device: &Device) -> Result<()> {
@@ -193,37 +195,93 @@ fn check_device_tensor_allocation(
     checked_allocation_bytes(1, bytes, Some(limit), subject).map(|_| ())
 }
 
-fn tensor_f32(values: Vec<f32>, shape: [usize; 2], device: &Device) -> Tensor<2> {
-    Tensor::from_data(TensorData::new(values, shape), device)
+fn checked_brute_force_scratch(
+    query_rows: usize,
+    reference_rows: usize,
+    k: usize,
+    limit: DeviceAllocationLimit,
+) -> Result<usize> {
+    common_neighbors::bounded_neighbor_scratch(
+        query_rows,
+        reference_rows,
+        k,
+        4,
+        limit.max_page_bytes,
+        limit.alignment,
+    )
+    .map(|plan| plan.live_bytes)
+    .ok_or(HdbscanError::Overflow(
+        "bounded brute-force neighbor scratch",
+    ))
 }
 
-fn exact_neighbors_blocked(data: &Tensor<2>, k: usize) -> Result<(Vec<i32>, Vec<f32>)> {
-    let [n, features] = data.dims();
-    let width = u32::try_from(k).map_err(|_| HdbscanError::Overflow("neighbor width"))?;
-    let block_rows = n.saturating_sub(1).clamp(1, 64);
-    let mut ids = Vec::with_capacity(n * k);
-    let mut distances = Vec::with_capacity(n * k);
-    for start in (0..n).step_by(block_rows) {
-        let end = start.saturating_add(block_rows).min(n);
-        let offset =
-            u32::try_from(start).map_err(|_| HdbscanError::Overflow("query row offset"))?;
-        let query = data.clone().slice([start..end, 0..features]);
-        let (block_ids, block_distances) =
-            common_neighbors::exact_neighbors(query, data.clone(), width, true, offset, true);
-        ids.extend(
-            block_ids
-                .to_data()
-                .try_to_vec::<i32>()
-                .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
-        );
-        distances.extend(
-            block_distances
-                .to_data()
-                .try_to_vec::<f32>()
-                .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
-        );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoreSearchMemory {
+    device_bytes: usize,
+    host_bytes: usize,
+}
+
+fn core_search_memory(
+    n: usize,
+    features: usize,
+    min_samples: usize,
+    search: HdbscanSearch,
+    tree_bytes: usize,
+    brute_force_scratch_bytes: usize,
+) -> Result<CoreSearchMemory> {
+    let k = min_samples.min(n.saturating_sub(1));
+    let q = n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS);
+    let input = n
+        .checked_mul(features)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or(HdbscanError::Overflow("core search input live bytes"))?;
+    let core = n
+        .checked_mul(4)
+        .ok_or(HdbscanError::Overflow("core search core live bytes"))?;
+    let compact = n
+        .checked_mul(k)
+        .and_then(|v| v.checked_mul(8))
+        .ok_or(HdbscanError::Overflow("core search compact live bytes"))?;
+    // Host IDs/distances coexist with the fitted public ID array during padded output construction.
+    let public = n
+        .checked_mul(min_samples)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or(HdbscanError::Overflow(
+            "core search public neighbor live bytes",
+        ))?;
+    let host_bytes = compact
+        .checked_add(public)
+        .and_then(|v| v.checked_add(core))
+        .ok_or(HdbscanError::Overflow("core search host live bytes"))?;
+    let device_bytes = match search {
+        HdbscanSearch::KdTree => input
+            .checked_add(core)
+            .and_then(|v| v.checked_add(compact))
+            .and_then(|v| v.checked_add(tree_bytes)),
+        HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
+            // Input/core, bounded query view, batch ID/distance outputs, extracted core and
+            // the final concatenated core coexist at the most conservative cat boundary.
+            let batch = q
+                .checked_mul(k)
+                .and_then(|v| v.checked_mul(8))
+                .and_then(|v| v.checked_add(q.checked_mul(features)?.checked_mul(4)?))
+                .and_then(|v| v.checked_add(q.checked_mul(8)?));
+            input
+                .checked_add(core)
+                .and_then(|v| v.checked_add(n.checked_mul(4)?))
+                .and_then(|v| v.checked_add(batch?))
+                .and_then(|v| v.checked_add(brute_force_scratch_bytes))
+        }
     }
-    Ok((ids, distances))
+    .ok_or(HdbscanError::Overflow("core search device live bytes"))?;
+    Ok(CoreSearchMemory {
+        device_bytes,
+        host_bytes,
+    })
+}
+
+fn tensor_f32(values: Vec<f32>, shape: [usize; 2], device: &Device) -> Tensor<2> {
+    Tensor::from_data(TensorData::new(values, shape), device)
 }
 
 fn tensor_i32(values: Vec<i32>, shape: [usize; 1], device: &Device) -> Tensor<1, Int> {
@@ -263,10 +321,11 @@ fn clone_device_kd_tree(tree: &DeviceKdTree<Dispatch>) -> DeviceKdTree<Dispatch>
 }
 
 struct CoreDistances {
-    core_sq: Vec<f32>,
+    device_core_sq: Tensor<1>,
+    seed_core_sq: Vec<f32>,
     neighbors: Vec<i32>,
     knn_sq: Vec<f32>,
-    width: usize,
+    k: usize,
 }
 
 fn core_distances(
@@ -276,10 +335,16 @@ fn core_distances(
     tree: Option<&DeviceKdTree<Dispatch>>,
 ) -> Result<CoreDistances> {
     let n = data.dims()[0];
-    let width = min_samples;
     let k = min_samples.min(n - 1);
+    checked_allocation_bytes(
+        n.checked_mul(k)
+            .ok_or(HdbscanError::Overflow("compact neighbor elements"))?,
+        8,
+        None,
+        "compact host seed allocation",
+    )?;
     let k_width = u32::try_from(k).map_err(|_| HdbscanError::Overflow("neighbor width"))?;
-    let (short_ids, short_distances) = match search {
+    let (short_ids, short_distances, device_core_sq) = match search {
         HdbscanSearch::KdTree => {
             let tree = tree.expect("KD-tree route uploads the tree before neighbor search");
             let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
@@ -289,48 +354,115 @@ fn core_distances(
             );
             let ids = Tensor::<2, Int>::from_dispatch(ids);
             let distances = Tensor::<2>::from_dispatch(distances);
-            (
-                ids.to_data()
-                    .try_to_vec::<i32>()
-                    .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
+            let core = if min_samples >= n {
+                Tensor::full([n], f32::INFINITY, &data.device())
+            } else if min_samples == 1 {
+                Tensor::zeros([n], &data.device())
+            } else {
                 distances
-                    .to_data()
-                    .try_to_vec::<f32>()
-                    .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
-            )
+                    .clone()
+                    .slice([0..n, (min_samples - 1)..min_samples])
+                    .reshape([n])
+            };
+            let [id_data, distance_data] = Transaction::default()
+                .register(ids)
+                .register(distances.clone())
+                .try_execute()
+                .map_err(|error| HdbscanError::Numerical(error.to_string()))?
+                .try_into()
+                .map_err(|_| {
+                    HdbscanError::Numerical("neighbor readback returned wrong arity".into())
+                })?;
+            let ids = id_data
+                .try_to_vec::<i32>()
+                .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
+            let distances_host = distance_data
+                .try_to_vec::<f32>()
+                .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
+            (ids, distances_host, core)
         }
-        HdbscanSearch::BruteForce | HdbscanSearch::Auto => exact_neighbors_blocked(data, k)?,
+        HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
+            let block_rows = n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS);
+            let mut ids = Vec::with_capacity(
+                n.checked_mul(k)
+                    .ok_or(HdbscanError::Overflow("compact neighbor elements"))?,
+            );
+            let mut distances_host = Vec::with_capacity(ids.capacity());
+            let mut core_blocks = Vec::new();
+            for start in (0..n).step_by(block_rows) {
+                let end = start.saturating_add(block_rows).min(n);
+                let query = data.clone().slice([start..end, 0..data.dims()[1]]);
+                let (block_ids, block_distances) = common_neighbors::exact_neighbors(
+                    query,
+                    data.clone(),
+                    k_width,
+                    true,
+                    u32::try_from(start).map_err(|_| HdbscanError::Overflow("query row offset"))?,
+                    true,
+                );
+                let block_rows_count = end - start;
+                let core = if min_samples >= n {
+                    Tensor::full([block_rows_count], f32::INFINITY, &data.device())
+                } else if min_samples == 1 {
+                    Tensor::zeros([block_rows_count], &data.device())
+                } else {
+                    block_distances
+                        .clone()
+                        .slice([0..block_rows_count, (min_samples - 1)..min_samples])
+                        .reshape([block_rows_count])
+                };
+                core_blocks.push(core);
+                let [id_data, distance_data] = Transaction::default()
+                    .register(block_ids)
+                    .register(block_distances)
+                    .try_execute()
+                    .map_err(|error| HdbscanError::Numerical(error.to_string()))?
+                    .try_into()
+                    .map_err(|_| {
+                        HdbscanError::Numerical("neighbor readback returned wrong arity".into())
+                    })?;
+                ids.extend(
+                    id_data
+                        .try_to_vec::<i32>()
+                        .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
+                );
+                distances_host.extend(
+                    distance_data
+                        .try_to_vec::<f32>()
+                        .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
+                );
+            }
+            (ids, distances_host, Tensor::cat(core_blocks, 0))
+        }
     };
-    let slots = n
-        .checked_mul(width)
-        .ok_or(HdbscanError::Overflow("neighbor output elements"))?;
-    checked_allocation_bytes(slots, 8, None, "neighbor output allocation")?;
-    let mut neighbors = vec![-1; slots];
-    let mut knn_sq = vec![f32::INFINITY; slots];
-    for row in 0..n {
-        let from = row * k;
-        let to = row * width;
-        neighbors[to..to + k].copy_from_slice(&short_ids[from..from + k]);
-        knn_sq[to..to + k].copy_from_slice(&short_distances[from..from + k]);
-    }
-    let core_sq = if min_samples >= n {
+    checked_allocation_bytes(short_ids.len(), 4, None, "compact neighbor ID allocation")?;
+    checked_allocation_bytes(
+        short_distances.len(),
+        4,
+        None,
+        "compact neighbor distance allocation",
+    )?;
+    let seed_core_sq = if min_samples >= n {
         vec![f32::INFINITY; n]
     } else if min_samples == 1 {
         vec![0.0; n]
     } else {
-        (0..n).map(|row| knn_sq[row * width + width - 1]).collect()
+        (0..n)
+            .map(|row| short_distances[row * k + min_samples - 1])
+            .collect()
     };
     Ok(CoreDistances {
-        core_sq,
-        neighbors,
-        knn_sq,
-        width,
+        device_core_sq,
+        seed_core_sq,
+        neighbors: short_ids,
+        knn_sq: short_distances,
+        k,
     })
 }
 
 fn spanning_tree(
     data: &Tensor<2>,
-    core: &CoreDistances,
+    core: &mut CoreDistances,
     search: HdbscanSearch,
     tree: Option<&fast_hdbscan_core::KdTree>,
     device_tree: Option<&DeviceKdTree<Dispatch>>,
@@ -340,29 +472,24 @@ fn spanning_tree(
     #[cfg(feature = "tracing")]
     let _boruvka_span = tracing::info_span!("boruvka_total").entered();
     let mut edges = init_from_knn(
-        &core.core_sq,
+        &core.seed_core_sq,
         &core.neighbors,
         &core.knn_sq,
-        core.width,
+        core.k,
         &mut dsu,
     )?;
+    drop(std::mem::take(&mut core.knn_sq));
     let mut component_count = (0..n)
         .map(|point| dsu.find(point))
         .collect::<std::collections::HashSet<_>>()
         .len();
-    let core_tensor = (component_count > 1).then(|| {
-        Tensor::<1>::from_data(TensorData::new(core.core_sq.clone(), [n]), &data.device())
-    });
     while component_count > 1 {
         #[cfg(feature = "tracing")]
         let _round_span = tracing::info_span!("boruvka_round", component_count).entered();
         let point_components: Vec<i32> = (0..n)
             .map(|point| i32::try_from(dsu.find(point)).expect("validated row count fits i32"))
             .collect();
-        let core_tensor = core_tensor
-            .as_ref()
-            .expect("multiple components upload core distances")
-            .clone();
+        let core_tensor = core.device_core_sq.clone();
         let component_tensor = Tensor::<1, Int>::from_data(
             TensorData::new(point_components.clone(), [n]),
             &data.device(),
@@ -405,12 +532,19 @@ fn spanning_tree(
                 )
             }
         };
-        let candidate_distances = Tensor::<1>::from_dispatch(candidate_distances)
-            .to_data()
+        let [distance_data, index_data] = Transaction::default()
+            .register(Tensor::<1>::from_dispatch(candidate_distances))
+            .register(Tensor::<1, Int>::from_dispatch(candidate_indices))
+            .try_execute()
+            .map_err(|error| HdbscanError::Numerical(error.to_string()))?
+            .try_into()
+            .map_err(|_| {
+                HdbscanError::Numerical("candidate readback returned wrong arity".into())
+            })?;
+        let candidate_distances = distance_data
             .try_to_vec::<f32>()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
-        let candidate_indices = Tensor::<1, Int>::from_dispatch(candidate_indices)
-            .to_data()
+        let candidate_indices = index_data
             .try_to_vec::<i32>()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
         #[cfg(feature = "tracing")]
@@ -494,6 +628,17 @@ impl HDBSCAN {
             .search
             .resolve(n, features, min_samples, actual_backend);
         let cuda_row_pitch = matches!(actual_backend, BackendChoice::Cuda { .. });
+        let brute_force_scratch_bytes =
+            if n > 1 && resolved_search == HdbscanSearch::BruteForce && cuda_row_pitch {
+                checked_brute_force_scratch(
+                    n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS),
+                    n,
+                    min_samples.min(n - 1),
+                    allocation_limit,
+                )?
+            } else {
+                0
+            };
         #[cfg(feature = "tracing")]
         profile_sync(&device)?;
         #[cfg(feature = "tracing")]
@@ -528,13 +673,13 @@ impl HDBSCAN {
             let neighbor_slots = n
                 .checked_mul(min_samples)
                 .ok_or(HdbscanError::Overflow("neighbor output elements"))?;
-            checked_allocation_bytes(neighbor_slots, 8, None, "neighbor output allocation")?;
+            checked_allocation_bytes(neighbor_slots, 4, None, "public neighbor ID allocation")?;
             let sizing = crate::kernels::validate_boruvka_candidate_sizing(n)?;
             let neighbor_width = min_samples.min(n - 1);
             let neighbor_device_rows = if resolved_search == HdbscanSearch::KdTree {
                 n
             } else {
-                n.saturating_sub(1).clamp(1, 64)
+                n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS)
             };
             let neighbor_device_elements = neighbor_device_rows
                 .checked_mul(neighbor_width)
@@ -595,6 +740,46 @@ impl HDBSCAN {
             } else {
                 None
             };
+
+            let tree_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
+                [
+                    tree.indices.len(),
+                    tree.starts.len(),
+                    tree.ends.len(),
+                    tree.is_leaf.len(),
+                ]
+                .into_iter()
+                .try_fold(0usize, |sum, elements| {
+                    elements
+                        .checked_mul(4)
+                        .and_then(|bytes| sum.checked_add(bytes))
+                        .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
+                })
+                .and_then(|bytes| {
+                    let bounds = tree
+                        .starts
+                        .len()
+                        .checked_mul(tree.n_features)
+                        .and_then(|elements| elements.checked_mul(8))
+                        .ok_or(HdbscanError::Overflow("KD-tree bounds live bytes"))?;
+                    bytes
+                        .checked_add(bounds)
+                        .and_then(|v| v.checked_add(tree.starts.len().checked_mul(4)?))
+                        .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
+                })
+            })?;
+            let memory = core_search_memory(
+                n,
+                features,
+                min_samples,
+                resolved_search,
+                tree_bytes,
+                brute_force_scratch_bytes,
+            )?;
+            if memory.device_bytes > isize::MAX as usize || memory.host_bytes > isize::MAX as usize
+            {
+                return Err(HdbscanError::Overflow("core search live-memory plan"));
+            }
             if let Some(tree) = &host_tree {
                 for (elements, element_size, subject) in [
                     (tree.indices.len(), 4, "KD-tree index allocation"),
@@ -640,9 +825,9 @@ impl HDBSCAN {
 
             #[cfg(feature = "tracing")]
             let _core_distances_span = tracing::info_span!("core_distances", rows = n).entered();
-            let core = core_distances(&data, min_samples, resolved_search, device_tree.as_ref())?;
-            core_values = core.core_sq.iter().map(|value| value.sqrt()).collect();
-            neighbors = core.neighbors.clone();
+            let mut core =
+                core_distances(&data, min_samples, resolved_search, device_tree.as_ref())?;
+            core_values = core.seed_core_sq.iter().map(|value| value.sqrt()).collect();
             #[cfg(feature = "tracing")]
             profile_sync(&device)?;
             #[cfg(feature = "tracing")]
@@ -653,11 +838,25 @@ impl HDBSCAN {
                 tracing::info_span!("mst", rows = n, search = ?resolved_search).entered();
             let sorted_mst = spanning_tree(
                 &data,
-                &core,
+                &mut core,
                 resolved_search,
                 host_tree.as_ref(),
                 device_tree.as_ref(),
             )?;
+            if core.k == min_samples {
+                neighbors = core.neighbors;
+            } else {
+                let slots = n
+                    .checked_mul(min_samples)
+                    .ok_or(HdbscanError::Overflow("public neighbor output elements"))?;
+                checked_allocation_bytes(slots, 4, None, "public neighbor output allocation")?;
+                let mut public = vec![-1; slots];
+                for row in 0..n {
+                    public[row * min_samples..row * min_samples + core.k]
+                        .copy_from_slice(&core.neighbors[row * core.k..(row + 1) * core.k]);
+                }
+                neighbors = public;
+            }
             #[cfg(feature = "tracing")]
             profile_sync(&device)?;
             #[cfg(feature = "tracing")]
@@ -891,6 +1090,31 @@ mod search_tests {
         assert!(
             check_device_tensor_allocation(&[2, 5], 4, too_small_pitched_limit, true, "test")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn core_search_memory_accounts_for_bounded_and_full_routes() {
+        let brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 4096).unwrap();
+        let cpu_brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 0).unwrap();
+        let kd = core_search_memory(1024, 8, 5, HdbscanSearch::KdTree, 4096, 0).unwrap();
+        assert_eq!(brute.device_bytes, 65_536);
+        assert_eq!(cpu_brute.device_bytes, 61_440);
+        assert_eq!(kd.device_bytes, 81_920);
+        assert!(brute.device_bytes < kd.device_bytes);
+        assert_eq!(brute.host_bytes, kd.host_bytes);
+        assert!(core_search_memory(usize::MAX, 8, 5, HdbscanSearch::BruteForce, 0, 0).is_err());
+    }
+
+    #[test]
+    fn impossible_neighbor_scratch_is_typed_overflow_before_allocation() {
+        let limit = DeviceAllocationLimit {
+            max_page_bytes: 128,
+            alignment: 64,
+        };
+        assert_eq!(
+            checked_brute_force_scratch(256, 1024, 100, limit).unwrap_err(),
+            HdbscanError::Overflow("bounded brute-force neighbor scratch"),
         );
     }
 

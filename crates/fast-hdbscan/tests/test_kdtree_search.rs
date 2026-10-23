@@ -234,6 +234,62 @@ fn check_kd_oracle(device: &Device) {
     }
 }
 
+fn check_small_neighbor_boundaries(device: &Device) {
+    let cases = [
+        vec![vec![2.0f32, -1.0]],
+        vec![vec![0.0, 0.0], vec![3.0, 4.0]],
+        vec![vec![0.0, 0.0]; 4],
+    ];
+    for input in cases {
+        let n = input.len();
+        let values = input.iter().flatten().copied().collect::<Vec<_>>();
+        let tree = KdTree::build(&values, n, D).unwrap();
+        let mut widths = vec![1, n, n + 5];
+        if n > 1 {
+            widths.push(n - 1);
+        }
+        widths.sort_unstable();
+        widths.dedup();
+        for k in widths {
+            let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
+                Tensor::<2>::from_data(TensorData::new(values.clone(), [n, D]), device)
+                    .into_dispatch(),
+                make_device_tree(&tree, &vec![0; n], device),
+                k as u32,
+            );
+            let ids = Tensor::<2, Int>::from_dispatch(ids)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap();
+            let distances = Tensor::<2>::from_dispatch(distances)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let mut expected_ids = vec![n as i32; n * k];
+            let mut expected_distances = vec![f32::INFINITY; n * k];
+            for row in 0..n {
+                let mut candidates = (0..n)
+                    .filter(|&candidate| candidate != row)
+                    .map(|candidate| {
+                        let distance = (0..D).fold(0.0f32, |sum, feature| {
+                            let delta = values[row * D + feature] - values[candidate * D + feature];
+                            sum + delta * delta
+                        });
+                        (distance, candidate as i32)
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                for (slot, &(distance, candidate)) in candidates.iter().take(k).enumerate() {
+                    expected_ids[row * k + slot] = candidate;
+                    expected_distances[row * k + slot] = distance;
+                }
+            }
+            assert_eq!(ids, expected_ids, "n={n}, k={k}");
+            assert_eq!(distances, expected_distances, "n={n}, k={k}");
+        }
+    }
+}
+
 fn check_permuted_tree_row_oracles(device: &Device) {
     let n = 163usize;
     let d = 3usize;
@@ -254,7 +310,7 @@ fn check_permuted_tree_row_oracles(device: &Device) {
     assert_ne!(tree.indices, (0..n as i32).collect::<Vec<_>>());
     let data = Tensor::<2>::from_data(TensorData::new(values.clone(), [n, d]), device);
 
-    for k in [1usize, n + 2] {
+    for k in [1usize, 2, 3, 5, 8, 9, 31, 32, 33, n + 2] {
         let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
             data.clone().into_dispatch(),
             make_device_tree(&tree, &components, device),
@@ -351,6 +407,7 @@ fn test_device_kdtree_extension_roundtrip_cuda() {
 #[test]
 fn kd_traversals_match_exact_host_oracles_cpu() {
     check_kd_oracle(&Device::cpu());
+    check_small_neighbor_boundaries(&Device::cpu());
     check_permuted_tree_row_oracles(&Device::cpu());
     check_overflow_distances(&Device::cpu(), fast_hdbscan::BackendChoice::Cpu);
 }
@@ -361,6 +418,7 @@ fn kd_traversals_match_exact_host_oracles_cuda() {
     let device = cuda_device();
     if let Some(device) = device {
         check_kd_oracle(&device);
+        check_small_neighbor_boundaries(&device);
         check_permuted_tree_row_oracles(&device);
         check_overflow_distances(&device, BackendChoice::Cuda { device_index: 0 });
     }
@@ -421,7 +479,7 @@ fn check_overflow_distances(device: &Device, backend: fast_hdbscan::BackendChoic
             .all(|&value| value == f32::INFINITY)
     );
 
-    for min_samples in [1, 3] {
+    for min_samples in [1, 2, 3, 8] {
         for search in [HdbscanSearch::BruteForce, HdbscanSearch::KdTree] {
             let fitted = HDBSCAN::new(
                 HdbscanConfig {
@@ -442,11 +500,30 @@ fn check_overflow_distances(device: &Device, backend: fast_hdbscan::BackendChoic
                     .iter()
                     .all(|edge| edge.weight == f64::INFINITY && edge.src < 3 && edge.dst < 3)
             );
+            let width = min_samples.min(2);
+            let mut expected_neighbors = vec![-1; 3 * min_samples];
+            for row in 0..3 {
+                let mut candidates = (0..3)
+                    .filter(|&candidate| candidate != row)
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable();
+                for (slot, candidate) in candidates.into_iter().take(width).enumerate() {
+                    expected_neighbors[row * min_samples + slot] = candidate as i32;
+                }
+            }
+            assert_eq!(fitted.neighbors(), expected_neighbors);
+            let expected_core = if min_samples >= 3 {
+                f32::INFINITY
+            } else if min_samples == 1 {
+                0.0
+            } else {
+                f32::INFINITY
+            };
             assert!(
                 fitted
-                    .neighbors()
+                    .core_distances()
                     .iter()
-                    .all(|&index| index == -1 || (0..3).contains(&index))
+                    .all(|&core| core == expected_core)
             );
             assert!(fitted.probabilities().iter().all(|value| value.is_finite()));
             let expected_cut = if min_samples == 1 {

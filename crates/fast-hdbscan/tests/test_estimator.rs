@@ -386,43 +386,133 @@ fn estimator_min_samples_boundaries_match_independent_neighbor_oracle_on_cuda() 
 }
 
 fn min_samples_boundary_cases(backend: BackendChoice) {
+    use fast_hdbscan_core::oracle::{brute_force_mst, exact_neighbors};
+
+    let cases = [
+        (vec![vec![4.0, -2.0]], false),
+        (vec![vec![0.0, 0.0], vec![3.0, 4.0]], false),
+        (
+            vec![
+                vec![0.0, 0.0],
+                vec![0.0, 0.0],
+                vec![1.0, 0.0],
+                vec![1.0, 0.0],
+            ],
+            false,
+        ),
+        (
+            vec![
+                vec![0.0, 0.0],
+                vec![1.0, 0.25],
+                vec![3.0, -0.5],
+                vec![7.0, 2.0],
+            ],
+            true,
+        ),
+    ];
+    for (input, check_host_mst_order) in &cases {
+        let flat = input.iter().flatten().copied().collect::<Vec<_>>();
+        let n = input.len();
+        let mut min_samples_values = vec![1, n, n + 5];
+        if n > 1 {
+            min_samples_values.push(n - 1);
+        }
+        min_samples_values.sort_unstable();
+        min_samples_values.dedup();
+        for min_samples in min_samples_values {
+            let expected = exact_neighbors(&flat, n, 2, min_samples).unwrap();
+            let width = min_samples.min(n.saturating_sub(1));
+            let mut expected_neighbors = if n == 1 {
+                // The estimator deliberately retains its existing singleton contract:
+                // no public neighbor rows are emitted at all.
+                Vec::new()
+            } else {
+                vec![-1; n * min_samples]
+            };
+            if n > 1 {
+                for row in 0..n {
+                    expected_neighbors[row * min_samples..row * min_samples + width]
+                        .copy_from_slice(&expected.neighbors[row * width..(row + 1) * width]);
+                }
+            }
+            for search in [HdbscanSearch::BruteForce, HdbscanSearch::KdTree] {
+                let config = HdbscanConfig {
+                    min_cluster_size: 2,
+                    min_samples: Some(min_samples),
+                    ..Default::default()
+                };
+                let fitted = HDBSCAN::new(config, backend)
+                    .with_search(search)
+                    .fit(input)
+                    .unwrap();
+                assert_eq!(fitted.search(), search);
+                assert_eq!(
+                    fitted.neighbors(),
+                    expected_neighbors,
+                    "n={n}, min_samples={min_samples}, search={search:?}"
+                );
+                for (row, &actual) in fitted.core_distances().iter().enumerate() {
+                    let expected_core = if min_samples >= n {
+                        f32::INFINITY
+                    } else if min_samples == 1 {
+                        0.0
+                    } else {
+                        expected.core_sq[row].sqrt()
+                    };
+                    assert_eq!(
+                        actual, expected_core,
+                        "n={n}, min_samples={min_samples}, row={row}, search={search:?}"
+                    );
+                }
+
+                // Tied MST topology has a separate device Boruvka tie contract. For the
+                // tie-free case, assert the full host-sorted edge sequence and orientation.
+                if *check_host_mst_order && min_samples == 1 {
+                    let oracle = brute_force_mst(&flat, n, 2, min_samples).unwrap();
+                    assert_eq!(
+                        fitted.minimum_spanning_tree(),
+                        oracle,
+                        "host MST source order for search={search:?}"
+                    );
+                }
+            }
+        }
+    }
+    estimator_batch_boundary_cases(backend);
+}
+
+fn estimator_batch_boundary_cases(backend: BackendChoice) {
     use fast_hdbscan_core::oracle::exact_neighbors;
 
-    let input = [
-        vec![0.0, 0.0],
-        vec![1.0, 0.25],
-        vec![3.0, -0.5],
-        vec![7.0, 2.0],
-    ];
-    let flat = input.iter().flatten().copied().collect::<Vec<_>>();
-    let n = input.len();
-    for min_samples in [1, n - 1, n, n + 5] {
+    for n in [63usize, 64, 65, 257, 258, 513, 514] {
+        let input = (0..n)
+            .map(|row| {
+                vec![
+                    ((row * 37 + row / 5) % 101) as f32,
+                    ((row * 19 + row / 7) % 83) as f32,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let flat = input.iter().flatten().copied().collect::<Vec<_>>();
+        let min_samples = 3;
+        let expected = exact_neighbors(&flat, n, 2, min_samples).unwrap();
         let config = HdbscanConfig {
             min_cluster_size: 2,
             min_samples: Some(min_samples),
             ..Default::default()
         };
-        let fitted = HDBSCAN::new(config, backend).fit(&input).unwrap();
-        let expected = exact_neighbors(&flat, n, 2, min_samples).unwrap();
-        let width = min_samples.min(n.saturating_sub(1));
-        let mut expected_neighbors = vec![-1; n * min_samples];
-        for row in 0..n {
-            expected_neighbors[row * min_samples..row * min_samples + width]
-                .copy_from_slice(&expected.neighbors[row * width..(row + 1) * width]);
-        }
-        assert_eq!(
-            fitted.neighbors, expected_neighbors,
-            "min_samples={min_samples}"
-        );
-        for (actual, expected_sq) in fitted.core_distances.iter().zip(expected.core_sq) {
-            assert_eq!(*actual, expected_sq.sqrt(), "min_samples={min_samples}");
-        }
-        if min_samples >= n {
-            assert!(
-                fitted
-                    .core_distances
-                    .iter()
-                    .all(|distance| distance.is_infinite())
+        let search = HdbscanSearch::BruteForce;
+        let fitted = HDBSCAN::new(config, backend)
+            .with_search(search)
+            .fit(&input)
+            .unwrap();
+        assert_eq!(fitted.search(), search);
+        assert_eq!(fitted.neighbors(), expected.neighbors, "n={n}, {search:?}");
+        for (row, &core) in fitted.core_distances().iter().enumerate() {
+            assert_eq!(
+                core,
+                expected.core_sq[row].sqrt(),
+                "n={n}, row={row}, {search:?}"
             );
         }
     }

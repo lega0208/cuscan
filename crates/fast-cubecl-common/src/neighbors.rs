@@ -2,10 +2,91 @@ use crate::backend::NeighborOps;
 use burn::backend::Dispatch;
 use burn::tensor::{Int, Tensor};
 
+pub(crate) const REFERENCE_TILE: usize = 128;
+pub(crate) const MAX_REFERENCE_GROUPS: usize = 4;
+pub(crate) const MAX_NEIGHBOR_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundedNeighborScratch {
+    pub query_rows: usize,
+    pub live_bytes: usize,
+}
+
+/// Checked GPU scratch plan for bounded exact-neighbor partials and merge lists.
+pub fn bounded_neighbor_scratch(
+    query_rows: usize,
+    reference_rows: usize,
+    k: usize,
+    distance_element_size: usize,
+    max_page: usize,
+    alignment: usize,
+) -> Option<BoundedNeighborScratch> {
+    if query_rows == 0
+        || reference_rows == 0
+        || k == 0
+        || distance_element_size == 0
+        || max_page == 0
+        || alignment == 0
+    {
+        return None;
+    }
+    let groups = reference_rows
+        .div_ceil(REFERENCE_TILE)
+        .min(MAX_REFERENCE_GROUPS);
+    let align = |bytes: usize| {
+        bytes
+            .checked_add(alignment.checked_sub(1)?)
+            .map(|value| value / alignment * alignment)
+    };
+    let index_row = k.checked_mul(4)?;
+    let distance_row = k.checked_mul(distance_element_size)?;
+    let partial_index_row = index_row.checked_mul(groups)?;
+    let partial_distance_row = distance_row.checked_mul(groups)?;
+    let live_row = partial_index_row
+        .checked_add(partial_distance_row)?
+        .checked_add(index_row.checked_mul(2)?)?
+        .checked_add(distance_row.checked_mul(2)?)?;
+    let mut rows = (MAX_NEIGHBOR_SCRATCH_BYTES / live_row)
+        .min(max_page / partial_index_row)
+        .min(max_page / partial_distance_row)
+        .min(max_page / index_row)
+        .min(max_page / distance_row)
+        .max(1)
+        .min(query_rows);
+    loop {
+        let pi = align(rows.checked_mul(partial_index_row)?)?;
+        let pd = align(rows.checked_mul(partial_distance_row)?)?;
+        let ri = align(rows.checked_mul(index_row)?)?;
+        let rd = align(rows.checked_mul(distance_row)?)?;
+        let live_bytes = pi
+            .checked_add(pd)?
+            .checked_add(ri.checked_add(rd)?.checked_mul(2)?)?;
+        if pi <= max_page
+            && pd <= max_page
+            && ri <= max_page
+            && rd <= max_page
+            && live_bytes <= MAX_NEIGHBOR_SCRATCH_BYTES
+        {
+            return Some(BoundedNeighborScratch {
+                query_rows: rows,
+                live_bytes,
+            });
+        }
+        if rows == 1 {
+            return None;
+        }
+        rows -= 1;
+    }
+}
+
 /// Device exact-neighbor operation dispatched on the input backend.
 ///
 /// Squared mode permits missing neighbors, represented by raw reference-row-count
 /// indices and positive infinity. Euclidean mode preserves UMAP's strict width.
+/// Brute-force scratch is bounded by 32 MiB total, further capped by the selected
+/// device's per-allocation limit; query groups shrink as runtime `k` grows.
+/// CPU and unsquared requests retain the direct serial-reference kernel; squared
+/// CUDA requests use grouped partial lists and merge dispatches.
 pub fn exact_neighbors(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -71,6 +152,64 @@ mod tests {
 
     fn tensor(values: Vec<f32>, rows: usize, device: &Device) -> Tensor<2> {
         Tensor::from_data(TensorData::new(values, [rows, 1]), device)
+    }
+
+    fn exact_oracle(
+        query: &[f32],
+        reference: &[f32],
+        k: usize,
+        offset: usize,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let mut ids = Vec::with_capacity(query.len() * k);
+        let mut distances = Vec::with_capacity(query.len() * k);
+        for (row, &value) in query.iter().enumerate() {
+            let mut candidates = reference
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| *id != row + offset)
+                .map(|(id, &other)| {
+                    let delta = value - other;
+                    ((delta * delta, id as i32), delta * delta)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then(a.0.1.cmp(&b.0.1)));
+            for slot in 0..k {
+                if let Some(candidate) = candidates.get(slot) {
+                    ids.push(candidate.0.1);
+                    distances.push(candidate.1);
+                } else {
+                    ids.push(reference.len() as i32);
+                    distances.push(f32::INFINITY);
+                }
+            }
+        }
+        (ids, distances)
+    }
+
+    #[test]
+    fn tiled_merge_matches_independent_oracle_across_query_and_reference_tails() {
+        for device in devices() {
+            let query: Vec<f32> = (0..701).map(|i| (i % 17) as f32).collect();
+            let mut reference: Vec<f32> = (0..763).map(|i| ((i * 7) % 23) as f32).collect();
+            reference[12..713].copy_from_slice(&query);
+            let (actual_ids, actual_distances) = exact_neighbors(
+                tensor(query.clone(), query.len(), &device),
+                tensor(reference.clone(), reference.len(), &device),
+                1300,
+                true,
+                12,
+                true,
+            );
+            let (expected_ids, expected_distances) = exact_oracle(&query, &reference, 1300, 12);
+            assert_eq!(
+                actual_ids.to_data().try_to_vec::<i32>().unwrap(),
+                expected_ids
+            );
+            assert_eq!(
+                actual_distances.to_data().try_to_vec::<f32>().unwrap(),
+                expected_distances
+            );
+        }
     }
 
     #[test]
