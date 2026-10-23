@@ -3,7 +3,7 @@
 
 Build the Rust companion first (build time is not measured):
 
-    cargo build --release --no-default-features --features cpu,tracing \
+    cargo build --release --features tracing \
         --example profile_standard_stages
 
 Then run from the repository root:
@@ -330,8 +330,8 @@ def main() -> int:
         return 0
     if not args.binary.exists():
         parser.error(
-            f"{args.binary} missing; build with: cargo build --release --no-default-features "
-            f"--features {args.backend},tracing --example profile_standard_stages"
+            f"{args.binary} missing; build with: cargo build --release --features tracing "
+            "--example profile_standard_stages"
         )
 
     with tempfile.TemporaryDirectory() as temp:

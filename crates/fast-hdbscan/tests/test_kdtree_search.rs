@@ -2,7 +2,6 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Int, Tensor, TensorData},
 };
-#[cfg(feature = "cuda")]
 use fast_hdbscan::BackendChoice;
 use fast_hdbscan::{DeviceKdTree, HdbscanOps};
 use fast_hdbscan_core::kdtree::KdTree;
@@ -289,7 +288,6 @@ fn check_small_neighbor_boundaries(device: &Device) {
         }
     }
 }
-
 fn check_permuted_tree_row_oracles(device: &Device) {
     let n = 163usize;
     let d = 3usize;
@@ -388,13 +386,11 @@ fn check_permuted_tree_row_oracles(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn test_device_kdtree_extension_roundtrip_cpu() {
     check_extension_roundtrip(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn test_device_kdtree_extension_roundtrip_cuda() {
     let device = cuda_device();
@@ -403,7 +399,6 @@ fn test_device_kdtree_extension_roundtrip_cuda() {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn kd_traversals_match_exact_host_oracles_cpu() {
     check_kd_oracle(&Device::cpu());
@@ -412,7 +407,6 @@ fn kd_traversals_match_exact_host_oracles_cpu() {
     check_overflow_distances(&Device::cpu(), fast_hdbscan::BackendChoice::Cpu);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn kd_traversals_match_exact_host_oracles_cuda() {
     let device = cuda_device();
@@ -537,13 +531,8 @@ fn check_overflow_distances(device: &Device, backend: fast_hdbscan::BackendChoic
     }
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_device() -> Option<Device> {
-    match fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    ) {
+    match fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }) {
         Ok((device, _)) => Some(device),
         Err(error) => {
             assert!(
@@ -554,13 +543,4 @@ fn cuda_device() -> Option<Device> {
             None
         }
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn required_cuda_kdtree_tests_fail_when_cuda_is_not_compiled() {
-    assert!(
-        std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-        "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-    );
 }

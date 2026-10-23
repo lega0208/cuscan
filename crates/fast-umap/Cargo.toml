@@ -15,9 +15,8 @@ homepage.workspace = true
 fast-umap-core = { workspace = true }
 fast-cubecl-common = { workspace = true }
 burn = { workspace = true }
-# Enable CubeCL with a concrete CPU or GPU runtime.
-burn-cubecl = { workspace = true, optional = true }
-cubecl = { workspace = true, optional = true }
+burn-cubecl = { workspace = true }
+cubecl = { workspace = true }
 cubecl-cpu = { workspace = true, optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -37,44 +36,27 @@ ciborium = { workspace = true }
 log = { workspace = true }
 
 [features]
-# Every backend feature enables CubeCL persistence so autotune, throughput calibration and
-# GPU compilation results are cached on disk across processes. Without it, each process
-# repeats CPU throughput calibration (~7 s) and recompiles every CUDA kernel.
-default = ["cuda", "cpu"]
-# CUDA requires an NVIDIA runtime; CPU remains independently selectable.
-cuda = [
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "fast-cubecl-common/cuda",
-] # NVIDIA CUDA backend
-cpu = [
-  "dep:burn-cubecl",
-  "dep:cubecl",
-  "fast-cubecl-common/cpu",
-] # CubeCL LLVM CPU runtime
 cubecl-ir-dump = ["dep:cubecl-cpu", "cubecl-cpu/pliron-dump"]
 
 tracing = [
   "dep:tracing",
   "burn/tracing",
-  "cubecl?/tracing",
+  "cubecl/tracing",
   "fast-umap-core/tracing",
   "fast-cubecl-common/tracing",
 ]
 
 [[bench]]
 name = "standard_umap_cpu"
-required-features = ["cpu"]
 harness = false
 
 [[bench]]
 name = "standard_umap_cuda"
-required-features = ["cuda"]
 harness = false
 
 [[example]]
 name = "profile_standard_cuda"
-required-features = ["cuda", "tracing"]
+required-features = ["tracing"]
 
 [[example]]
 name = "profile_standard_stages"
@@ -82,4 +64,3 @@ required-features = ["tracing"]
 
 [[example]]
 name = "ann_construction_worker"
-required-features = ["cuda"]

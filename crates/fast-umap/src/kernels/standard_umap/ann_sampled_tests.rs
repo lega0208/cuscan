@@ -475,13 +475,11 @@ fn run_kernel_fixtures(device: CubeDevice) {
     flag_transition_fixture(device);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn sampled_kernels_cpu_match_injected_contract_fixtures() {
     run_kernel_fixtures(CubeDevice::Cpu(Default::default()));
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn sampled_kernels_cuda_match_injected_contract_fixtures() {
     let count = crate::cuda_backend::try_device_count()

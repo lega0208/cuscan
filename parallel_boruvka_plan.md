@@ -1,9 +1,23 @@
 # Plan: upstream `parallel_boruvka` gaps — D>30 kNN-graph route and `reproducible=False`
 
-Status: **plan only, revision 4** (adds the device winner-reduction design in §4.8; the earlier
-Architect approvals in §9 apply to revision 3, not this extension). No product source has
-been changed. Every kernel or Rust fragment below is **pseudocode: not compiled and not run on
+Status: **plan only, revision 5** (updates the build/runtime baseline after backend feature
+removal; revision 4 adds the device winner-reduction design in §4.8). Architect review scope
+is recorded in §9. No product source has been changed **for this plan**. Every kernel or Rust
+fragment below is **pseudocode: not compiled and not run on
 any backend**, unless a line explicitly says otherwise.
+
+Build baseline: CPU (CubeCL LLVM) and CUDA are now unconditional capabilities of common,
+both facades, and the Python extension, including `--no-default-features` builds. Repository
+`cpu`/`cuda` Cargo features and caller-permission arguments no longer exist. Upstream backend
+dependency features remain enabled. This completed baseline change does not implement any
+Borůvka/ANN work proposed here. Optional `tracing`, UMAP `cubecl-ir-dump`, and core
+`test-support` remain available.
+
+Backend coverage is selected at runtime: deterministic CPU fixtures explicitly request CPU;
+CUDA cases discover availability before device construction and honor `FAST_UMAP_REQUIRE_CUDA=1`.
+Explicit CPU must not probe CUDA; Auto prefers CUDA and uses CPU only on confirmed absence;
+discovery errors propagate and execution failures never trigger fallback. Shared runtime calls
+use `selected_device(choice)` and `validate_backend_choice(choice)`, without permission flags.
 
 ## 0. Goal and scope
 
@@ -778,11 +792,11 @@ Future focused commands (not run for this plan):
 
 ```sh
 cargo test -p fast-hdbscan-core --features test-support
-cargo test -p fast-hdbscan --no-default-features --features cpu --test test_component_reduce
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda --test test_component_reduce
+cargo test -p fast-hdbscan --test test_component_reduce
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --test test_component_reduce
 ```
 
-Then run the affected existing HDBSCAN suites and feature matrix from §7. The new CUDA harness
+Then run the affected existing HDBSCAN suites and build-contract matrix from §7. The new CUDA harness
 must honor `FAST_UMAP_REQUIRE_CUDA=1`; a hardware skip is not a passing gate. No speedup is
 claimed by this plan, nor by a passing CPU-runtime test.
 
@@ -821,7 +835,7 @@ Each milestone ends at a passing gate, and the product works at every step.
 | M3 | §3.2 config fields, `MstGraph` resolution, exact-source `KnnGraph` | §3.3 exact-oracle tests; `blobs_d50` `Complete` gate |
 | M4 | ANN source for m > 4096, width campaign at k ∈ {15, 45, 60} | §3.3 ANN gates; the measured width limit is recorded |
 | M5 | §4.4–4.5 shared bound on the KD route | §4.7 bitwise equality on CPU and CUDA |
-| M6 | Python plumbing, `blobs_d50_knn` fixture and schema, test updates, docs | Python suites on CPU and CUDA, ruff/ty, feature matrix |
+| M6 | Python plumbing, `blobs_d50_knn` fixture and schema, test updates, docs | Python suites on CPU and CUDA, ruff/ty, build-contract matrix |
 | M7 | §4.8 core membership/ordered-merge contract and standalone device reduction | §4.8.6 oracle parity and error gates on CPU and required CUDA |
 | M8 | §4.8 compact estimator readback, tracing and end-to-end measurements | Both candidate routes and bound modes retain bitwise MST outputs; full transfer/fit cost reported |
 
@@ -835,22 +849,29 @@ Dependencies:
 
 ## 7. Verification commands
 
-These are future acceptance commands. None was run for this plan.
+These are future acceptance commands for this plan's implementation. Baseline checks run during
+backend feature removal do not prove any proposed kernel, relocation, or algorithm here.
+Both Rust backend test variants compile into the same artifacts; ordinary runs may skip absent
+CUDA hardware, while required-CUDA runs must execute it. Python's CUDA GIL diagnostic requires
+the optional `tracing` build below.
 
 ```sh
 cargo test -p fast-hdbscan-core --features test-support
-cargo test -p fast-cubecl-common --no-default-features --features cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common --no-default-features --features cuda
-cargo test -p fast-hdbscan --no-default-features --features cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda
-cargo test -p fast-umap --no-default-features --features cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap --no-default-features --features cuda
-uv run maturin develop --release --no-default-features --features cpu,cuda
+cargo test -p fast-cubecl-common
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common
+cargo test -p fast-hdbscan
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan
+cargo test -p fast-umap
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-umap
+uv run maturin develop --release --features tracing
 FAST_UMAP_TEST_BACKEND=cpu uv run --no-sync pytest python/tests/test_hdbscan.py python/tests/test_standard_*.py
-FAST_UMAP_TEST_BACKEND=cuda FAST_UMAP_REQUIRE_CUDA=1 uv run --no-sync pytest python/tests/test_hdbscan.py
+FAST_UMAP_TEST_BACKEND=cuda FAST_UMAP_REQUIRE_CUDA=1 uv run --no-sync pytest python/tests/test_hdbscan.py python/tests/test_standard_*.py
 bash scripts/test_features.sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --no-default-features --features fast-umap/cpu,fast-hdbscan/cpu,fast-umap-python/cpu
+cargo check --workspace --all-targets --no-default-features
+cargo check --workspace --all-targets --features fast-umap/tracing,fast-hdbscan/tracing,fast-umap-python/tracing
+cargo check -p fast-umap --all-targets --features cubecl-ir-dump
+cargo clippy --workspace --all-targets
 uv run ruff check && uv run ruff format --check && uv run ty check
 ```
 
@@ -915,3 +936,8 @@ Revision 4's §4.8 received a focused read-only Architect review of ordering, va
 associativity, buffer bounds, CPU/GPU decomposition and integration. It returned no concrete
 issues. The existing destination-`n` error contract and absence of new cycle-validation errors
 are explicit above. This is design review only, not compilation or backend execution evidence.
+
+Revision 5 updates only the baseline assumptions and future verification commands after the
+completed backend-feature removal. It does not change the algorithm designs or extend the
+scope of prior Architect approvals. The build-contract matrix is `scripts/test_features.sh`;
+there are no CPU-only/CUDA-only compilation lanes or missing-compiled-backend cases to add.

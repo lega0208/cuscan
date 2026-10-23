@@ -758,7 +758,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cpu")]
     #[test]
     fn kd_neighbors_enabled_diagnostics_match_disabled_launch() {
         let device = CubeDevice::Cpu(Default::default());
@@ -880,7 +879,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cpu")]
     #[test]
     fn validate_tree_rejects_levels_and_malformed_shapes() {
         let device = CubeDevice::Cpu(Default::default());
@@ -1055,35 +1053,24 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cpu")]
     #[test]
     fn box_lower_bound_matches_point_box_oracle_cpu() {
         verify_box_bounds(&CubeDevice::Cpu(Default::default()));
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     fn box_lower_bound_matches_point_box_oracle_cuda() {
-        let cuda = CubeDevice::enumerate_all()
-            .into_iter()
-            .find(|device| matches!(device, CubeDevice::Cuda(_)));
-        let Some(cuda) = cuda else {
+        let count =
+            fast_cubecl_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if count == 0 {
             assert!(
                 std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
                 "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
             );
             eprintln!("SKIPPED: no CUDA device");
             return;
-        };
+        }
+        let cuda = CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 });
         verify_box_bounds(&cuda);
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    #[test]
-    fn required_cuda_box_bounds_fail_when_cuda_is_not_compiled() {
-        assert!(
-            std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-            "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-        );
     }
 }

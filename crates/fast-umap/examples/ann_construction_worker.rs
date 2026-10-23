@@ -1,7 +1,6 @@
 //! Persistent CUDA ANN construction worker for construction-only campaigns.
 //!
-//! Build with `cargo build --release --no-default-features --features cuda
-//! --example ann_construction_worker`. Invoke as
+//! Build with `cargo build --release --example ann_construction_worker`. Invoke as
 //! `ann_construction_worker INPUT.f32le ROWS FEATURES [DEVICE_INDEX]`; it reads
 //! one JSON command per stdin line and emits one JSON response per command.
 

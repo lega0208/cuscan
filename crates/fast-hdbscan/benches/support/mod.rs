@@ -133,19 +133,13 @@ fn config() -> criterion::Criterion {
         .confidence_level(0.95)
 }
 
-#[cfg(feature = "cpu")]
 pub fn run_cpu(c: &mut Criterion) {
     run(c, BackendChoice::Cpu, "cpu");
 }
 
-#[cfg(feature = "cuda")]
 pub fn run_cuda(c: &mut Criterion) {
     let required = env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some();
-    match fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    ) {
+    match fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }) {
         Ok(_) => run(c, BackendChoice::Cuda { device_index: 0 }, "cuda"),
         Err(error) if required => {
             panic!("FAST_UMAP_REQUIRE_CUDA is set but CUDA is unavailable: {error}")
@@ -278,9 +272,8 @@ fn benchmark_stages(
     n: usize,
     d: usize,
 ) {
-    let (device, _) =
-        fast_cubecl_common::selected_device(backend, cfg!(feature = "cpu"), cfg!(feature = "cuda"))
-            .unwrap_or_else(|error| panic!("{backend_name} stage benchmark device: {error}"));
+    let (device, _) = fast_cubecl_common::selected_device(backend)
+        .unwrap_or_else(|error| panic!("{backend_name} stage benchmark device: {error}"));
     let data = tensor_f32_2(flat.to_vec(), [n, d], &device);
     let width = case.config.resolved_min_samples().min(n.saturating_sub(1));
     let width_u32 = u32::try_from(width).expect("fixture neighbor width fits u32");

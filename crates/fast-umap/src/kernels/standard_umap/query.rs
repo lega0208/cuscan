@@ -637,7 +637,6 @@ mod tests {
         assert!(std::panic::catch_unwind(|| geometry(23, 7, 7, 7, 3)).is_err());
     }
 
-    #[cfg(feature = "cpu")]
     #[test]
     fn query_cpu_chunk_geometry_reports_runtime_limits() {
         let client = burn_cubecl::CubeDevice::cpu().unwrap().client();

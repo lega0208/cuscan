@@ -8,7 +8,7 @@ use burn::backend::{
 };
 
 /// Forward-only operations used by the nonparametric standard UMAP path.
-#[backend_extension(Cube: cfg(any(feature = "cpu", feature = "cuda")), Fusion: cfg(any(feature = "cpu", feature = "cuda")))]
+#[backend_extension(Cube, Fusion)]
 pub trait StandardUmapOps: Backend {
     #[fusion(meta = |data, k, seed, max_iterations| {
         assert!(data.shape.len() == 2 && data.shape[0] >= 2 && data.shape[1] > 0,

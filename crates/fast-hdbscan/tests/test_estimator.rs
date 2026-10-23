@@ -283,20 +283,14 @@ fn fixture_suite(backend: BackendChoice) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn estimator_matches_pinned_fixtures_on_cpu() {
     fixture_suite(BackendChoice::Cpu);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn estimator_matches_pinned_fixtures_on_cuda() {
-    let resolved = fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    );
+    let resolved = fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 });
     let Ok(_) = resolved else {
         assert!(
             std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
@@ -306,15 +300,6 @@ fn estimator_matches_pinned_fixtures_on_cuda() {
         return;
     };
     fixture_suite(BackendChoice::Cuda { device_index: 0 });
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn required_cuda_estimator_fails_when_cuda_is_not_compiled() {
-    assert!(
-        std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-        "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-    );
 }
 
 #[test]
@@ -328,12 +313,7 @@ fn estimator_validates_configuration_and_input_and_dbscan_epsilon() {
             .fit(&[vec![0.0]])
             .is_err()
     );
-    let backend = if cfg!(feature = "cpu") {
-        BackendChoice::Cpu
-    } else {
-        BackendChoice::Cuda { device_index: 0 }
-    };
-    let valid = HDBSCAN::new(HdbscanConfig::default(), backend);
+    let valid = HDBSCAN::new(HdbscanConfig::default(), BackendChoice::Cpu);
     assert!(valid.fit(&[]).is_err());
     assert!(valid.fit(&[vec![0.0], vec![0.0, 1.0]]).is_err());
     let fitted = valid.fit(&[vec![0.0], vec![1.0], vec![2.0]]).unwrap();
@@ -361,20 +341,14 @@ fn estimator_validates_configuration_and_input_and_dbscan_epsilon() {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn estimator_min_samples_boundaries_match_independent_neighbor_oracle_on_cpu() {
     min_samples_boundary_cases(BackendChoice::Cpu);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn estimator_min_samples_boundaries_match_independent_neighbor_oracle_on_cuda() {
-    let Ok(_) = fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    ) else {
+    let Ok(_) = fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }) else {
         assert!(
             std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
             "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
@@ -518,20 +492,14 @@ fn estimator_batch_boundary_cases(backend: BackendChoice) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn estimator_handles_finite_row_remapping_and_small_finite_sets_on_cpu() {
     finite_remapping_cases(BackendChoice::Cpu);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn estimator_handles_finite_row_remapping_and_small_finite_sets_on_cuda() {
-    let Ok(_) = fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    ) else {
+    let Ok(_) = fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }) else {
         assert!(
             std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
             "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
@@ -775,22 +743,14 @@ fn route_parity_cases(backend: BackendChoice) {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn forced_search_routes_match_on_cpu() {
     route_parity_cases(BackendChoice::Cpu);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn forced_search_routes_match_on_cuda() {
-    if fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    )
-    .is_err()
-    {
+    if fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }).is_err() {
         assert!(
             std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
             "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
@@ -799,14 +759,4 @@ fn forced_search_routes_match_on_cuda() {
         return;
     }
     route_parity_cases(BackendChoice::Cuda { device_index: 0 });
-}
-
-#[cfg(not(feature = "cpu"))]
-#[test]
-fn explicit_cpu_backend_fails_when_cpu_is_not_compiled() {
-    assert!(
-        HDBSCAN::new(HdbscanConfig::default(), BackendChoice::Cpu)
-            .fit(&[vec![0.0]])
-            .is_err()
-    );
 }

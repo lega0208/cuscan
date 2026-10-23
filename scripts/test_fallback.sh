@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Only discovery-confirmed CUDA absence permits Auto to choose CPU.
-# No kernel/execution failure is retried on another backend.
-cargo test -p fast-umap --no-default-features --features cpu --lib backend_selection
-cargo test -p fast-umap --no-default-features --features cpu --lib cpu_device_construction_failure
+# Auto falls back only after confirmed CUDA absence; execution failures never retry.
+cargo test -p fast-cubecl-common --lib -- --exact device::tests::resolution_distinguishes_cuda_presence_absence_and_discovery_failure
+cargo test -p fast-cubecl-common --lib -- --exact device::tests::cpu_device_construction_failure_is_reported_without_fallback
+cargo test -p fast-umap --test test_standard_umap
+cargo test -p fast-umap --test test_standard_dispatch

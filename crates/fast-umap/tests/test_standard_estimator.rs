@@ -1,18 +1,7 @@
 use fast_umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
 
-#[cfg(feature = "cpu")]
 fn estimator_test_backend() -> BackendChoice {
     BackendChoice::Cpu
-}
-
-#[cfg(all(not(feature = "cpu"), feature = "cuda"))]
-fn estimator_test_backend() -> BackendChoice {
-    BackendChoice::Cuda { device_index: 0 }
-}
-
-#[cfg(not(any(feature = "cpu", feature = "cuda")))]
-fn estimator_test_backend() -> BackendChoice {
-    BackendChoice::Auto
 }
 
 #[test]
@@ -448,7 +437,6 @@ fn auto_search_fits_small_inputs_with_exact_search() {
     );
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_estimator_smoke_runs_on_requested_cuda_device() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -527,11 +515,10 @@ fn query_diagnostics_preserve_output_and_expose_actual_neighbors() {
 // It asserts only shape, finiteness, and workload identity; drift and repeat spread are
 // reported as data for comparison across builds. Run it explicitly, for example:
 //   FAST_UMAP_DRIFT_OUT=/abs/path/outside/repo/drift-before-cpu.json \
-//     cargo test --locked --no-default-features --features cpu --test test_standard_estimator \
+//     cargo test --locked --test test_standard_estimator \
 //     seeded_drift_diagnostic -- --ignored --nocapture
 // Optional FAST_UMAP_DRIFT_BASELINE=/abs/path/to/previous.json compares against a prior capture.
 // FAST_UMAP_DRIFT_LABEL is an optional free-text tag stored in the output.
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod seeded_drift {
     use burn::backend::Dispatch;
     use burn::tensor::{Device, Int, Tensor, TensorData};
@@ -551,16 +538,8 @@ mod seeded_drift {
     const EPOCHS: usize = 50;
     const COMPONENTS: usize = 2;
 
-    #[cfg(feature = "cpu")]
     fn drift_backend() -> (&'static str, BackendChoice, Device) {
         ("cpu", BackendChoice::Cpu, Device::cpu())
-    }
-
-    #[cfg(all(not(feature = "cpu"), feature = "cuda"))]
-    fn drift_backend() -> (&'static str, BackendChoice, Device) {
-        let device = fast_umap::cuda_backend::device(0)
-            .expect("seeded drift diagnostic requires a CUDA device");
-        ("cuda", BackendChoice::Cuda { device_index: 0 }, device)
     }
 
     fn drift_data(rows: usize, features: usize) -> Vec<Vec<f32>> {

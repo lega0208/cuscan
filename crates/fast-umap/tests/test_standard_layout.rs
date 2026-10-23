@@ -349,7 +349,6 @@ fn verify_fixture(device: &Device, reference_order: bool) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_cpu() {
     verify_fixture(&Device::cpu(), false);
@@ -357,7 +356,6 @@ fn standard_layout_matches_frozen_optimizer_epochs_and_ordered_prefixes_on_cpu()
 
 /// Exercises the fused Dispatch backend with production dtypes: f32
 /// coordinates/atomics, f64 clocks, i64 RNG `[head_rows, 3]`, and i32 indices.
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_layout_single_head_f64_reference_continues_actual_state() {
     let device = Device::cpu();
@@ -490,7 +488,6 @@ fn standard_layout_single_head_f64_reference_continues_actual_state() {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_layout_runs_estimator_produced_f64_clock_state() {
     let data = (0..12)
@@ -527,7 +524,6 @@ fn standard_layout_runs_estimator_produced_f64_clock_state() {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_layout_plain_cube_backend_active_update_preserves_observers() {
     use burn::backend::ops::{FloatTensorOps, IntTensorOps};
@@ -706,13 +702,11 @@ fn verify_zero_controls_and_repeats(device: &Device, _reference_order: bool) {
     assert_ne!(rng.to_data().try_to_vec::<i64>().unwrap(), rng_data);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_layout_zero_controls_and_repeated_fixture_runs_remain_valid() {
     verify_zero_controls_and_repeats(&Device::cpu(), false);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_layout_matches_frozen_optimizer_epochs_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -724,12 +718,4 @@ fn standard_layout_matches_frozen_optimizer_epochs_on_cuda() {
     };
     verify_fixture(&device, false);
     verify_zero_controls_and_repeats(&device, false);
-}
-
-#[cfg(all(not(feature = "cuda"), test))]
-#[test]
-fn cuda_layout_is_required_when_requested_without_cuda_feature() {
-    if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
-        panic!("FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled");
-    }
 }

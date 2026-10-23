@@ -3,7 +3,7 @@
 
 Run from the repository root with ``uv run --no-sync python scripts/compare_umap_spans.py``.
 Build the companion first (build time is excluded from the runtime budget):
-``cargo build --release --no-default-features --features cuda,tracing
+``cargo build --release --features tracing
 --example profile_standard_cuda``.
 
 Primary workload: identical clustered float32 5000x32 input, 20 epochs, Euclidean,
@@ -2643,7 +2643,7 @@ def _cli() -> int:
     if not binary.is_file():
         print(
             f"CUDA profiler executable not found: {binary}\nBuild it first:\n"
-            "  cargo build --release --no-default-features --features cuda,tracing "
+            "  cargo build --release --features tracing "
             "--example profile_standard_cuda",
             file=sys.stderr,
         )

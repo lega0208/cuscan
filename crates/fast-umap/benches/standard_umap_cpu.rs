@@ -1,5 +1,5 @@
-//! CubeCL CPU standard UMAP profiler. Quick smoke run: `cargo bench --no-default-features
-//! --features cpu --bench standard_umap_cpu -- --test`. Add `--features tracing` and set
+//! CubeCL CPU standard UMAP profiler. Quick smoke run: `cargo bench
+//! --bench standard_umap_cpu -- --test`. Add `--features tracing` and set
 //! `FAST_UMAP_TRACE=console` for span-close output, or set it to a Chrome trace
 //! filename (for example `FAST_UMAP_TRACE=umap.json`). `RUST_LOG` controls the
 //! tracing filter. Tracing setup is compiled only with the `tracing` feature and

@@ -402,7 +402,6 @@ fn verify_reference_cases(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_matches_reference_fixtures_on_cpu() {
     verify_reference_cases(&Device::cpu());
@@ -476,13 +475,11 @@ fn verify_global_mean_oracle_cases(device: &Device) {
     verify_f64_mean_case(device, indices, distances, [n, k], 0.5, false, n);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cpu() {
     verify_global_mean_oracle_cases(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -495,7 +492,6 @@ fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cuda() {
     verify_global_mean_oracle_cases(&device);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors() {
     let device = Device::cpu();
@@ -606,7 +602,6 @@ fn verify_bipartite_forward_memberships(graph: &GraphValues, mix: f32) {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cpu() {
     let device = Device::cpu();
@@ -629,7 +624,6 @@ fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cpu(
     );
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -658,7 +652,6 @@ fn bipartite_graph_preserves_forward_memberships_across_set_op_mix_ratio_on_cuda
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero() {
     let graph = run_graph(
@@ -707,7 +700,6 @@ fn bipartite_smooth_knn_matches_reference_when_nearest_distances_are_nonzero() {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_fuzzy_graph_marks_invalid_reference_indices() {
     let graph = run_graph(
@@ -728,7 +720,6 @@ fn standard_fuzzy_graph_marks_invalid_reference_indices() {
     );
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_fuzzy_graph_matches_reference_fixtures_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {

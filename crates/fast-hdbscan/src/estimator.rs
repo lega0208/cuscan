@@ -620,9 +620,7 @@ impl HDBSCAN {
         let min_samples = self.config.resolved_min_samples();
         #[cfg(feature = "tracing")]
         let _backend_setup_span = tracing::info_span!("backend_setup").entered();
-        let (device, actual_backend) =
-            selected_device(self.backend, cfg!(feature = "cpu"), cfg!(feature = "cuda"))
-                .map_err(map_backend_error)?;
+        let (device, actual_backend) = selected_device(self.backend).map_err(map_backend_error)?;
         let allocation_limit = allocation_limit(&device)?;
         let resolved_search = self
             .search
@@ -1118,11 +1116,9 @@ mod search_tests {
         );
     }
 
-    #[cfg(feature = "cpu")]
     #[test]
     fn selected_cpu_reports_allocation_properties_without_tensor_upload() {
-        let (device, _) =
-            selected_device(BackendChoice::Cpu, true, cfg!(feature = "cuda")).unwrap();
+        let (device, _) = selected_device(BackendChoice::Cpu).unwrap();
         let limit = allocation_limit(&device).unwrap();
         assert!(limit.max_page_bytes > 0);
         assert!(limit.alignment > 0);

@@ -9,17 +9,14 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["cuda", "cpu"]
-cpu = ["dep:burn-cubecl", "dep:cubecl", "fast-cubecl-common/cpu"]
-cuda = ["dep:burn-cubecl", "dep:cubecl", "fast-cubecl-common/cuda"]
 tracing = ["dep:tracing", "fast-cubecl-common/tracing", "fast-hdbscan-core/tracing"]
 
 [dependencies]
 fast-cubecl-common = { workspace = true }
 fast-hdbscan-core = { workspace = true }
 burn = { workspace = true }
-burn-cubecl = { workspace = true, optional = true }
-cubecl = { workspace = true, optional = true }
+burn-cubecl = { workspace = true }
+cubecl = { workspace = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -37,9 +34,7 @@ required-features = ["tracing"]
 [[bench]]
 name = "hdbscan_cpu"
 harness = false
-required-features = ["cpu"]
 
 [[bench]]
 name = "hdbscan_cuda"
 harness = false
-required-features = ["cuda"]

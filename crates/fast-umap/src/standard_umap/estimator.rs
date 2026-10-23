@@ -1164,8 +1164,7 @@ fn weighted_initialization(
 fn selected_device(
     choice: crate::standard_umap::BackendChoice,
 ) -> Result<(Device, crate::standard_umap::BackendChoice)> {
-    fast_cubecl_common::selected_device(choice, cfg!(feature = "cpu"), cfg!(feature = "cuda"))
-        .map_err(super::backend_choice::map_backend_error)
+    fast_cubecl_common::selected_device(choice).map_err(super::backend_choice::map_backend_error)
 }
 
 fn matrix_tensor(data: &[Vec<f32>], device: &Device) -> Tensor<2> {
@@ -1603,10 +1602,7 @@ mod tests {
 
     #[test]
     fn transform_flat_preserves_validation_errors() {
-        #[cfg(feature = "cpu")]
         let backend = crate::standard_umap::BackendChoice::Cpu;
-        #[cfg(all(not(feature = "cpu"), feature = "cuda"))]
-        let backend = crate::standard_umap::BackendChoice::Cuda { device_index: 0 };
         let data = (0..16)
             .map(|row| vec![row as f32, row as f32 * 0.25])
             .collect::<Vec<_>>();
@@ -1841,7 +1837,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn first_coordinate_rng_matches_original_full_embedding_bits() {
         let device = Device::cpu();
         let values = vec![-0.0f32, 99.0, 1.25, -17.0, -3.5, 0.0];
@@ -1906,13 +1901,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn chunked_weighted_initialization_matches_original_on_cpu() {
         assert_chunked_weighted_initialization_matches_original(&Device::cpu(), 200);
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn cuda_chunked_weighted_initialization_matches_original_with_small_limit() {
         let Some(device) = crate::cuda_backend::device(0) else {
             assert!(
@@ -1975,13 +1968,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn positive_maximum_validates_singleton_on_cpu() {
         assert_positive_maximum_rejected(&Device::cpu());
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn positive_maximum_validates_singleton_on_cuda() {
         let Some(device) = crate::cuda_backend::device(0) else {
             assert!(
@@ -2008,13 +1999,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn query_stats_bool_scalar_detects_nonleading_marker_on_cpu() {
         assert_query_stats_detects_invalid_marker(&Device::cpu());
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn query_stats_bool_scalar_detects_nonleading_marker_on_cuda() {
         let Some(device) = crate::cuda_backend::device(0) else {
             assert!(
@@ -2089,13 +2078,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn head_csr_device_matches_host_on_cpu() {
         device_csr_matches_host(&Device::cpu());
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn head_csr_device_matches_host_on_cuda() {
         if let Some(device) = crate::cuda_backend::device(0) {
             device_csr_matches_host(&device);
@@ -2117,7 +2104,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cpu")]
     fn transform_graph_marker_errors_checked_per_call() {
         let device = Device::cpu();
         let valid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0], [1]), &device);

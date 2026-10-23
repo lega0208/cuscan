@@ -3,8 +3,8 @@
 
 Build the native companion before running (the backend must match --backend):
 
-    cargo build -p fast-hdbscan --release --no-default-features \\
-        --features cpu,tracing --example profile_hdbscan_stages
+    cargo build -p fast-hdbscan --release --features tracing \\
+        --example profile_hdbscan_stages
 
 Then run, for example:
 
@@ -606,7 +606,7 @@ def main() -> int:
     if not args.binary.is_file():
         parser.error(
             f"{args.binary} missing; build with: cargo build -p fast-hdbscan --release "
-            f"--no-default-features --features {args.backend},tracing "
+            "--features tracing "
             "--example profile_hdbscan_stages"
         )
 

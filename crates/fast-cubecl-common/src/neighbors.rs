@@ -114,40 +114,21 @@ pub fn squared_euclidean_distance_block(query: Tensor<2>, reference: Tensor<2>) 
     ))
 }
 
-#[cfg(all(test, any(feature = "cpu", feature = "cuda")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use burn::tensor::{Device, TensorData};
 
     fn devices() -> Vec<Device> {
-        #[cfg(all(feature = "cpu", feature = "cuda"))]
-        {
-            let mut devices = vec![Device::cpu()];
-            let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
-            if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
-                assert!(count > 0, "required CUDA execution has no usable device");
-            }
-            if count > 0 {
-                devices.push(Device::cuda(0));
-            }
-            devices
+        let mut devices = vec![Device::cpu()];
+        let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
+            assert!(count > 0, "required CUDA execution has no usable device");
         }
-        #[cfg(all(feature = "cpu", not(feature = "cuda")))]
-        {
-            vec![Device::cpu()]
+        if count > 0 {
+            devices.push(Device::cuda(0));
         }
-        #[cfg(all(feature = "cuda", not(feature = "cpu")))]
-        {
-            let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
-            if std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some() {
-                assert!(count > 0, "required CUDA execution has no usable device");
-            }
-            if count > 0 {
-                vec![Device::cuda(0)]
-            } else {
-                Vec::new()
-            }
-        }
+        devices
     }
 
     fn tensor(values: Vec<f32>, rows: usize, device: &Device) -> Tensor<2> {
@@ -293,10 +274,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "neighbor count exceeds available references")]
     fn euclidean_mode_rejects_excess_width_at_execution() {
-        #[cfg(feature = "cpu")]
         let device = Device::cpu();
-        #[cfg(not(feature = "cpu"))]
-        let device = Device::cuda(0);
         let (_, d) = exact_neighbors(
             tensor(vec![0.0], 1, &device),
             tensor(vec![3.0, 4.0], 2, &device),

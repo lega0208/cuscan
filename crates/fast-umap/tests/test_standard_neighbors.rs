@@ -43,12 +43,10 @@ fn exercise_blocks(device: Device) {
 }
 
 #[test]
-#[cfg(feature = "cpu")]
 fn exact_consumer_crosses_blocks_on_cpu() {
     exercise_blocks(Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn exact_consumer_crosses_blocks_on_actual_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -63,11 +61,7 @@ fn exact_consumer_crosses_blocks_on_actual_cuda() {
 
 #[test]
 fn exact_consumer_rejects_invalid_widths_and_alignment() {
-    #[cfg(feature = "cpu")]
     let device = Device::cpu();
-    #[cfg(all(not(feature = "cpu"), feature = "cuda"))]
-    let device =
-        fast_umap::cuda_backend::device(0).expect("CUDA device required for CUDA-only tests");
     let fit = Tensor::<2>::zeros([3, 2], &device);
     let query = Tensor::<2>::zeros([2, 2], &device);
     assert!(exact_neighbors(fit.clone(), fit.clone(), 0, true).is_err());

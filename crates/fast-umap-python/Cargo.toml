@@ -19,7 +19,4 @@ fast-umap = { workspace = true }
 fast-hdbscan = { workspace = true }
 
 [features]
-default = ["cuda", "cpu"]
-cpu = ["fast-umap/cpu", "fast-hdbscan/cpu"]
-cuda = ["fast-umap/cuda", "fast-hdbscan/cuda"]
 tracing = ["fast-umap/tracing", "fast-hdbscan/tracing"]

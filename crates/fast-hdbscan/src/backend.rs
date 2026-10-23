@@ -21,7 +21,7 @@ pub struct DeviceKdTree<B: Backend> {
 }
 
 /// Backend operation used to find each point's exact outgoing Borůvka edge.
-#[backend_extension(Cube: cfg(any(feature = "cpu", feature = "cuda")), Fusion: cfg(any(feature = "cpu", feature = "cuda")))]
+#[backend_extension(Cube, Fusion)]
 pub trait HdbscanOps: Backend {
     #[fusion(meta = |data, core_sq, point_components| {
         let shape = [data.shape[0]];

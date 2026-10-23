@@ -4,7 +4,7 @@ use burn::backend::{
     tensor::{FloatTensor, IntTensor},
 };
 
-#[backend_extension(Cube: cfg(any(feature = "cpu", feature = "cuda")), Fusion: cfg(any(feature = "cpu", feature = "cuda")))]
+#[backend_extension(Cube, Fusion)]
 pub trait NeighborOps: Backend {
     #[fusion(meta = |query, reference, k, exclude_self, query_offset, squared| {
         let shape = [query.shape[0], *k as usize];

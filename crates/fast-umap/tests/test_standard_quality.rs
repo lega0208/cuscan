@@ -118,7 +118,6 @@ fn matrix_from_npz(archive: &mut ZipArchive<File>, name: &str) -> Matrix {
     npy_matrix(&bytes)
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn matrix_from_npz_path(path: &std::path::Path, name: &str) -> Matrix {
     let mut archive = ZipArchive::new(File::open(path).unwrap())
         .unwrap_or_else(|error| panic!("could not open {}: {error}", path.display()));
@@ -142,7 +141,6 @@ fn fixture() -> (Value, Vec<(String, Matrix, Matrix)>) {
     (reference, cases)
 }
 
-#[cfg(feature = "cuda")]
 fn device_for_cuda() -> Option<Device> {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
         assert!(
@@ -155,18 +153,12 @@ fn device_for_cuda() -> Option<Device> {
     Some(device)
 }
 
-#[cfg(feature = "cuda")]
 fn backend(device: &Device) -> BackendChoice {
-    if cfg!(feature = "cuda") && fast_umap::cuda_backend::device(0).as_ref() == Some(device) {
+    if fast_umap::cuda_backend::device(0).as_ref() == Some(device) {
         BackendChoice::Cuda { device_index: 0 }
     } else {
         BackendChoice::Cpu
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-fn backend(_: &Device) -> BackendChoice {
-    BackendChoice::Cpu
 }
 
 fn distances(left: &[f32], right: &[f32], width: usize) -> f64 {
@@ -230,7 +222,6 @@ fn matrix_from_embedding(embedding: &[Vec<f32>]) -> Matrix {
     }
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f64 {
     let n = original.rows;
     assert_eq!(embedded.rows, n, "trustworthiness row shape");
@@ -277,7 +268,6 @@ fn bounded_trustworthiness(original: &Matrix, embedded: &Matrix, k: usize) -> f6
     1.0 - 2.0 * penalty as f64 / normalizer
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn original_ranks(original: &Matrix) -> Vec<usize> {
     let n = original.rows;
     let mut ranks = vec![0usize; n * n];
@@ -303,7 +293,6 @@ fn original_ranks(original: &Matrix) -> Vec<usize> {
     ranks
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn bounded_trustworthiness_with_ranks(
     original: &Matrix,
     embedded: &Matrix,
@@ -339,7 +328,6 @@ fn bounded_trustworthiness_with_ranks(
     1.0 - 2.0 * penalty as f64 / normalizer
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn assert_approximate_fit_quality(
     device: &Device,
     name: &str,
@@ -618,7 +606,6 @@ fn run_quality(device: Device) {
     );
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 #[test]
 fn cached_trustworthiness_matches_bounded_with_ties() {
     let original = Matrix {
@@ -699,14 +686,11 @@ fn run_recall(device: Device) {
     }
     let fit_recall = fit_weighted_hits as f64 / fit_weighted_rows as f64;
     let query_recall = query_weighted_hits as f64 / query_weighted_rows as f64;
-    #[cfg(feature = "cpu")]
     let device_name = if device == Device::cpu() {
         "CPU"
     } else {
         "CUDA"
     };
-    #[cfg(not(feature = "cpu"))]
-    let device_name = "CUDA";
     eprintln!(
         "{device_name} ANN tie-aware recall: fit@14={fit_recall:.6}, transform-query@15={query_recall:.6}"
     );
@@ -721,18 +705,15 @@ fn run_recall(device: Device) {
 }
 
 #[test]
-#[cfg(feature = "cpu")]
 fn standard_ann_recall_on_cpu() {
     run_recall(Device::cpu());
 }
 
 #[test]
-#[cfg(feature = "cpu")]
 fn standard_quality_trustworthiness_on_cpu() {
     run_quality(Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_ann_recall_on_cuda() {
     let Some(device) = device_for_cuda() else {
@@ -741,7 +722,6 @@ fn standard_ann_recall_on_cuda() {
     run_recall(device);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_quality_trustworthiness_on_cuda() {
     let Some(device) = device_for_cuda() else {
@@ -781,13 +761,11 @@ fn run_approximate_fit_quality_per_frozen_fixture_case(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_approximate_fit_quality_per_frozen_fixture_case() {
     run_approximate_fit_quality_per_frozen_fixture_case(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_approximate_fit_quality_per_frozen_fixture_case() {
     let Some(device) = device_for_cuda() else {
@@ -871,13 +849,11 @@ fn run_long_run_quality(device: &Device) {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_long_quality_reference() {
     run_long_run_quality(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_long_quality_reference() {
     let Some(device) = device_for_cuda() else {
@@ -977,28 +953,17 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_approximate_fit_quality_campaign() {
     run_approximate_fit_quality_campaign(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_approximate_fit_quality_campaign() {
     let Some(device) = device_for_cuda() else {
         return;
     };
     run_approximate_fit_quality_campaign(&device);
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn cuda_quality_is_required_when_requested_without_cuda_feature() {
-    assert!(
-        std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-        "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-    );
 }
 
 fn resource_rows(rows: usize, features: usize) -> Vec<Vec<f32>> {
@@ -1042,7 +1007,6 @@ fn fit_without_dense_matrix(backend: BackendChoice, rows: usize) {
 
 /// A dense N x N f32 matrix at N=20,000 needs 1.6 GB; the sparse pipeline
 /// stays O(N*K). Measured ~40 s in release on a Ryzen 7 9800X3D.
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_fit_larger_than_dense_memory_budget_completes() {
     let rows = 20_000usize;
@@ -1051,7 +1015,6 @@ fn cpu_fit_larger_than_dense_memory_budget_completes() {
 }
 
 /// N=60,000 dense f32 distances need 14.4 GB, beyond a 10 GiB RTX 3080.
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_fit_larger_than_device_dense_memory_completes() {
     let Some(_device) = device_for_cuda() else {

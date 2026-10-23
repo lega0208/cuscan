@@ -31,9 +31,13 @@ burn = { version = "0.22.1", default-features = false, features = [
   "autotune",
   "extension",
   "persistence",
+  "cubecl",
+  "cpu",
+  "cuda",
+  "fusion",
 ] }
-burn-cubecl = { version = "0.22.1", default-features = false }
-cubecl = { version = "0.11.1", default-features = false }
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["cpu", "cuda"] }
+cubecl = { version = "0.11.1", default-features = false, features = ["cpu", "cuda", "persistence"] }
 cubecl-cpu = { version = "0.11.1", default-features = false }
 cudarc = { version = "0.19.10", features = [
   "std",

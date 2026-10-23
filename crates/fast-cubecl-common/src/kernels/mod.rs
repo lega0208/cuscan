@@ -1,7 +1,5 @@
 use burn::cubecl::CubeDim;
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod cube_backend;
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod neighbors;
 
 pub fn legal_cube_dim(client: &cubecl::client::Client, preferred: CubeDim) -> CubeDim {

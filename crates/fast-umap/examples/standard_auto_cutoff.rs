@@ -49,7 +49,6 @@ fn benchmark(label: &str, backend: BackendChoice) -> Option<usize> {
 
 fn main() {
     let cpu_crossover = benchmark("CPU", BackendChoice::Cpu);
-    #[cfg(feature = "cuda")]
     let cuda_crossover = if let Some(device) = fast_umap::cuda_backend::device(0) {
         let _ = device;
         benchmark("CUDA", BackendChoice::Cuda { device_index: 0 })
@@ -57,12 +56,6 @@ fn main() {
         println!("CUDA unavailable; no CUDA crossover measurement");
         None
     };
-    #[cfg(not(feature = "cuda"))]
-    let cuda_crossover: Option<usize> = {
-        println!("CUDA feature is not enabled; no CUDA crossover measurement");
-        None
-    };
-
     // AUTO_EXACT_MAX_ROWS follows the measured CUDA crossover when present, otherwise CPU.
     println!(
         "CUDA-preferred recommended AUTO_EXACT_MAX_ROWS: {:?}",

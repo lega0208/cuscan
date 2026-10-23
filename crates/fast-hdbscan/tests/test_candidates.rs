@@ -2,7 +2,6 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Int, Tensor, TensorData},
 };
-#[cfg(feature = "cuda")]
 use fast_hdbscan::BackendChoice;
 use fast_hdbscan::HdbscanOps;
 
@@ -54,7 +53,6 @@ fn check_candidates(device: &Device, n: usize, components_count: usize) {
     assert_eq!(destinations, expected_destinations);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn boruvka_candidates_match_host_oracle_across_reference_tiles_cpu() {
     for (n, components) in [(1, 1), (2, 2), (257, 2), (513, 7)] {
@@ -62,14 +60,9 @@ fn boruvka_candidates_match_host_oracle_across_reference_tiles_cpu() {
     }
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn boruvka_candidates_match_host_oracle_across_reference_tiles_cuda() {
-    let resolved = fast_cubecl_common::selected_device(
-        BackendChoice::Cuda { device_index: 0 },
-        cfg!(feature = "cpu"),
-        true,
-    );
+    let resolved = fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 });
     let Ok((device, _)) = resolved else {
         assert!(
             std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
@@ -81,13 +74,4 @@ fn boruvka_candidates_match_host_oracle_across_reference_tiles_cuda() {
     for (n, components) in [(1, 1), (2, 2), (257, 2), (513, 7)] {
         check_candidates(&device, n, components);
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn required_cuda_candidates_fail_when_cuda_is_not_compiled() {
-    assert!(
-        std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-        "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-    );
 }

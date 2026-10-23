@@ -158,9 +158,7 @@ def test_cuda_load_forwards_device_index_strictly(tmp_path: Path) -> None:
             phrase in str(error).lower()
             for phrase in (
                 "unavailable",
-                "not compiled",
                 "no device",
-                "requires the `cuda` feature",
             )
         ):
             pytest.skip(f"CUDA backend unavailable: {error}")

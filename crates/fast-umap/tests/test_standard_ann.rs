@@ -120,13 +120,11 @@ fn run_shape_cases(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_preserves_shape_and_geometric_contracts() {
     run_shape_cases(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_preserves_shape_and_geometric_contracts() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -411,13 +409,11 @@ fn run_quality_case(device: &Device) {
     check_refinement_quality(device, values, n, features, 15, 0x5eed);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_refines_seed_candidates_with_more_neighbor_joins() {
     run_quality_case(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_refines_seed_candidates_with_more_neighbor_joins() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -430,7 +426,6 @@ fn cuda_ann_refines_seed_candidates_with_more_neighbor_joins() {
     run_quality_case(&device);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_resolves_equal_distances_by_neighbor_id() {
     let values = vec![0.0f32, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0];
@@ -440,7 +435,6 @@ fn cpu_ann_resolves_equal_distances_by_neighbor_id() {
     assert_eq!(&distances[..4], &[1.0; 4]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn ann_rejects_invalid_tiny_width_and_singleton_input() {
     let device = Device::cpu();
@@ -466,14 +460,12 @@ fn ann_rejects_invalid_tiny_width_and_singleton_input() {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_handles_minimal_two_row_input() {
     let (ids, distances) = approximate(&Device::cpu(), vec![0.0, 3.0], 2, 1, 1, 42, 3);
     check_rows(&ids, &distances, &[0.0, 3.0], 2, 1, 1);
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn check_query_sentinels_and_budget(device: &Device) {
     use fast_umap::standard_umap::approximate_query_budget;
     let reference =
@@ -510,7 +502,6 @@ fn check_query_sentinels_and_budget(device: &Device) {
     ));
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn check_finite_input_distance_overflow(device: &Device) {
     let values = vec![f32::MAX, -f32::MAX, 0.0, 1.0];
     let (ids, distances) = approximate(device, values.clone(), 4, 1, 2, 991, 0);
@@ -541,19 +532,16 @@ fn check_finite_input_distance_overflow(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_query_sentinels_and_checked_budget_overflow() {
     check_query_sentinels_and_budget(&Device::cpu());
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn cpu_ann_handles_finite_coordinates_whose_squared_distance_overflows() {
     check_finite_input_distance_overflow(&Device::cpu());
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn cuda_ann_runs_on_device_and_query_sentinels() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -565,13 +553,4 @@ fn cuda_ann_runs_on_device_and_query_sentinels() {
     };
     check_query_sentinels_and_budget(&device);
     check_finite_input_distance_overflow(&device);
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn required_cuda_mode_fails_when_cuda_support_is_not_compiled() {
-    assert!(
-        std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
-        "FAST_UMAP_REQUIRE_CUDA is set, but CUDA support is not compiled"
-    );
 }

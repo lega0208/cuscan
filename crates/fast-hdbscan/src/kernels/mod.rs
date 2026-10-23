@@ -1,15 +1,11 @@
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod boruvka;
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 mod kdtree;
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
 
 use burn::backend::tensor::{FloatTensor, IntTensor};
 use burn_cubecl::CubeBackend;
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 impl crate::backend::HdbscanOps for CubeBackend {
     fn boruvka_candidates(
         data: FloatTensor<Self>,

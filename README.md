@@ -13,17 +13,17 @@ See [docs.rs](https://docs.rs/crate/fast-umap/latest) for the full API reference
 
 ```toml
 [dependencies]
-fast-umap = { version = "1.6.0", default-features = false, features = ["cpu"] }
+fast-umap = { version = "1.6.0" }
 ```
 
 | Feature | Description |
 |---------|-------------|
-| `cpu` | CubeCL LLVM CPU runtime (default) |
-| `cuda` | NVIDIA CUDA runtime (default) |
 | `tracing` | Instrument fit/transform phases and enable Burn/CubeCL tracing |
 | `cubecl-ir-dump` | Dump CubeCL CPU IR for kernel inspection |
 
-At least one of `cpu` or `cuda` must be enabled.
+CubeCL LLVM CPU and CUDA support are always compiled. CUDA still requires a
+working NVIDIA runtime/device; compiling it does not initialize CUDA or require
+CUDA hardware. Runtime backend selection is controlled by the `backend` argument.
 
 ---
 
@@ -51,11 +51,11 @@ From the repository root, install in editable mode with `uv`:
 uv sync
 ```
 
-For a CPU-only local extension build, explicitly select the CPU feature. Avoid
-running `uv sync` before tests, because syncing can replace the local extension:
+Build the local extension with both backends available. Avoid running `uv sync`
+before tests, because syncing can replace the local extension:
 
 ```shell
-uv run maturin develop --release --no-default-features --features cpu
+uv run maturin develop --release
 uv run --no-sync pytest python/tests/test_standard_*.py
 ```
 
@@ -145,7 +145,7 @@ uv run --no-sync python scripts/benchmark_serialization.py --output serializatio
 
 ```shell
 uv sync
-uv run maturin develop --release --no-default-features --features cpu
+uv run maturin develop --release
 uv run --no-sync pytest python/tests
 uv run ruff check
 uv run ruff format --check
@@ -208,10 +208,8 @@ it does not generate point plots. Both scripts print timing tables and accept
 Build their native companions separately so build time is not measured:
 
 ```sh
-cargo build -p fast-umap --release --no-default-features \
-  --features cpu,tracing --example profile_standard_stages
-cargo build -p fast-hdbscan --release --no-default-features \
-  --features cpu,tracing --example profile_hdbscan_stages
+cargo build -p fast-umap --release --features tracing --example profile_standard_stages
+cargo build -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
 
 uv run --no-sync python comparison/compare_stages.py --backend cpu \
   --html comparison/umap_stages.html --json comparison/umap_stages.json
@@ -292,8 +290,8 @@ projected = model.transform(X_new)
   Unexpected discovery errors propagate; explicit selections are strict, and
   construction or execution failures never cause backend substitution. Spectral initialization is host-side.
   `BackendChoice::validate()` returns the shared `BackendError` and validates
-  common-crate capabilities. UMAP operations enforce their own enabled backend
-  features and map backend failures to `UmapError::BackendUnavailable`.
+  common-crate capabilities. UMAP operations use the always-compiled backends
+  and map backend failures to `UmapError::BackendUnavailable`.
 - **Neighbor search:** `Exact` (blocked exact search, no N x N matrix),
   `Approximate` (NN-Descent for fit, bounded graph search for transform), or
   `Auto` (`Exact` up to `AUTO_EXACT_MAX_ROWS` rows, `Approximate` above).
@@ -328,18 +326,18 @@ Burn/CubeCL tracing. The library does not install a subscriber. Profiling benche
 install one only when `FAST_UMAP_TRACE` is set; leave it unset for timing runs.
 
 ```sh
-cargo bench -p fast-umap --no-default-features --features cpu --bench standard_umap_cpu
-cargo bench -p fast-umap --no-default-features --features cuda --bench standard_umap_cuda
+cargo bench -p fast-umap --bench standard_umap_cpu
+cargo bench -p fast-umap --bench standard_umap_cuda
 
 # Chrome/Perfetto trace (import the JSON file into ui.perfetto.dev)
 FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace cargo bench -p fast-umap \
-  --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
+  --features tracing --bench standard_umap_cpu -- --test
 FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench -p fast-umap \
-  --no-default-features --features cuda,tracing --bench standard_umap_cuda -- --test
+  --features tracing --bench standard_umap_cuda -- --test
 
 # Console span timings instead of a trace file
 FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench -p fast-umap \
-  --no-default-features --features cpu,tracing --bench standard_umap_cpu -- --test
+  --features tracing --bench standard_umap_cpu -- --test
 ```
 
 CUDA requires a working NVIDIA runtime. Traces are
@@ -351,7 +349,7 @@ embedding readback, with deterministic inputs prepared outside the timed loop.
 Compare standard UMAP with **umap-learn 0.5.12**, using CUDA only:
 
 ```sh
-cargo build -p fast-umap --release --no-default-features --features cuda,tracing --example profile_standard_cuda
+cargo build -p fast-umap --release --features tracing --example profile_standard_cuda
 uv run --no-sync python scripts/compare_umap_spans.py --output comparison.json --trace cuda-trace.json
 ```
 
@@ -394,9 +392,8 @@ The Standard CPU test lane uses CubeCL LLVM and does not require a GPU.
 
 ```shell
 cargo test -p fast-umap-core
-cargo test -p fast-umap --no-default-features --features cpu
-bash scripts/test_features.sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common --no-default-features --features cuda -- --nocapture
+cargo test -p fast-umap
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common -- --nocapture
 ```
 
 Default quality fixtures retain every dataset with three fixed seeds, 10 graph
@@ -408,8 +405,8 @@ signed gaps are diagnostics only. Recall thresholds are unchanged.
 An opt-in 200-epoch fit/transform case retains longer-optimization coverage:
 
 ```shell
-FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --no-default-features --features cpu --test test_standard_quality long_quality
-FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --no-default-features --features cuda --test test_standard_quality long_quality
+FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --test test_standard_quality long_quality
+FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --test test_standard_quality long_quality
 ```
 
 Regenerate only quality fixtures (without replacing graph/layout references) with:
@@ -502,10 +499,10 @@ exclude self, use `-1` padding, and core distances include infinite padding.
 `dbscan_clustering(epsilon)` returns a `Result` and rejects NaN.
 
 ```shell
-cargo test -p fast-hdbscan --no-default-features --features cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --no-default-features --features cuda
-cargo bench -p fast-hdbscan --no-default-features --features cpu --bench hdbscan_cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --no-default-features --features cuda --bench hdbscan_cuda
+cargo test -p fast-hdbscan
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan
+cargo bench -p fast-hdbscan --bench hdbscan_cpu
+FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --bench hdbscan_cuda
 ```
 
 Criterion benchmarks compare forced routes on the same fixtures and seeded

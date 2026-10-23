@@ -62,7 +62,6 @@ fn run_large_offset_distance_case(device: &Device) {
     assert_eq!(neighbor_distances, [1.0]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_squared_distance_dispatch_uses_cpu_for_rectangular_blocks() {
     assert_eq!(
@@ -71,13 +70,11 @@ fn standard_squared_distance_dispatch_uses_cpu_for_rectangular_blocks() {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn standard_squared_distance_and_self_exclusion_preserve_large_offset_precision_on_cpu() {
     run_large_offset_distance_case(&Device::cpu());
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn exact_neighbors_excludes_global_self_and_orders_ties_by_index_on_cpu() {
     let device = Device::cpu();
@@ -94,7 +91,6 @@ fn exact_neighbors_excludes_global_self_and_orders_ties_by_index_on_cpu() {
     assert_eq!(distances, [1.0, 1.0, 2.0, 0.0, 1.0, 1.0]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn exact_neighbors_is_bipartite_without_implicit_equal_index_exclusion() {
     let device = Device::cpu();
@@ -108,7 +104,6 @@ fn exact_neighbors_is_bipartite_without_implicit_equal_index_exclusion() {
     assert_eq!(distances, [0.0, 0.0, 2.0]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn exact_neighbors_handles_query_block_boundary_on_cpu() {
     let device = Device::cpu();
@@ -126,7 +121,6 @@ fn exact_neighbors_handles_query_block_boundary_on_cpu() {
     }
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn standard_squared_distance_dispatch_uses_cuda_when_available() {
     let observed_device = fast_umap::cuda_backend::device(0);
@@ -142,7 +136,6 @@ fn standard_squared_distance_dispatch_uses_cuda_when_available() {
     run_large_offset_distance_case(&device);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn exact_neighbors_dispatches_cuda_for_ties_zeros_and_block_boundary() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {

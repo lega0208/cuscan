@@ -2,7 +2,6 @@ use burn::backend::Dispatch;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use fast_umap::backend::StandardUmapOps;
 
-#[cfg(feature = "cpu")]
 #[test]
 fn query_phase1_byte_capture() {
     let Ok(directory) = std::env::var("QUERY_PHASE1_CAPTURE_DIR") else {
@@ -63,7 +62,6 @@ fn query_phase1_byte_capture() {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_query(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -88,7 +86,6 @@ fn run_query(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_prevalidated_query(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -113,7 +110,6 @@ fn run_prevalidated_query(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn run_query_with_entry(
     query: Tensor<2>,
     reference: Tensor<2>,
@@ -167,7 +163,6 @@ fn run_query_with_entry(
     )
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     // A path graph makes traversal observable: a query near row 5 can reach
     // its nearest point only by following several retained training edges.
@@ -188,7 +183,6 @@ fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     (query, reference, graph)
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u64) -> Vec<i32> {
     const MODULUS: i64 = 2_147_483_647;
     let n_u64 = u64::try_from(n).unwrap();
@@ -214,7 +208,6 @@ fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u6
     starts
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn self_edge_query_reference(
     n: usize,
     capacity: usize,
@@ -239,7 +232,6 @@ fn self_edge_query_reference(
     (indices, distances, stats)
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_is_seeded_bounded_and_bipartite() {
     let device = Device::cpu();
@@ -295,7 +287,6 @@ fn approximate_query_is_seeded_bounded_and_bipartite() {
     assert_eq!(distances, [0.0]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_seed_offsets_preserve_block_identity() {
     let device = Device::cpu();
@@ -334,7 +325,6 @@ fn approximate_query_seed_offsets_preserve_block_identity() {
     assert_eq!(whole.2, split_stats);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
     let device = Device::cpu();
@@ -369,7 +359,6 @@ fn approximate_query_queue_capacity_changes_work_on_adversarial_graph() {
     );
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_orders_equal_distances_by_reference_id() {
     let device = Device::cpu();
@@ -388,13 +377,11 @@ fn approximate_query_orders_equal_distances_by_reference_id() {
     assert_eq!(distances, [0.0, 0.0, 1.0]);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_marks_invalid_graph_indices_in_stats() {
     assert_invalid_graph_indices_in_stats(&Device::cpu());
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
     let device = Device::cpu();
@@ -413,7 +400,6 @@ fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
     assert_eq!(prevalidated, validating);
 }
 
-#[cfg(any(feature = "cpu", feature = "cuda"))]
 fn assert_invalid_graph_indices_in_stats(device: &Device) {
     let reference =
         Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0], [4, 1]), device);
@@ -429,7 +415,6 @@ fn assert_invalid_graph_indices_in_stats(device: &Device) {
     }
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_uses_seeded_unique_floyd_starts() {
     let device = Device::cpu();
@@ -476,7 +461,6 @@ fn approximate_query_uses_seeded_unique_floyd_starts() {
     assert_eq!(sample.2, [7, 7]);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn approximate_query_runs_on_cuda_when_requested() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -518,7 +502,6 @@ fn approximate_query_runs_on_cuda_when_requested() {
     assert_eq!(stats, [4, 4]);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn approximate_query_prevalidated_matches_validating_entry_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {
@@ -546,7 +529,6 @@ fn approximate_query_prevalidated_matches_validating_entry_on_cuda() {
     assert!(!prevalidated.2.contains(&-1));
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
     let Some(cuda_device) = fast_umap::cuda_backend::device(0) else {
@@ -559,13 +541,11 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
     assert_prevalidated_chunks_large_batch_with_host_oracle(&cuda_device);
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_cpu_chunks_large_batch_with_host_oracle() {
     assert_prevalidated_chunks_large_batch_with_host_oracle(&Device::cpu());
 }
 
-#[cfg(feature = "cpu")]
 #[test]
 fn approximate_query_cpu_handles_single_row_chunk() {
     let device = Device::cpu();
@@ -675,7 +655,6 @@ fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
     assert_eq!(invalid_stats, vec![-1; query_rows * 2]);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn approximate_query_marks_invalid_graph_indices_in_stats_on_cuda() {
     let Some(device) = fast_umap::cuda_backend::device(0) else {

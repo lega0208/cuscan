@@ -2,7 +2,6 @@
 
 /// A missing runtime and the driver's explicit no-device result are absence;
 /// all other driver failures are surfaced to backend selection.
-#[cfg(feature = "cuda")]
 pub fn try_device_count() -> Result<usize, String> {
     // SAFETY: This only checks whether the CUDA driver library can be loaded.
     if !unsafe { cudarc::driver::sys::is_culib_present() } {
@@ -17,17 +16,14 @@ pub fn try_device_count() -> Result<usize, String> {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub fn device_count() -> usize {
     try_device_count().unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"))
 }
 
-#[cfg(feature = "cuda")]
 pub fn is_available() -> bool {
     device_count() > 0
 }
 
-#[cfg(feature = "cuda")]
 pub fn device(index: usize) -> Option<burn::tensor::Device> {
     (index < device_count()).then(|| burn::tensor::Device::cuda(index))
 }

@@ -258,22 +258,14 @@ pub(crate) fn fit_hdbscan(
 
 #[pyfunction]
 pub(crate) fn hdbscan_cuda_available(py: Python<'_>) -> bool {
-    #[cfg(feature = "cuda")]
-    {
-        py.detach(|| {
-            HDBSCAN::new(
-                HdbscanConfig::default(),
-                BackendChoice::Cuda { device_index: 0 },
-            )
-            .fit(&[vec![0.0_f32]])
-            .is_ok()
-        })
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = py;
-        false
-    }
+    py.detach(|| {
+        HDBSCAN::new(
+            HdbscanConfig::default(),
+            BackendChoice::Cuda { device_index: 0 },
+        )
+        .fit(&[vec![0.0_f32]])
+        .is_ok()
+    })
 }
 
 fn map_hdbscan_error(error: HdbscanError) -> PyErr {
