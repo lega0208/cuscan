@@ -193,3 +193,158 @@ fn squared_distance(data: &[f32], d: usize, i: usize, j: usize) -> f32 {
     }
     sum
 }
+
+/// Independent neighbor graph and reference MST for graph-route tests.
+#[derive(Debug, Default)]
+pub struct KnnKruskalOracle {
+    pub ids: Vec<i32>,
+    pub dist_sq: Vec<f32>,
+    pub core: Vec<f64>,
+    pub edges: Vec<SortedMstEdge>,
+    pub bridges: usize,
+}
+
+/// Independently construct exact non-self neighbors and a Kruskal reference tree.
+pub fn knn_kruskal_oracle(
+    data: &[f32],
+    rows: usize,
+    d: usize,
+    min_samples: usize,
+    k: usize,
+) -> Result<KnnKruskalOracle> {
+    if rows == 0 && d > 0 && data.is_empty() {
+        return Ok(KnnKruskalOracle::default());
+    }
+    validate_data(data, rows, d)?;
+    if rows > i32::MAX as usize {
+        return Err(HdbscanError::Overflow("kNN point index"));
+    }
+    let slots = rows
+        .checked_mul(k)
+        .ok_or(HdbscanError::Overflow("kNN graph allocation"))?;
+    for (elements, size) in [
+        (slots, std::mem::size_of::<i32>()),
+        (slots, std::mem::size_of::<f32>()),
+        (rows, std::mem::size_of::<f64>()),
+        (slots, std::mem::size_of::<(f64, usize, usize, usize)>()),
+        (rows.saturating_sub(1), std::mem::size_of::<SortedMstEdge>()),
+        (
+            rows,
+            std::mem::size_of::<usize>() + std::mem::size_of::<u32>(),
+        ),
+    ] {
+        let bytes = elements
+            .checked_mul(size)
+            .ok_or(HdbscanError::Overflow("kNN graph allocation"))?;
+        if bytes > isize::MAX as usize {
+            return Err(HdbscanError::Overflow("kNN graph allocation"));
+        }
+    }
+    let neighbor_bytes = rows
+        .saturating_sub(1)
+        .checked_mul(std::mem::size_of::<(f32, usize)>())
+        .ok_or(HdbscanError::Overflow("kNN oracle neighbor storage"))?;
+    if neighbor_bytes > isize::MAX as usize {
+        return Err(HdbscanError::Overflow("kNN oracle neighbor storage"));
+    }
+    let mut ids = vec![-1; slots];
+    let mut distances = vec![f32::INFINITY; slots];
+    for row in 0..rows {
+        let mut neighbors = Vec::with_capacity(rows.saturating_sub(1));
+        for other in 0..rows {
+            if other != row {
+                neighbors.push((squared_distance(data, d, row, other), other));
+            }
+        }
+        neighbors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (column, &(distance, other)) in neighbors.iter().take(k).enumerate() {
+            ids[row * k + column] = other as i32;
+            distances[row * k + column] = distance;
+        }
+    }
+    let mut core = vec![0.0; rows];
+    if min_samples > 1 {
+        for row in 0..rows {
+            let column = min_samples - 1;
+            if column < k && ids[row * k + column] >= 0 {
+                core[row] = (distances[row * k + column] as f64).sqrt();
+            } else {
+                core[row] = f64::INFINITY;
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    for row in 0..rows {
+        for column in 0..k {
+            let ordinal = row * k + column;
+            let other = ids[ordinal];
+            if other < 0 {
+                continue;
+            }
+            let weight = core[row]
+                .max(core[other as usize])
+                .max((distances[ordinal] as f64).sqrt())
+                + 0.0;
+            if weight.is_finite() {
+                candidates.push((weight, ordinal, row, other as usize));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut parent: Vec<usize> = (0..rows).collect();
+    let mut ranks = vec![0u32; rows];
+    fn root(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+    let mut edges = Vec::new();
+    for (weight, _, src, dst) in candidates {
+        let (a, b) = (root(&mut parent, src), root(&mut parent, dst));
+        if a != b {
+            let (mut winner, mut loser) = (a, b);
+            if ranks[winner] < ranks[loser] {
+                std::mem::swap(&mut winner, &mut loser);
+            }
+            parent[loser] = winner;
+            if ranks[winner] == ranks[loser] {
+                ranks[winner] += 1;
+            }
+            edges.push(SortedMstEdge {
+                src: src as u32,
+                dst: dst as u32,
+                weight,
+            });
+        }
+    }
+    let mut minima = vec![usize::MAX; rows];
+    for point in 0..rows {
+        let r = root(&mut parent, point);
+        minima[r] = minima[r].min(point);
+    }
+    let mut reps: Vec<usize> = minima.into_iter().filter(|&x| x != usize::MAX).collect();
+    reps.sort_unstable();
+    let bridges = reps.len().saturating_sub(1);
+    for pair in reps.windows(2) {
+        edges.push(SortedMstEdge {
+            src: pair[0] as u32,
+            dst: pair[1] as u32,
+            weight: f64::INFINITY,
+        });
+    }
+    edges.sort_by(|a, b| {
+        a.weight
+            .total_cmp(&b.weight)
+            .then(a.src.cmp(&b.src))
+            .then(a.dst.cmp(&b.dst))
+    });
+    Ok(KnnKruskalOracle {
+        ids,
+        dist_sq: distances,
+        core,
+        edges,
+        bridges,
+    })
+}

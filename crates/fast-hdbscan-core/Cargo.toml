@@ -24,3 +24,7 @@ tempfile = { workspace = true }
 [[test]]
 name = "mst_oracle"
 required-features = ["test-support"]
+
+[[test]]
+name = "knn_kruskal_oracle"
+required-features = ["test-support"]

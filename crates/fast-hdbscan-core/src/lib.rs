@@ -9,6 +9,7 @@ pub mod dsu;
 pub mod error;
 pub mod finite;
 pub mod kdtree;
+pub mod knn_kruskal;
 pub mod labels;
 pub mod linkage;
 pub mod mst;
