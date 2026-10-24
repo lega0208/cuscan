@@ -15,6 +15,7 @@ burn-cubecl = { workspace = true }
 cubecl = { workspace = true }
 cubecl-cpu = { workspace = true }
 cudarc = { workspace = true }
+rayon = { workspace = true }
 
 [features]
 default = []

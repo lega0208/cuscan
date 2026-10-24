@@ -18,7 +18,7 @@ pub mod oracle;
 pub mod select;
 
 pub use condense::CondensedTree;
-pub use config::{ClusterSelectionMethod, HdbscanConfig};
+pub use config::{ClusterSelectionMethod, HdbscanConfig, MstGraph};
 pub use error::HdbscanError;
 pub use kdtree::KdTree;
 pub use linkage::{LinkageRow, SortedMstEdge};

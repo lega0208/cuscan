@@ -24,6 +24,17 @@
       "hdbscan.py": "4483f870ef092004b416376e7f5935127b1c434c",
       "numba_kdtree.py": "414553a5e98b033c0daaf37c5efc421fba13d0f7"
     },
+    "knn_graph_sources": {
+      "pynndescent_version": "0.6.0",
+      "modules": {
+        "nndescent.py": "a4353f25f43606da6e35fe08678f360172940ba4",
+        "kruskal.py": "0a5c7df222aad488d929773181af516c51dafa63",
+        "precomputed.py": "da6b7e52e5f0fb2b854596504f79bacd3c10f7d3"
+      },
+      "build_knn_graph": "(data, n_neighbors, metric='euclidean', metric_kwds=None, random_state=None)",
+      "compute_mst_from_knn_graph": "(data, min_samples, metric='euclidean', metric_kwds=None, knn_k=None, random_state=None)",
+      "random_state": 42
+    },
     "signatures": {
       "condense_tree": "(hierarchy, min_cluster_size=10, max_cluster_size=inf, sample_weights=None, lambda_method='hdbscan')",
       "get_cluster_labelling_at_cut": "(linkage_tree, cut, min_cluster_size)",
@@ -83,6 +94,26 @@
         "epsilon": 0.0,
         "persistence": 0.0,
         "max_cluster_size": null
+      },
+      "status": "reference",
+      "divergence": "none"
+    },
+    {
+      "id": "blobs_d50_knn",
+      "dataset": "blobs",
+      "n": 48,
+      "dimensions": 50,
+      "seed": 1103,
+      "params": {
+        "min_samples": 5,
+        "min_cluster_size": 5,
+        "selection": "eom",
+        "allow_single_cluster": false,
+        "epsilon": 0.0,
+        "persistence": 0.0,
+        "max_cluster_size": null,
+        "mst_graph": "knn_graph",
+        "knn_k": 15
       },
       "status": "reference",
       "divergence": "none"

@@ -8,7 +8,7 @@ use burn::{
     backend::Dispatch,
     tensor::{Int, Tensor, TensorData},
 };
-use fast_umap::backend::StandardUmapOps;
+use fast_cubecl_common::{ann_preflight, backend::NeighborOps};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -30,8 +30,10 @@ fn read_features(path: &Path, rows: usize, features: usize) -> Result<Vec<f32>, 
         .into());
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|part| f32::from_le_bytes(part.try_into().expect("4-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|part| f32::from_le_bytes(*part))
         .collect())
 }
 
@@ -90,8 +92,14 @@ fn perform(
         TensorData::new(host_features.to_vec(), [rows, features]),
         device,
     );
-    let (indices, distances) =
-        <Dispatch as StandardUmapOps>::approximate_neighbors(input.into_dispatch(), k, seed, cap);
+    ann_preflight(device, rows, features, k as usize)?;
+    let (indices, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
+        input.into_dispatch(),
+        k,
+        seed,
+        cap,
+        false,
+    );
     let ids = Tensor::<2, Int>::from_dispatch(indices)
         .to_data()
         .try_to_vec::<i32>()?;

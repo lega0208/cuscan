@@ -4,15 +4,6 @@ use burn_cubecl::CubeBackend;
 mod standard_umap;
 
 impl crate::backend::StandardUmapOps for CubeBackend {
-    fn approximate_neighbors(
-        data: FloatTensor<Self>,
-        k: u32,
-        seed: u64,
-        max_iterations: u32,
-    ) -> (IntTensor<Self>, FloatTensor<Self>) {
-        standard_umap::approximate_neighbors(data, k, seed, max_iterations)
-    }
-
     fn approximate_query(
         query: FloatTensor<Self>,
         reference: FloatTensor<Self>,

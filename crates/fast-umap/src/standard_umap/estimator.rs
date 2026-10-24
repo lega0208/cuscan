@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::backend::StandardUmapOps;
+use fast_cubecl_common::{AnnError, ann_preflight, backend::NeighborOps};
 
 use super::{
     Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
@@ -180,12 +181,21 @@ impl UMAP {
                 (neighbors.indices, neighbors.distances)
             }
             NeighborSearch::Approximate => {
+                ann_preflight(&device, n, features, widths.nonself).map_err(
+                    |error| match error {
+                        AnnError::InvalidInput(message) => UmapError::InvalidInput(message),
+                        AnnError::Capability(message) => UmapError::BackendUnavailable(message),
+                        AnnError::Workspace(message) => UmapError::Numerical(message),
+                        AnnError::Overflow(_) => UmapError::Overflow("ANN workspace"),
+                    },
+                )?;
                 let iters = (n as f64).log2().round().max(5.0) as u32;
-                let (indices, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+                let (indices, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
                     training_data.clone().into_dispatch(),
                     widths.nonself as u32,
                     seed,
                     iters,
+                    false,
                 );
                 (
                     Tensor::from_dispatch(indices),

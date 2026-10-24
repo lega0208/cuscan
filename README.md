@@ -253,7 +253,8 @@ need not sum to the median total. Raw JSON retains the per-run measurements.
 
 Native device-work stages include synchronization; these are host wall timings,
 not individual GPU kernel timings. HDBSCAN's
-`--search auto|brute-force|kd-tree` selects only the native search route. Above
+`--search auto|brute-force|kd-tree` selects only the native complete-graph search route;
+the port's kNN-graph route above 30 input features is not covered by `--search`. Above
 30 input features, fast_hdbscan uses approximate pynndescent neighbors instead
 of its KD-tree/Borůvka path; the script warns about this algorithm mismatch.
 Timing results alone do not establish clustering or embedding quality. Each
@@ -444,15 +445,34 @@ cut_labels = model.dbscan_clustering(0.5)
 
 `backend="auto"` chooses usable CUDA when available, otherwise CPU; explicit
 `"cpu"` and `"cuda"` selections never fall back after an execution error.
-`reproducible` is accepted but has no effect: the port is always deterministic.
-Only exact Euclidean, unweighted Borůvka clustering is supported. Non-default
-metric, algorithm/Kruskal, knn_k, sample-weight, cannot-link and semi-supervised
-options raise `NotImplementedError`.
+`reproducible` (default `False`) selects the bound mode of the complete-graph KD-tree
+route. `False` shares per-component pruning bounds within each Borůvka launch and returns
+exact component winners. `True` gives each row independent candidates without the shared
+bound. Tests show bitwise-identical MST endpoints and weights between the two modes on five
+fixtures, seeded tie sets and one Auto-KD-region dataset. Brute-force and kNN-graph routes
+ignore the flag. Only exact Euclidean, unweighted clustering is supported. Non-default
+metric, `algorithm="kruskal"`, sample-weight, cannot-link and semi-supervised options raise
+`NotImplementedError`. `knn_k` accepts `None` or a positive integer; bool and float values
+raise `ValueError`.
 
-This release uses exact MST construction at every dimension. Upstream 0.3.2's
-public estimator switches to an approximate graph above 30 dimensions; that
-path is deferred to a separate implementation. D>30 correctness is checked
-against the pinned exact reference, not the approximate estimator's MST.
+Route selection follows upstream's dimension rule. Up to 30 features, the estimator builds
+the exact complete mutual-reachability graph. Above 30 features it builds a kNN graph.
+The graph width is `min(max(knn_k or max(3 * min_samples, 15), min_samples), n_finite - 1)`.
+It uses exact neighbors when `n_finite <= 4096` or the width exceeds 60. Otherwise it uses
+approximate neighbors (CubeCL ANN, fixed seed 42, squared distances,
+`max(5, round(log2(n)))` iterations). Kruskal runs over the kNN edges. Components left
+disconnected are joined by `+inf` bridges between each component's smallest finite-row index.
+The exact branch costs O(n²·d) work, like the complete route. The ANN branch was validated only
+up to width 60, on synthetic 6000×40 and 6000×50 data with three seeds and three widths per
+backend. Mean recall was at least 0.9998 on both backends, per-case ARI was 1.0, and the
+maximum finite-MST-sum relative error was 7.1e-6. These are measurements on those datasets,
+not guarantees for other data. The campaign's fit times are observations, not speedup claims.
+
+Divergences from upstream: the port removes the query row from its own neighbor list, while
+upstream drops column 0, which can be a duplicate row; `knn_k=0` is rejected; the ANN seed is
+fixed. ANN-branch results therefore match upstream in distribution, not bit for bit. Python
+selects the route by feature count only. Rust `MstGraph::KnnGraph` can be forced at any
+dimension. `algorithm="kruskal"` on the complete graph remains unimplemented.
 Equal-distance edges use deterministic port-side ordering, so tied-data cluster
 memberships can differ from upstream even when the threshold connectivity
 hierarchy is identical; upstream traversal-order parity is not promised.
@@ -498,6 +518,12 @@ with the original-row mapping available through `finite_index()`. Neighbors
 exclude self, use `-1` padding, and core distances include infinite padding.
 `dbscan_clustering(epsilon)` returns a `Result` and rejects NaN.
 
+`HdbscanConfig::mst_graph` (`MstGraph::{Auto, Complete, KnnGraph}`, default `Auto`) selects
+the graph and `knn_k` sets the kNN width; both are Rust-only fields except that Python
+exposes `knn_k`. `Auto` resolves to `KnnGraph` above 30 features and to `Complete` otherwise.
+`with_search` and `FittedHDBSCAN::search()` apply only to the complete-graph route.
+`HdbscanConfig::reproducible` (default `false`) has the bound-mode meaning described above.
+
 ```shell
 cargo test -p fast-hdbscan
 FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan
@@ -512,7 +538,8 @@ cases; full-fit timings include upload, device execution and host readback.
 Set `FAST_HDBSCAN_BENCH_STAGES=1` for isolated neighbor, single candidate-round
 and synchronized tree-upload timings. Candidate-stage cases use singleton
 components, not total MST construction; upload timings include readback.
-Component-bound pruning and device winner reduction are not enabled.
+The default `reproducible=false` mode uses shared component bounds on the complete-graph KD
+route. Device-side component winner reduction is not implemented.
 
 Local Phase 4 measurements on Ryzen 7 9800X3D CPU and RTX 3080 CUDA used 100
 samples, 95% confidence intervals, three separate processes per runtime, two

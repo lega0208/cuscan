@@ -7,7 +7,7 @@
 mod support;
 
 fn hdbscan_cpu(c: &mut criterion::Criterion) {
-    support::run_cpu(c);
+    support::run(c, fast_hdbscan::BackendChoice::Cpu, "cpu");
 }
 
 criterion::criterion_group! {

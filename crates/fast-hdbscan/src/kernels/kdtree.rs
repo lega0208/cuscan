@@ -57,6 +57,20 @@ fn box_lower_bound_test_kernel<F: Float>(
 }
 
 #[cube(launch)]
+fn reset_component_bounds<I: Int>(
+    bounds: &mut Tensor<I>,
+    length: u32,
+    #[define(I)] _dtype: ElemType,
+) {
+    let mut position = ABSOLUTE_POS_X as usize;
+    let stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
+    while position < length as usize {
+        bounds[position] = I::cast_from(0x7f80_0000i32);
+        position += stride;
+    }
+}
+
+#[cube(launch)]
 fn kd_candidates_kernel<F: Float, I: Int>(
     data: &Tensor<F>,
     core_sq: &Tensor<F>,
@@ -68,7 +82,9 @@ fn kd_candidates_kernel<F: Float, I: Int>(
     bounds_min: &Tensor<F>,
     bounds_max: &Tensor<F>,
     node_components: &Tensor<I>,
+    component_bounds: &mut Tensor<Atomic<I>>,
     row_count: u32,
+    #[comptime] shared_bound: bool,
     #[comptime] diagnostics_enabled: bool,
     out_weights: &mut Tensor<F>,
     out_indices: &mut Tensor<I>,
@@ -83,6 +99,11 @@ fn kd_candidates_kernel<F: Float, I: Int>(
             let n = data.shape(0);
             let component = components[row];
             let core = core_sq[row];
+            let mut component_bound = F::new(f32::INFINITY);
+            if comptime![shared_bound] {
+                component_bound =
+                    F::reinterpret(component_bounds[u32::cast_from(component) as usize].load());
+            }
             let mut best = F::new(f32::INFINITY);
             let mut best_index = n;
             let mut stack = Array::<u32>::new(KD_STACK_LEN);
@@ -90,6 +111,10 @@ fn kd_candidates_kernel<F: Float, I: Int>(
             stack[0] = 0;
             bound_stack[0] = F::max(box_lower_bound(data, bounds_min, bounds_max, row, 0), core);
             let mut stack_len = 1usize;
+            // Equality must remain active: the first source wins component ties.
+            if comptime![shared_bound] && core > component_bound {
+                stack_len = 0;
+            }
             let mut nodes_popped = 0i32;
             let mut leaf_positions_scanned = 0i32;
             while stack_len > 0 {
@@ -99,7 +124,13 @@ fn kd_candidates_kernel<F: Float, I: Int>(
                 }
                 let node = stack[stack_len] as usize;
                 let lower = bound_stack[stack_len];
-                if lower <= best && node_components[node] != component {
+                if comptime![shared_bound] {
+                    component_bound = F::min(
+                        component_bound,
+                        F::reinterpret(component_bounds[u32::cast_from(component) as usize].load()),
+                    );
+                }
+                if lower <= best && lower <= component_bound && node_components[node] != component {
                     if is_leaf[node] != I::cast_from(0) {
                         let start = u32::cast_from(starts[node]) as usize;
                         let end = u32::cast_from(ends[node]) as usize;
@@ -120,6 +151,18 @@ fn kd_candidates_kernel<F: Float, I: Int>(
                                 if weight < best || (weight == best && candidate < best_index) {
                                     best = weight;
                                     best_index = candidate;
+                                    if comptime![shared_bound] && best < component_bound {
+                                        let mut bits = I::reinterpret(best);
+                                        // Float addition can be erased by fast-math; M0 proves this integer encoding.
+                                        if bits == I::cast_from(i32::MIN) {
+                                            bits = I::cast_from(0);
+                                        }
+                                        let previous = F::reinterpret(
+                                            component_bounds[u32::cast_from(component) as usize]
+                                                .fetch_min(bits),
+                                        );
+                                        component_bound = F::min(previous, best);
+                                    }
                                 }
                             }
                         }
@@ -136,23 +179,23 @@ fn kd_candidates_kernel<F: Float, I: Int>(
                         );
                         // Push farther first so the nearer child is popped first; left wins equal bounds.
                         if left_bound <= right_bound {
-                            if right_bound <= best {
+                            if right_bound <= best && right_bound <= component_bound {
                                 stack[stack_len] = right as u32;
                                 bound_stack[stack_len] = right_bound;
                                 stack_len += 1;
                             }
-                            if left_bound <= best {
+                            if left_bound <= best && left_bound <= component_bound {
                                 stack[stack_len] = left as u32;
                                 bound_stack[stack_len] = left_bound;
                                 stack_len += 1;
                             }
                         } else {
-                            if left_bound <= best {
+                            if left_bound <= best && left_bound <= component_bound {
                                 stack[stack_len] = left as u32;
                                 bound_stack[stack_len] = left_bound;
                                 stack_len += 1;
                             }
-                            if right_bound <= best {
+                            if right_bound <= best && right_bound <= component_bound {
                                 stack[stack_len] = right as u32;
                                 bound_stack[stack_len] = right_bound;
                                 stack_len += 1;
@@ -163,6 +206,9 @@ fn kd_candidates_kernel<F: Float, I: Int>(
             }
             out_weights[row] = best;
             out_indices[row] = I::cast_from(best_index);
+            if comptime![shared_bound] && best_index == n {
+                out_indices[row] = I::cast_from(-1);
+            }
             if comptime![diagnostics_enabled] {
                 diagnostics[row * 2] = I::cast_from(nodes_popped);
                 diagnostics[row * 2 + 1] = I::cast_from(leaf_positions_scanned);
@@ -463,6 +509,8 @@ pub(super) fn boruvka_candidates_kd(
     core_sq: FloatTensor<CubeBackend>,
     point_components: IntTensor<CubeBackend>,
     tree: DeviceKdTree<CubeBackend>,
+    reproducible: bool,
+    scratch: &mut super::KdBoundScratch,
 ) -> (FloatTensor<CubeBackend>, IntTensor<CubeBackend>) {
     let data = into_contiguous(data);
     let core_sq = into_contiguous(core_sq);
@@ -484,6 +532,20 @@ pub(super) fn boruvka_candidates_kd(
     let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
     let client = data.client.clone();
     let (cube_count, dim) = kd_launch_geometry(&client, n);
+    let bound_len = if reproducible { 1 } else { n };
+    assert_eq!(scratch.bounds.shape().dims::<1>(), [bound_len]);
+    assert_eq!(scratch.bounds.dtype, DType::I32);
+    // Scratch is private and allocated per call. CubeCL's asynchronous allocation
+    // initialization holds transient handle clones, so can_mut cannot prove that ownership.
+    // Sole reset, on this launch's client/stream. Never seed from kNN distances.
+    reset_component_bounds::launch(
+        &client,
+        cube_count.clone(),
+        dim,
+        scratch.bounds.clone().into_tensor_arg(),
+        u32::try_from(bound_len).expect("validated KD bound length"),
+        dtype_to_storage_type(DType::I32),
+    );
     kd_candidates_kernel::launch(
         &client,
         cube_count,
@@ -498,7 +560,9 @@ pub(super) fn boruvka_candidates_kd(
         tree.bounds_min.clone().into_tensor_arg(),
         tree.bounds_max.clone().into_tensor_arg(),
         tree.node_components.clone().into_tensor_arg(),
+        scratch.bounds.clone().into_tensor_arg(),
         u32::try_from(n).expect("validated KD row count"),
+        !reproducible,
         diagnostics_enabled,
         weights.clone().into_tensor_arg(),
         destinations.clone().into_tensor_arg(),
@@ -682,7 +746,7 @@ fn allocate_float(data: &FloatTensor<CubeBackend>, rows: usize) -> FloatTensor<C
     )
 }
 
-fn allocate_int(data: &FloatTensor<CubeBackend>, rows: usize) -> IntTensor<CubeBackend> {
+pub(super) fn allocate_int(data: &FloatTensor<CubeBackend>, rows: usize) -> IntTensor<CubeBackend> {
     CubeTensor::new_contiguous(
         data.client.clone(),
         data.device.clone(),
@@ -873,7 +937,7 @@ mod tests {
         );
         let counts = into_data_sync(enabled_counts).try_to_vec::<i32>().unwrap();
         assert_eq!(counts.len(), rows * 2);
-        for pair in counts.chunks_exact(2) {
+        for pair in counts.as_chunks::<2>().0 {
             assert!(pair[0] > 0 && pair[0] as usize <= host_tree.starts.len());
             assert!(pair[1] >= 0 && pair[1] as usize <= rows);
         }

@@ -7,6 +7,13 @@
     "outlier_order": "raw-row indices in upstream set-difference order",
     "labels": "raw-row order; -1 is noise"
   },
+  "knn_graph_route": {
+    "mst_graph_value": "knn_graph",
+    "required_params": ["mst_graph", "knn_k"],
+    "knn_k": "min(max(3*min_samples, 15), n-1)",
+    "neighbor_columns": "all knn_k columns equal the exact non-self numpy kNN after self removal; MST neighbors are the first min_samples columns",
+    "random_state": 42
+  },
   "case_statuses": {
     "reference": {
       "required": [
@@ -324,7 +331,8 @@
     "reproducible",
     "dimensions",
     "artifact_hashes",
-    "signatures"
+    "signatures",
+    "knn_graph_sources"
   ],
   "manifest_reference_required": [
     "package",
@@ -337,7 +345,8 @@
     "artifact_hashes",
     "release_source_blobs",
     "comparison_commit_blob_ids",
-    "signatures"
+    "signatures",
+    "knn_graph_sources"
   ],
   "cross_array_contracts": [
     "MST has max(finite_n-1,0) weights",

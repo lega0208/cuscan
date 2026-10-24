@@ -64,6 +64,7 @@ fn config(params: &Value) -> HdbscanConfig {
         max_cluster_size: parameter_usize(params, "max_cluster_size"),
         cluster_selection_epsilon: params["epsilon"].as_f64().unwrap_or(0.0),
         cluster_selection_persistence: params["persistence"].as_f64().unwrap_or(0.0),
+        ..Default::default()
     }
 }
 
@@ -431,7 +432,7 @@ fn persistence_fixture_below_equal_and_above_boundaries() {
 #[cfg(feature = "test-support")]
 #[test]
 fn oracle_fixture_core_distances_and_mst_weights_match() {
-    use fast_hdbscan_core::oracle::{brute_force_mst, exact_neighbors};
+    use fast_hdbscan_core::oracle::{brute_force_mst, exact_neighbors, knn_kruskal_oracle};
     let root = fixture_root();
     let manifest = read_json(&root.join("manifest.json"));
     let mut compared = 0;
@@ -457,15 +458,38 @@ fn oracle_fixture_core_distances_and_mst_weights_match() {
             panic!("{id}: applicable reference fixture has no finite rows");
         }
         let ms = parameter_usize(&meta["parameters"], "min_samples").unwrap_or(5);
-        let knn = exact_neighbors(&compact, n, d, ms).unwrap();
-        let expected_cores = f32_values(core_header);
+        let graph_route = match meta["parameters"]["mst_graph"].as_str() {
+            None => false,
+            Some("knn_graph") => true,
+            Some(other) => panic!("{id}: unknown fixture mst_graph {other}"),
+        };
+        // Graph fixtures use the independent kNN-Kruskal reference, whose graph width is
+        // upstream's min(max(knn_k, min_samples), n - 1). Its bridges are infinite edges.
+        let (actual_cores, actual, graph_bridges) = if graph_route {
+            let knn_k = parameter_usize(&meta["parameters"], "knn_k")
+                .unwrap_or_else(|| panic!("{id}: knn_graph fixture missing knn_k"));
+            let k = knn_k.max(ms).min(n.saturating_sub(1));
+            let oracle = knn_kruskal_oracle(&compact, n, d, ms, k).unwrap();
+            (oracle.core, oracle.edges, Some(oracle.bridges))
+        } else {
+            let knn = exact_neighbors(&compact, n, d, ms).unwrap();
+            let cores = knn
+                .core_sq
+                .iter()
+                .map(|&sq| sq.sqrt() as f64)
+                .collect::<Vec<f64>>();
+            (cores, brute_force_mst(&compact, n, d, ms).unwrap(), None)
+        };
+        let expected_cores = f32_values(core_header)
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<f64>>();
         assert_eq!(
-            knn.core_sq.len(),
+            actual_cores.len(),
             expected_cores.len(),
             "{id}: core-distance length"
         );
-        for (i, (&sq, &want)) in knn.core_sq.iter().zip(&expected_cores).enumerate() {
-            let got = sq.sqrt();
+        for (i, (&got, &want)) in actual_cores.iter().zip(&expected_cores).enumerate() {
             assert!(
                 got == want
                     || (got.is_finite()
@@ -475,7 +499,6 @@ fn oracle_fixture_core_distances_and_mst_weights_match() {
                 "{id}: core distance {i}: {got:?} != {want:?}"
             );
         }
-        let actual = brute_force_mst(&compact, n, d, ms).unwrap();
         let expected = matrix(&root, &arrays, "mst_weights");
         assert_eq!(actual.len(), expected.len(), "{id}: oracle MST edge count");
         let mut weights = actual.iter().map(|edge| edge.weight).collect::<Vec<_>>();
@@ -491,6 +514,10 @@ fn oracle_fixture_core_distances_and_mst_weights_match() {
                         && (got - want).abs() <= 1.0e-5 * want.abs()),
                 "{id}: MST weight {i}: {got:?} != {want:?}"
             );
+        }
+        if let Some(bridges) = graph_bridges {
+            let infinite = weights.iter().filter(|w| w.is_infinite()).count();
+            assert_eq!(infinite, bridges, "{id}: graph infinite bridge count");
         }
         compared += 1;
         let oracle_host = clusters_from_spanning_tree(&actual, &config(&meta["parameters"]))

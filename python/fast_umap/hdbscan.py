@@ -38,7 +38,15 @@ _ArrayName = Literal[
 
 
 class HDBSCAN:
-    """Hierarchical density-based clustering backed by the native fast-hdbscan engine."""
+    """Hierarchical density-based clustering backed by the native fast-hdbscan engine.
+
+    ``reproducible=True`` gives the complete-graph KD route independent per-row bounds, so
+    repeated fits use the same reduction order. It does not change the algorithm.
+
+    ``knn_k`` sets the non-self neighbor width of the kNN graph route, used by the default
+    ``Auto`` graph above 30 features. ``None`` uses ``max(3 * min_samples, 15)``; any width is
+    raised to at least ``min_samples`` and capped at ``n_samples - 1``.
+    """
 
     _fitted_state: _FittedState
 
@@ -197,13 +205,13 @@ class HDBSCAN:
             raise ValueError("device_index must be a non-negative integer")
         if not isinstance(self.reproducible, (bool, np.bool_)):
             raise ValueError("reproducible must be a boolean")
+        self._positive_integer("knn_k", self.knn_k, allow_none=True)
 
         unsupported = (
             ("semi_supervised", self.semi_supervised, False),
             ("ss_algorithm", self.ss_algorithm, "bc"),
             ("metric", self.metric, "euclidean"),
             ("algorithm", self.algorithm, "boruvka"),
-            ("knn_k", self.knn_k, None),
             ("cannot_link", self.cannot_link, None),
             ("validate_cannot_link", self.validate_cannot_link, True),
             ("cannot_link_groups", self.cannot_link_groups, None),
@@ -253,6 +261,7 @@ class HDBSCAN:
             backend=self.backend,
             device_index=int(self.device_index),
             reproducible=bool(self.reproducible),
+            knn_k=None if self.knn_k is None else int(self.knn_k),
         )
 
         labels = np.array(fitted.labels, dtype=np.intp, copy=True)

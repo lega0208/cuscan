@@ -11,10 +11,12 @@ mod injected_kernel_tests;
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ann_forest::{MAX_CANDIDATES, WorkspaceError, build_forest, plan_workspace, tree_count};
-use super::{
-    ann_independent_launch, ann_should_stop, reverse_count, reverse_scatter, reverse_zero,
+use super::ann_forest::{WorkspaceError, build_forest, plan_workspace, tree_count};
+use super::orchestration::{
+    AnnPlan, ann_independent_launch, ann_output, ann_should_stop, plan_for_client, reverse_count,
+    reverse_scatter, reverse_zero,
 };
+use crate::error::AnnError;
 use burn::{
     backend::{TensorMetadata, cubecl::dtype_to_storage_type},
     tensor::{DType, Shape},
@@ -191,33 +193,27 @@ pub(super) fn approximate_neighbors(
     k: usize,
     seed: u64,
     max_iterations: u32,
-) -> (CubeTensor, CubeTensor) {
+    squared: bool,
+) -> Result<(CubeTensor, CubeTensor), AnnError> {
     let profile = std::env::var_os("FAST_UMAP_ANN_PROFILE").is_some();
     let init_start = std::time::Instant::now();
     let data = into_contiguous(data);
     let [n, features] = data.shape().dims::<2>();
-    assert!(n >= 2 && features > 0 && k > 0 && k < n);
     assert_eq!(data.dtype, DType::F32);
-    assert!(n <= i32::MAX as usize);
-    let width = fast_umap_core::ann::candidate_width(n, k);
-    let capacity = MAX_CANDIDATES.min(n - 1);
-    let trees = tree_count(n).expect("ANN forest tree count overflow");
-    let plan = plan_workspace(n, width, capacity, features, trees)
-        .expect("ANN workspace planning overflowed");
-    let n_u32 = u32::try_from(n).expect("ANN row count exceeds CubeCL range");
-    let width_u32 = u32::try_from(width).expect("ANN width exceeds CubeCL range");
-    let cap_u32 = u32::try_from(capacity).expect("ANN sample capacity exceeds CubeCL range");
-    let max_total_slots = n
-        .checked_mul(plan.pair_slots_per_center)
-        .expect("ANN pair slot count overflows usize");
-    assert!(
-        max_total_slots <= i32::MAX as usize,
-        "ANN pair slot prefix exceeds i32"
-    );
-    let pair_slots = plan.max_pair_slots_per_tile;
-    let pair_elements = pair_slots;
-    let endpoint_elements = plan.max_endpoint_records;
     let client = data.client.clone();
+    let plan: AnnPlan = plan_for_client(&client, n, features, k)?;
+    let width = plan.host.width;
+    let capacity = plan.host.capacity;
+    let workspace = plan.host.workspace;
+    let n_u32 = u32::try_from(n).expect("ANN row count validated by plan");
+    let width_u32 = u32::try_from(width).expect("ANN width validated by plan");
+    let cap_u32 = u32::try_from(capacity).expect("ANN sample capacity validated by plan");
+    let pair_slots = workspace.max_pair_slots_per_tile;
+    let pair_elements = pair_slots;
+    let endpoint_elements = workspace.max_endpoint_records;
+    let max_total_slots = n
+        .checked_mul(workspace.pair_slots_per_center)
+        .expect("ANN pair slot count overflows usize");
     let (mut candidates, mut distances, mut flags, forest_rows, forest_offsets, forest_pairs) =
         forest_seed(&data, n, features, width, capacity, seed)
             .expect("ANN RP forest initialization exceeds workspace contract");
@@ -251,10 +247,10 @@ pub(super) fn approximate_neighbors(
     let center_cursors = empty_tensor(&data, Shape::new([n]), DType::I32);
     let chunk_sums = empty_tensor(&data, Shape::new([n.div_ceil(PREFIX_CHUNK)]), DType::I32);
     let prefix = |values: &CubeTensor, offsets: &CubeTensor, cursors: &CubeTensor| {
-        exclusive_prefix(&client, values, offsets, cursors, &chunk_sums, n);
+        exclusive_prefix(&client, values, offsets, cursors, &chunk_sums, n)
     };
-    let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32);
-    let (row_count, row_dim) = ann_independent_launch(&client, n_u32);
+    let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32)?;
+    let (row_count, row_dim) = ann_independent_launch(&client, n_u32)?;
     let mut forest_offset = 0usize;
     let mut forest_destination_a = false;
     let mut forest_current_ids = candidates.clone();
@@ -262,7 +258,7 @@ pub(super) fn approximate_neighbors(
     while forest_offset < forest_pairs {
         let slots = (forest_pairs - forest_offset).min(pair_slots);
         let slots_u32 = u32::try_from(slots).expect("ANN forest tile exceeds CubeCL range");
-        let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32);
+        let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
         forest_pair_slots_kernel::launch(
             &client,
             pair_count.clone(),
@@ -299,7 +295,7 @@ pub(super) fn approximate_neighbors(
             slots_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors);
+        prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
         endpoint_scatter_kernel::launch(
             &client,
             pair_count.clone(),
@@ -317,8 +313,7 @@ pub(super) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             ],
         );
-        let (cpu_merge, merge_count, merge_dim) =
-            super::ann_launch_geometry(&client, DType::F32.size(), n_u32);
+        let (cpu_merge, merge_count, merge_dim) = plan.merge_geometry();
         let target_is_a = !forest_destination_a;
         if target_is_a {
             endpoint_merge_kernel::launch(
@@ -400,9 +395,9 @@ pub(super) fn approximate_neighbors(
         eprintln!(
             "ANN_PROFILE init_ms={:.3} forest_pairs={forest_pairs} H={width} C={capacity} workspace_bytes={} W={} staging_bytes={}",
             init_start.elapsed().as_secs_f64() * 1000.0,
-            plan.workspace_bytes,
-            plan.formula_workspace_bytes,
-            plan.staging_bytes
+            workspace.workspace_bytes,
+            workspace.formula_workspace_bytes,
+            workspace.staging_bytes
         );
     }
     for iteration in 0..max_iterations {
@@ -410,7 +405,7 @@ pub(super) fn approximate_neighbors(
         let source_ids = candidates.clone();
         let source_distances = distances.clone();
         let source_flags = flags.clone();
-        let (reverse_count_units, reverse_dim) = ann_independent_launch(&client, n_u32);
+        let (reverse_count_units, reverse_dim) = ann_independent_launch(&client, n_u32)?;
         reverse_zero::launch(
             &client,
             reverse_count_units.clone(),
@@ -428,7 +423,7 @@ pub(super) fn approximate_neighbors(
             width_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix(&reverse_counts, &reverse_offsets, &reverse_cursors);
+        prefix(&reverse_counts, &reverse_offsets, &reverse_cursors)?;
         reverse_scatter::launch(
             &client,
             reverse_count_units,
@@ -468,7 +463,7 @@ pub(super) fn approximate_neighbors(
             cap_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix(&pair_counts, &center_offsets, &center_cursors);
+        prefix(&pair_counts, &center_offsets, &center_cursors)?;
         let total_bytes = client.read_one_unchecked(
             center_offsets
                 .handle
@@ -500,7 +495,7 @@ pub(super) fn approximate_neighbors(
         while slot_offset < total_slots {
             let slots = (total_slots - slot_offset).min(pair_slots);
             let slots_u32 = u32::try_from(slots).expect("ANN pair tile exceeds CubeCL range");
-            let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32);
+            let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
             pair_slots_kernel::launch(
                 &client,
                 pair_count.clone(),
@@ -539,7 +534,7 @@ pub(super) fn approximate_neighbors(
                 slots_u32,
                 dtype_to_storage_type(DType::I32),
             );
-            prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors);
+            prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
             endpoint_scatter_kernel::launch(
                 &client,
                 pair_count.clone(),
@@ -557,8 +552,7 @@ pub(super) fn approximate_neighbors(
                     dtype_to_storage_type(DType::I32),
                 ],
             );
-            let (cpu_merge, merge_count, merge_dim) =
-                super::ann_launch_geometry(&client, DType::F32.size(), n_u32);
+            let (cpu_merge, merge_count, merge_dim) = plan.merge_geometry();
             let target_is_a = !has_destination || !destination_is_a;
             if target_is_a {
                 endpoint_merge_kernel::launch(
@@ -661,7 +655,7 @@ pub(super) fn approximate_neighbors(
     }
     let output_indices = empty_tensor(&data, Shape::new([n, k]), DType::I32);
     let output_distances = empty_tensor(&data, Shape::new([n, k]), DType::F32);
-    super::ann_output::launch(
+    ann_output::launch(
         &client,
         helper_count,
         helper_dim,
@@ -671,12 +665,13 @@ pub(super) fn approximate_neighbors(
         output_distances.clone().into_tensor_arg(),
         width_u32,
         u32::try_from(k).expect("ANN output width exceeds CubeCL range"),
+        squared,
         [
             dtype_to_storage_type(DType::F32),
             dtype_to_storage_type(DType::I32),
         ],
     );
-    (output_indices, output_distances)
+    Ok((output_indices, output_distances))
 }
 
 /// Parallel exclusive prefix of `values[0..len]` into `offsets[0..=len]`,
@@ -688,10 +683,10 @@ fn exclusive_prefix(
     cursors: &CubeTensor,
     chunk_sums: &CubeTensor,
     len: usize,
-) {
+) -> Result<(), AnnError> {
     let chunks = u32::try_from(len.div_ceil(PREFIX_CHUNK)).expect("ANN prefix chunks exceed u32");
     let chunk = PREFIX_CHUNK as u32;
-    let (count, dim) = ann_independent_launch(client, chunks);
+    let (count, dim) = ann_independent_launch(client, chunks)?;
     chunk_sum_kernel::launch(
         client,
         count.clone(),
@@ -719,6 +714,7 @@ fn exclusive_prefix(
         chunk,
         dtype_to_storage_type(DType::I32),
     );
+    Ok(())
 }
 
 #[cube]

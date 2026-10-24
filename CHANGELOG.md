@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HDBSCAN kNN-graph route:** `MstGraph::{Auto, Complete, KnnGraph}` and `knn_k` in `HdbscanConfig`. The graph width is `min(max(knn_k or max(3s, 15), s), n_finite - 1)`. Exact neighbors are used for at most 4096 finite rows or width above 60; larger inputs use common ANN (seed 42, squared distances). Kruskal runs on the kNN edges, and disconnected components are joined by `+inf` bridges. Python exposes `HDBSCAN(knn_k=...)`, and `reproducible` is forwarded to Rust.
 - **Python fitted-model serialization:** `fast_umap.UMAP.save(path, overwrite=False)` and `UMAP.load(path, backend="auto", device_index=0)` persist fitted numeric state in versioned HDF5 schema v1 using the optional `serialization` extra (`h5py` and `hdf5plugin`). Compression uses lossless Blosc2 Zstandard level 1 with byte shuffle in 32768-row chunks; backend/device remain load-time choices, and Rust does not link HDF5.
 - **Standard (non-parametric) UMAP:** Rust `UMAP`/`FittedUMAP` with `UMAPConfig`, `BackendChoice` (Flex or CUDA) and `NeighborSearch` (`Exact`, `Approximate`, `Auto`), plus Python `fast_umap.UMAP`. Follows umap-learn 0.5.12 (smooth-kNN fuzzy graph, bounded Lanczos spectral initialization, reference SGD schedule and Tausworthe sampling); fit and transform run neighbor search, graph construction and layout on the selected backend through the forward-only `StandardUmapOps` extension.
 - Added an optional CUDA backend that reuses the CubeCL kernels; enable it with the `cuda` feature. Runtime requires an NVIDIA GPU and CUDA runtime libraries (`libcuda`, `libnvrtc`); `nvcc`/CUDA toolkit are optional at build time.
@@ -31,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `ParametricUMAP` fit and transform do not standardize features internally.** They receive caller-provided values as-is, so feature scales affect geometry. Saved weights preserve the caller-input contract; weights trained with former internal standardization require the original external preprocessing at inference or retraining; no automatic migration is provided.
 - Dropped the Burn `train` feature to provide deterministic CPU execution.
 - Python `transform` handles empty inputs and reports feature-count mismatches as `ValueError`.
+- **HDBSCAN default route above 30 features:** `MstGraph::Auto` (the default) now builds a kNN graph when there are more than 30 features, matching upstream `fast_hdbscan` 0.3.2. Previously every dimension used the exact complete graph, so MST, labels and probabilities for those inputs can change. Up to 30 features the exact complete graph is unchanged.
+- **HDBSCAN `reproducible` is no longer a no-op:** `false` (default) shares per-component KD bounds within each launch; `true` uses independent per-row candidates. The brute-force and kNN-graph routes ignore it.
+- HDBSCAN approximate-neighbor kernels moved from `fast-umap` into `fast-cubecl-common` (`NeighborOps::approximate_neighbors` with a squared-output flag). Standalone ANN IDs and distance bits matched the captured baselines on CPU and required CUDA; UMAP embeddings are covered by the existing quality gates, not bitwise equality.
 
 ---
 

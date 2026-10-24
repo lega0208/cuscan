@@ -309,6 +309,17 @@
     },
     "dimensions": 2,
     "entrypoint": "fast_hdbscan.boruvka.parallel_boruvka",
+    "knn_graph_sources": {
+      "build_knn_graph": "(data, n_neighbors, metric='euclidean', metric_kwds=None, random_state=None)",
+      "compute_mst_from_knn_graph": "(data, min_samples, metric='euclidean', metric_kwds=None, knn_k=None, random_state=None)",
+      "modules": {
+        "kruskal.py": "0a5c7df222aad488d929773181af516c51dafa63",
+        "nndescent.py": "a4353f25f43606da6e35fe08678f360172940ba4",
+        "precomputed.py": "da6b7e52e5f0fb2b854596504f79bacd3c10f7d3"
+      },
+      "pynndescent_version": "0.6.0",
+      "random_state": 42
+    },
     "known_issue_repros": [
       {
         "id": "pr72_segments_in_branch_leaf",

@@ -6,7 +6,7 @@ use criterion::Criterion;
 use fast_cubecl_common::neighbors;
 use fast_hdbscan::{
     BackendChoice, ClusterSelectionMethod, DeviceKdTree, HDBSCAN, HdbscanConfig, HdbscanOps,
-    HdbscanSearch,
+    HdbscanSearch, MstGraph,
 };
 use serde_json::Value;
 use std::env;
@@ -70,6 +70,7 @@ fn fixture_config(parameters: &Value) -> HdbscanConfig {
         max_cluster_size: parameters["max_cluster_size"].as_u64().map(|n| n as usize),
         cluster_selection_epsilon: parameters["epsilon"].as_f64().unwrap(),
         cluster_selection_persistence: parameters["persistence"].as_f64().unwrap(),
+        ..Default::default()
     }
 }
 
@@ -133,22 +134,7 @@ fn config() -> criterion::Criterion {
         .confidence_level(0.95)
 }
 
-pub fn run_cpu(c: &mut Criterion) {
-    run(c, BackendChoice::Cpu, "cpu");
-}
-
-pub fn run_cuda(c: &mut Criterion) {
-    let required = env::var_os("FAST_UMAP_REQUIRE_CUDA").is_some();
-    match fast_cubecl_common::selected_device(BackendChoice::Cuda { device_index: 0 }) {
-        Ok(_) => run(c, BackendChoice::Cuda { device_index: 0 }, "cuda"),
-        Err(error) if required => {
-            panic!("FAST_UMAP_REQUIRE_CUDA is set but CUDA is unavailable: {error}")
-        }
-        Err(error) => eprintln!("SKIPPED CUDA HDBSCAN benchmarks: {error}"),
-    }
-}
-
-fn run(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
+pub fn run(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
     let filter = selected_case_filter();
     let all_cases = cases();
     let selected = all_cases
@@ -210,6 +196,44 @@ fn run(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
         });
         if env::var("FAST_HDBSCAN_BENCH_STAGES").as_deref() == Ok("1") {
             benchmark_stages(&mut group, case, backend, backend_name, &flat, n, d);
+        }
+    }
+    group.finish();
+    run_kd_bound(c, backend, backend_name);
+}
+
+// Full-fit reproducibility comparison on the complete-graph KD route. Every case lies inside the
+// Auto KD region (256..=2048 rows, <=30 features, min_samples <=32), so both toggles measure the
+// same route that Auto would select for these shapes.
+fn run_kd_bound(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
+    let mut group = c.benchmark_group(format!("kd_bound/{backend_name}"));
+    for (rows, dimensions) in [(1024, 10), (1024, 30), (2048, 10), (2048, 30)] {
+        let data = synthetic(rows, dimensions);
+        for min_samples in [16, 32] {
+            for reproducible in [false, true] {
+                let config = HdbscanConfig {
+                    min_cluster_size: 5,
+                    min_samples: Some(min_samples),
+                    mst_graph: MstGraph::Complete,
+                    reproducible,
+                    ..HdbscanConfig::default()
+                };
+                let estimator = HDBSCAN::new(config, backend).with_search(HdbscanSearch::KdTree);
+                let id = format!("{rows}x{dimensions}_s{min_samples}/reproducible={reproducible}");
+                group.bench_function(id, |b| {
+                    b.iter(|| {
+                        std::hint::black_box(
+                            estimator
+                                .fit(std::hint::black_box(&data))
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "{backend_name} kd_bound {rows}x{dimensions} fit: {error}"
+                                    )
+                                }),
+                        )
+                    })
+                });
+            }
         }
     }
     group.finish();
@@ -371,6 +395,7 @@ fn benchmark_stages(
                     core_tensor.clone().into_dispatch(),
                     component_tensor.clone().into_dispatch(),
                     fresh_tree,
+                    true,
                 );
                 let weights: Tensor<1> = Tensor::from_dispatch(weights);
                 let destinations: Tensor<1, Int> = Tensor::from_dispatch(destinations);

@@ -20,7 +20,7 @@ PARITY_CASES = [
     for case in MANIFEST["cases"]
     if case["status"] == "reference"
     and case["divergence"] == "none"
-    and case["id"] not in {"blobs_d50", "moons_leaf"}
+    and case["id"] not in {"blobs_d50", "blobs_d50_knn", "moons_leaf"}
 ]
 
 # These case-specific assessments preserve the pinned Rust oracle as the gate.
@@ -214,7 +214,7 @@ def test_phase_one_fixtures_match_upstream(
     np.testing.assert_allclose(model.core_distances_, reference._core_distances, rtol=1e-6, atol=0)
 
 
-@pytest.mark.parametrize("case_id", ["blobs_d50", "moons_leaf"])
+@pytest.mark.parametrize("case_id", ["moons_leaf"])
 def test_known_upstream_divergences_keep_exact_fixture_as_gate(
     case_id: str, hdbscan_backend: Literal["cpu", "cuda"]
 ) -> None:
@@ -224,39 +224,13 @@ def test_known_upstream_divergences_keep_exact_fixture_as_gate(
     model = estimator(hdbscan_backend, **params).fit(x)
 
     # Phase 1 generated these arrays from the pinned upstream exact oracle; they remain
-    # strict for both cases despite the unrelated public-upstream differences.
+    # strict despite the unrelated public-upstream differences.
     assert adjusted_rand_score(expected["labels"], model.labels_) == 1.0
     assert_close_with_infs(model.probabilities_, expected["probabilities"], 1e-5)
     assert_close_with_infs(model.minimum_spanning_tree_[:, 2], expected["mst_weights"], 1e-5)
     np.testing.assert_allclose(model.core_distances_, expected["core_distances"], rtol=1e-6, atol=0)
 
     reference = upstream.HDBSCAN(**params).fit(x)
-
-    if case_id == "blobs_d50":
-        upstream_mst = np.asarray(reference._min_spanning_tree, dtype=np.float64)
-        upstream_cores = np.asarray(reference._core_distances, dtype=np.float64)
-        diagnostics: dict[str, Any] = {
-            "case": case_id,
-            "reason": KNOWN_UPSTREAM_DIVERGENCES[case_id],
-            "label_assessment": label_assessment(expected["labels"], reference.labels_),
-            "upstream_mst_shape": list(upstream_mst.shape),
-            "stored_mst_shape": list(expected["mst"].shape),
-            "upstream_core_shape": list(upstream_cores.shape),
-            "stored_core_shape": list(expected["core_distances"].shape),
-        }
-        if upstream_mst.shape == expected["mst"].shape:
-            diagnostics["mst_weight_max_abs_delta"] = float(
-                np.max(np.abs(expected["mst_weights"] - upstream_mst[:, 2]))
-            )
-        if upstream_cores.shape == expected["core_distances"].shape:
-            diagnostics["core_distance_max_abs_delta"] = float(
-                np.max(np.abs(expected["core_distances"] - upstream_cores))
-            )
-        warnings.warn(
-            f"informational upstream comparison: {json.dumps(diagnostics, sort_keys=True)}",
-            stacklevel=1,
-        )
-        return
 
     upstream_mst = np.asarray(reference._min_spanning_tree, dtype=np.float64)
     upstream_cores = np.asarray(reference._core_distances, dtype=np.float64)
@@ -336,6 +310,17 @@ def test_known_upstream_divergences_keep_exact_fixture_as_gate(
     )
 
 
+def test_knn_graph_default_route_matches_fixture(hdbscan_backend: Literal["cpu", "cuda"]) -> None:
+    # Default config resolves this d=50 fixture to the KnnGraph route; the stored oracle is the
+    # pynndescent kNN graph validated exactly against numpy during generation.
+    x, metadata, expected = fixture_data("blobs_d50_knn")
+    model = estimator(hdbscan_backend, **estimator_params(metadata)).fit(x)
+    assert adjusted_rand_score(expected["labels"], model.labels_) == 1.0
+    assert_close_with_infs(model.probabilities_, expected["probabilities"], 1e-5)
+    assert_close_with_infs(model.minimum_spanning_tree_[:, 2], expected["mst_weights"], 1e-5)
+    np.testing.assert_allclose(model.core_distances_, expected["core_distances"], rtol=1e-6, atol=0)
+
+
 @pytest.mark.parametrize("case_id", ["duplicates_ties", "persistence_equal"])
 def test_annotated_tie_fixtures_use_tie_safe_checks(
     case_id: str,
@@ -357,7 +342,7 @@ def test_annotated_tie_fixtures_use_tie_safe_checks(
     assert model.labels_.shape == (len(x),)
 
 
-@pytest.mark.parametrize("case_id", [*PARITY_CASES, "blobs_d50", "moons_leaf"])
+@pytest.mark.parametrize("case_id", [*PARITY_CASES, "blobs_d50", "blobs_d50_knn", "moons_leaf"])
 def test_cuda_and_cpu_match_on_phase_one_fixtures(
     case_id: str, hdbscan_backend: Literal["cpu", "cuda"]
 ) -> None:
@@ -385,7 +370,6 @@ def test_cuda_and_cpu_match_on_phase_one_fixtures(
         ({"cluster_selection_persistence": 0}, ValueError),
         ({"metric": "manhattan"}, NotImplementedError),
         ({"algorithm": "kruskal"}, NotImplementedError),
-        ({"knn_k": 3}, NotImplementedError),
         ({"cannot_link": object()}, NotImplementedError),
         ({"cannot_link_groups": np.array([0, 1])}, NotImplementedError),
         ({"semi_supervised": True}, NotImplementedError),
@@ -591,14 +575,79 @@ def test_successful_refit_replaces_state(
     assert model.labels_.shape == (2 * len(x),)
 
 
-def test_reproducible_option_is_accepted_without_changing_results(
+@pytest.fixture
+def kd_region_data(request: pytest.FixtureRequest) -> np.ndarray:
+    rows, dims = request.param
+    rng = np.random.default_rng(20241023 + rows + dims)
+    centers = rng.normal(scale=8.0, size=(4, dims))
+    assignment = rng.integers(0, len(centers), size=rows)
+    noise = rng.normal(scale=1.0, size=(rows, dims))
+    return np.ascontiguousarray(centers[assignment] + noise, dtype=np.float32)
+
+
+def assert_bitwise_equal(actual: np.ndarray, expected: np.ndarray) -> None:
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize(
+    ("kd_region_data", "min_samples"),
+    [
+        ((256, 2), 5),
+        ((512, 12), 5),
+        ((2048, 30), 32),
+    ],
+    indirect=["kd_region_data"],
+)
+def test_reproducible_kd_route_is_bitwise_identical_to_default(
+    kd_region_data: np.ndarray,
+    min_samples: int,
     hdbscan_backend: Literal["cpu", "cuda"],
 ) -> None:
+    ordinary = estimator(hdbscan_backend, min_samples=min_samples).fit(kd_region_data)
+    reproducible = estimator(hdbscan_backend, min_samples=min_samples, reproducible=True).fit(
+        kd_region_data
+    )
+    for name in (
+        "labels_",
+        "probabilities_",
+        "condensed_tree_",
+        "single_linkage_tree_",
+        "minimum_spanning_tree_",
+        "neighbors_",
+        "core_distances_",
+        "finite_index_",
+    ):
+        assert_bitwise_equal(getattr(ordinary, name), getattr(reproducible, name))
+
+
+def test_knn_k_is_forwarded_to_knn_graph_route(hdbscan_backend: Literal["cpu", "cuda"]) -> None:
+    # knn_k=15 is the stored width of the d=50 kNN-graph fixture; the explicit value must
+    # reproduce the same strict fixture assertions as the default route.
+    x, metadata, expected = fixture_data("blobs_d50_knn")
+    model = estimator(hdbscan_backend, **estimator_params(metadata), knn_k=15).fit(x)
+    assert adjusted_rand_score(expected["labels"], model.labels_) == 1.0
+    assert_close_with_infs(model.probabilities_, expected["probabilities"], 1e-5)
+    assert_close_with_infs(model.minimum_spanning_tree_[:, 2], expected["mst_weights"], 1e-5)
+    np.testing.assert_allclose(model.core_distances_, expected["core_distances"], rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("knn_k", [0, -1, True, 2.0])
+def test_knn_k_rejects_non_positive_integers(
+    knn_k: Any, hdbscan_backend: Literal["cpu", "cuda"]
+) -> None:
     x, _, _ = fixture_data("blobs_d2")
-    ordinary = estimator(hdbscan_backend).fit(x)
-    reproducible = estimator(hdbscan_backend, reproducible=True).fit(x)
-    np.testing.assert_array_equal(ordinary.labels_, reproducible.labels_)
-    assert_close_with_infs(ordinary.probabilities_, reproducible.probabilities_, 0.0)
+    with pytest.raises(ValueError):
+        estimator(hdbscan_backend, knn_k=knn_k).fit(x)
+    with pytest.raises(ValueError):
+        _fast_umap.fit_hdbscan(x, knn_k=knn_k)
+
+
+def test_native_knn_k_accepts_none_and_positive_integers() -> None:
+    x, _, _ = fixture_data("blobs_d2")
+    assert _fast_umap.fit_hdbscan(x, knn_k=None).labels.shape == (len(x),)
+    assert _fast_umap.fit_hdbscan(x, knn_k=3).labels.shape == (len(x),)
 
 
 def test_explicit_cuda_does_not_fall_back(

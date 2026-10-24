@@ -12,6 +12,16 @@ pub enum ClusterSelectionMethod {
     Leaf,
 }
 
+/// Graph used to construct the mutual-reachability spanning tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MstGraph {
+    /// Use the kNN graph above 30 features, otherwise the complete graph.
+    #[default]
+    Auto,
+    Complete,
+    KnnGraph,
+}
+
 /// HDBSCAN configuration shared by every backend. Backend choice is not part of this type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HdbscanConfig {
@@ -24,6 +34,11 @@ pub struct HdbscanConfig {
     pub max_cluster_size: Option<usize>,
     pub cluster_selection_epsilon: f64,
     pub cluster_selection_persistence: f64,
+    pub mst_graph: MstGraph,
+    /// Nonself graph width; ignored for the complete graph.
+    pub knn_k: Option<usize>,
+    /// Use independent bounds on the complete-graph KD route.
+    pub reproducible: bool,
 }
 
 impl Default for HdbscanConfig {
@@ -36,6 +51,9 @@ impl Default for HdbscanConfig {
             max_cluster_size: None,
             cluster_selection_epsilon: 0.0,
             cluster_selection_persistence: 0.0,
+            mst_graph: MstGraph::Auto,
+            knn_k: None,
+            reproducible: false,
         }
     }
 }
@@ -52,6 +70,9 @@ impl HdbscanConfig {
             return Err(HdbscanError::InvalidConfig(
                 "min_samples must be positive".into(),
             ));
+        }
+        if self.knn_k == Some(0) {
+            return Err(HdbscanError::InvalidConfig("knn_k must be positive".into()));
         }
         for (name, value) in [
             ("cluster_selection_epsilon", self.cluster_selection_epsilon),

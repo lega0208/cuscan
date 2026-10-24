@@ -1,4 +1,4 @@
-//! Backend-neutral CubeCL discovery and exact-neighbor operations.
+//! Backend-neutral CubeCL discovery and neighbor operations.
 pub mod backend;
 mod backend_choice;
 pub mod cuda_backend;
@@ -9,5 +9,6 @@ pub mod neighbors;
 
 pub use backend_choice::{BackendChoice, validate_backend_choice};
 pub use device::{construct_cpu_device, selected_device};
-pub use error::BackendError;
+pub use error::{AnnError, BackendError};
+pub use kernels::ann::{AnnPlan, ann_preflight};
 pub use kernels::legal_cube_dim;

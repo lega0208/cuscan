@@ -10,26 +10,6 @@ use burn::backend::{
 /// Forward-only operations used by the nonparametric standard UMAP path.
 #[backend_extension(Cube, Fusion)]
 pub trait StandardUmapOps: Backend {
-    #[fusion(meta = |data, k, seed, max_iterations| {
-        assert!(data.shape.len() == 2 && data.shape[0] >= 2 && data.shape[1] > 0,
-            "ANN input requires at least two rows and one feature");
-        assert!(*k > 0 && (*k as usize) < data.shape[0],
-            "ANN neighbor width must be in 1..N");
-        let shape = [data.shape[0], *k as usize];
-        (
-            burn::backend::fusion::custom::TensorSpec::new(shape.into(), burn::tensor::DType::I32),
-            burn::backend::fusion::custom::TensorSpec::new(shape.into(), data.dtype),
-        )
-    })]
-    /// Approximate fit neighbors by bounded NN-Descent. Returns `[N, k]` nonself
-    /// indices and Euclidean distances sorted by `(distance, index)`.
-    fn approximate_neighbors(
-        data: FloatTensor<Self>,
-        k: u32,
-        seed: u64,
-        max_iterations: u32,
-    ) -> (IntTensor<Self>, FloatTensor<Self>);
-
     #[fusion(meta = |query, reference, graph, k, candidate_capacity, visit_capacity, seed, query_offset| {
         let rows = query.shape[0];
         let shape = [rows, *k as usize];

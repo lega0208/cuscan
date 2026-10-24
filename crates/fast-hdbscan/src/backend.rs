@@ -59,7 +59,7 @@ pub trait HdbscanOps: Backend {
         k: u32,
     ) -> (IntTensor<Self>, FloatTensor<Self>);
 
-    #[fusion(meta = |data, core_sq, point_components, tree| {
+    #[fusion(meta = |data, core_sq, point_components, tree, reproducible| {
         let shape = [data.shape[0]];
         (
             burn::backend::fusion::custom::TensorSpec::new(shape.into(), data.dtype),
@@ -69,11 +69,15 @@ pub trait HdbscanOps: Backend {
             ),
         )
     })]
-    /// Exact per-point MRD² candidate to the nearest point in another component.
+    /// MRD² candidates preserving component winners. Reproducible mode returns
+    /// every row's exact candidate. Shared mode preserves only first-source
+    /// component winners; other rows may return heavier, scheduling-dependent
+    /// candidates or be pruned to `(inf, -1)`.
     fn boruvka_candidates_kd(
         data: FloatTensor<Self>,
         core_sq: FloatTensor<Self>,
         point_components: IntTensor<Self>,
         #[extension_type] tree: DeviceKdTree<Self>,
+        reproducible: bool,
     ) -> (FloatTensor<Self>, IntTensor<Self>);
 }

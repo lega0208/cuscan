@@ -2,6 +2,7 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Int, Tensor, TensorData},
 };
+use fast_cubecl_common::{ann_preflight, backend::NeighborOps};
 use fast_umap::{
     backend::StandardUmapOps,
     standard_umap::{
@@ -368,11 +369,13 @@ fn assert_approximate_fit_quality(
             TensorData::new(train.values.clone(), [train.rows, train.cols]),
             device,
         );
-        let (ids, _) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+        ann_preflight(device, train.rows, train.cols, k).unwrap();
+        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
             train_tensor.clone().into_dispatch(),
             k as u32,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
+            false,
         );
         let ids = Tensor::<2, Int>::from_dispatch(ids)
             .to_data()
@@ -641,11 +644,13 @@ fn run_recall(device: Device) {
         );
         let fit_k = 14usize;
         let seed = 47u64;
-        let (ids, _) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+        ann_preflight(&device, train.rows, train.cols, fit_k).unwrap();
+        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
             train_tensor.clone().into_dispatch(),
             fit_k as u32,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
+            false,
         );
         let graph = Tensor::<2, Int>::from_dispatch(ids);
         let approximate_fit = graph.to_data().try_to_vec::<i32>().unwrap();
@@ -933,11 +938,13 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
             TensorData::new(train.values.clone(), [train.rows, train.cols]),
             device,
         );
-        let (ids, _) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+        ann_preflight(device, train.rows, train.cols, 14).unwrap();
+        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
             data.into_dispatch(),
             14,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
+            false,
         );
         let ids = Tensor::<2, Int>::from_dispatch(ids)
             .to_data()

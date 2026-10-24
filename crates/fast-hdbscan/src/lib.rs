@@ -6,5 +6,7 @@ pub mod kernels;
 
 pub use backend::{DeviceKdTree, HdbscanOps};
 pub use estimator::{FittedHDBSCAN, HDBSCAN, HdbscanSearch};
+#[doc(hidden)]
+pub use estimator::{KnnDiagnostics, KnnNeighborSource, KnnSource, fit_knn_graph_with_source};
 pub use fast_cubecl_common::BackendChoice;
-pub use fast_hdbscan_core::{ClusterSelectionMethod, HdbscanConfig, HdbscanError};
+pub use fast_hdbscan_core::{ClusterSelectionMethod, HdbscanConfig, HdbscanError, MstGraph};

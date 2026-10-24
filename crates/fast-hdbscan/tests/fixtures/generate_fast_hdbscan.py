@@ -40,6 +40,34 @@ COMPARISON_COMMIT_BLOBS = {
 }
 
 
+KNN_GRAPH_BLOBS = {
+    "nndescent.py": "a4353f25f43606da6e35fe08678f360172940ba4",
+    "kruskal.py": "0a5c7df222aad488d929773181af516c51dafa63",
+    "precomputed.py": "da6b7e52e5f0fb2b854596504f79bacd3c10f7d3",
+}
+KNN_GRAPH_RANDOM_STATE = 42
+
+
+def knn_graph_sources() -> dict:
+    import fast_hdbscan.kruskal as kruskal
+    import fast_hdbscan.nndescent as nndescent
+    import fast_hdbscan.precomputed as precomputed
+
+    modules = {"nndescent.py": nndescent, "kruskal.py": kruskal, "precomputed.py": precomputed}
+    for filename, expected_blob in KNN_GRAPH_BLOBS.items():
+        source = Path(modules[filename].__file__).read_bytes()
+        git_blob = hashlib.sha1(f"blob {len(source)}\0".encode() + source).hexdigest()
+        if git_blob != expected_blob:
+            raise RuntimeError(f"installed {filename} differs from the verified knn graph source")
+    return {
+        "pynndescent_version": importlib.metadata.version("pynndescent"),
+        "modules": KNN_GRAPH_BLOBS,
+        "build_knn_graph": str(inspect.signature(nndescent.build_knn_graph)),
+        "compute_mst_from_knn_graph": str(inspect.signature(nndescent.compute_mst_from_knn_graph)),
+        "random_state": KNN_GRAPH_RANDOM_STATE,
+    }
+
+
 def provenance() -> dict:
     from fast_hdbscan import boruvka, cluster_trees, hdbscan
 
@@ -101,6 +129,7 @@ def provenance() -> dict:
             "uv.lock pins release wheel and sdist SHA-256 hashes."
         ),
         "release_source_blobs": RELEASE_BLOBS,
+        "knn_graph_sources": knn_graph_sources(),
         "comparison_commit_blob_ids": COMPARISON_COMMIT_BLOBS,
         "artifact_hashes": {"sdist": EXPECTED["sdist"], "wheel": EXPECTED["wheel"]},
         "modules": {
@@ -316,6 +345,27 @@ def tie_evidence(x: np.ndarray, core: np.ndarray, mst: np.ndarray, condensed, pa
     }
 
 
+def knn_graph_mst(
+    x: np.ndarray, min_samples: int, knn_k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    from fast_hdbscan import nndescent
+
+    _, knn_indices, _ = nndescent.build_knn_graph(x, knn_k, random_state=KNN_GRAPH_RANDOM_STATE)
+    if len(np.unique(x, axis=0)) != len(x):
+        raise RuntimeError("knn graph fixtures must not contain duplicate rows")
+    squared = np.sum((x[:, None, :].astype(np.float64) - x[None, :, :]) ** 2, axis=2)
+    np.fill_diagonal(squared, np.inf)
+    exact = np.argsort(squared, axis=1, kind="stable")[:, :knn_k]
+    if not np.array_equal(knn_indices, exact):
+        raise RuntimeError("pynndescent knn graph differs from the exact non-self kNN oracle")
+    mst, neighbors, core = nndescent.compute_mst_from_knn_graph(
+        x, min_samples, knn_k=knn_k, random_state=KNN_GRAPH_RANDOM_STATE
+    )
+    if not np.array_equal(neighbors, knn_indices[:, :min_samples]):
+        raise RuntimeError("compute_mst_from_knn_graph neighbors differ from the validated graph")
+    return mst, neighbors, core
+
+
 def create_case(case: dict, reference: dict) -> tuple[dict, dict]:
     from fast_hdbscan import boruvka, hdbscan
     from numba import get_num_threads, set_num_threads
@@ -397,14 +447,17 @@ def create_case(case: dict, reference: dict) -> tuple[dict, dict]:
             raise RuntimeError(
                 f"{case['id']} must not invoke Boruvka with fewer than two finite rows"
             )
-        tree = hdbscan.build_kdtree(clean)
-        mst, neighbors, core = boruvka.parallel_boruvka(
-            tree,
-            get_num_threads(),
-            min_samples=params["min_samples"],
-            sample_weights=np.zeros(1, dtype=np.float32),
-            reproducible=True,
-        )
+        if params.get("mst_graph") == "knn_graph":
+            mst, neighbors, core = knn_graph_mst(clean, params["min_samples"], params["knn_k"])
+        else:
+            tree = hdbscan.build_kdtree(clean)
+            mst, neighbors, core = boruvka.parallel_boruvka(
+                tree,
+                get_num_threads(),
+                min_samples=params["min_samples"],
+                sample_weights=np.zeros(1, dtype=np.float32),
+                reproducible=True,
+            )
         labels, probabilities, linkage, condensed, sorted_mst = hdbscan.clusters_from_spanning_tree(
             mst,
             min_cluster_size=params["min_cluster_size"],
@@ -605,6 +658,10 @@ def validate_manifest(manifest: dict, schema: dict) -> None:
             raise RuntimeError(f"unknown case status: {case['status']}")
         if case["n"] <= 0 or case["dimensions"] <= 0:
             raise RuntimeError("fixture dimensions must be positive")
+        if case["params"].get("mst_graph") == "knn_graph":
+            expected_width = min(max(3 * case["params"]["min_samples"], 15), case["n"] - 1)
+            if case["params"]["knn_k"] != expected_width:
+                raise RuntimeError(f"{case['id']} knn_k differs from the default graph width")
 
 
 def main() -> int:

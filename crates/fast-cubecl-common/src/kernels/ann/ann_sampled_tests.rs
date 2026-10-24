@@ -54,7 +54,7 @@ fn read_f32(tensor: &CubeTensor) -> Vec<f32> {
 }
 
 fn launch_units(client: &cubecl::client::Client, units: usize) -> (CubeCount, CubeDim) {
-    ann_independent_launch(client, u32::try_from(units).unwrap())
+    ann_independent_launch(client, u32::try_from(units).unwrap()).unwrap()
 }
 
 fn merge_fixture(device: CubeDevice) {
@@ -72,7 +72,9 @@ fn merge_fixture(device: CubeDevice) {
     let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
     let (cpu_merge, count, dim) =
-        super::super::ann_launch_geometry(&client, DType::F32.size(), n as u32);
+        super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
+            .unwrap()
+            .geometry();
     endpoint_merge_kernel::launch(
         &client,
         count,
@@ -135,7 +137,9 @@ fn duplicate_merge_fixture(device: CubeDevice) {
     let workspace_ids = i32_tensor(&device, &[n, width], vec![3; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
     let (cpu_merge, count, dim) =
-        super::super::ann_launch_geometry(&client, DType::F32.size(), n as u32);
+        super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
+            .unwrap()
+            .geometry();
     endpoint_merge_kernel::launch(
         &client,
         count,
@@ -466,7 +470,44 @@ fn flag_transition_fixture(device: CubeDevice) {
     assert_eq!(read_i32(&new_count), [0]);
 }
 
+fn squared_output_fixture(device: CubeDevice) {
+    let client = device.client();
+    let n = 2usize;
+    let width = 2usize;
+    let k = 2usize;
+    let indices = i32_tensor(&device, &[n, width], vec![1, 0, 0, 1]);
+    // Zero, ordinary, infinite and ordinary squared distances.
+    let squared = f32_tensor(&device, &[n, width], vec![0.0, 4.0, f32::INFINITY, 9.0]);
+    for (squared_output, expected) in [
+        (true, vec![0.0, 4.0, f32::INFINITY, 9.0]),
+        (false, vec![0.0, 2.0, f32::INFINITY, 3.0]),
+    ] {
+        let output_indices = i32_tensor(&device, &[n, k], vec![0; n * k]);
+        let output_distances = f32_tensor(&device, &[n, k], vec![0.0; n * k]);
+        let (count, dim) = launch_units(&client, n);
+        ann_output::launch(
+            &client,
+            count,
+            dim,
+            indices.clone().into_tensor_arg(),
+            squared.clone().into_tensor_arg(),
+            output_indices.clone().into_tensor_arg(),
+            output_distances.clone().into_tensor_arg(),
+            width as u32,
+            k as u32,
+            squared_output,
+            [
+                dtype_to_storage_type(DType::F32),
+                dtype_to_storage_type(DType::I32),
+            ],
+        );
+        assert_eq!(read_i32(&output_indices), [1, 0, 0, 1]);
+        assert_eq!(read_f32(&output_distances), expected);
+    }
+}
+
 fn run_kernel_fixtures(device: CubeDevice) {
+    squared_output_fixture(device.clone());
     merge_fixture(device.clone());
     duplicate_merge_fixture(device.clone());
     sampled_pair_slots_fixture(device.clone());

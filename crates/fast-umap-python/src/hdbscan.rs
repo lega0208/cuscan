@@ -6,6 +6,7 @@ use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyFloat};
 
 #[pyclass(frozen, unsendable)]
 pub(crate) struct FittedHDBSCAN {
@@ -158,6 +159,7 @@ pub(crate) fn fit_hdbscan(
         "backend",
         "device_index",
         "reproducible",
+        "knn_k",
     ];
     for (key, _) in kwargs.iter() {
         let key = key.extract::<String>()?;
@@ -212,11 +214,16 @@ pub(crate) fn fit_hdbscan(
         .map(|value| value.extract::<usize>())
         .transpose()?
         .unwrap_or(0);
-    let _reproducible = kwargs
+    let reproducible = kwargs
         .get_item("reproducible")?
         .map(|value| value.extract::<bool>())
         .transpose()?
         .unwrap_or(false);
+    let knn_k = kwargs
+        .get_item("knn_k")?
+        .map(|value| optional_positive_integer(&value, "knn_k"))
+        .transpose()?
+        .unwrap_or(None);
     let backend = match backend {
         ref backend if backend == "auto" => BackendChoice::Auto,
         ref backend if backend == "cpu" => BackendChoice::Cpu,
@@ -244,6 +251,9 @@ pub(crate) fn fit_hdbscan(
         max_cluster_size,
         cluster_selection_epsilon,
         cluster_selection_persistence,
+        knn_k,
+        reproducible,
+        ..Default::default()
     };
     let input = x
         .as_array()
@@ -254,6 +264,21 @@ pub(crate) fn fit_hdbscan(
     py.detach(|| HDBSCAN::new(config, backend).fit(&input))
         .map(|inner| FittedHDBSCAN { inner })
         .map_err(map_hdbscan_error)
+}
+
+/// Accepts `None` or a strictly positive Python integer; rejects bool, float, zero and negatives.
+fn optional_positive_integer(value: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<usize>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let rejected = || PyValueError::new_err(format!("{name} must be a positive integer or None"));
+    if value.is_instance_of::<PyBool>() || value.is_instance_of::<PyFloat>() {
+        return Err(rejected());
+    }
+    match value.extract::<usize>() {
+        Ok(parsed) if parsed > 0 => Ok(Some(parsed)),
+        _ => Err(rejected()),
+    }
 }
 
 #[pyfunction]

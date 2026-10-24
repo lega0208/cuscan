@@ -1,7 +1,6 @@
 //! Backend-free host code for Standard UMAP: configuration, validation, errors, model state,
-//! host-side query/ANN sizing math, and spectral initialization.
+//! host-side query sizing math, and spectral initialization.
 
-pub mod ann;
 mod config;
 pub mod init;
 pub mod query;

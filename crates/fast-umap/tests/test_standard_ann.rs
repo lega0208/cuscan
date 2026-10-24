@@ -2,6 +2,7 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Tensor, TensorData},
 };
+use fast_cubecl_common::{ann_preflight, backend::NeighborOps};
 use fast_umap::backend::StandardUmapOps;
 
 fn points(rows: usize, features: usize, salt: usize) -> Vec<f32> {
@@ -40,11 +41,13 @@ fn approximate(
     iterations: u32,
 ) -> (Vec<i32>, Vec<f32>) {
     let data = Tensor::<2>::from_data(TensorData::new(values, [n, features]), device);
-    let (ids, distances) = <Dispatch as StandardUmapOps>::approximate_neighbors(
+    ann_preflight(device, n, features, k).unwrap();
+    let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
         data.into_dispatch(),
         k as u32,
         seed,
         iterations,
+        false,
     );
     (
         Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
@@ -438,26 +441,12 @@ fn cpu_ann_resolves_equal_distances_by_neighbor_id() {
 #[test]
 fn ann_rejects_invalid_tiny_width_and_singleton_input() {
     let device = Device::cpu();
-    let data = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0], [2, 1]), &device);
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ =
-                <Dispatch as StandardUmapOps>::approximate_neighbors(data.into_dispatch(), 0, 1, 3);
-        }))
-        .is_err()
-    );
-    let singleton = Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), &device);
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = <Dispatch as StandardUmapOps>::approximate_neighbors(
-                singleton.into_dispatch(),
-                1,
-                42,
-                3,
-            );
-        }))
-        .is_err()
-    );
+    for (n, features, k) in [(2, 1, 0), (1, 1, 1), (2, 1, 2), (2, 0, 1)] {
+        assert!(matches!(
+            ann_preflight(&device, n, features, k),
+            Err(fast_cubecl_common::AnnError::InvalidInput(_))
+        ));
+    }
 }
 
 #[test]

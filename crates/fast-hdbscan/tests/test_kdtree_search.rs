@@ -86,6 +86,7 @@ fn check_extension_roundtrip(device: &Device) {
         core.into_dispatch(),
         components.clone().into_dispatch(),
         make_device_tree(&tree, &components_values, device),
+        true,
     );
     assert_eq!(
         Tensor::<1, Int>::from_dispatch(indices)
@@ -175,6 +176,7 @@ fn check_kd_oracle(device: &Device) {
         core_tensor.into_dispatch(),
         components_tensor.into_dispatch(),
         make_device_tree(&tree, &components_values, device),
+        true,
     );
     let weights = Tensor::<1>::from_dispatch(weights)
         .to_data()
@@ -214,6 +216,7 @@ fn check_kd_oracle(device: &Device) {
         Tensor::<1, Int>::from_data(TensorData::new(components_values.clone(), [N]), device)
             .into_dispatch(),
         make_device_tree(&tree, &components_values, device),
+        true,
     );
     let weights = Tensor::<1>::from_dispatch(weights)
         .to_data()
@@ -354,6 +357,7 @@ fn check_permuted_tree_row_oracles(device: &Device) {
         Tensor::<1, Int>::from_data(TensorData::new(components.clone(), [n]), device)
             .into_dispatch(),
         make_device_tree(&tree, &components, device),
+        true,
     );
     let weights = Tensor::<1>::from_dispatch(weights)
         .to_data()
@@ -456,6 +460,7 @@ fn check_overflow_distances(device: &Device, backend: fast_hdbscan::BackendChoic
         Tensor::<1>::from_data(TensorData::new(vec![0.0; 3], [3]), device).into_dispatch(),
         Tensor::<1, Int>::from_data(TensorData::new(vec![0, 1, 2], [3]), device).into_dispatch(),
         make_device_tree(&tree, &[0, 1, 2], device),
+        true,
     );
     assert_eq!(
         Tensor::<1, Int>::from_dispatch(destinations)

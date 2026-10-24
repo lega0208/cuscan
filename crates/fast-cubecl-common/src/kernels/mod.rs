@@ -1,4 +1,5 @@
 use burn::cubecl::CubeDim;
+pub(crate) mod ann;
 mod cube_backend;
 mod neighbors;
 

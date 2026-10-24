@@ -4,9 +4,12 @@ use burn::{
     backend::{Dispatch, DispatchDevice},
     tensor::{Device, Int, Tensor, TensorData, Transaction},
 };
-use fast_cubecl_common::{BackendChoice, neighbors as common_neighbors, selected_device};
+use fast_cubecl_common::{
+    AnnError, BackendChoice, ann_preflight, backend::NeighborOps, neighbors as common_neighbors,
+    selected_device,
+};
 use fast_hdbscan_core::{
-    HdbscanConfig, HdbscanError, HostClustering,
+    HdbscanConfig, HdbscanError, HostClustering, MstGraph,
     condense::CondensedTree,
     dsu::RankDsu,
     error::Result,
@@ -14,6 +17,7 @@ use fast_hdbscan_core::{
         compact_rows, flatten_input, remap_condensed, remap_linkage, scatter_labels,
         scatter_probabilities, split_finite,
     },
+    knn_kruskal::{KnnGraph, knn_kruskal},
     labels::dbscan_cut,
     linkage::{LinkageRow, SortedMstEdge},
     mst::{finalize_mst, init_from_knn, merge_components},
@@ -22,6 +26,57 @@ use fast_hdbscan_core::{
 use crate::backend::{DeviceKdTree, HdbscanOps};
 
 const NEIGHBOR_BATCH_ROWS: usize = 256;
+const KNN_GRAPH_EXACT_MAX_ROWS: usize = 4096;
+const ANN_VALIDATED_MAX_WIDTH: usize = 60;
+
+/// Comparator policy for kNN graph construction.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnnSource {
+    Exact,
+    /// Explicit ANN comparator, independent of the production width limit.
+    Ann,
+    Auto,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnnNeighborSource {
+    Exact,
+    Approximate,
+}
+
+/// Graph evidence in finite-row indexing. Distances are squared Euclidean.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct KnnDiagnostics {
+    pub source: KnnNeighborSource,
+    pub neighbors: Vec<i32>,
+    pub distances_sq: Vec<f32>,
+    pub k: usize,
+    pub bridges: usize,
+    pub finite_weight_sum: f64,
+    pub allocation_bytes: usize,
+}
+
+fn resolve_graph(requested: MstGraph, features: usize) -> MstGraph {
+    match requested {
+        MstGraph::Auto if features > 30 => MstGraph::KnnGraph,
+        MstGraph::Auto => MstGraph::Complete,
+        graph => graph,
+    }
+}
+
+fn graph_width(n: usize, min_samples: usize, knn_k: Option<usize>) -> Result<usize> {
+    let width = match knn_k {
+        Some(width) => width,
+        None => min_samples
+            .checked_mul(3)
+            .ok_or(HdbscanError::Overflow("default kNN graph width"))?
+            .max(15),
+    };
+    Ok(width.max(min_samples).min(n.saturating_sub(1)))
+}
 
 #[cfg(feature = "tracing")]
 fn profile_sync(device: &Device) -> Result<()> {
@@ -331,11 +386,11 @@ struct CoreDistances {
 fn core_distances(
     data: &Tensor<2>,
     min_samples: usize,
+    k: usize,
     search: HdbscanSearch,
     tree: Option<&DeviceKdTree<Dispatch>>,
 ) -> Result<CoreDistances> {
     let n = data.dims()[0];
-    let k = min_samples.min(n - 1);
     checked_allocation_bytes(
         n.checked_mul(k)
             .ok_or(HdbscanError::Overflow("compact neighbor elements"))?,
@@ -466,6 +521,7 @@ fn spanning_tree(
     search: HdbscanSearch,
     tree: Option<&fast_hdbscan_core::KdTree>,
     device_tree: Option<&DeviceKdTree<Dispatch>>,
+    reproducible: bool,
 ) -> Result<Vec<SortedMstEdge>> {
     let n = data.dims()[0];
     let mut dsu = RankDsu::new(n);
@@ -519,6 +575,7 @@ fn spanning_tree(
                     core_tensor.into_dispatch(),
                     component_tensor.into_dispatch(),
                     device_tree,
+                    reproducible,
                 );
                 #[cfg(feature = "tracing")]
                 profile_sync(&data.device())?;
@@ -569,7 +626,149 @@ fn spanning_tree(
     Ok(finalize_mst(edges))
 }
 
-/// HDBSCAN estimator using exact device neighbors and Borůvka candidates.
+fn public_neighbors(ids: &[i32], n: usize, width: usize, min_samples: usize) -> Result<Vec<i32>> {
+    let slots = n
+        .checked_mul(min_samples)
+        .ok_or(HdbscanError::Overflow("public neighbor output elements"))?;
+    checked_allocation_bytes(slots, 4, None, "public neighbor ID allocation")?;
+    let mut public = vec![-1; slots];
+    let copied = width.min(min_samples);
+    for row in 0..n {
+        public[row * min_samples..row * min_samples + copied]
+            .copy_from_slice(&ids[row * width..row * width + copied]);
+    }
+    Ok(public)
+}
+
+fn knn_spanning_tree(
+    data: &Tensor<2>,
+    min_samples: usize,
+    k: usize,
+    source: KnnSource,
+) -> Result<(fast_hdbscan_core::knn_kruskal::KnnMst, KnnDiagnostics)> {
+    let n = data.dims()[0];
+    let slots = n
+        .checked_mul(k)
+        .ok_or(HdbscanError::Overflow("kNN graph elements"))?;
+    // Check each buffer and their combined accounting before any graph allocation.
+    // Sort workspace conservatively reserves another full candidate tuple array.
+    let mut allocation_bytes = 0usize;
+    for (elements, size, subject) in [
+        (slots, 4, "kNN graph IDs"),
+        (slots, 4, "kNN graph distances"),
+        (
+            n.checked_mul(min_samples)
+                .ok_or(HdbscanError::Overflow("public neighbors"))?,
+            4,
+            "public neighbor IDs",
+        ),
+        (
+            slots,
+            std::mem::size_of::<(f64, usize, usize, usize)>(),
+            "kNN candidate tuples",
+        ),
+        (
+            slots,
+            std::mem::size_of::<(f64, usize, usize, usize)>(),
+            "kNN candidate sort workspace",
+        ),
+    ] {
+        let bytes = checked_allocation_bytes(elements, size, None, subject)?;
+        allocation_bytes = allocation_bytes
+            .checked_add(bytes)
+            .ok_or(HdbscanError::Overflow("kNN graph live allocation bytes"))?;
+    }
+    checked_allocation_bytes(allocation_bytes, 1, None, "kNN graph live allocation bytes")?;
+    let approximate = match source {
+        KnnSource::Exact => false,
+        KnnSource::Ann => true,
+        KnnSource::Auto => n > KNN_GRAPH_EXACT_MAX_ROWS && k <= ANN_VALIDATED_MAX_WIDTH,
+    };
+    let (mut ids, distances_sq) = if approximate {
+        ann_preflight(&data.device(), n, data.dims()[1], k).map_err(|error| match error {
+            AnnError::InvalidInput(message) => HdbscanError::InvalidInput(message),
+            AnnError::Capability(message) => HdbscanError::BackendUnavailable(message),
+            AnnError::Workspace(message) => HdbscanError::Numerical(message),
+            AnnError::Overflow(_) => HdbscanError::Overflow("ANN workspace"),
+        })?;
+        let width = u32::try_from(k).map_err(|_| HdbscanError::Overflow("ANN neighbor width"))?;
+        let iterations = (n as f64).log2().round().max(5.0) as u32;
+        let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
+            data.clone().into_dispatch(),
+            width,
+            42,
+            iterations,
+            true,
+        );
+        let [id_data, distance_data] = Transaction::default()
+            .register(Tensor::<2, Int>::from_dispatch(ids))
+            .register(Tensor::<2>::from_dispatch(distances))
+            .try_execute()
+            .map_err(|error| HdbscanError::Numerical(error.to_string()))?
+            .try_into()
+            .map_err(|_| HdbscanError::Numerical("ANN readback returned wrong arity".into()))?;
+        (
+            id_data
+                .try_to_vec::<i32>()
+                .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
+            distance_data
+                .try_to_vec::<f32>()
+                .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
+        )
+    } else {
+        let core = core_distances(data, min_samples, k, HdbscanSearch::BruteForce, None)?;
+        (core.neighbors, core.knn_sq)
+    };
+    for (id, distance) in ids.iter_mut().zip(&distances_sq) {
+        // Common exact search represents a missing nonfinite neighbor by (n, +inf).
+        // Convert only that documented sentinel, never repair invalid graph records.
+        if *id == n as i32 && *distance == f32::INFINITY {
+            *id = -1;
+        }
+    }
+    let result = knn_kruskal(
+        KnnGraph {
+            ids: &ids,
+            dist_sq: &distances_sq,
+            rows: n,
+            k,
+        },
+        min_samples,
+    )?;
+    let diagnostics = KnnDiagnostics {
+        source: if approximate {
+            KnnNeighborSource::Approximate
+        } else {
+            KnnNeighborSource::Exact
+        },
+        neighbors: ids,
+        distances_sq,
+        k,
+        bridges: result.bridges,
+        finite_weight_sum: result
+            .edges
+            .iter()
+            .filter(|edge| edge.weight.is_finite())
+            .map(|edge| edge.weight)
+            .sum(),
+        allocation_bytes,
+    };
+    Ok((result, diagnostics))
+}
+
+/// Force the kNN graph with a controlled neighbor source for exact comparisons.
+#[doc(hidden)]
+pub fn fit_knn_graph_with_source(
+    data: &[Vec<f32>],
+    mut config: HdbscanConfig,
+    backend: BackendChoice,
+    source: KnnSource,
+) -> Result<FittedHDBSCAN> {
+    config.mst_graph = MstGraph::KnnGraph;
+    HDBSCAN::new(config, backend).fit_with_source(data, source)
+}
+
+/// HDBSCAN estimator using complete or kNN mutual-reachability graphs.
 #[derive(Debug, Clone)]
 pub struct HDBSCAN {
     config: HdbscanConfig,
@@ -592,6 +791,10 @@ impl HDBSCAN {
     }
 
     pub fn fit(&self, input: &[Vec<f32>]) -> Result<FittedHDBSCAN> {
+        self.fit_with_source(input, KnnSource::Auto)
+    }
+
+    fn fit_with_source(&self, input: &[Vec<f32>], source: KnnSource) -> Result<FittedHDBSCAN> {
         #[cfg(feature = "tracing")]
         let _input_validation_span = tracing::info_span!("input_validation").entered();
         self.config.validate()?;
@@ -622,16 +825,25 @@ impl HDBSCAN {
         let _backend_setup_span = tracing::info_span!("backend_setup").entered();
         let (device, actual_backend) = selected_device(self.backend).map_err(map_backend_error)?;
         let allocation_limit = allocation_limit(&device)?;
-        let resolved_search = self
-            .search
-            .resolve(n, features, min_samples, actual_backend);
+        let resolved_graph = resolve_graph(self.config.mst_graph, features);
+        let neighbor_width = if resolved_graph == MstGraph::KnnGraph {
+            graph_width(n, min_samples, self.config.knn_k)?
+        } else {
+            min_samples.min(n.saturating_sub(1))
+        };
+        let resolved_search = if resolved_graph == MstGraph::Complete {
+            self.search
+                .resolve(n, features, min_samples, actual_backend)
+        } else {
+            HdbscanSearch::BruteForce
+        };
         let cuda_row_pitch = matches!(actual_backend, BackendChoice::Cuda { .. });
         let brute_force_scratch_bytes =
             if n > 1 && resolved_search == HdbscanSearch::BruteForce && cuda_row_pitch {
                 checked_brute_force_scratch(
                     n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS),
                     n,
-                    min_samples.min(n - 1),
+                    neighbor_width,
                     allocation_limit,
                 )?
             } else {
@@ -650,6 +862,7 @@ impl HDBSCAN {
         let mut condensed = CondensedTree::default();
         let mut labels = vec![-1; raw_n];
         let mut probabilities = vec![0.0; raw_n];
+        let mut knn_diagnostics = None;
         #[cfg(feature = "tracing")]
         let result_finalization_span;
 
@@ -666,199 +879,230 @@ impl HDBSCAN {
                 cuda_row_pitch,
                 "finite input allocation",
             )?;
-            check_device_allocation(n, 4, allocation_limit, "core-distance allocation")?;
-            check_device_allocation(n, 4, allocation_limit, "component-label allocation")?;
-            let neighbor_slots = n
-                .checked_mul(min_samples)
-                .ok_or(HdbscanError::Overflow("neighbor output elements"))?;
-            checked_allocation_bytes(neighbor_slots, 4, None, "public neighbor ID allocation")?;
-            let sizing = crate::kernels::validate_boruvka_candidate_sizing(n)?;
-            let neighbor_width = min_samples.min(n - 1);
-            let neighbor_device_rows = if resolved_search == HdbscanSearch::KdTree {
-                n
+            let sorted_mst = if resolved_graph == MstGraph::KnnGraph {
+                let device_rows = n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS);
+                for subject in ["device graph IDs", "device graph distances"] {
+                    check_device_tensor_allocation(
+                        &[device_rows, neighbor_width],
+                        4,
+                        allocation_limit,
+                        cuda_row_pitch,
+                        subject,
+                    )?;
+                }
+                let data = tensor_f32(finite_values, [n, features], &device);
+                let (graph_mst, diagnostics) =
+                    knn_spanning_tree(&data, min_samples, neighbor_width, source)?;
+                neighbors =
+                    public_neighbors(&diagnostics.neighbors, n, diagnostics.k, min_samples)?;
+                core_values = graph_mst.core.iter().map(|&value| value as f32).collect();
+                knn_diagnostics = Some(diagnostics);
+                #[cfg(feature = "tracing")]
+                drop(_input_preparation_span);
+                graph_mst.edges
             } else {
-                n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS)
-            };
-            let neighbor_device_elements = neighbor_device_rows
-                .checked_mul(neighbor_width)
-                .ok_or(HdbscanError::Overflow("device neighbor output elements"))?;
-            check_device_allocation(
-                neighbor_device_elements,
-                4,
-                allocation_limit,
-                "device neighbor index allocation",
-            )?;
-            check_device_allocation(
-                neighbor_device_elements,
-                4,
-                allocation_limit,
-                "device neighbor distance allocation",
-            )?;
-            let scratch_elements = sizing
-                .block_rows
-                .checked_mul(sizing.tiles)
-                .ok_or(HdbscanError::Overflow("Boruvka candidate scratch elements"))?;
-            if resolved_search == HdbscanSearch::BruteForce {
+                check_device_allocation(n, 4, allocation_limit, "core-distance allocation")?;
+                check_device_allocation(n, 4, allocation_limit, "component-label allocation")?;
+                let neighbor_slots = n
+                    .checked_mul(min_samples)
+                    .ok_or(HdbscanError::Overflow("neighbor output elements"))?;
+                checked_allocation_bytes(neighbor_slots, 4, None, "public neighbor ID allocation")?;
+                let sizing = crate::kernels::validate_boruvka_candidate_sizing(n)?;
+                let neighbor_device_rows = if resolved_search == HdbscanSearch::KdTree {
+                    n
+                } else {
+                    n.saturating_sub(1).clamp(1, NEIGHBOR_BATCH_ROWS)
+                };
+                let neighbor_device_elements = neighbor_device_rows
+                    .checked_mul(neighbor_width)
+                    .ok_or(HdbscanError::Overflow("device neighbor output elements"))?;
                 check_device_allocation(
-                    scratch_elements,
+                    neighbor_device_elements,
                     4,
                     allocation_limit,
-                    "Boruvka candidate weight scratch allocation",
+                    "device neighbor index allocation",
                 )?;
                 check_device_allocation(
-                    scratch_elements,
+                    neighbor_device_elements,
                     4,
                     allocation_limit,
-                    "Boruvka candidate index scratch allocation",
+                    "device neighbor distance allocation",
                 )?;
-            }
-            check_device_allocation(
-                n,
-                4,
-                allocation_limit,
-                "Boruvka candidate weight output allocation",
-            )?;
-            check_device_allocation(
-                n,
-                4,
-                allocation_limit,
-                "Boruvka candidate index output allocation",
-            )?;
-            #[cfg(feature = "tracing")]
-            drop(_input_preparation_span);
+                let scratch_elements = sizing
+                    .block_rows
+                    .checked_mul(sizing.tiles)
+                    .ok_or(HdbscanError::Overflow("Boruvka candidate scratch elements"))?;
+                if resolved_search == HdbscanSearch::BruteForce {
+                    check_device_allocation(
+                        scratch_elements,
+                        4,
+                        allocation_limit,
+                        "Boruvka candidate weight scratch allocation",
+                    )?;
+                    check_device_allocation(
+                        scratch_elements,
+                        4,
+                        allocation_limit,
+                        "Boruvka candidate index scratch allocation",
+                    )?;
+                }
+                check_device_allocation(
+                    n,
+                    4,
+                    allocation_limit,
+                    "Boruvka candidate weight output allocation",
+                )?;
+                check_device_allocation(
+                    n,
+                    4,
+                    allocation_limit,
+                    "Boruvka candidate index output allocation",
+                )?;
+                #[cfg(feature = "tracing")]
+                drop(_input_preparation_span);
 
-            #[cfg(feature = "tracing")]
-            let _tree_build_span = tracing::info_span!("tree_build", rows = n).entered();
-            let host_tree = if resolved_search == HdbscanSearch::KdTree {
-                Some(fast_hdbscan_core::KdTree::build(
-                    &finite_values,
+                #[cfg(feature = "tracing")]
+                let _tree_build_span = tracing::info_span!("tree_build", rows = n).entered();
+                let host_tree = if resolved_search == HdbscanSearch::KdTree {
+                    Some(fast_hdbscan_core::KdTree::build(
+                        &finite_values,
+                        n,
+                        features,
+                    )?)
+                } else {
+                    None
+                };
+
+                let tree_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
+                    [
+                        tree.indices.len(),
+                        tree.starts.len(),
+                        tree.ends.len(),
+                        tree.is_leaf.len(),
+                    ]
+                    .into_iter()
+                    .try_fold(0usize, |sum, elements| {
+                        elements
+                            .checked_mul(4)
+                            .and_then(|bytes| sum.checked_add(bytes))
+                            .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
+                    })
+                    .and_then(|bytes| {
+                        let bounds = tree
+                            .starts
+                            .len()
+                            .checked_mul(tree.n_features)
+                            .and_then(|elements| elements.checked_mul(8))
+                            .ok_or(HdbscanError::Overflow("KD-tree bounds live bytes"))?;
+                        bytes
+                            .checked_add(bounds)
+                            .and_then(|v| v.checked_add(tree.starts.len().checked_mul(4)?))
+                            .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
+                    })
+                })?;
+                let memory = core_search_memory(
                     n,
                     features,
-                )?)
-            } else {
-                None
+                    min_samples,
+                    resolved_search,
+                    tree_bytes,
+                    brute_force_scratch_bytes,
+                )?;
+                if memory.device_bytes > isize::MAX as usize
+                    || memory.host_bytes > isize::MAX as usize
+                {
+                    return Err(HdbscanError::Overflow("core search live-memory plan"));
+                }
+                if let Some(tree) = &host_tree {
+                    for (elements, element_size, subject) in [
+                        (tree.indices.len(), 4, "KD-tree index allocation"),
+                        (tree.starts.len(), 4, "KD-tree start allocation"),
+                        (tree.ends.len(), 4, "KD-tree end allocation"),
+                        (tree.is_leaf.len(), 4, "KD-tree leaf allocation"),
+                    ] {
+                        check_device_allocation(elements, element_size, allocation_limit, subject)?;
+                    }
+                    check_device_tensor_allocation(
+                        &[tree.starts.len(), tree.n_features],
+                        4,
+                        allocation_limit,
+                        cuda_row_pitch,
+                        "KD-tree minimum-bounds allocation",
+                    )?;
+                    check_device_tensor_allocation(
+                        &[tree.starts.len(), tree.n_features],
+                        4,
+                        allocation_limit,
+                        cuda_row_pitch,
+                        "KD-tree maximum-bounds allocation",
+                    )?;
+                    // Per-round node-component labels are uploaded separately from the static tree.
+                    check_device_allocation(
+                        tree.starts.len(),
+                        4,
+                        allocation_limit,
+                        "KD-tree node-component allocation",
+                    )?;
+                }
+                #[cfg(feature = "tracing")]
+                drop(_tree_build_span);
+
+                #[cfg(feature = "tracing")]
+                let _input_upload_span = tracing::info_span!("input_upload", rows = n).entered();
+                let data = tensor_f32(finite_values, [n, features], &device);
+                let device_tree = host_tree.as_ref().map(|tree| upload_kd_tree(tree, &device));
+                #[cfg(feature = "tracing")]
+                profile_sync(&device)?;
+                #[cfg(feature = "tracing")]
+                drop(_input_upload_span);
+
+                #[cfg(feature = "tracing")]
+                let _core_distances_span =
+                    tracing::info_span!("core_distances", rows = n).entered();
+                let mut core = core_distances(
+                    &data,
+                    min_samples,
+                    neighbor_width,
+                    resolved_search,
+                    device_tree.as_ref(),
+                )?;
+                core_values = core.seed_core_sq.iter().map(|value| value.sqrt()).collect();
+                #[cfg(feature = "tracing")]
+                profile_sync(&device)?;
+                #[cfg(feature = "tracing")]
+                drop(_core_distances_span);
+
+                #[cfg(feature = "tracing")]
+                let _mst_span =
+                    tracing::info_span!("mst", rows = n, search = ?resolved_search).entered();
+                let sorted_mst = spanning_tree(
+                    &data,
+                    &mut core,
+                    resolved_search,
+                    host_tree.as_ref(),
+                    device_tree.as_ref(),
+                    self.config.reproducible,
+                )?;
+                if core.k == min_samples {
+                    neighbors = core.neighbors;
+                } else {
+                    let slots = n
+                        .checked_mul(min_samples)
+                        .ok_or(HdbscanError::Overflow("public neighbor output elements"))?;
+                    checked_allocation_bytes(slots, 4, None, "public neighbor output allocation")?;
+                    let mut public = vec![-1; slots];
+                    for row in 0..n {
+                        public[row * min_samples..row * min_samples + core.k]
+                            .copy_from_slice(&core.neighbors[row * core.k..(row + 1) * core.k]);
+                    }
+                    neighbors = public;
+                }
+                #[cfg(feature = "tracing")]
+                profile_sync(&device)?;
+                #[cfg(feature = "tracing")]
+                drop(_mst_span);
+                sorted_mst
             };
-
-            let tree_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
-                [
-                    tree.indices.len(),
-                    tree.starts.len(),
-                    tree.ends.len(),
-                    tree.is_leaf.len(),
-                ]
-                .into_iter()
-                .try_fold(0usize, |sum, elements| {
-                    elements
-                        .checked_mul(4)
-                        .and_then(|bytes| sum.checked_add(bytes))
-                        .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
-                })
-                .and_then(|bytes| {
-                    let bounds = tree
-                        .starts
-                        .len()
-                        .checked_mul(tree.n_features)
-                        .and_then(|elements| elements.checked_mul(8))
-                        .ok_or(HdbscanError::Overflow("KD-tree bounds live bytes"))?;
-                    bytes
-                        .checked_add(bounds)
-                        .and_then(|v| v.checked_add(tree.starts.len().checked_mul(4)?))
-                        .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
-                })
-            })?;
-            let memory = core_search_memory(
-                n,
-                features,
-                min_samples,
-                resolved_search,
-                tree_bytes,
-                brute_force_scratch_bytes,
-            )?;
-            if memory.device_bytes > isize::MAX as usize || memory.host_bytes > isize::MAX as usize
-            {
-                return Err(HdbscanError::Overflow("core search live-memory plan"));
-            }
-            if let Some(tree) = &host_tree {
-                for (elements, element_size, subject) in [
-                    (tree.indices.len(), 4, "KD-tree index allocation"),
-                    (tree.starts.len(), 4, "KD-tree start allocation"),
-                    (tree.ends.len(), 4, "KD-tree end allocation"),
-                    (tree.is_leaf.len(), 4, "KD-tree leaf allocation"),
-                ] {
-                    check_device_allocation(elements, element_size, allocation_limit, subject)?;
-                }
-                check_device_tensor_allocation(
-                    &[tree.starts.len(), tree.n_features],
-                    4,
-                    allocation_limit,
-                    cuda_row_pitch,
-                    "KD-tree minimum-bounds allocation",
-                )?;
-                check_device_tensor_allocation(
-                    &[tree.starts.len(), tree.n_features],
-                    4,
-                    allocation_limit,
-                    cuda_row_pitch,
-                    "KD-tree maximum-bounds allocation",
-                )?;
-                // Per-round node-component labels are uploaded separately from the static tree.
-                check_device_allocation(
-                    tree.starts.len(),
-                    4,
-                    allocation_limit,
-                    "KD-tree node-component allocation",
-                )?;
-            }
-            #[cfg(feature = "tracing")]
-            drop(_tree_build_span);
-
-            #[cfg(feature = "tracing")]
-            let _input_upload_span = tracing::info_span!("input_upload", rows = n).entered();
-            let data = tensor_f32(finite_values, [n, features], &device);
-            let device_tree = host_tree.as_ref().map(|tree| upload_kd_tree(tree, &device));
-            #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
-            #[cfg(feature = "tracing")]
-            drop(_input_upload_span);
-
-            #[cfg(feature = "tracing")]
-            let _core_distances_span = tracing::info_span!("core_distances", rows = n).entered();
-            let mut core =
-                core_distances(&data, min_samples, resolved_search, device_tree.as_ref())?;
-            core_values = core.seed_core_sq.iter().map(|value| value.sqrt()).collect();
-            #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
-            #[cfg(feature = "tracing")]
-            drop(_core_distances_span);
-
-            #[cfg(feature = "tracing")]
-            let _mst_span =
-                tracing::info_span!("mst", rows = n, search = ?resolved_search).entered();
-            let sorted_mst = spanning_tree(
-                &data,
-                &mut core,
-                resolved_search,
-                host_tree.as_ref(),
-                device_tree.as_ref(),
-            )?;
-            if core.k == min_samples {
-                neighbors = core.neighbors;
-            } else {
-                let slots = n
-                    .checked_mul(min_samples)
-                    .ok_or(HdbscanError::Overflow("public neighbor output elements"))?;
-                checked_allocation_bytes(slots, 4, None, "public neighbor output allocation")?;
-                let mut public = vec![-1; slots];
-                for row in 0..n {
-                    public[row * min_samples..row * min_samples + core.k]
-                        .copy_from_slice(&core.neighbors[row * core.k..(row + 1) * core.k]);
-                }
-                neighbors = public;
-            }
-            #[cfg(feature = "tracing")]
-            profile_sync(&device)?;
-            #[cfg(feature = "tracing")]
-            drop(_mst_span);
             #[cfg(feature = "tracing")]
             let _cluster_span = tracing::info_span!("cluster_extraction", rows = n).entered();
             let host = fast_hdbscan_core::clusters_from_spanning_tree(&sorted_mst, &self.config)?;
@@ -909,6 +1153,8 @@ impl HDBSCAN {
             n_features: features,
             raw_n,
             search: resolved_search,
+            resolved_graph,
+            knn_diagnostics,
         };
         #[cfg(feature = "tracing")]
         drop(result_finalization_span);
@@ -935,9 +1181,25 @@ pub struct FittedHDBSCAN {
     n_features: usize,
     raw_n: usize,
     search: HdbscanSearch,
+    resolved_graph: MstGraph,
+    knn_diagnostics: Option<KnnDiagnostics>,
 }
 
 impl FittedHDBSCAN {
+    /// The requested graph policy, including `Auto` when that was requested.
+    pub fn mst_graph(&self) -> MstGraph {
+        self.config.mst_graph
+    }
+
+    pub fn resolved_mst_graph(&self) -> MstGraph {
+        self.resolved_graph
+    }
+
+    #[doc(hidden)]
+    pub fn knn_diagnostics(&self) -> Option<&KnnDiagnostics> {
+        self.knn_diagnostics.as_ref()
+    }
+
     pub fn dbscan_clustering(&self, epsilon: f64) -> Result<Vec<i32>> {
         let labels = dbscan_cut(&self.linkage, epsilon, self.config.resolved_min_samples())?;
         if self.finite_index.len() == self.raw_n {

@@ -14,3 +14,25 @@ impl fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+/// Failure to validate an approximate-neighbor launch before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnError {
+    InvalidInput(String),
+    Capability(String),
+    Workspace(String),
+    Overflow(String),
+}
+
+impl fmt::Display for AnnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message)
+            | Self::Capability(message)
+            | Self::Workspace(message)
+            | Self::Overflow(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AnnError {}
