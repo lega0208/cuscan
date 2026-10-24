@@ -570,7 +570,16 @@ Set `FAST_HDBSCAN_BENCH_STAGES=1` for isolated neighbor, single candidate-round
 and synchronized tree-upload timings. Candidate-stage cases use singleton
 components, not total MST construction; upload timings include readback.
 The default `reproducible=false` mode uses shared component bounds on the complete-graph KD
-route. Device-side component winner reduction is not implemented.
+route. Both complete-graph candidate routes feed a two-pass device component-winner
+reduction using stable host CSR membership. Only compact ordered winners return to the
+host DSU; candidate tensors remain device-resident. CUDA uses shared-tree reductions;
+CPU uses barrier-free tiled folds. Metadata upload and two dispatches can outweigh the
+smaller readback, particularly in early rounds; this is not a speedup guarantee.
+The tracing profiler reports per-round metadata prepare/upload, candidate kernel,
+component reduction, winner readback and host merge scopes. Kernel scopes include
+profiling synchronization, not isolated device execution time. The retrospective
+`analyze/analyze_recovery.py` byte model is explicitly historical (pre-M7), not a
+component-reduction transfer model.
 
 Local Phase 4 measurements on Ryzen 7 9800X3D CPU and RTX 3080 CUDA used 100
 samples, 95% confidence intervals, three separate processes per runtime, two

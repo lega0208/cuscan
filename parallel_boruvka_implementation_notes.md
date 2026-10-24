@@ -187,3 +187,159 @@ Auto proof status: the campaign's pre-cutoff Auto probe (4097 x 31, width 1024) 
 - Read-only checks in this documentation pass: parsed the JSON files and recomputed the counts and aggregates above; grepped the working tree for the removed gate and planned checks. Source algorithms were checked by the leader.
 - Leader-run gates (cited, not re-run here): final required-CUDA `cargo test -p fast-hdbscan --release`: 74 passed, 7 ignored (artifact91), with the boundary 60/61/75/256 regression passing in artifact91. Explicitly ignored Auto 1024 CPU/CUDA: 2 passed, 34.08 s (artifact93). Common: 49 unit tests plus 2 atomic tests passed on both backends (artifact72). Shared UMAP: 11 ANN tests and 3 neighbor tests passed on actual CPU and CUDA (artifact68). Python final release build: `pytest python/tests/test_hdbscan_resources.py python/tests/test_hdbscan.py -q` produced 77 passed, 12 skipped, 1 existing informational upstream warning (artifact96), including all 22 resource-advisory tests; Ruff and ty passed. Paired comparison passed (artifact81): 76 measured pairs, 7 omitted.
 - Final acceptance: native architect review found and resolved one remaining advisory accounting defect: ANN input readback and decoding overlap as two f32 host copies, separate from the earlier facade input lifetime. All ANN host phase terms now pass through unchanged; a 64-feature regression checks both CPU and CUDA estimates. Both final architect lanes returned APPROVED/CLEAR. After this correction, 27 facade unit tests, a rebuilt release extension and all 22 Python resource tests passed; workspace Clippy and Rust formatting passed (artifact171). Latest CPU/CUDA injected fixtures passed, as did all 8 campaign policy tests (artifact170); paired evidence comparison and the optional tracing build passed (artifact172). The interrupted incremental debug build initially hit anonymous-symbol linker errors (artifact169); a non-incremental rebuild passed without source or test suppression. Upstream Burn future-incompatibility notices remain visible. The width-4096 high-density cell remains unmeasured, not a quality pass or a product restriction.
+
+## M7/M8: stable membership and device component reduction
+
+### ADR and implementation
+
+Decision: host-built stable CSR membership plus tiled two-pass component reduction.
+Core owns checked membership and ordered compact-winner validation/DSU merge; the
+facade owns kernels and scratch. Component slots follow first source appearance,
+not root ID. Members remain ascending within each slot. The production n-row host
+reducer is removed from featureless builds and retained only as a test oracle.
+Candidate arithmetic, kNN initialization, graph Kruskal, estimator/model/Python
+APIs and serialized formats are unchanged.
+
+The initial tile width is 512. CUDA uses a legal power-of-two block up to 128 units
+and three shared u32 arrays (1536 bytes at B=128), with identity-filled tails and
+uniform barriers. Smaller legal blocks retain the same at-most-512 member tiles;
+tile coverage is lane-strided, not truncated. The CPU specialization compiles out
+all shared memory/barriers and uses one cube of at most the available CPU core
+count, partitioning tiles/components into contiguous chunks. Launch offsets batch
+whole cubes when necessary. Each pass overwrites every logical output; explicit
+n/p/c bounds do not infer logical length from raw allocation capacity.
+
+Both passes carry original weight bits, source and earliest bad row as integers.
+NaN/negative classification and monotonic comparison keys are bit-based, including
+subnormals and signed-zero ties; selected payloads are never recomputed. A real
+infinite candidate beats identity. Every row, including absent/losing rows, is
+classified. Compact [c,5] metadata carries source, destination, bad row, error kind
+and offending index; all validation completes before any union. Error kind 1
+(numerical) precedes kind 2 (index) on the same row. Fusion receives scalar c and
+declares exact f32[c]/i32[c,5] outputs; empty outputs dispatch no kernels.
+
+The device operation validates tensor shapes, dtypes, common device, checked
+workspace arithmetic and aligned per-buffer page limits. Hardware properties do
+not expose a total free-device-memory cap: combined workspace is addressability
+checked, not advertised as a free-memory guarantee. The estimator validates new
+allocations before upload. Metadata tensor contents come from the checked host
+plan, not a new device-to-host validation transfer.
+
+Tracing now has disjoint round scopes `boruvka_metadata_prepare_upload`,
+`boruvka_candidate_kernel`, `boruvka_component_reduction`,
+`boruvka_winner_readback`, `boruvka_host_merge`. Profiler JSON exposes
+`round_stage_seconds` and `seed_and_round_overhead_seconds`; candidate/reduction
+timings include profiling synchronization. CPU and required-CUDA real fits check
+span counts for KD and brute. `analyze/analyze_recovery.py` deliberately retains
+its old capture schema and analytic full-row readback model, explicitly labeled
+historical-pre-M7 in its documentation and output; it is not M7/M8 transfer
+evidence. New metadata uploads/two dispatches may outweigh compact readback.
+
+### Immutable comparator and exact results
+
+Before product edits, detached pristine worktree
+`/home/marc/projects/fast-umap-m7-pristine` was created at
+`1f06e2a52de8538fae1b75517adafa1a8e67e625` (tree
+`7b23c0ff77491812d3d8ba7e6afbef7a466d1285`) and verified clean. It remains clean.
+External harness `/tmp/fast-umap-m7-baseline/main.rs` SHA256
+`f8e8a88ef5e2d92fcc1770d8f6f111a8e0137e78ca053b3285cb2331b53b3e52`
+uses the public estimator API and serializes ordered src/dst/f64 weight bits.
+Separate reference/candidate manifests differ only in checkout dependency paths;
+builds use separate target directories and the identical harness source.
+Reference manifest SHA256
+`a7789be5460d9f019ea628f85a449129cb3293fd5115e32f5bb284b528b36a13`;
+candidate manifest SHA256
+`40bebf9f562571e06eac35cb5d75afcf882c00a57cda11c18c90d089a0133bce`.
+Build command for each side: `cargo build --release --manifest-path
+/tmp/fast-umap-m7-baseline/{reference,candidate}/Cargo.toml --target-dir
+/tmp/fast-umap-m7-baseline/target-{reference,candidate}` (one side at a time).
+Run binary `mst_baseline_capture DEVICE ROUTE REPRO OUTPUT`.
+
+All eight current captures matched immutable baseline files byte-for-byte:
+CPU/CUDA KD reproducible true/false, brute true with internal opposite-flag MST-bit
+assertion, and Auto graph with explicit brute search plus complete-route assertion.
+No baseline was overwritten or recaptured. Reference files and SHA256 index are
+read-only under `/tmp/fast-umap-m7-baseline/captures/reference` and
+`reference-capture-sha256.txt`. Index entries (filename: SHA256):
+
+```text
+cpu-auto-true.txt: e647bc08539fac3d383795ac50d02f3f542450c1067ab77f4c7ee913ad0bbd86
+cpu-brute-true.txt: 2899d6f049f63099f5d1d5eb2130fe414da83f7018f840e7bc18be2cd159a0ed
+cpu-kd-false.txt: ec6d6b44e66be5c2bd42ba27fe457ca436764f34a729331e56292036c5c239c9
+cpu-kd-true.txt: 5976345c68c309756c81867a3986737d4edee946ed3b06a2d033610d6360f8c2
+cuda-auto-true.txt: 040d2bdcffaab637641b5d4ad96a6489418b5be26853e6bff101385a12e1b550
+cuda-brute-true.txt: b44cb8f80b0106ddaf5a7b4daec55705eb9bd1379b518723d9ddd6aac36a0948
+cuda-kd-false.txt: 50898c607a8f943d7c36ad7d3ed159cd4f38fc6b88c35b76976f7f6b09d7f883
+cuda-kd-true.txt: dcb6ef45674dc07840a54543c9a9bcf2cef1600b907c8b0076f0c893f0c29352
+```
+
+### Correctness and tooling evidence
+
+Actual runtime: Linux x86-64 WSL2, RTX 3080 (driver 617.14), CubeCL 0.11.1,
+Burn 0.22.1. Required-CUDA tests executed on hardware; none took hardware skips.
+Leader ran the entire approved command matrix: core featureless/test-support;
+common and HDBSCAN default/required-CUDA; tracing profiler example both modes;
+UMAP both modes; release Maturin with tracing; Python HDBSCAN/Standard CPU/CUDA;
+`scripts/test_features.sh`; workspace all-target checks no-default-features and
+tracing; UMAP all-target cubecl-ir-dump; workspace Clippy; Rust format check;
+Ruff check/format check and ty. New standalone reducer and real-candidate round
+replay pass on CPU/CUDA. Tests cover pending Fusion dependencies, exact shapes,
+zero/one, B/T tails, skew/interleaved roots, signed zero/subnormals/MAX/infinity,
+absent/losing/multiple errors and source-order precedence. Direct kernel tests
+poison/reuse scratch across changed partitions, force one-cube batches and pass
+larger-capacity buffers with explicit smaller logical counts.
+Test-only counters at the actual host launch callsites additionally prove empty
+input makes zero launches and an ordinary input makes one tile plus one finish
+launch on both runtimes. Observed block sizes in that test: CPU 2, CUDA 128
+(leader output 128). Counters compile out of production builds.
+
+Evidence tool outputs: core 46; common 49; UMAP 50; new oracle/replay 55;
+scratch/tracing 56; full HDBSCAN 57; immutable comparisons 58;
+feature/build matrix 59; Python 60; quality checks in the leader tool receipt.
+One initial common incremental link failed on stale anonymous symbols; all later
+Cargo gates used `CARGO_INCREMENTAL=0`, with no test/code suppression. Burn
+future-incompatibility warnings remain visible. Python CPU: 75 passed/14 skipped
+(CUDA-only/cross-backend tests and unavailable-CUDA scenario); CUDA: 88 passed/1
+skipped (the test specifically requiring a host without CUDA). Both retained the
+existing informational upstream leaf-extraction warning. Existing ignored Rust
+diagnostic/performance probes are not substituted for correctness coverage.
+
+### Bounded campaign (observational, not a speedup claim)
+
+Separate identical-source public-API campaign harness is
+`/tmp/fast-umap-m7-baseline/campaign/campaign.rs`, SHA256
+`dd3a2f9ec978273f8a7c7a2b58036cb05de3fb77f905ea4629eda080cdcc4355`.
+Supervisor `supervise.py` SHA256
+`c305828ff1e2f975e6a4e42ea27cd4751216c04438487793943c2c6bab35555a`.
+Separate `pristine/current` manifests and target directories compile it against
+each checkout before runtime. `uv run --no-sync python
+/tmp/fast-umap-m7-baseline/campaign/supervise.py` runs the frozen schedule.
+The external monotonic controller budgets 120 s/device across both versions,
+including process startup/JIT/warmup/measurements and bookkeeping; child allowance
+119 s reserves 1 s for kill/reap/report. Timeout kills the whole process group,
+even if its leader exited; reports retain launch failures/timeouts/omissions.
+
+Predeclared subset: existing `synthetic/n256_d2_ms5` grid cell (256x2,
+min_samples=min_cluster_size=5), exact `benches/support/mod.rs::synthetic`
+deterministic index-derived seed formula, KD true then brute true then KD false.
+Each cell runs A-pristine then B-current; one warmup and three measured fits per
+child. No reverse blocks: results are order-unbalanced, without confidence
+intervals. Total elapsed: CPU 1.238807692 s; CUDA 2.090146980 s. All six pairs
+completed, all 255 ordered MST tuples per pair were exactly equal. No selected
+cell timed out or was omitted. All other grid sizes/dimensions, giant-segment
+isolation, memory-peak/transfer measurements and reversed blocks are unmeasured.
+
+| Device | Cell | Pristine mean fit ms | Current mean fit ms |
+|---|---|---:|---:|
+| CPU | KD true | 4.340830 | 2.782516 |
+| CPU | Brute true | 3.112673 | 4.508799 |
+| CPU | KD false | 2.301078 | 2.871409 |
+| CUDA | KD true | 1.823764 | 1.997937 |
+| CUDA | Brute true | 2.502392 | 2.117480 |
+| CUDA | KD false | 2.397249 | 2.500949 |
+
+Results, child logs and supervisor receipts remain under the campaign `results/`
+directory (leader summary output 62). These small A/B observations include
+slowdowns; no threshold or throughput promise gates correctness. Follow-ups are
+measurement only: characterize early-round metadata overhead and giant late
+segments before considering vectorization, another hierarchy or adaptive routing.

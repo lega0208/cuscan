@@ -41,6 +41,23 @@ pub trait HdbscanOps: Backend {
         point_components: IntTensor<Self>,
     ) -> (FloatTensor<Self>, IntTensor<Self>);
 
+    #[fusion(meta = |_weights, _indices, _members, _tile_starts, _tile_ends, _partial_offsets, component_count| {
+        let c = *component_count as usize;
+        (
+            burn::backend::fusion::custom::TensorSpec::new([c].into(), burn::tensor::DType::F32),
+            burn::backend::fusion::custom::TensorSpec::new([c, 5].into(), burn::tensor::DType::I32),
+        )
+    })]
+    fn component_reduce(
+        candidate_weights: FloatTensor<Self>,
+        candidate_indices: IntTensor<Self>,
+        members: IntTensor<Self>,
+        tile_starts: IntTensor<Self>,
+        tile_ends: IntTensor<Self>,
+        partial_offsets: IntTensor<Self>,
+        component_count: u32,
+    ) -> (FloatTensor<Self>, IntTensor<Self>);
+
     #[fusion(meta = |data, tree, k| {
         let shape = [data.shape[0], *k as usize];
         (

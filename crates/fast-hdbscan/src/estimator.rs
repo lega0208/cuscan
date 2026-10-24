@@ -20,7 +20,7 @@ use fast_hdbscan_core::{
     knn_kruskal::{KnnGraph, knn_kruskal},
     labels::dbscan_cut,
     linkage::{LinkageRow, SortedMstEdge},
-    mst::{finalize_mst, init_from_knn, merge_components},
+    mst::{ComponentReductionPlan, finalize_mst, init_from_knn, merge_component_winners},
 };
 
 use crate::backend::{DeviceKdTree, HdbscanOps};
@@ -559,43 +559,80 @@ fn spanning_tree(
     while component_count > 1 {
         #[cfg(feature = "tracing")]
         let _round_span = tracing::info_span!("boruvka_round", component_count).entered();
+        #[cfg(feature = "tracing")]
+        let metadata_span = tracing::info_span!("boruvka_metadata_prepare_upload").entered();
         let point_components: Vec<i32> = (0..n)
             .map(|point| i32::try_from(dsu.find(point)).expect("validated row count fits i32"))
             .collect();
+        let plan = ComponentReductionPlan::build(
+            &point_components,
+            crate::kernels::COMPONENT_REDUCTION_TILE_WIDTH,
+        )?;
+        let c = plan.offsets.len() - 1;
+        let p = plan.tile_starts.len();
+        let limit = allocation_limit(&data.device())?;
+        let mut workspace = 0usize;
+        for (elements, subject) in [
+            (n, "component members"),
+            (p, "component tile starts"),
+            (p, "component tile ends"),
+            (c + 1, "component partial offsets"),
+            (p, "component partial weights"),
+            (p, "component partial sources"),
+            (p, "component partial errors"),
+            (c, "component winner weights"),
+            (
+                c.checked_mul(5)
+                    .ok_or(HdbscanError::Overflow("winner metadata"))?,
+                "component winner metadata",
+            ),
+        ] {
+            let bytes = checked_allocation_bytes(elements, 4, Some(limit), subject)?;
+            workspace = workspace
+                .checked_add(bytes)
+                .ok_or(HdbscanError::Overflow("component reduction workspace"))?;
+        }
+        checked_allocation_bytes(workspace, 1, None, "component reduction workspace")?;
         let core_tensor = core.device_core_sq.clone();
         let component_tensor = Tensor::<1, Int>::from_data(
             TensorData::new(point_components.clone(), [n]),
             &data.device(),
         );
+        let members = tensor_i32(plan.members.clone(), [n], &data.device()).into_dispatch();
+        let tile_starts = tensor_i32(plan.tile_starts.clone(), [p], &data.device()).into_dispatch();
+        let tile_ends = tensor_i32(plan.tile_ends.clone(), [p], &data.device()).into_dispatch();
+        let partial_offsets =
+            tensor_i32(plan.partial_offsets.clone(), [c + 1], &data.device()).into_dispatch();
+        let round_tree = if search == HdbscanSearch::KdTree {
+            let host_tree = tree.expect("KD-tree route retains host tree for fresh node labels");
+            let mut round_tree = clone_device_kd_tree(
+                device_tree.expect("KD-tree route uploads the tree before Boruvka"),
+            );
+            round_tree.node_components = tensor_i32(
+                host_tree.node_components(&point_components)?,
+                [host_tree.starts.len()],
+                &data.device(),
+            )
+            .into_dispatch();
+            Some(round_tree)
+        } else {
+            None
+        };
         #[cfg(feature = "tracing")]
         profile_sync(&data.device())?;
         #[cfg(feature = "tracing")]
-        let _candidate_span = tracing::info_span!("boruvka_candidates_readback").entered();
+        drop(metadata_span);
+        #[cfg(feature = "tracing")]
+        let candidate_span = tracing::info_span!("boruvka_candidate_kernel").entered();
         let (candidate_distances, candidate_indices) = match search {
             HdbscanSearch::KdTree => {
-                let host_tree =
-                    tree.expect("KD-tree route retains host tree for fresh node labels");
-                let mut device_tree = clone_device_kd_tree(
-                    device_tree.expect("KD-tree route uploads the tree before Boruvka"),
-                );
-                // Recompute from fresh DSU labels each round; point labels are never cached.
-                let node_components = host_tree.node_components(&point_components)?;
-                device_tree.node_components =
-                    tensor_i32(node_components, [host_tree.starts.len()], &data.device())
-                        .into_dispatch();
-                #[cfg(feature = "tracing")]
-                profile_sync(&data.device())?;
-                #[cfg(feature = "tracing")]
-                let _kernel_span = tracing::info_span!("boruvka_kernel").entered();
                 let (weights, destinations) = <Dispatch as HdbscanOps>::boruvka_candidates_kd(
                     data.clone().into_dispatch(),
                     core_tensor.into_dispatch(),
                     component_tensor.into_dispatch(),
-                    device_tree,
+                    round_tree.expect("KD-tree metadata prepared for this round"),
                     reproducible,
                 );
-                #[cfg(feature = "tracing")]
-                profile_sync(&data.device())?;
                 (weights, destinations)
             }
             HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
@@ -606,34 +643,64 @@ fn spanning_tree(
                 )
             }
         };
+        #[cfg(feature = "tracing")]
+        profile_sync(&data.device())?;
+        #[cfg(feature = "tracing")]
+        drop(candidate_span);
+        #[cfg(feature = "tracing")]
+        let reduction_span = tracing::info_span!("boruvka_component_reduction").entered();
+        let (winner_weights, winner_metadata) = <Dispatch as HdbscanOps>::component_reduce(
+            candidate_distances,
+            candidate_indices,
+            members,
+            tile_starts,
+            tile_ends,
+            partial_offsets,
+            u32::try_from(c).map_err(|_| HdbscanError::Overflow("component count"))?,
+        );
+        #[cfg(feature = "tracing")]
+        profile_sync(&data.device())?;
+        #[cfg(feature = "tracing")]
+        drop(reduction_span);
+        #[cfg(feature = "tracing")]
+        let readback_span = tracing::info_span!("boruvka_winner_readback").entered();
+        let winner_weights = Tensor::<1>::from_dispatch(winner_weights);
+        let winner_metadata = Tensor::<2, Int>::from_dispatch(winner_metadata);
+        if winner_weights.dims() != [c] || winner_metadata.dims() != [c, 5] {
+            return Err(HdbscanError::Numerical(
+                "component reduction returned wrong shapes".into(),
+            ));
+        }
         let [distance_data, index_data] = Transaction::default()
-            .register(Tensor::<1>::from_dispatch(candidate_distances))
-            .register(Tensor::<1, Int>::from_dispatch(candidate_indices))
+            .register(winner_weights)
+            .register(winner_metadata)
             .try_execute()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?
             .try_into()
-            .map_err(|_| {
-                HdbscanError::Numerical("candidate readback returned wrong arity".into())
-            })?;
-        let candidate_distances = distance_data
+            .map_err(|_| HdbscanError::Numerical("winner readback returned wrong arity".into()))?;
+        let winner_weights = distance_data
             .try_to_vec::<f32>()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
-        let candidate_indices = index_data
+        let winner_metadata = index_data
             .try_to_vec::<i32>()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
         #[cfg(feature = "tracing")]
-        drop(_candidate_span);
-        merge_components(
+        drop(readback_span);
+        #[cfg(feature = "tracing")]
+        let merge_span = tracing::info_span!("boruvka_host_merge").entered();
+        merge_component_winners(
             &mut dsu,
-            &point_components,
-            &candidate_distances,
-            &candidate_indices,
+            &plan,
+            &winner_weights,
+            &winner_metadata,
             &mut edges,
         )?;
         component_count = (0..n)
             .map(|point| dsu.find(point))
             .collect::<std::collections::HashSet<_>>()
             .len();
+        #[cfg(feature = "tracing")]
+        drop(merge_span);
     }
     if edges.len() != n - 1 {
         return Err(HdbscanError::Numerical(

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Aggregate retrospective core-distance recovery captures and source-derived models."""
+"""Aggregate historical pre-M7 core-distance recovery captures and analytic models.
+
+This retrospective consumer intentionally retains the original/current capture schema
+and full n-row candidate-readback byte model used by that recovery experiment. It
+does not model M7/M8 component metadata uploads or compact winner readbacks and must
+not be used as measured transfer evidence for the component-reduction implementation.
+Current tracing stages are consumed by profile_hdbscan_stages.rs instead.
+"""
 
 import itertools
 import json
@@ -594,6 +601,7 @@ def main():
     if not isinstance(manifest.get("captures"), list) or not manifest["captures"]:
         fail("manifest must contain a non-empty captures array")
     output = {
+        "model_scope": "historical-pre-M7-full-candidate-readback",
         "provenance": manifest.get("provenance"),
         "methodology": (
             "Retrospective original-source capture analysis; instrumented timings"
@@ -616,6 +624,11 @@ def main():
             " liveness/physical peak models."
         ),
         "limitations": [
+            (
+                "Historical pre-M7 schema and analytic byte model: excludes component"
+                " membership uploads, two-pass reduction and compact winner readbacks."
+                " Not applicable to M7/M8 transfer or timing claims."
+            ),
             (
                 "Allocator values are sampled runtime allocator reports, not actual"
                 " physical VRAM, process-wide/global peak, or continuous maxima."

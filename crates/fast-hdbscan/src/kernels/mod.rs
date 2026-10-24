@@ -1,5 +1,8 @@
 mod boruvka;
+mod component_reduce;
 mod kdtree;
+
+pub const COMPONENT_REDUCTION_TILE_WIDTH: usize = 512;
 
 pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
 
@@ -31,6 +34,26 @@ impl crate::backend::HdbscanOps for CubeBackend {
         point_components: IntTensor<Self>,
     ) -> (FloatTensor<Self>, IntTensor<Self>) {
         boruvka::boruvka_candidates(data, core_sq, point_components)
+    }
+
+    fn component_reduce(
+        candidate_weights: FloatTensor<Self>,
+        candidate_indices: IntTensor<Self>,
+        members: IntTensor<Self>,
+        tile_starts: IntTensor<Self>,
+        tile_ends: IntTensor<Self>,
+        partial_offsets: IntTensor<Self>,
+        component_count: u32,
+    ) -> (FloatTensor<Self>, IntTensor<Self>) {
+        component_reduce::component_reduce(
+            candidate_weights,
+            candidate_indices,
+            members,
+            tile_starts,
+            tile_ends,
+            partial_offsets,
+            component_count,
+        )
     }
 
     fn exact_neighbors_kd(

@@ -92,6 +92,14 @@ fn named_seconds(
     Ok(seconds)
 }
 
+const BORUVKA_ROUND_STAGES: [&str; 5] = [
+    "boruvka_metadata_prepare_upload",
+    "boruvka_candidate_kernel",
+    "boruvka_component_reduction",
+    "boruvka_winner_readback",
+    "boruvka_host_merge",
+];
+
 fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
     let mut samples = Vec::new();
     let mut start = None;
@@ -105,34 +113,29 @@ fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value
             }
         } else if event["ph"] == "E" {
             let begin = start.take().ok_or("unbalanced Boruvka total")?;
-            let durations = named_seconds(
-                &events[begin..=index],
-                &[
-                    "boruvka_total",
-                    "boruvka_round",
-                    "boruvka_candidates_readback",
-                    "boruvka_kernel",
-                ],
-            )?;
+            let names = ["boruvka_total", "boruvka_round"]
+                .into_iter()
+                .chain(BORUVKA_ROUND_STAGES)
+                .collect::<Vec<_>>();
+            let durations = named_seconds(&events[begin..=index], &names)?;
             let total = durations["boruvka_total"][0];
             let rounds = durations.get("boruvka_round").cloned().unwrap_or_default();
-            let candidates = durations
-                .get("boruvka_candidates_readback")
-                .cloned()
-                .unwrap_or_default();
-            if rounds.len() != candidates.len() {
-                return Err("Boruvka candidate and round count mismatch".into());
+            let mut stages = BTreeMap::new();
+            for name in BORUVKA_ROUND_STAGES {
+                let values = durations.get(name).cloned().unwrap_or_default();
+                if values.len() != rounds.len() {
+                    return Err(format!("Boruvka {name} and round count mismatch").into());
+                }
+                stages.insert(name, values);
             }
-            let candidate_total: f64 = candidates.iter().sum();
-            let kernels = durations.get("boruvka_kernel").cloned().unwrap_or_default();
+            let round_total: f64 = rounds.iter().sum();
             samples.push(serde_json::json!({
                 "total_seconds": total,
                 "round_count": rounds.len(),
                 "round_seconds": rounds,
-                "candidates_readback_seconds": candidates,
-                "kd_kernel_seconds": kernels,
-                "driver_and_seed_seconds": total - candidate_total,
-                "scope": "Nested inclusive timings; candidates include node-label generation/upload, kernel and readbacks. Driver residual includes kNN seeding, labels, synchronization and host merges; not isolated kernel time."
+                "round_stage_seconds": stages,
+                "seed_and_round_overhead_seconds": total - round_total,
+                "scope": "Round stages are disjoint host wall-clock scopes. Metadata includes labels, stable CSR and node-label preparation/uploads; candidate and reduction include profiling device synchronization; winner readback transfers compact outputs; host merge includes component recount. Total and round timings are inclusive; residual is seeding and work outside rounds, not isolated kernel time."
             }));
         }
     }
@@ -144,7 +147,7 @@ fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    use super::{STAGES, boruvka_samples, exclude_warmup, stage_seconds};
+    use super::{BORUVKA_ROUND_STAGES, STAGES, boruvka_samples, exclude_warmup, stage_seconds};
     use serde_json::json;
 
     #[test]
@@ -192,21 +195,118 @@ mod tests {
 
     #[test]
     fn separates_round_samples_and_accounts_for_driver_work() {
-        let events = [
+        let mut events = vec![
             json!({"name":"boruvka_total", "ph":"B", "ts":0.0}),
             json!({"name":"boruvka_round", "ph":"B", "ts":1.0}),
-            json!({"name":"boruvka_candidates_readback", "ph":"B", "ts":2.0}),
-            json!({"name":"boruvka_candidates_readback", "ph":"E", "ts":5.0}),
+        ];
+        for (index, stage) in BORUVKA_ROUND_STAGES.into_iter().enumerate() {
+            events.push(json!({"name":stage, "ph":"B", "ts":1.0 + index as f64}));
+            events.push(json!({"name":stage, "ph":"E", "ts":2.0 + index as f64}));
+        }
+        events.extend([
             json!({"name":"boruvka_round", "ph":"E", "ts":7.0}),
             json!({"name":"boruvka_total", "ph":"E", "ts":10.0}),
-        ];
+        ]);
         let samples = boruvka_samples(&events).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0]["round_count"], 1);
         assert_eq!(samples[0]["round_seconds"], json!([6e-6]));
-        assert!((samples[0]["driver_and_seed_seconds"].as_f64().unwrap() - 7e-6).abs() < 1e-15);
-        assert!(boruvka_samples(&events[..5]).is_err());
-        assert!(boruvka_samples(&events[5..]).is_err());
+        assert!(
+            (samples[0]["seed_and_round_overhead_seconds"]
+                .as_f64()
+                .unwrap()
+                - 4e-6)
+                .abs()
+                < 1e-15
+        );
+        for stage in BORUVKA_ROUND_STAGES {
+            assert_eq!(samples[0]["round_stage_seconds"][stage], json!([1e-6]));
+        }
+        assert!(boruvka_samples(&events[..events.len() - 1]).is_err());
+        assert!(boruvka_samples(&events[events.len() - 1..]).is_err());
+        events.remove(2);
+        assert!(boruvka_samples(&events).is_err());
+    }
+
+    fn traced_fit(backend: fast_hdbscan::BackendChoice) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.json");
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(&path)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("warn,fast_hdbscan=info"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rows = (0..48)
+                .map(|row| {
+                    let x = row as f32;
+                    vec![(x * 0.173).sin(), (x * 0.119).cos(), (x * 0.071).sin()]
+                })
+                .collect::<Vec<_>>();
+            for search in [
+                fast_hdbscan::HdbscanSearch::BruteForce,
+                fast_hdbscan::HdbscanSearch::KdTree,
+            ] {
+                fast_hdbscan::HDBSCAN::new(
+                    fast_hdbscan::HdbscanConfig {
+                        min_cluster_size: 4,
+                        min_samples: Some(4),
+                        mst_graph: fast_hdbscan::MstGraph::Complete,
+                        ..Default::default()
+                    },
+                    backend,
+                )
+                .with_search(search)
+                .fit(&rows)
+                .unwrap();
+            }
+        });
+        drop(guard);
+        let events =
+            serde_json::from_slice::<Vec<serde_json::Value>>(&std::fs::read(path).unwrap())
+                .unwrap();
+        let samples = boruvka_samples(&events).unwrap();
+        assert_eq!(samples.len(), 2);
+        for sample in samples {
+            let rounds = sample["round_count"].as_u64().unwrap() as usize;
+            assert!(rounds > 0, "fixture must exercise component reduction");
+            for stage in BORUVKA_ROUND_STAGES {
+                assert_eq!(
+                    sample["round_stage_seconds"][stage]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    rounds
+                );
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| event["name"] != "boruvka_candidates_readback")
+        );
+    }
+
+    #[test]
+    fn real_traced_fit_cpu_stage_counts() {
+        traced_fit(fast_hdbscan::BackendChoice::Cpu);
+    }
+
+    #[test]
+    fn real_traced_fit_cuda_stage_counts() {
+        let count = fast_cubecl_common::cuda_backend::try_device_count().unwrap();
+        if count == 0 {
+            assert_ne!(
+                std::env::var("FAST_UMAP_REQUIRE_CUDA").as_deref(),
+                Ok("1"),
+                "required CUDA unavailable"
+            );
+            eprintln!("SKIPPED tracing CUDA: no usable device");
+            return;
+        }
+        traced_fit(fast_hdbscan::BackendChoice::Cuda { device_index: 0 });
     }
 }
 

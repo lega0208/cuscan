@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 zip = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-chrome = { workspace = true }
+tempfile = { workspace = true }
 
 [[example]]
 name = "profile_hdbscan_stages"
