@@ -34,6 +34,11 @@ def fit_hdbscan(
     x: NDArray[np.float32],
     **kwargs: object,
 ) -> FittedHDBSCAN: ...
+def estimate_hdbscan_resources(
+    n_finite: int,
+    features: int,
+    **kwargs: object,
+) -> dict[str, object]: ...
 def hdbscan_cuda_available() -> bool: ...
 def fit_umap(
     x: NDArray[np.float32],

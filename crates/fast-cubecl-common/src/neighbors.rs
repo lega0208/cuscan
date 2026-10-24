@@ -2,6 +2,9 @@ use crate::backend::NeighborOps;
 use burn::backend::Dispatch;
 use burn::tensor::{Int, Tensor};
 
+/// Client-independent checked ANN allocation estimate; see `ann_host_estimate`.
+pub use crate::kernels::ann::{AnnEstimate, AnnPhase, AnnPhaseBytes, ann_host_estimate};
+
 pub(crate) const REFERENCE_TILE: usize = 128;
 pub(crate) const MAX_REFERENCE_GROUPS: usize = 4;
 pub(crate) const MAX_NEIGHBOR_SCRATCH_BYTES: usize = 32 * 1024 * 1024;

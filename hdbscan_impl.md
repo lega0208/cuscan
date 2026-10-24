@@ -49,12 +49,19 @@ M7–M8) and complete-graph `algorithm="kruskal"` (Phase 6) are not implemented.
 
 Deliberate divergences from upstream's `D > 30` route (no weights; `parallel_boruvka_plan.md` §1.1):
 - Upstream sends `D > 30` to pynndescent kNN plus Kruskal before considering `algorithm`. The port
-  does the same with `Auto`. Exact neighbors are used for `n_finite <= 4096` or width > 60;
-  otherwise common ANN is used with seed 42 and squared distances.
+  does the same with `Auto`. Exact neighbors are used for `n_finite <= 4096`; above 4096 finite rows,
+  `Auto` uses common ANN with seed 42 and squared distances at any effective width. There is no
+  width cutoff. Resource limits are typed checked-planning errors, not width clamps, retries or exact
+  fallbacks. The former width-60 gate is historical (see `parallel_boruvka_implementation_notes.md`).
 - Self removal drops the query row, not column 0 (upstream may drop a duplicate row).
 - `knn_k` must be a positive integer or `None`; `0` is rejected. Upstream silently replaces it with `min_samples`.
-- The ANN branch is validated only up to width 60. Its results match upstream in distribution, not
-  bit for bit. Exact-neighbor results match wherever pynndescent's graph is exact.
+- The ANN branch's measured support is limited to the shapes recorded in
+  `parallel_boruvka_implementation_notes.md` (width-validation section): 6000x40/50 blobs at effective
+  widths 25 through 512, diverse 40-feature distributions at widths 60 through 256, 12000x50 at widths
+  60/120/256 for seed 42, and 4097x31 at width 1024 for seed 42. Widths and shapes outside those
+  records, including the 4097x31 width-4096 cell, are unmeasured. This is an evidence scope, not a
+  product width limit. Its results match upstream in distribution, not bit for bit. Exact-neighbor
+  results match wherever pynndescent's graph is exact.
 - Fixture generation for the complete graph still calls pinned upstream
   `parallel_boruvka(..., reproducible=True)` directly, then passes that MST through upstream's
   tree/label/probability functions. `blobs_d50` is excluded from default-route parity as a known
@@ -75,7 +82,7 @@ The existing workspace is `fast-umap-python → fast-umap → fast-umap-core`
   `standard_umap/neighbors.rs` orchestration stays in `fast-umap`.
 
 HDBSCAN uses common exact neighbors, and common ANN only for the kNN-graph route above 4096
-finite rows at width ≤60. It does not use UMAP's fuzzy graph, layout, spectral init (`faer`)
+finite rows, at any effective width. It does not use UMAP's fuzzy graph, layout, spectral init (`faer`)
 or model state.
 
 ### Options considered

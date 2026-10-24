@@ -25,9 +25,8 @@ use fast_hdbscan_core::{
 
 use crate::backend::{DeviceKdTree, HdbscanOps};
 
-const NEIGHBOR_BATCH_ROWS: usize = 256;
+pub(crate) const NEIGHBOR_BATCH_ROWS: usize = 256;
 const KNN_GRAPH_EXACT_MAX_ROWS: usize = 4096;
-const ANN_VALIDATED_MAX_WIDTH: usize = 60;
 
 /// Comparator policy for kNN graph construction.
 #[doc(hidden)]
@@ -59,7 +58,7 @@ pub struct KnnDiagnostics {
     pub allocation_bytes: usize,
 }
 
-fn resolve_graph(requested: MstGraph, features: usize) -> MstGraph {
+pub(crate) fn resolve_graph(requested: MstGraph, features: usize) -> MstGraph {
     match requested {
         MstGraph::Auto if features > 30 => MstGraph::KnnGraph,
         MstGraph::Auto => MstGraph::Complete,
@@ -67,7 +66,7 @@ fn resolve_graph(requested: MstGraph, features: usize) -> MstGraph {
     }
 }
 
-fn graph_width(n: usize, min_samples: usize, knn_k: Option<usize>) -> Result<usize> {
+pub(crate) fn graph_width(n: usize, min_samples: usize, knn_k: Option<usize>) -> Result<usize> {
     let width = match knn_k {
         Some(width) => width,
         None => min_samples
@@ -76,6 +75,24 @@ fn graph_width(n: usize, min_samples: usize, knn_k: Option<usize>) -> Result<usi
             .max(15),
     };
     Ok(width.max(min_samples).min(n.saturating_sub(1)))
+}
+
+/// Whether the kNN graph over `n` finite rows uses ANN for the given source policy.
+pub(crate) fn knn_uses_ann(source: KnnSource, n: usize) -> bool {
+    match source {
+        KnnSource::Exact => false,
+        KnnSource::Ann => true,
+        KnnSource::Auto => n > KNN_GRAPH_EXACT_MAX_ROWS,
+    }
+}
+
+pub(crate) fn map_ann_error(error: AnnError) -> HdbscanError {
+    match error {
+        AnnError::InvalidInput(message) => HdbscanError::InvalidInput(message),
+        AnnError::Capability(message) => HdbscanError::BackendUnavailable(message),
+        AnnError::Workspace(message) => HdbscanError::Numerical(message),
+        AnnError::Overflow(_) => HdbscanError::Overflow("ANN workspace"),
+    }
 }
 
 #[cfg(feature = "tracing")]
@@ -644,7 +661,7 @@ fn knn_spanning_tree(
     data: &Tensor<2>,
     min_samples: usize,
     k: usize,
-    source: KnnSource,
+    approximate: bool,
 ) -> Result<(fast_hdbscan_core::knn_kruskal::KnnMst, KnnDiagnostics)> {
     let n = data.dims()[0];
     let slots = n
@@ -679,18 +696,8 @@ fn knn_spanning_tree(
             .ok_or(HdbscanError::Overflow("kNN graph live allocation bytes"))?;
     }
     checked_allocation_bytes(allocation_bytes, 1, None, "kNN graph live allocation bytes")?;
-    let approximate = match source {
-        KnnSource::Exact => false,
-        KnnSource::Ann => true,
-        KnnSource::Auto => n > KNN_GRAPH_EXACT_MAX_ROWS && k <= ANN_VALIDATED_MAX_WIDTH,
-    };
     let (mut ids, distances_sq) = if approximate {
-        ann_preflight(&data.device(), n, data.dims()[1], k).map_err(|error| match error {
-            AnnError::InvalidInput(message) => HdbscanError::InvalidInput(message),
-            AnnError::Capability(message) => HdbscanError::BackendUnavailable(message),
-            AnnError::Workspace(message) => HdbscanError::Numerical(message),
-            AnnError::Overflow(_) => HdbscanError::Overflow("ANN workspace"),
-        })?;
+        ann_preflight(&data.device(), n, data.dims()[1], k).map_err(map_ann_error)?;
         let width = u32::try_from(k).map_err(|_| HdbscanError::Overflow("ANN neighbor width"))?;
         let iterations = (n as f64).log2().round().max(5.0) as u32;
         let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
@@ -825,12 +832,11 @@ impl HDBSCAN {
         let _backend_setup_span = tracing::info_span!("backend_setup").entered();
         let (device, actual_backend) = selected_device(self.backend).map_err(map_backend_error)?;
         let allocation_limit = allocation_limit(&device)?;
-        let resolved_graph = resolve_graph(self.config.mst_graph, features);
-        let neighbor_width = if resolved_graph == MstGraph::KnnGraph {
-            graph_width(n, min_samples, self.config.knn_k)?
-        } else {
-            min_samples.min(n.saturating_sub(1))
-        };
+        let plan = crate::resources::plan_fit(n, features, &self.config, actual_backend, source)?;
+        #[cfg(feature = "tracing")]
+        crate::resources::emit_advisory(&plan.estimate);
+        let resolved_graph = plan.graph;
+        let neighbor_width = plan.width;
         let resolved_search = if resolved_graph == MstGraph::Complete {
             self.search
                 .resolve(n, features, min_samples, actual_backend)
@@ -892,7 +898,7 @@ impl HDBSCAN {
                 }
                 let data = tensor_f32(finite_values, [n, features], &device);
                 let (graph_mst, diagnostics) =
-                    knn_spanning_tree(&data, min_samples, neighbor_width, source)?;
+                    knn_spanning_tree(&data, min_samples, neighbor_width, plan.approximate)?;
                 neighbors =
                     public_neighbors(&diagnostics.neighbors, n, diagnostics.k, min_samples)?;
                 core_values = graph_mst.core.iter().map(|&value| value as f32).collect();

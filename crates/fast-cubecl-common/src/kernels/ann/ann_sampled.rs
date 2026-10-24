@@ -11,10 +11,12 @@ mod injected_kernel_tests;
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ann_forest::{WorkspaceError, build_forest, plan_workspace, tree_count};
+use super::ann_forest::{
+    WorkspaceError, build_forest, forest_leaf_limit, plan_workspace, tree_count,
+};
 use super::orchestration::{
     AnnPlan, ann_independent_launch, ann_output, ann_should_stop, plan_for_client, reverse_count,
-    reverse_scatter, reverse_zero,
+    reverse_scatter, reverse_zero, workspace_error,
 };
 use crate::error::AnnError;
 use burn::{
@@ -28,7 +30,7 @@ use cubecl::prelude::*;
 const PRIORITY_MODULUS: u64 = 2_147_483_647;
 // C=60 produced 268.5M mostly masked slots per iteration on the fixed input
 // (CPU pair/merge ~5s). A separate per-class cap keeps staging work bounded.
-const PREFIX_CHUNK: usize = 128;
+pub(super) const PREFIX_CHUNK: usize = 128;
 
 /// Build bounded forest leaf membership on the host. Distances and graph
 /// updates are executed by the shared pair-slot/endpoint pipeline.
@@ -51,8 +53,8 @@ pub(super) fn forest_seed(
     WorkspaceError,
 > {
     let trees = tree_count(n)?;
-    let leaf_size = 10usize.max(heap_width.saturating_mul(2)).min(n);
-    plan_workspace(n, heap_width, max_candidates, features, trees)?;
+    let leaf_size = forest_leaf_limit(n, heap_width);
+    let workspace = plan_workspace(n, heap_width, max_candidates, features, trees)?;
     let input_bytes = data.client.read_one_unchecked(data.handle.clone());
     let expected_bytes = n
         .checked_mul(features)
@@ -79,12 +81,18 @@ pub(super) fn forest_seed(
                 .and_then(|pairs| sum.checked_add(pairs / 2))
                 .ok_or(WorkspaceError::ArithmeticOverflow)
         })?;
+    // The plan and the built forest must agree exactly; both come from the
+    // same midpoint recurrence, so any mismatch is a planner defect.
+    debug_assert_eq!(forest.row_ids.len(), workspace.forest_membership_len);
+    debug_assert_eq!(forest.leaf_offsets.len() - 1, workspace.forest_leaf_count);
+    debug_assert_eq!(forest_pair_slots, workspace.forest_pair_count);
     let heap_len = n
         .checked_mul(heap_width)
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
     let sentinel_id = i32::try_from(n).map_err(|_| WorkspaceError::InvalidDimensions)?;
     let ids = vec![sentinel_id; heap_len];
-    let distances = vec![f32::MAX; heap_len];
+    // Empty slots carry the same (n, +inf) missing-neighbor contract as exact search.
+    let distances = vec![f32::INFINITY; heap_len];
     let flags = vec![0i32; heap_len];
     let mut membership = Vec::with_capacity(forest.row_ids.len());
     for &id in &forest.row_ids {
@@ -216,7 +224,7 @@ pub(super) fn approximate_neighbors(
         .expect("ANN pair slot count overflows usize");
     let (mut candidates, mut distances, mut flags, forest_rows, forest_offsets, forest_pairs) =
         forest_seed(&data, n, features, width, capacity, seed)
-            .expect("ANN RP forest initialization exceeds workspace contract");
+            .map_err(|error| workspace_error("RP forest initialization", error))?;
     let pair_left = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
     let pair_right = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
     let pair_distances = empty_tensor(&data, Shape::new([pair_elements]), DType::F32);
@@ -400,6 +408,9 @@ pub(super) fn approximate_neighbors(
             workspace.staging_bytes
         );
     }
+    let mut stop_reason = "max_iterations";
+    let mut iterations_run = 0u32;
+    let mut last_new_count: Option<i32> = None;
     for iteration in 0..max_iterations {
         let pool_start = std::time::Instant::now();
         let source_ids = candidates.clone();
@@ -645,13 +656,21 @@ pub(super) fn approximate_neighbors(
             dtype_to_storage_type(DType::I32),
         );
         std::mem::swap(&mut flags, &mut next_flags);
-        if iteration > 0 {
+        iterations_run = iteration + 1;
+        if iteration > 0 || profile {
             let bytes = client.read_one_unchecked(new_count.handle.clone());
             let count = i32::from_ne_bytes(bytes[..4].try_into().expect("ANN counter is i32"));
-            if ann_should_stop(count, n, width) {
+            last_new_count = Some(count);
+            if iteration > 0 && ann_should_stop(count, n, width) {
+                stop_reason = "converged";
                 break;
             }
         }
+    }
+    if profile {
+        eprintln!(
+            "ANN_PROFILE stop reason={stop_reason} iterations={iterations_run} max_iterations={max_iterations} final_new_count={last_new_count:?} capacity={capacity} width={width}"
+        );
     }
     let output_indices = empty_tensor(&data, Shape::new([n, k]), DType::I32);
     let output_distances = empty_tensor(&data, Shape::new([n, k]), DType::F32);
@@ -896,8 +915,8 @@ pub(super) fn random_fill_kernel<F: Float, I: Int>(
                         data[row * features + feature] - data[candidate * features + feature];
                     squared += difference * difference;
                 }
-                let distance_valid =
-                    squared >= F::new(0.0f32) && squared <= F::new(3.402_823_5e38_f32);
+                // +inf is a real overflowed squared distance; NaN and negatives are rejected.
+                let distance_valid = squared >= F::new(0.0f32);
                 if distance_valid {
                     let mut rank = 0usize;
                     while rank < slot {
@@ -926,7 +945,7 @@ pub(super) fn random_fill_kernel<F: Float, I: Int>(
         }
         while slot < width {
             ids[base + slot] = I::cast_from(n as i32);
-            distances[base + slot] = F::new(3.402_823_5e38_f32);
+            distances[base + slot] = F::new(f32::INFINITY);
             flags[base + slot] = I::cast_from(0i32);
             slot += 1;
         }
@@ -1119,7 +1138,7 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int>(
                 let difference = data[left * features + feature] - data[right * features + feature];
                 squared += difference * difference;
             }
-            let valid = squared >= F::new(0.0f32) && squared <= F::new(3.402_823_5e38_f32);
+            let valid = squared >= F::new(0.0f32);
             pair_left[slot] = I::cast_from(left as i32);
             pair_right[slot] = I::cast_from(right as i32);
             pair_distances[slot] = squared;
@@ -1310,8 +1329,7 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int>(
                 squared += difference * difference;
             }
         }
-        let max_distance = F::new(3.402_823_5e38_f32);
-        let distance_valid = valid && squared >= F::new(0.0f32) && squared <= max_distance;
+        let distance_valid = valid && squared >= F::new(0.0f32);
         pair_valid[slot] = I::cast_from(if distance_valid { 1i32 } else { 0i32 });
         pair_distances[slot] = squared;
     }
@@ -1385,19 +1403,13 @@ fn serial_endpoint_insert<F: Float, I: Int>(
     base: usize,
 ) {
     let id_value = u32::cast_from(id) as usize;
-    let max_distance = F::new(3.402_823_5e38_f32);
     let worst_index = u32::cast_from(ids[base + width - 1]) as usize;
     let worst_distance = distances[base + width - 1];
     // A full heap cannot change for a record not better than its worst entry.
     let improves = worst_index >= n
         || proposal_distance < worst_distance
         || (proposal_distance == worst_distance && id_value < worst_index);
-    if improves
-        && id_value < n
-        && id_value != row
-        && proposal_distance >= F::new(0.0f32)
-        && proposal_distance <= max_distance
-    {
+    if improves && id_value < n && id_value != row && proposal_distance >= F::new(0.0f32) {
         let mut duplicate = width;
         for slot in 0..width {
             if ids[base + slot] == id {
@@ -1422,7 +1434,7 @@ fn serial_endpoint_insert<F: Float, I: Int>(
                 slot += 1;
             }
             ids[base + width - 1] = I::cast_from(n as i32);
-            distances[base + width - 1] = F::new(3.402_823_5e38_f32);
+            distances[base + width - 1] = F::new(f32::INFINITY);
         }
         let mut rank = 0usize;
         while rank < width {
@@ -1469,11 +1481,7 @@ fn cooperative_endpoint_insert<F: Float, I: Int>(
 ) -> u32 {
     let lane = UNIT_POS_X as usize;
     let id_value = u32::cast_from(id) as usize;
-    let max_distance = F::new(3.402_823_5e38_f32);
-    let valid = id_value < n
-        && id_value != row
-        && proposal_distance >= F::new(0.0f32)
-        && proposal_distance <= max_distance;
+    let valid = id_value < n && id_value != row && proposal_distance >= F::new(0.0f32);
     let mut slot = lane;
     let mut duplicate_slot = width;
     while slot < width {
@@ -1937,7 +1945,7 @@ pub(super) fn merge_proposals(
         row.truncate(heap_width);
     }
     for &(left, right, distance) in proposals {
-        if left >= n || right >= n || left == right || !distance.is_finite() || distance < 0.0 {
+        if left >= n || right >= n || left == right || distance.is_nan() || distance < 0.0 {
             continue;
         }
         merge_endpoint(&mut rows[left], right, distance, heap_width);

@@ -442,6 +442,10 @@ fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<hdbscan::FittedHDBSCAN>()?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
     module.add_function(wrap_pyfunction!(hdbscan::fit_hdbscan, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        hdbscan::estimate_hdbscan_resources,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(hdbscan::hdbscan_cuda_available, module)?)?;
     module.add_function(wrap_pyfunction!(load, module)?)?;
     Ok(())

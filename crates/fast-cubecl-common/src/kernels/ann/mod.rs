@@ -6,4 +6,6 @@ mod ann_sampled;
 mod orchestration;
 
 pub(crate) use orchestration::approximate_neighbors;
-pub use orchestration::{AnnPlan, ann_preflight};
+pub use orchestration::{
+    AnnEstimate, AnnPhase, AnnPhaseBytes, AnnPlan, ann_host_estimate, ann_preflight,
+};

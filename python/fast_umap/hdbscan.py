@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Literal, TypedDict
 
 import numpy as np
@@ -46,6 +47,12 @@ class HDBSCAN:
     ``knn_k`` sets the non-self neighbor width of the kNN graph route, used by the default
     ``Auto`` graph above 30 features. ``None`` uses ``max(3 * min_samples, 15)``; any width is
     raised to at least ``min_samples`` and capped at ``n_samples - 1``.
+
+    Before a kNN-route fit, one ``UserWarning`` is emitted when the native estimate reaches
+    1 GiB (2**30 bytes) of host or CUDA-device allocation. It is a usability advisory, not a
+    safety boundary: fitting continues with the same settings, and warning filters can suppress
+    or escalate it. The estimate is conditional on the backend (``Auto`` reports both CPU and
+    CUDA scenarios) and does not measure available memory. Complete-graph fits emit no advisory.
     """
 
     _fitted_state: _FittedState
@@ -234,6 +241,15 @@ class HDBSCAN:
         sample_weight: ArrayLike | float | None = None,
         **fit_params: object,
     ) -> HDBSCAN:
+        return self._fit(X, y, sample_weight, fit_params)
+
+    def _fit(
+        self,
+        X: ArrayLike,
+        y: ArrayLike | None,
+        sample_weight: ArrayLike | float | None,
+        fit_params: dict[str, object],
+    ) -> HDBSCAN:
         if y is not None:
             raise NotImplementedError("y and semi-supervised fitting are not supported")
         if sample_weight is not None:
@@ -246,23 +262,14 @@ class HDBSCAN:
         if not np.any(finite_rows):
             raise ValueError("X must contain at least one fully finite row")
 
-        max_cluster_size = self.max_cluster_size
-        if max_cluster_size is not None and np.isposinf(max_cluster_size):
-            max_cluster_size = None
-        fitted = _fast_umap.fit_hdbscan(
-            x,
-            min_cluster_size=int(self.min_cluster_size),
-            min_samples=None if self.min_samples is None else int(self.min_samples),
-            cluster_selection_method=self.cluster_selection_method,
-            allow_single_cluster=bool(self.allow_single_cluster),
-            max_cluster_size=None if max_cluster_size is None else int(max_cluster_size),
-            cluster_selection_epsilon=float(self.cluster_selection_epsilon),
-            cluster_selection_persistence=float(self.cluster_selection_persistence),
-            backend=self.backend,
-            device_index=int(self.device_index),
-            reproducible=bool(self.reproducible),
-            knn_k=None if self.knn_k is None else int(self.knn_k),
+        native_kwargs = self._native_kwargs()
+        estimate = _fast_umap.estimate_hdbscan_resources(
+            int(np.count_nonzero(finite_rows)),
+            int(x.shape[1]),
+            **native_kwargs,
         )
+        self._warn_resource_advisory(estimate)
+        fitted = _fast_umap.fit_hdbscan(x, **native_kwargs)
 
         labels = np.array(fitted.labels, dtype=np.intp, copy=True)
         probabilities_raw = np.array(fitted.probabilities, dtype=np.float32, copy=True)
@@ -304,6 +311,75 @@ class HDBSCAN:
         }
         return self
 
+    def _native_kwargs(self) -> dict[str, object]:
+        max_cluster_size = self.max_cluster_size
+        if max_cluster_size is not None and np.isposinf(max_cluster_size):
+            max_cluster_size = None
+        return {
+            "min_cluster_size": int(self.min_cluster_size),
+            "min_samples": None if self.min_samples is None else int(self.min_samples),
+            "cluster_selection_method": self.cluster_selection_method,
+            "allow_single_cluster": bool(self.allow_single_cluster),
+            "max_cluster_size": None if max_cluster_size is None else int(max_cluster_size),
+            "cluster_selection_epsilon": float(self.cluster_selection_epsilon),
+            "cluster_selection_persistence": float(self.cluster_selection_persistence),
+            "backend": self.backend,
+            "device_index": int(self.device_index),
+            "reproducible": bool(self.reproducible),
+            "knn_k": None if self.knn_k is None else int(self.knn_k),
+        }
+
+    @staticmethod
+    def _warn_resource_advisory(estimate: dict[str, object]) -> None:
+        knn = estimate["knn"]
+        if not isinstance(knn, dict) or knn["advisory"] is None:
+            return
+        advisory = knn["advisory"]
+        gib = float(2**30)
+        scenarios = knn["scenarios"]
+        parts = []
+        for scenario in scenarios:
+            if scenario["backend"] == "cpu":
+                parts.append(
+                    f"CPU host+runtime {scenario['host_peak_bytes'] / gib:.2f} GiB "
+                    "(overlapping host and runtime buffers)"
+                )
+            else:
+                parts.append(
+                    f"CUDA host {scenario['host_peak_bytes'] / gib:.2f} GiB and device "
+                    f"{scenario['device_peak_bytes'] / gib:.2f} GiB (separate peaks)"
+                )
+        if len(scenarios) > 1:
+            backend_note = (
+                "Backend 'auto' is unresolved, so the CPU and CUDA figures are conditional "
+                "alternatives: only the backend actually selected runs, and they are not summed."
+            )
+        else:
+            backend_note = f"Backend {scenarios[0]['backend']!r} was requested."
+        min_samples = knn["min_samples"]
+        if advisory["width_floor_applies"]:
+            advice = (
+                f"knn_k is below min_samples={min_samples}, so that floor is in effect: the "
+                f"effective width stays at {min_samples} and lowering knn_k further will not "
+                "reduce it. Lowering min_samples changes clustering semantics and is not advised."
+            )
+        else:
+            advice = (
+                f"Consider lowering knn_k; the effective width cannot be below "
+                f"min_samples={min_samples}."
+            )
+        # Frames: warnings.warn -> this method -> _fit -> fit/fit_predict -> caller.
+        warnings.warn(
+            f"HDBSCAN kNN graph: {knn['finite_rows']} finite rows, effective width "
+            f"{knn['effective_width']} (min_samples={min_samples}), {knn['directed_edges']} "
+            f"directed edges, density {knn['density']:.3g}. Estimated peak allocations "
+            f"(estimates, not total process usage): {'; '.join(parts)}. {backend_note} "
+            f"This may use substantial memory and take longer. {advice} "
+            "Execution continues with your settings.",
+            UserWarning,
+            stacklevel=4,
+        )
+
     def fit_predict(
         self,
         X: ArrayLike,
@@ -311,7 +387,7 @@ class HDBSCAN:
         sample_weight: ArrayLike | float | None = None,
         **fit_params: object,
     ) -> NDArray[np.intp]:
-        return self.fit(X, y=y, sample_weight=sample_weight, **fit_params).labels_.copy()
+        return self._fit(X, y, sample_weight, fit_params).labels_.copy()
 
     def dbscan_clustering(self, eps: float) -> NDArray[np.intp]:
         if not hasattr(self, "_fitted_state"):

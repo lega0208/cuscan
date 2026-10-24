@@ -1166,7 +1166,7 @@ fn assert_large_width_diagnostics(
 }
 
 fn knn_graph_large_width_source_selection_cases(backend: BackendChoice) {
-    // m > 4096 with effective k_graph <= 60 is eligible for ANN under Auto; k_graph > 60 stays exact.
+    // m > 4096 routes to ANN under Auto for every effective width (width cutoff removed).
     let n = 4097;
     let d = 31;
     let input = deterministic_rows(n, d);
@@ -1187,7 +1187,8 @@ fn knn_graph_large_width_source_selection_cases(backend: BackendChoice) {
         "auto width 15",
     );
 
-    // s=25 gives k_graph = 75 > 60, so Auto must select exact and match a forced exact fit.
+    // Width cutoff removed (leader-authorized): above 4096 rows Auto resolves to ANN for every
+    // width. s=25 gives k_graph = 75, which must now route Approximate and match forced ANN bitwise.
     let width75 = knn_width(25, None, n);
     assert_eq!(width75, 75);
     let config75 = HdbscanConfig {
@@ -1200,19 +1201,19 @@ fn knn_graph_large_width_source_selection_cases(backend: BackendChoice) {
         &auto75,
         n,
         width75,
-        KnnNeighborSource::Exact,
+        KnnNeighborSource::Approximate,
         "auto width 75",
     );
     let forced75 =
-        fit_knn_graph_with_source(&input, knn_config(25, None), backend, KnnSource::Exact).unwrap();
+        fit_knn_graph_with_source(&input, knn_config(25, None), backend, KnnSource::Ann).unwrap();
     assert_large_width_diagnostics(
         &forced75,
         n,
         width75,
-        KnnNeighborSource::Exact,
-        "forced exact width 75",
+        KnnNeighborSource::Approximate,
+        "forced ANN width 75",
     );
-    assert_fits_bitwise_equal(&auto75, &forced75, "auto vs forced exact width 75");
+    assert_fits_bitwise_equal(&auto75, &forced75, "auto vs forced ANN width 75");
     let auto_diag = auto75.knn_diagnostics().unwrap();
     let forced_diag = forced75.knn_diagnostics().unwrap();
     assert_eq!(auto_diag.neighbors, forced_diag.neighbors, "width 75 ids");
@@ -1227,6 +1228,69 @@ fn knn_graph_large_width_source_selection_cases(backend: BackendChoice) {
         forced_diag.finite_weight_sum.to_bits(),
         "width 75 finite weight sum bits"
     );
+}
+
+/// Post-cutoff high-density width 1024 (n=4097, d=31): one Auto fit and one forced-ANN fit per
+/// backend, no warmup and no timed repeats. Auto must resolve to Approximate and match forced ANN
+/// bitwise on every diagnostic and tree output. Width 4096 is an explicit bounded omission of the
+/// user-approved campaign budget, not a cap in the test.
+fn knn_auto_matches_forced_ann_high_density_1024_case(backend: BackendChoice) {
+    let n = 4097;
+    let d = 31;
+    let input = deterministic_rows(n, d);
+    let width = knn_width(25, Some(1024), n);
+    assert_eq!(width, 1024);
+    let config = HdbscanConfig {
+        min_cluster_size: 2,
+        min_samples: Some(25),
+        knn_k: Some(1024),
+        ..Default::default()
+    };
+    let auto = HDBSCAN::new(config.clone(), backend).fit(&input).unwrap();
+    let forced = fit_knn_graph_with_source(&input, config, backend, KnnSource::Ann).unwrap();
+    assert_large_width_diagnostics(
+        &auto,
+        n,
+        width,
+        KnnNeighborSource::Approximate,
+        "auto width 1024",
+    );
+    assert_large_width_diagnostics(
+        &forced,
+        n,
+        width,
+        KnnNeighborSource::Approximate,
+        "forced ANN width 1024",
+    );
+    assert_fits_bitwise_equal(&auto, &forced, "auto vs forced ANN width 1024");
+    let auto_diag = auto.knn_diagnostics().unwrap();
+    let forced_diag = forced.knn_diagnostics().unwrap();
+    assert_eq!(auto_diag.neighbors, forced_diag.neighbors, "width 1024 ids");
+    assert_eq!(
+        f32_bits(&auto_diag.distances_sq),
+        f32_bits(&forced_diag.distances_sq),
+        "width 1024 squared-distance bits"
+    );
+    assert_eq!(auto_diag.bridges, forced_diag.bridges, "width 1024 bridges");
+    assert_eq!(
+        auto_diag.finite_weight_sum.to_bits(),
+        forced_diag.finite_weight_sum.to_bits(),
+        "width 1024 finite weight sum bits"
+    );
+}
+
+#[test]
+#[ignore = "post-cutoff verification: one Auto and one forced-ANN fit at n=4097, width 1024 (CPU)"]
+fn verify_auto_routes_high_density_1024_on_cpu() {
+    knn_auto_matches_forced_ann_high_density_1024_case(BackendChoice::Cpu);
+}
+
+#[test]
+#[ignore = "post-cutoff verification: one Auto and one forced-ANN fit at n=4097, width 1024 (CUDA)"]
+fn verify_auto_routes_high_density_1024_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_auto_matches_forced_ann_high_density_1024_case(backend);
+    }
 }
 
 /// Separated Gaussian-like blobs from deterministic offsets; ANN recall is not asserted here,
@@ -1303,6 +1367,380 @@ fn knn_graph_forced_ann_repeatable_on_cpu() {
 fn knn_graph_forced_ann_repeatable_on_cuda() {
     if let Some(backend) = cuda_backend_or_skip() {
         knn_graph_forced_ann_repeatable_cases(backend);
+    }
+}
+
+/// Structural contract shared by every kNN graph route. Padding `-1` is legal only with `+inf`
+/// distance (the documented nonfinite sentinel). Every other slot is a valid non-self id, ids are
+/// unique per row, distances are never NaN, and distances are sorted per row. This never asserts
+/// that ANN ids equal exact ids.
+fn assert_knn_structure(
+    fitted: &FittedHDBSCAN,
+    rows: usize,
+    width: usize,
+    source: KnnNeighborSource,
+    case: &str,
+) {
+    assert_eq!(fitted.resolved_mst_graph(), MstGraph::KnnGraph, "{case}");
+    let diagnostics = fitted.knn_diagnostics().expect("KnnGraph diagnostics");
+    assert_eq!(diagnostics.source, source, "{case}: neighbor source");
+    assert_eq!(diagnostics.k, width, "{case}: effective width");
+    assert_eq!(
+        diagnostics.neighbors.len(),
+        rows * width,
+        "{case}: neighbor length"
+    );
+    assert_eq!(
+        diagnostics.distances_sq.len(),
+        rows * width,
+        "{case}: distance length"
+    );
+    assert_eq!(
+        fitted.minimum_spanning_tree().len(),
+        rows - 1,
+        "{case}: spanning edges"
+    );
+    for row in 0..rows {
+        let ids = &diagnostics.neighbors[row * width..(row + 1) * width];
+        let distances = &diagnostics.distances_sq[row * width..(row + 1) * width];
+        let mut valid = std::collections::HashSet::new();
+        for (slot, (&id, &distance)) in ids.iter().zip(distances).enumerate() {
+            assert!(
+                !distance.is_nan(),
+                "{case}: NaN distance at row {row} slot {slot}"
+            );
+            if id == -1 {
+                assert_eq!(
+                    distance,
+                    f32::INFINITY,
+                    "{case}: padding without +inf at row {row} slot {slot}"
+                );
+                continue;
+            }
+            assert!(
+                id >= 0 && (id as usize) < rows && id as usize != row,
+                "{case}: invalid id {id} at row {row} slot {slot}"
+            );
+            assert!(valid.insert(id), "{case}: duplicate id {id} at row {row}");
+        }
+        assert!(
+            distances.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{case}: distances unsorted at row {row}"
+        );
+    }
+}
+
+/// Bitwise comparison of two fits from the same forced source and config.
+fn assert_forced_repeat_identical(first: &FittedHDBSCAN, second: &FittedHDBSCAN, case: &str) {
+    let a = first.knn_diagnostics().expect("KnnGraph diagnostics");
+    let b = second.knn_diagnostics().expect("KnnGraph diagnostics");
+    assert_eq!(a.neighbors, b.neighbors, "{case}: ids");
+    assert_eq!(
+        f32_bits(&a.distances_sq),
+        f32_bits(&b.distances_sq),
+        "{case}: distance bits"
+    );
+    assert_eq!(a.bridges, b.bridges, "{case}: bridges");
+    assert_eq!(
+        a.finite_weight_sum.to_bits(),
+        b.finite_weight_sum.to_bits(),
+        "{case}: finite weight sum bits"
+    );
+    assert_fits_bitwise_equal(first, second, case);
+}
+
+/// Forced ANN at widths around 60, the 64/65 pool edge, 75 and 120, plus 256 where the retained
+/// width exceeds the sampling capacity. Structure and repeatability only; no exact-id equality.
+fn knn_forced_ann_width_sweep_cases(backend: BackendChoice) {
+    let n = 600;
+    let input = seeded_tie_rows(11, n, 8);
+    for width in [59usize, 60, 61, 64, 65, 75, 120, 256] {
+        let case = format!("forced ANN width {width}");
+        assert_eq!(knn_width(5, Some(width), n), width);
+        let first =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        let second =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        assert_knn_structure(&first, n, width, KnnNeighborSource::Approximate, &case);
+        assert_knn_structure(&second, n, width, KnnNeighborSource::Approximate, &case);
+        assert_forced_repeat_identical(&first, &second, &case);
+    }
+}
+
+/// Requests at n - 2, n - 1 and beyond n - 1 on a small input: the effective width must cap at
+/// n - 1 for both source paths, and forced ANN must repeat bitwise.
+fn knn_small_input_width_edge_cases(backend: BackendChoice) {
+    let n = 40;
+    let input = seeded_tie_rows(5, n, 3);
+    for requested in [n - 2, n - 1, n + 10] {
+        let width = knn_width(5, Some(requested), n);
+        assert_eq!(width, requested.min(n - 1));
+        for (source, expected) in [
+            (KnnSource::Ann, KnnNeighborSource::Approximate),
+            (KnnSource::Exact, KnnNeighborSource::Exact),
+        ] {
+            let case = format!("small n={n} requested={requested} source={source:?}");
+            let fitted =
+                fit_knn_graph_with_source(&input, knn_config(5, Some(requested)), backend, source)
+                    .unwrap();
+            assert_knn_structure(&fitted, n, width, expected, &case);
+        }
+        let first = fit_knn_graph_with_source(
+            &input,
+            knn_config(5, Some(requested)),
+            backend,
+            KnnSource::Ann,
+        )
+        .unwrap();
+        let second = fit_knn_graph_with_source(
+            &input,
+            knn_config(5, Some(requested)),
+            backend,
+            KnnSource::Ann,
+        )
+        .unwrap();
+        assert_forced_repeat_identical(&first, &second, &format!("small requested={requested}"));
+    }
+}
+
+/// min_samples raises the request: default width 75 at min_samples 25, a raised explicit request,
+/// and a larger default-derived width at min_samples 40.
+fn knn_min_samples_floor_cases(backend: BackendChoice) {
+    let n = 200;
+    let input = seeded_tie_rows(9, n, 6);
+    for (min_samples, requested, expected) in [
+        (25usize, None, 75usize),
+        (25, Some(10), 25),
+        (40, None, 120),
+        (25, Some(60), 60),
+    ] {
+        assert_eq!(knn_width(min_samples, requested, n), expected);
+        let case = format!("forced ANN min_samples={min_samples} knn_k={requested:?}");
+        let fitted = fit_knn_graph_with_source(
+            &input,
+            knn_config(min_samples, requested),
+            backend,
+            KnnSource::Ann,
+        )
+        .unwrap();
+        assert_knn_structure(&fitted, n, expected, KnnNeighborSource::Approximate, &case);
+    }
+}
+
+/// Exact duplicate rows: each point appears 15 times, so zero-distance and equidistant candidates
+/// dominate every row's ordering. Forced ANN must keep ids unique and non-self.
+fn knn_duplicate_rows_cases(backend: BackendChoice) {
+    let base = seeded_tie_rows(21, 20, 3);
+    let input: Vec<Vec<f32>> = (0..15).flat_map(|_| base.iter().cloned()).collect();
+    let n = input.len();
+    for width in [61usize, 75] {
+        let case = format!("duplicate rows width {width}");
+        let first =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        let second =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        assert_knn_structure(&first, n, width, KnnNeighborSource::Approximate, &case);
+        assert_forced_repeat_identical(&first, &second, &case);
+        let exact = fit_knn_graph_with_source(
+            &input,
+            knn_config(5, Some(width)),
+            backend,
+            KnnSource::Exact,
+        )
+        .unwrap();
+        assert_knn_structure(&exact, n, width, KnnNeighborSource::Exact, &case);
+    }
+}
+
+/// Four clusters 100 apart with width 61 and 120 leave the kNN graph disconnected, so at least
+/// three bridge edges are required for a spanning tree.
+fn knn_disconnected_groups_cases(backend: BackendChoice) {
+    let n = 600;
+    let input = separated_blob_rows(n, 8);
+    for width in [61usize, 120] {
+        let case = format!("disconnected groups width {width}");
+        let first =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        let second =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+                .unwrap();
+        assert_knn_structure(&first, n, width, KnnNeighborSource::Approximate, &case);
+        assert_forced_repeat_identical(&first, &second, &case);
+        let bridges = first.knn_diagnostics().unwrap().bridges;
+        assert!(
+            bridges >= 3,
+            "{case}: four disconnected groups need at least 3 bridges, got {bridges}"
+        );
+    }
+}
+
+/// Finite coordinates whose cross-group squared distances overflow f32 to +inf. The 40-row group
+/// shifted by 1e20 has only 39 same-group neighbours, so width 61 must take +inf candidates. Both
+/// source paths keep structure and NaN-free distances; forced ANN repeats bitwise.
+fn knn_squared_distance_overflow_cases(backend: BackendChoice) {
+    let n = 300;
+    let mut input = seeded_tie_rows(31, n, 4);
+    for row in input.iter_mut().skip(260) {
+        row[0] += 1.0e20;
+    }
+    let width = 61;
+    for (label, source, expected) in [
+        ("exact", KnnSource::Exact, KnnNeighborSource::Exact),
+        ("forced ANN", KnnSource::Ann, KnnNeighborSource::Approximate),
+    ] {
+        let fitted =
+            fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, source).unwrap();
+        assert_knn_structure(&fitted, n, width, expected, label);
+        let diagnostics = fitted.knn_diagnostics().unwrap();
+        assert!(
+            diagnostics.distances_sq.iter().any(|d| d.is_infinite()),
+            "{label}: overflow path was not exercised"
+        );
+        assert!(
+            diagnostics.finite_weight_sum.is_finite(),
+            "{label}: finite weight sum must sum finite edges only"
+        );
+    }
+    let first =
+        fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+            .unwrap();
+    let second =
+        fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
+            .unwrap();
+    assert_forced_repeat_identical(&first, &second, "forced ANN overflow repeat");
+}
+
+/// Non-finite rows are removed before the graph. Remapped neighbor ids must index finite rows
+/// only, and widths requested above the finite row count cap at finite_rows - 1.
+fn knn_finite_remapping_width_cases(backend: BackendChoice) {
+    let finite = seeded_tie_rows(33, 96, 3);
+    let mut input = Vec::new();
+    let mut next = 0;
+    for row in 0..120 {
+        if row % 5 == 0 {
+            input.push(vec![f32::NAN, 0.0, 0.0]);
+        } else {
+            input.push(finite[next].clone());
+            next += 1;
+        }
+    }
+    assert_eq!(next, 96);
+    for requested in [61usize, 500] {
+        let width = knn_width(5, Some(requested), 96);
+        assert_eq!(width, requested.min(95));
+        for (source, expected) in [
+            (KnnSource::Ann, KnnNeighborSource::Approximate),
+            (KnnSource::Exact, KnnNeighborSource::Exact),
+        ] {
+            let case = format!("finite remap requested={requested} source={source:?}");
+            let fitted =
+                fit_knn_graph_with_source(&input, knn_config(5, Some(requested)), backend, source)
+                    .unwrap();
+            assert_eq!(fitted.finite_index().len(), 96, "{case}");
+            assert_eq!(fitted.labels().len(), input.len(), "{case}");
+            for (row, label) in fitted.labels().iter().enumerate() {
+                if row % 5 == 0 {
+                    assert_eq!(*label, -1, "{case}: non-finite row {row}");
+                }
+            }
+            assert!(
+                fitted
+                    .finite_index()
+                    .iter()
+                    .all(|&row| input[row as usize].iter().all(|v| v.is_finite())),
+                "{case}: finite_index must map to finite input rows"
+            );
+            assert_knn_structure(&fitted, 96, width, expected, &case);
+        }
+    }
+}
+
+#[test]
+fn knn_forced_ann_width_sweep_on_cpu() {
+    knn_forced_ann_width_sweep_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_forced_ann_width_sweep_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_forced_ann_width_sweep_cases(backend);
+    }
+}
+
+#[test]
+fn knn_small_input_width_edges_on_cpu() {
+    knn_small_input_width_edge_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_small_input_width_edges_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_small_input_width_edge_cases(backend);
+    }
+}
+
+#[test]
+fn knn_min_samples_floor_on_cpu() {
+    knn_min_samples_floor_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_min_samples_floor_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_min_samples_floor_cases(backend);
+    }
+}
+
+#[test]
+fn knn_duplicate_rows_on_cpu() {
+    knn_duplicate_rows_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_duplicate_rows_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_duplicate_rows_cases(backend);
+    }
+}
+
+#[test]
+fn knn_disconnected_groups_on_cpu() {
+    knn_disconnected_groups_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_disconnected_groups_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_disconnected_groups_cases(backend);
+    }
+}
+
+#[test]
+fn knn_squared_distance_overflow_on_cpu() {
+    knn_squared_distance_overflow_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_squared_distance_overflow_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_squared_distance_overflow_cases(backend);
+    }
+}
+
+#[test]
+fn knn_finite_remapping_width_on_cpu() {
+    knn_finite_remapping_width_cases(BackendChoice::Cpu);
+}
+
+#[test]
+fn knn_finite_remapping_width_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        knn_finite_remapping_width_cases(backend);
     }
 }
 

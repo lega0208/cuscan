@@ -1395,7 +1395,7 @@ exact MST either way, so the switch is a performance choice.
 
 Graph route. `MstGraph::KnnGraph` (the `Auto` default above 30 features) does not use S4 to S6. It
 takes exact common squared neighbors, or shared ANN when `KnnSource::Auto` selects it (finite rows
-above 4096 and effective width at most 60), then runs host `knn_kruskal`. See
+above 4096, at any effective width; no width cutoff), then runs host `knn_kruskal`. See
 `hdbscan_phase6_plan.md`. The Complete route keeps the KD and brute-force rule above.
 
 ## Per-stage test matrix

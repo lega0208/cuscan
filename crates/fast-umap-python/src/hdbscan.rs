@@ -1,12 +1,12 @@
 use fast_hdbscan::{
     BackendChoice, ClusterSelectionMethod, FittedHDBSCAN as RustFittedHDBSCAN, HDBSCAN,
-    HdbscanConfig, HdbscanError,
+    HdbscanConfig, HdbscanError, MstGraph, estimate_fit_resources,
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyFloat};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyList};
 
 #[pyclass(frozen, unsendable)]
 pub(crate) struct FittedHDBSCAN {
@@ -141,12 +141,10 @@ impl FittedHDBSCAN {
     }
 }
 
-#[pyfunction(signature = (x, **kwargs))]
-pub(crate) fn fit_hdbscan(
-    py: Python<'_>,
-    x: PyReadonlyArray2<'_, f32>,
+/// Parses the native config and backend shared by fit and the resource estimate bridge.
+fn parse_hdbscan_kwargs(
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
-) -> PyResult<FittedHDBSCAN> {
+) -> PyResult<(HdbscanConfig, BackendChoice)> {
     let kwargs = kwargs.ok_or_else(|| PyTypeError::new_err("keyword arguments are required"))?;
     const ALLOWED: &[&str] = &[
         "min_cluster_size",
@@ -255,6 +253,16 @@ pub(crate) fn fit_hdbscan(
         reproducible,
         ..Default::default()
     };
+    Ok((config, backend))
+}
+
+#[pyfunction(signature = (x, **kwargs))]
+pub(crate) fn fit_hdbscan(
+    py: Python<'_>,
+    x: PyReadonlyArray2<'_, f32>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<FittedHDBSCAN> {
+    let (config, backend) = parse_hdbscan_kwargs(kwargs)?;
     let input = x
         .as_array()
         .rows()
@@ -264,6 +272,73 @@ pub(crate) fn fit_hdbscan(
     py.detach(|| HDBSCAN::new(config, backend).fit(&input))
         .map(|inner| FittedHDBSCAN { inner })
         .map_err(map_hdbscan_error)
+}
+
+/// Pure resource estimate for a fit shape. Uses the same native config and backend parsing as
+/// `fit_hdbscan`; it neither scans data nor initializes CUDA.
+#[pyfunction(signature = (n_finite, features, **kwargs))]
+pub(crate) fn estimate_hdbscan_resources<'py>(
+    py: Python<'py>,
+    n_finite: usize,
+    features: usize,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (config, backend) = parse_hdbscan_kwargs(kwargs)?;
+    let estimate =
+        estimate_fit_resources(n_finite, features, &config, backend).map_err(map_hdbscan_error)?;
+    let result = PyDict::new(py);
+    let graph = match estimate.resolved_graph {
+        MstGraph::Complete => "complete",
+        MstGraph::KnnGraph => "knn",
+        // `resolve_graph` never returns Auto; reaching this is a planner bug, reported as such.
+        MstGraph::Auto => {
+            return Err(PyRuntimeError::new_err(
+                "internal error: resource planner returned unresolved MstGraph::Auto",
+            ));
+        }
+    };
+    result.set_item("resolved_graph", graph)?;
+    let knn = match &estimate.knn {
+        None => py.None(),
+        Some(knn) => {
+            let entry = PyDict::new(py);
+            entry.set_item("source", format!("{:?}", knn.source).to_lowercase())?;
+            // effective_width: production graph width. retained_width: candidate width kept by
+            // the source (ANN may exceed effective_width). Both are reported separately.
+            entry.set_item("effective_width", knn.effective_width)?;
+            entry.set_item("retained_width", knn.retained_width)?;
+            entry.set_item("finite_rows", knn.finite_rows)?;
+            entry.set_item("min_samples", knn.min_samples)?;
+            entry.set_item("directed_edges", knn.directed_edges)?;
+            entry.set_item("density", knn.density)?;
+            let scenarios = PyList::empty(py);
+            for scenario in &knn.scenarios {
+                let item = PyDict::new(py);
+                item.set_item("backend", format!("{:?}", scenario.backend).to_lowercase())?;
+                item.set_item("host_peak_bytes", scenario.host_peak_bytes)?;
+                item.set_item("device_peak_bytes", scenario.device_peak_bytes)?;
+                scenarios.append(item)?;
+            }
+            entry.set_item("scenarios", scenarios)?;
+            match &knn.advisory {
+                None => entry.set_item("advisory", py.None())?,
+                Some(advisory) => {
+                    let item = PyDict::new(py);
+                    item.set_item("threshold_bytes", advisory.threshold_bytes)?;
+                    let triggers = PyList::empty(py);
+                    for backend in &advisory.triggers {
+                        triggers.append(format!("{backend:?}").to_lowercase())?;
+                    }
+                    item.set_item("triggers", triggers)?;
+                    item.set_item("width_floor_applies", advisory.width_floor_applies)?;
+                    entry.set_item("advisory", item)?;
+                }
+            }
+            entry.into_any().unbind()
+        }
+    };
+    result.set_item("knn", knn)?;
+    Ok(result)
 }
 
 /// Accepts `None` or a strictly positive Python integer; rejects bool, float, zero and negatives.

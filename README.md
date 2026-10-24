@@ -458,15 +458,20 @@ raise `ValueError`.
 Route selection follows upstream's dimension rule. Up to 30 features, the estimator builds
 the exact complete mutual-reachability graph. Above 30 features it builds a kNN graph.
 The graph width is `min(max(knn_k or max(3 * min_samples, 15), min_samples), n_finite - 1)`.
-It uses exact neighbors when `n_finite <= 4096` or the width exceeds 60. Otherwise it uses
-approximate neighbors (CubeCL ANN, fixed seed 42, squared distances,
-`max(5, round(log2(n)))` iterations). Kruskal runs over the kNN edges. Components left
+It uses exact neighbors when `n_finite <= 4096`. Above 4096 finite rows it uses approximate
+neighbors at the resolved width (CubeCL ANN, fixed seed 42, squared distances,
+`max(5, round(log2(n)))` iterations); the width is not separately capped. Kruskal runs over the kNN edges. Components left
 disconnected are joined by `+inf` bridges between each component's smallest finite-row index.
-The exact branch costs O(n²·d) work, like the complete route. The ANN branch was validated only
-up to width 60, on synthetic 6000×40 and 6000×50 data with three seeds and three widths per
-backend. Mean recall was at least 0.9998 on both backends, per-case ARI was 1.0, and the
-maximum finite-MST-sum relative error was 7.1e-6. These are measurements on those datasets,
-not guarantees for other data. The campaign's fit times are observations, not speedup claims.
+The exact branch costs O(n²·d) work, like the complete route. The ANN branch's width is
+independent of the exact-route row limit. Quality evidence is empirical: on synthetic 6000×40 and
+6000×50 data at widths up to 60, three seeds per backend gave mean recall of at least 0.9998, per-case
+ARI of 1.0, and a maximum finite-MST-sum relative error of 7.1e-6. The current width campaign completed
+76 cases per backend, all passing; seven planned cases per backend were not completed (six large-seed
+cases skipped under the time budget and the high-density 4097×31 case at width 4096 timed out
+without output), so it does not establish
+comprehensive validation across all shapes. Resource estimates (see the advisory above) are practical
+guidance for memory use, not guarantees of memory or quality for every shape or dataset. The campaign's
+fit times are observations, not speedup claims.
 
 Divergences from upstream: the port removes the query row from its own neighbor list, while
 upstream drops column 0, which can be a duplicate row; `knn_k=0` is rejected; the ANN seed is
@@ -484,6 +489,26 @@ Arrays are independent copies of the Rust-owned fitted snapshot. Probabilities
 are float32 for finite input and float64 when nonfinite rows are remapped,
 matching upstream. Trees are raw NumPy arrays, not plotting wrapper objects.
 Failed refits preserve the previous fitted snapshot and its DBSCAN cuts.
+
+Before a kNN-route fit, `fast_umap.HDBSCAN` calls the native shape-only estimator with the
+finite-row count, feature count and the same configuration, then emits one `UserWarning` when any
+applicable scenario reaches 1 GiB (2^30 bytes). The estimator reads no data, does not initialize
+CUDA and performs no device discovery. The complete graph and fewer than two finite rows produce
+no advisory. The graph width is `min(max(knn_k or max(3 * min_samples, 15), min_samples), n_finite - 1)`:
+nonfinite rows are not counted, and when `knn_k < min_samples` the `min_samples` floor applies. Directed
+edges and the dominant graph storage are `O(n * k)` with `n` finite rows and `k` the effective width.
+Approximate-neighbor fits also report a retained candidate width, `min(width + 4, n_finite - 1)`, which
+is distinct from the effective width and is not used for the directed-edge count.
+
+`backend="auto"` reports CPU and CUDA as conditional alternatives. They are not summed, and only the
+backend that fit resolves runs. The CPU figure is one overlapping host+runtime peak. The CUDA figures
+are separate host and device peaks. Each is the maximum over fit phases, not a sum of phases. These are
+estimates of the allocations the fit plan requests. They are not allocator reservations, cached memory,
+interpreter or other process memory, or an available-memory check. The estimate excludes the caller's
+raw input buffer and the outlier-compaction copy made when nonfinite rows are dropped, so it is a lower
+bound for inputs with dropped rows. The advisory does not block the fit, change the configuration, retry
+or fall back to another backend. Use the standard `warnings` filters to ignore or escalate it; `fast_umap`
+adds no separate option and keeps no duplicate estimator policy.
 
 The `fast-hdbscan` crate also exposes the Rust `HDBSCAN` estimator. For example,
 with its `cpu` feature enabled:
@@ -523,6 +548,12 @@ the graph and `knn_k` sets the kNN width; both are Rust-only fields except that 
 exposes `knn_k`. `Auto` resolves to `KnnGraph` above 30 features and to `Complete` otherwise.
 `with_search` and `FittedHDBSCAN::search()` apply only to the complete-graph route.
 `HdbscanConfig::reproducible` (default `false`) has the bound-mode meaning described above.
+
+`fast_hdbscan::estimate_fit_resources(n_finite, features, &config, backend_choice)` returns the same
+shape-only `FitResourceEstimate` without reading data or touching a device. `knn` is `None` on the
+complete route. With the crate's `tracing` feature, `fit` emits one `tracing::warn!` event carrying the
+same advisory fields; without that feature `fit` emits nothing. The same exclusions and CPU/CUDA
+semantics described for Python apply.
 
 ```shell
 cargo test -p fast-hdbscan
