@@ -8,12 +8,18 @@ and check parity against fixtures generated from the pinned reference package.
 
 Algorithm stages, upstream code and porting detail: `hdbscan_algo_impl.md`.
 
+Implementation status: phases 0–5 are implemented, and the parallel-Borůvka milestones M0–M6
+(kNN-graph route, shared KD component bounds, Python `knn_k`/`reproducible`) are implemented
+as described in `parallel_boruvka_plan.md`. Device-side component winner reduction (its §4.8,
+M7–M8) and complete-graph `algorithm="kruskal"` (Phase 6) are not implemented.
+
 ## Goals and non-goals
 
 ### Goals (first release)
 
-- Euclidean HDBSCAN with exact mutual-reachability MST (upstream `algorithm="boruvka"`,
-  `metric="euclidean"`).
+- Euclidean HDBSCAN (`metric="euclidean"`). Up to 30 features: exact complete mutual-reachability
+  MST (upstream `algorithm="boruvka"`). Above 30 features: upstream's kNN-graph route (see the
+  deliberate divergences below).
 - Upstream cluster-extraction options: `min_cluster_size`, `min_samples`,
   `cluster_selection_method` (`eom`/`leaf`), `allow_single_cluster`, `max_cluster_size`,
   `cluster_selection_epsilon`, `cluster_selection_persistence`.
@@ -28,8 +34,9 @@ Algorithm stages, upstream code and porting detail: `hdbscan_algo_impl.md`.
 
 ### Deferred (separate plans, in this order)
 
-1. `algorithm="kruskal"` with `knn_k` (approximate MST on a kNN graph, `+inf` bridges); upstream
-   obtains neighbors through exact KD-tree `parallel_tree_query`, not our ANN kernel.
+1. `algorithm="kruskal"` on the complete graph at ≤30 features (Phase 6). The kNN-graph route
+   itself is implemented under `parallel_boruvka_plan.md` M3–M4 for `Auto` above 30 features and
+   for an explicit Rust `MstGraph::KnnGraph`.
 2. `sample_weights`. Upstream's weighted Boruvka path mixes squared and unsquared distances:
    `parallel_tree_query` is called without `output_rdist=True` (`boruvka.py:567`), but the
    squared Boruvka search still uses it (`boruvka.py:203-207`) and the final `sqrt`
@@ -40,12 +47,18 @@ Algorithm stages, upstream code and porting detail: `hdbscan_algo_impl.md`.
 5. Non-Euclidean metrics. Upstream delegates these to pynndescent. Our neighbor kernels are
    Euclidean only.
 
-Known deliberate divergence: for `D > 30` with no weights, upstream switches to an *approximate*
-pynndescent kNN graph plus Kruskal (`hdbscan.py:447-463`) before considering `algorithm`.
-Therefore even `algorithm="kruskal", knn_k=None` does not select the exact public path. Our first
-release always computes the exact MST. For `D > 30`, the fixture generator must call pinned
-upstream `parallel_boruvka(..., reproducible=True)` directly, then pass that MST through upstream's
-tree/label/probability functions.
+Deliberate divergences from upstream's `D > 30` route (no weights; `parallel_boruvka_plan.md` §1.1):
+- Upstream sends `D > 30` to pynndescent kNN plus Kruskal before considering `algorithm`. The port
+  does the same with `Auto`. Exact neighbors are used for `n_finite <= 4096` or width > 60;
+  otherwise common ANN is used with seed 42 and squared distances.
+- Self removal drops the query row, not column 0 (upstream may drop a duplicate row).
+- `knn_k` must be a positive integer or `None`; `0` is rejected. Upstream silently replaces it with `min_samples`.
+- The ANN branch is validated only up to width 60. Its results match upstream in distribution, not
+  bit for bit. Exact-neighbor results match wherever pynndescent's graph is exact.
+- Fixture generation for the complete graph still calls pinned upstream
+  `parallel_boruvka(..., reproducible=True)` directly, then passes that MST through upstream's
+  tree/label/probability functions. `blobs_d50` is excluded from default-route parity as a known
+  upstream divergence; `blobs_d50_knn` checks the kNN route against pynndescent's graph.
 
 ## Crate structure
 
@@ -57,12 +70,13 @@ The existing workspace is `fast-umap-python → fast-umap → fast-umap-core`
 - Device resolution: `selected_device` and `resolve_backend_choice` in
   `standard_umap/estimator.rs:1164-1275`.
 - Launch limits: `legal_cube_dim` in `kernels/mod.rs:9-33`.
-- Exact and approximate Euclidean neighbor kernels: the `StandardUmapOps::exact_neighbors` and
-  `approximate_neighbors` methods, implemented in `kernels/standard_umap/{mod.rs,ann*.rs}` and
-  orchestrated by `standard_umap/neighbors.rs`.
+- Exact and approximate Euclidean neighbor kernels: `NeighborOps` in `fast-cubecl-common`
+  (`exact_neighbors`, and `approximate_neighbors` with a squared-output flag). UMAP's
+  `standard_umap/neighbors.rs` orchestration stays in `fast-umap`.
 
-HDBSCAN needs backend plumbing and exact neighbors only. It does not use ANN, UMAP's fuzzy graph,
-layout, spectral init (`faer`) or model state.
+HDBSCAN uses common exact neighbors, and common ANN only for the kNN-graph route above 4096
+finite rows at width ≤60. It does not use UMAP's fuzzy graph, layout, spectral init (`faer`)
+or model state.
 
 ### Options considered
 
@@ -86,7 +100,7 @@ crates/
       error.rs                 # BackendError (mapped by each facade)
       backend.rs               # trait NeighborOps (#[backend_extension])
       neighbors.rs             # exact_neighbors orchestration, NeighborList
-      kernels/{mod.rs, neighbors/…} # exact neighbors only; no ANN
+      kernels/{mod.rs, neighbors/…, ann/…} # exact and approximate neighbor kernels
   fast-hdbscan-core/           # NEW: backend-free host code
     src/
       lib.rs  config.rs  error.rs
@@ -130,9 +144,9 @@ or `rand`.
 
 - A `#[backend_extension]` trait and its only `impl … for CubeBackend` must be in the same
   crate. Hence:
-  - `NeighborOps` contains exact neighbors, squared-distance block, and backend plumbing only;
-    its trait and CubeBackend impl live in `fast-cubecl-common`. ANN kernels/helpers and
-    `approximate_neighbors` remain in `fast-umap` (HDBSCAN v1 does not use ANN).
+  - `NeighborOps` contains exact neighbors, the squared-distance block, `approximate_neighbors`
+    (ANN kernels relocated from `fast-umap`) and backend plumbing. Its trait and CubeBackend
+    impl live in `fast-cubecl-common`. `fast-hdbscan` uses it without a dependency on `fast-umap`.
     `StandardUmapOps` loses only the exact-neighbor and squared-distance methods; ANN and other
     UMAP-specific methods remain in place.
   - `HdbscanOps` (Boruvka candidate search, optional on-device component bookkeeping) is a new
@@ -178,6 +192,9 @@ pub struct HdbscanConfig {
     pub max_cluster_size: Option<usize>,  // None ≙ np.inf
     pub cluster_selection_epsilon: f64,
     pub cluster_selection_persistence: f64,
+    pub mst_graph: MstGraph,              // Auto (default): KnnGraph above 30 features, else Complete
+    pub knn_k: Option<usize>,             // kNN-graph width; ignored by Complete; Some(0) invalid
+    pub reproducible: bool,               // default false: shared KD component bounds
 }
 
 pub struct HDBSCAN { config: HdbscanConfig, backend: BackendChoice }
@@ -210,7 +227,8 @@ impl FittedHDBSCAN {
   `pyproject.toml [tool.maturin] module-name`) gains `fit_hdbscan(...)` and a frozen
   `FittedHDBSCAN` class in `crates/fast-umap-python/src/hdbscan.rs`.
 - `python/fast_umap/hdbscan.py`: `HDBSCAN` estimator mirroring upstream parameters in scope,
-  plus `backend="auto"` and `device_index=0`. Attributes: `labels_`, `probabilities_`,
+  plus `backend="auto"`, `device_index=0`, `knn_k` (positive integer or `None`) and
+  `reproducible` (bool). `mst_graph` is Rust-only; Python selects the route by feature count. Attributes: `labels_`, `probabilities_`,
   `condensed_tree_` (structured array with upstream dtype), `single_linkage_tree_`,
   `minimum_spanning_tree_` (raw arrays; upstream wraps them in `hdbscan.plots` classes only if
   `hdbscan` is installed, and we return the arrays), and `dbscan_clustering(eps)`. Unsupported

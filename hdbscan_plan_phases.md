@@ -9,11 +9,11 @@ This is an execution plan, not authorization to implement. It decomposes the pin
 - Rust workspace targets: `fast-cubecl-common`, `fast-hdbscan-core`, `fast-hdbscan`, existing `fast-umap`, and existing `fast-umap-python`; Python package remains `fast_umap` and native module remains `fast_umap._fast_umap`.
 - Public behavior: `HDBSCAN`/`FittedHDBSCAN`; labels, probabilities, single-linkage and condensed trees, sorted MST, finite-row-indexed neighbors and core distances, finite-index mapping, and `dbscan_clustering(epsilon)`.
 - Euclidean exact MST via `algorithm="boruvka"`; extraction options `min_cluster_size`, optional `min_samples`, `eom`/`leaf`, `allow_single_cluster`, optional maximum size, epsilon and persistence selection; non-finite rows are excluded from fitting and remapped as noise.
-- Backend selection follows current UMAP semantics: `Auto`, `Cpu`, `Cuda`; explicit backend selection never falls back. HDBSCAN does not import ANN, fuzzy graph, layout, spectral initialization, or model-state functionality.
+- Backend selection follows current UMAP semantics: `Auto`, `Cpu`, `Cuda`; explicit backend selection never falls back. HDBSCAN imports common ANN only for the kNN-graph route (`parallel_boruvka_plan.md`). It does not import the fuzzy graph, layout, spectral initialization, or model-state functionality.
 
 ### Explicit exclusions
 
-Do not implement in these phases: Kruskal/kNN graph MST; sample weights; precomputed/sparse metrics; cannot-link or semi-supervised constraints; non-Euclidean metrics; `PLSCAN`, branch detection, layer clusters; distribution/package renaming; ANN reuse for HDBSCAN. The D>30 upstream public-fit approximate path is deliberately not replicated: use exact pinned internal `parallel_boruvka(..., reproducible=True)` as fixture oracle at every dimension.
+Do not implement in these phases: complete-graph Kruskal (Phase 6); sample weights; precomputed/sparse metrics; cannot-link or semi-supervised constraints; non-Euclidean metrics; `PLSCAN`, branch detection, layer clusters; distribution/package renaming. The D>30 kNN-graph route is implemented under `parallel_boruvka_plan.md`, not in these phases. Complete-graph fixture oracles still use exact pinned internal `parallel_boruvka(..., reproducible=True)`.
 
 ### Cross-phase contracts
 
@@ -39,8 +39,6 @@ Completed scope, contracts, deliverables and exit gate: see [Phase 1 in the comp
 
 Completed scope, contracts, deliverables and exit gate: see [Phase 2 in the completed phases document](hdbscan_plan_phases_completed.md#phase-2--independent-host-exact-mst-oracle-s5s7-reference).
 
-Phase 3 remains unimplemented.
-
 ### Phase 3 — facade, brute-force device Borůvka, estimator (S3, S5–S7) — completed
 
 Completed scope, contracts, deliverables and exit gate: see [Phase 3 in the completed phases document](hdbscan_plan_phases_completed.md#phase-3--facade-bruteforce-device-boruvka-estimator-s3-s5s7).
@@ -55,7 +53,7 @@ Completed scope, contracts, deliverables and exit gate: see [Phase 5 in the comp
 
 ### Phase 6+ — separate plans only
 
-No work in this plan. Future separate proposals, in order: (1) `algorithm="kruskal"` with `knn_k`, using exact KD-tree `parallel_tree_query` rather than ANN and accounting for +inf bridges; (2) sample weights after resolving upstream squared/unsquared behavior; (3) precomputed sparse metrics, cannot-link, semi-supervised BC; (4) `PLSCAN`, branch detection/subclusters, layer clusters; (5) non-Euclidean metrics. Each needs its own semantics, API and acceptance plan. No compatibility aliases or speculative performance features are authorized here.
+No work in this plan. Future separate proposals, in order: (1) complete-graph `algorithm="kruskal"` at ≤30 features (the kNN-graph route is already implemented under `parallel_boruvka_plan.md`); (2) sample weights after resolving upstream squared/unsquared behavior; (3) precomputed sparse metrics, cannot-link, semi-supervised BC; (4) `PLSCAN`, branch detection/subclusters, layer clusters; (5) non-Euclidean metrics. Each needs its own semantics, API and acceptance plan. No compatibility aliases or speculative performance features are authorized here.
 
 ## Verification command ledger
 

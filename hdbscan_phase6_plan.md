@@ -6,7 +6,7 @@ High-level follow-up to `hdbscan_plan_phases.md`, Phase 6+, using `hdbscan_impl.
 
 Add unweighted `algorithm="kruskal"` with `knn_k`, on the existing CPU/CUDA backends, Rust estimator and Python API. Preserve the default exact Borůvka path and reuse the existing extraction pipeline. Implementation starts from an accepted Phase 5 baseline; this proposal does not certify its completion.
 
-Excluded: sample weights, sparse/precomputed inputs, constraints, semi-supervised clustering, non-Euclidean metrics, ANN/pynndescent, branch/layer clustering, package renaming and speculative GPU sorting or DSU implementations.
+Excluded: sample weights, sparse/precomputed inputs, constraints, semi-supervised clustering, non-Euclidean metrics, upstream pynndescent (the shared common ANN is used only by the Auto graph source; see Implementation status), branch/layer clustering, package renaming and speculative GPU sorting or DSU implementations.
 
 ## Important clarification: Kruskal has two modes
 
@@ -16,32 +16,35 @@ The earlier overview describes the kNN-graph follow-up, but upstream's `knn_k=No
 |---|---|
 | `boruvka`, `knn_k=None` | Existing exact algorithm, unchanged |
 | `kruskal`, positive integer `knn_k` | Exact Euclidean neighbors; approximate MST restricted to their graph; disconnected components joined with synthetic `+inf` edges |
-| `kruskal`, `knn_k=None` | Exact complete-graph Kruskal; quadratic edge storage and global sorting |
+| `kruskal`, `knn_k=None` (**superseded for the Rust graph route**) | Planned exact complete-graph Kruskal (6.3, not implemented). The implemented graph route uses the default effective width instead; see below |
 
-Deliver both Kruskal modes as separately gated milestones. Do not silently substitute Borůvka for dense Kruskal or invent a default k. A kNN graph built with exact neighbors can still miss complete-graph MST edges.
+Deliver both Kruskal modes as separately gated milestones.
 
-For D>30, continue the deliberate divergence: honor the selected algorithm and use exact distances/neighbors, never upstream public fit's automatic pynndescent dispatch. Direct pinned Kruskal internals, not public fit, are the strict oracle there.
+**Superseded contract (explicit):** the table's `knn_k=None` row and the earlier statement that `knn_k=None` is "not an automatically chosen graph width" describe the original plan. The approved M3 contract replaces them for the Rust graph route: `knn_k=None` under `MstGraph::KnnGraph` uses the effective default width `max(3*min_samples, 15)`, clamped as below. Upstream's euclidean `knn_k=None` is still complete, so this is a deliberate divergence. Explicit `MstGraph::Complete` is preserved and remains the Borůvka route. Do not silently substitute Borůvka for dense Kruskal or invent a default k. A kNN graph built with exact neighbors can still miss complete-graph MST edges.
+
+For D>30, the deliberate divergence from upstream's pynndescent dispatch stands. **Superseded contract (explicit):** the original plan's exact-only D>30 rule is replaced by the approved M3 `Auto` rule. `Auto` resolves to the kNN graph above 30 features, using exact common neighbors. It uses shared ANN only under the Auto source rule (above 4096 finite rows with effective width at most 60). Upstream pynndescent is never dispatched. Direct pinned Kruskal internals, not public fit, are the strict oracle there.
 
 ## Proposed contracts
 
 ### API and validation
 
 - Add a backend-free algorithm enum (`Boruvka`, `Kruskal`) and `knn_k: Option<usize>` to Rust configuration; default to Borůvka/None. Keep this separate from `HdbscanSearch::{Auto, BruteForce, KdTree}`, which chooses an exact neighbor/search implementation, not an MST algorithm.
-- Python accepts only `algorithm="boruvka"` or `"kruskal"`. Accept `knn_k=None` or a positive integer, including NumPy integers but excluding booleans. Unknown algorithms, invalid k and non-None k with Borůvka are configuration errors (`ValueError` / `InvalidConfig`), not ignored options. This intentionally tightens upstream's incomplete k validation.
+- Rust: `MstGraph::{Auto, Complete, KnnGraph}` with `knn_k: Option<usize>` implements this contract by route, not by algorithm name. `Auto` is the default. Explicit `Complete` is preserved. Zero `knn_k` is invalid even when the graph is ignored. The Rust route ignores `knn_k` for `Complete`.
+- Python accepts only `algorithm="boruvka"` or `"kruskal"`. (Status: `knn_k` is validated and passed to the native binding; `algorithm="kruskal"` is not yet exposed. See Implementation status.) Accept `knn_k=None` or a positive integer, including NumPy integers but excluding booleans. Unknown algorithms, invalid k and non-None k with Borůvka are configuration errors (`ValueError` / `InvalidConfig`), not ignored options. This intentionally tightens upstream's incomplete k validation.
 - Keep unsupported capabilities rejected with `NotImplementedError`; retain existing backend/error contracts and deterministic behavior. No execution fallback between backends or MST algorithms.
 - Preserve existing result names, finite-row indexing, tree remapping, probability widening on non-finite remap, and `dbscan_clustering` semantics. Zero finite rows remains an error; one finite row remains the existing all-noise degenerate result.
 
 ### Graph and numeric semantics
 
-- Let m be the finite-row count and s the resolved `min_samples`. For integer k, the non-self graph width is `max(k, s)` when s>1, otherwise k. Upstream uses **all** queried graph columns, not only the first k. Return only s neighbor columns, with -1 padding as needed; s=1 returns one column.
+- Let m be the finite-row count and s the resolved `min_samples`. For integer k, the non-self graph width is `min(max(k, s), m-1)` (implemented as `graph_width`). With `knn_k=None` on the graph route it is `min(max(max(3s, 15), s), m-1)`. This supersedes the original `knn_k=None` contract noted above. Upstream uses **all** queried graph columns, not only the first k. Return only s neighbor columns, with -1 padding as needed; s=1 returns one column.
 - Exclude the actual query-row id, rather than blindly dropping the first neighbor. Retain deterministic distance/index ties. Record this deliberate duplicate-point divergence from upstream's positional self removal in tie fixtures.
 - Query only available non-self rows and represent unavailable output slots by -1/+inf. For s>=m, cores are infinite; s=1 gives zero cores for ordinary m>1 fits. Oversized k must not generate invalid endpoints or unchecked allocations.
 - Integer-k distances start as the existing squared f32 exact-neighbor output. Widen to f64 **before** sqrt, then compute f64 mutual reachability `max(core[u], core[v], distance[u,v])`. Do not route Kruskal through Borůvka's f32-core/squared-weight finalizer.
 - Dense mode follows upstream's distinct precision: compute Euclidean pair distances with f64 accumulation over f32 input values, derive f64 cores, and emit one edge per upper-triangle pair. Reusing f32 squared blocks would change overflow and ordering semantics. Provide backend operations for this precision on both CPU and CUDA; inability to verify either lane blocks that milestone, not permission for silent host fallback.
 - Keep internal Kruskal cores and MST weights f64 through graph construction. Preserve the current public f32 core-distance output by narrowing only at the accessor/result boundary; document this port-level dtype divergence. Linkage remains f64 and downstream extraction retains its existing mixed precision. Do not change Borůvka numerics.
-- Dense mode returns `min(max(1,s), m-1)` neighbor columns, as upstream does, except the shared one-row special case. Document this branch-specific shape rather than pretending it is always s columns.
+- (Dense mode is not implemented; 6.3.) Dense mode returns `min(max(1,s), m-1)` neighbor columns, as upstream does, except the shared one-row special case. Document this branch-specific shape rather than pretending it is always s columns.
 - Use stable weight ordering with deterministic input ordinal: row-major directed query edges for kNN mode, upper-triangle enumeration for dense mode. Do not deduplicate or reorient graph edges before selection unless equivalence, including tie choices, is established.
-- In kNN mode filter padding, actual self-loops and non-finite MRD edges before Kruskal. Dense mode retains its legitimate infinite MRD edges, matching its upstream branch. Never index a core array with -1.
+- In kNN mode, `-1` padding is skipped and non-finite MRD candidates are skipped before Kruskal. Implemented deviation: self ids and other malformed rows (valid ids after padding, duplicates, out-of-range ids, NaN or negative distances, decreasing distances) are rejected by `knn_kruskal` validation rather than filtered. Dense mode retains its legitimate infinite MRD edges, matching its upstream branch. Never index a core array with -1.
 - Host union-find selects a spanning forest. If c components remain, take each component's smallest finite-row id, sort those representatives, and append c-1 consecutive `+inf` bridges. For m>1 the completed result has exactly m-1 edges, is acyclic and connected. Bridges are synthetic topology, not discovered finite distances.
 - Feed the completed tree through the existing MST sorting, linkage, condensation, selection, membership and finite-row remapping. Infinite bridges must produce valid lambda-zero behavior without NaN. Do not alter the established linkage-cut behavior for `epsilon=+inf` to accommodate this feature.
 
@@ -73,7 +76,7 @@ Check products, index conversions, padded outputs, graph-edge count, sorting scr
 
 ### 6.3 — Dense exact Kruskal
 
-Add the f64 pair-distance path and complete upper-triangle MRD edge construction. Tile device computation to bound scratch; retain the unavoidable O(m²) host graph and O(m² log m) sort cost. Avoid materializing a second full square matrix merely to enumerate edges. Define and document a deterministic resource-admission policy covering edges plus sort scratch; reject unsupported sizes with typed allocation/overflow errors before work begins. No arbitrary silent reduction of k or algorithm replacement.
+Status: not implemented. Add the f64 pair-distance path and complete upper-triangle MRD edge construction. Tile device computation to bound scratch; retain the unavoidable O(m²) host graph and O(m² log m) sort cost. Avoid materializing a second full square matrix merely to enumerate edges. Define and document a deterministic resource-admission policy covering edges plus sort scratch; reject unsupported sizes with typed allocation/overflow errors before work begins. No arbitrary silent reduction of k or algorithm replacement.
 
 Keep dense distances/cores separate from f32 kNN assumptions. Do not force dense mode through KD neighbor ordering where that would change its f64 core-distance calculation.
 
@@ -115,6 +118,20 @@ uv run ty check
 ```
 
 Retain fixture provenance, actual command results, benchmark/resource evidence and unverified hardware lanes with completion evidence. Later follow-ups remain separate: sample weights first requires resolving upstream weighted-distance semantics; precomputed/constraints and other deferred features do not enter this phase.
+
+## Implementation status (parallel Borůvka M0 to M5)
+
+This section records what landed. The milestone numbers refer to `parallel_boruvka_plan.md`, not to the 6.x numbering above. Items above that conflict with this section are historical and marked as superseded.
+
+- **6.1 graph core (M1):** `fast-hdbscan-core/src/knn_kruskal.rs` implements f64 cores and MRD after widening squared f32 distances, ordinal-stable ties, `+inf` bridges from each component's smallest finite-row id, and `sort_mst`. Oracle tests are independent of production helpers.
+- **6.2 integer-k route (M3):** `MstGraph::KnnGraph` runs on CPU and CUDA at every shape in M3, using exact common squared neighbors (brute force). It does not reuse the KD exact-neighbor kernel, which is a deliberate difference from the 6.2 text. Graph storage is `O(m * width)`, with checked allocation and byte accounting. Public neighbors keep `min_samples` columns with `-1` padding. Fixtures include `blobs_d50_knn`, generated from the upstream graph and checked against exact non-self neighbors.
+- **ANN source (M4):** `KnnSource::Auto` selects shared common ANN only for finite rows above 4096 and effective width at most 60 (`ANN_VALIDATED_MAX_WIDTH`). `KnnSource::Ann` is a hidden test seam and is not a Python API. Campaign gates (`crates/fast-hdbscan/tests/test_knn_width_campaign.rs`): mean recall at least 0.90 per backend and dataset, per-case ARI at least 0.95, exact bridge counts, and finite-MST-sum relative error at most 1%. Each backend ran 18 cases: two datasets by three seeds by three requested widths. Requested widths 15, 45 and 60 with `min_samples=25` produced effective widths 25, 45 and 60 (D18). Recorded results: all six per-backend mean-recall gates passed (lowest CUDA mean 0.99988889); per-case ARI 1.0; maximum finite-MST-sum relative error 7.07e-6; bridges matched exact; CPU/CUDA ARI gates passed; repeats matched. Raw JSON is under `crates/fast-hdbscan/.gjc/_session-01a169da-98fb-76d2-bad4-f28715c9381e/campaign/`. Median fit times are observational only, not speed claims.
+- **Shared KD bounds (M5):** on the complete-graph KD route, `reproducible=false` (the Rust and Python default) enables atomic per-component bounds reset before each traversal. `reproducible=true` gives per-row exact traversal. Winners are exact in both. Brute-force and graph routes ignore the flag. Timings and traversal counters in `parallel_boruvka_implementation_notes.md` are observational and are not new claims.
+- **Routing defaults (current behavior):** `MstGraph::Auto` resolves to `KnnGraph` above 30 features and to `Complete` otherwise. The native binding uses `Auto` by default, so Python `fit` above 30 features changes from exact Borůvka to the kNN graph. Above 4096 finite rows with effective width at most 60, that graph uses shared ANN (approximate). This is a change from the original exact-only plan. It is flagged for maintainer decision, not silently accepted.
+- **Complete-route KD selection:** see `hdbscan_algo_impl.md`, the KD route rule.
+- **6.3 dense exact Kruskal:** not implemented.
+- **6.4 Python and release evidence (M6):** in progress. `knn_k` is validated and passed to the native binding. `algorithm="kruskal"` is not yet exposed. Release evidence and documentation are M6 obligations.
+- **M7 and M8:** not started and out of scope for this document.
 
 ## Sources and architectural review
 

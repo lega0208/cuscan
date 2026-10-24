@@ -129,9 +129,12 @@ rows, `n ≤ i32::MAX`, and `n·d` fits `usize` and the device allocation limits
 *not* errors. S2 handles them. The Python wrapper repeats upstream's type checks
 (`np.issubdtype(type(eps), np.floating)`), so `cluster_selection_epsilon=0` (an `int`) raises
 `ValueError` as it does upstream, and it raises `NotImplementedError` for out-of-scope
-parameters (`sample_weight`, `metric != "euclidean"`, `algorithm="kruskal"`, `knn_k`,
-`cannot_link*`, `semi_supervised=True`). It accepts `reproducible` and ignores it, because the
-port is always deterministic.
+parameters (`sample_weight`, `metric != "euclidean"`, `algorithm` other than `"boruvka"`,
+`cannot_link*`, `semi_supervised=True`). The kruskal graph route is not yet exposed in Python. `knn_k`
+is validated as a positive integer or `None` and is ignored by the complete-graph route.
+`reproducible` is passed to the native estimator and selects the complete-graph KD bound mode (see
+S6). The default is `False` in Rust and Python. Winners, labels and MST are required to match across
+repeats. `reproducible=False` only lets non-winning shared candidates vary by schedule.
 
 Divergence: upstream accepts `epsilon=np.inf`. The port rejects it, as `hdbscan_impl.md`
 specifies.
@@ -210,7 +213,9 @@ is used only to seed S5. Missing neighbors (`k > n`) stay at the `inf`/`-1` init
 
 ```python
 if min_samples > 1:
-    distances, neighbors = parallel_tree_query(tree, tree.data, k=min_samples + 1, output_rdist=True)
+    distances, neighbors = parallel_tree_query(
+        tree, tree.data, k=min_samples + 1, output_rdist=True
+    )
     core_distances = distances.T[-1]
 else:
     core_distances = np.zeros(tree.data.shape[0], dtype=np.float32)
@@ -223,13 +228,14 @@ When `n ≤ min_samples` every core distance is `inf`. Every MRD edge is then `i
 hierarchy collapses at λ = 0, and all labels are `-1`. This was checked against 0.3.2 with
 `n=8, min_samples=10`: the MST has 7 `inf` edges and labels are all `-1`.
 
-**Port.** Reuse the exact-neighbor kernel (`NeighborOps::exact_neighbors`, currently
-`fast-umap/src/kernels/standard_umap/mod.rs:25-86`) with `exclude_self = true` and
+**Port.** Reuse the exact-neighbor kernel (`NeighborOps::exact_neighbors`, now in
+`fast-cubecl-common/src/kernels/neighbors.rs` behind the `fast-cubecl-common/src/neighbors.rs`
+wrapper; moved from UMAP) with `exclude_self = true` and
 `k = min_samples`. Excluding self and asking for `min_samples` neighbors gives the same k-th
 distance as upstream's `min_samples + 1` including self, including on duplicates (distance 0
-either way). The kernel currently takes the `sqrt` (`mod.rs:81-84`). The extraction adds a
-`squared: u32` launch argument so HDBSCAN reads squared `f32` values without a lossy square/sqrt
-round trip. UMAP passes false and preserves its `f32::MAX` initialization/output behavior;
+either way). The kernel applies `sqrt` only when `squared` is false. The `squared` flag is a `u32` launch
+argument (the Rust wrapper takes `bool`) so HDBSCAN reads squared `f32` values without a lossy
+square/sqrt round trip. UMAP passes false and preserves its `f32::MAX` initialization/output behavior;
 HDBSCAN uses true and `+inf` initialization:
 
 ```rust
@@ -309,8 +315,8 @@ Divergences to note in docs and tests:
 - Padding: upstream pads missing neighbors with `-1` (index) and `inf` (distance), and so do we.
 
 Performance: `exact_neighbors` is O(n²·d) with one unit per query. It is the same kernel UMAP
-uses for small inputs. A KD-tree kNN kernel (S4 traversal with a k-heap instead of a single
-best) is phase 4 work and shares the traversal skeleton from S6b.
+uses for small inputs. The KD-tree exact-neighbor kernel (`HdbscanOps::exact_neighbors_kd`) is implemented for the
+complete-graph KD route and shares the traversal skeleton from S6b.
 
 ## S4. KD-tree build (host, phase 4)
 
@@ -411,7 +417,8 @@ for edge in component_edges:
     from_component = ds_find(disjoint_set, np.int32(edge[0]))
     to_component = ds_find(disjoint_set, np.int32(edge[1]))
     if from_component != to_component:
-        result[result_idx] = (edge[0], edge[1], edge[2]); result_idx += 1
+        result[result_idx] = (edge[0], edge[1], edge[2])
+        result_idx += 1
         ds_union_by_rank(disjoint_set, from_component, to_component)
 ```
 
@@ -486,9 +493,11 @@ to cluster sizes), S6 does not run.
 n_components = len(np.unique(point_components))
 while n_components > 1:
     candidate_distances, candidate_indices = boruvka_tree_query_reproducible(
-        tree, node_components, point_components, core_distances, block_size)
-    new_edges = merge_components(components_disjoint_set, candidate_indices,
-                                 candidate_distances, point_components)
+        tree, node_components, point_components, core_distances, block_size
+    )
+    new_edges = merge_components(
+        components_disjoint_set, candidate_indices, candidate_distances, point_components
+    )
     n_components -= len(new_edges)
     update_component_vectors(tree, components_disjoint_set, node_components, point_components)
     all_edges = np.vstack((all_edges, new_edges))
@@ -588,9 +597,10 @@ missing (`inf`/`-1`). Only the per-component minimum is exact. Reproducible mode
 
 **Port contract.** Freeze one signature before implementing Phase 3. The trait accepts only immutable
 data inputs and the optional tree; component pruning is an implementation-internal KD-backend
-optimization, not a fusion-op argument. The CubeBackend implementation allocates its atomic
-per-root scratch and resets it before each launch when pruning is enabled. The brute-force variant
-does not use this scratch. `DeviceKdTree` is a CubeCL fusion input type with its required
+optimization, not a fusion-op argument. The CubeBackend implementation allocates private per-call
+`KdBoundScratch` (length n when shared bounds are enabled, one dummy element otherwise), resets it
+in the backend wrapper before each KD launch, and never exposes it through the trait; only the
+`reproducible: bool` flag crosses the trait. The brute-force variant does not use this scratch. `DeviceKdTree` is a CubeCL fusion input type with its required
 `ExtensionType` derive and kernel/fusion metadata implemented alongside this trait (not a
 host-only opaque value):
 
@@ -771,22 +781,26 @@ fn kd_boruvka_candidates<F: Float>(
 ```
 
 The CubeBackend implementation owns the `component_bound` scratch shown in the kernel signature;
-it is not a trait input, is never mutated through a fusion-registered input, and is allocated and
-reset internally immediately before each candidate launch. `use_component_bound` is likewise an
-implementation-internal policy (disabled until benchmarks justify enabling it).
+it is not a trait input and is never mutated through a fusion-registered input. It is allocated per
+call and reset immediately before each candidate launch. Shared bounds are selected by the
+`reproducible: bool` operation argument (`reproducible=false` enables them; default `false`). Brute-force
+and graph routes ignore the flag:
 
 Notes for implementation:
 
 - **Stack bound.** Near-first DFS pushes two nodes per internal visit and pops one, so the
   depth stays ≤ `n_levels + 1`. The host asserts `n_levels + 1 ≤ STACK_LEN`.
-- **Component bound lifetime.** When the internal pruning policy is enabled, before every
+- **Component bound lifetime.** When shared bounds are enabled (`reproducible=false`), before every
   candidate launch the implementation resets all `n` scratch slots to `0x7f80_0000` (+inf bits)
   in a separate launch that completes first. A bound must never carry over between rounds: after
   a DSU merge, the edge that set it may be internal to the merged component, and a stale bound
   would prune every valid outgoing edge. `fetch_min(+inf)` is a read and does not reset anything.
   The test covers multiple rounds whose winning weights increase from round to round.
-- **Component bound.** This is an optimization only, enabled per runtime once benchmarks justify
-  it. With it, a row may stop before reaching its true best. That is fine, because S6c consumes
+- **Component bound.** This is an optimization only. It is enabled on the complete-graph KD route
+  when `reproducible=false` (the default), and not by brute-force or graph routes. Winners are exact.
+  Fitted MST endpoint/weight-bit equality is tested on five fixtures, seeded tie sets and an
+  Auto-KD-region dataset. Non-winning shared candidates may differ by schedule. With it, a row may
+  stop before reaching its true best. That is fine, because S6c consumes
   only per-component minima. Two rules keep the per-component minimum exact and deterministic.
   Pruning is strict (`>`), so every candidate that ties the component winner is still visited by
   the row that owns it. And the bound is stored as `u32` bits of a non-negative, non-NaN `f32`,
@@ -899,9 +913,11 @@ path fully to the root.
 left_component = linkage_merge_find(linkage_merge, left)
 right_component = linkage_merge_find(linkage_merge, right)
 if left_component > right_component:
-    result[index][0] = left_component; result[index][1] = right_component
+    result[index][0] = left_component
+    result[index][1] = right_component
 else:
-    result[index][1] = left_component; result[index][0] = right_component
+    result[index][1] = left_component
+    result[index][0] = right_component
 result[index][2] = delta
 result[index][3] = linkage_merge.size[left_component] + linkage_merge.size[right_component]
 linkage_merge_join(linkage_merge, left_component, right_component)
@@ -970,8 +986,10 @@ for node in node_list:
     lambda_value = hdbscan_lambda_value(d)
     left_count = hierarchy[left - num_points, 3] if left >= num_points else sample_weights[left]
     ...
-    if left < num_points and right_count >= min_cluster_size: ...
-    elif left_count < min_cluster_size and right_count >= min_cluster_size: ...
+    if left < num_points and right_count >= min_cluster_size:
+        ...
+    elif left_count < min_cluster_size and right_count >= min_cluster_size:
+        ...
 ```
 
 `eliminate_branch` emits the branch's points in BFS order (`bfs_from_hierarchy`). The output
@@ -1183,7 +1201,8 @@ guard is kept anyway.
 cluster_label_map = {c: n for n, c in enumerate(np.sort(clusters))}
 disjoint_set = ds_rank_create(max(tree.parent.max() + 1, tree.child.max() + 1))
 for n in range(tree.parent.shape[0]):
-    child = tree.child[n]; parent = tree.parent[n]
+    child = tree.child[n]
+    parent = tree.parent[n]
     if child not in clusters:
         if child < n_samples and tree.lambda_val[n] == 0.0:
             continue
@@ -1338,7 +1357,7 @@ impl HDBSCAN {
         if split.finite_index.len() < 2 { return Ok(degenerate(&split, d)); }
         let ms = cfg.resolved_min_samples();
         let cd = core_distances(&finite, ms)?;                          // S3
-        let tree = use_kdtree(d).then(|| build_kdtree(&host_f, m, d)); // S4 (phase 4)
+        let tree = (search == KdTree).then(|| build_kdtree(&host_f, m, d)); // S4, route rule below
         let mut dsu = RankDsu::new(m);
         let mut edges = init_from_knn(&cd, ms, &mut dsu);               // S5
         let mut comps = count_components(&mut dsu);
@@ -1364,10 +1383,20 @@ impl HDBSCAN {
 }
 ```
 
-The KD path (`use_kdtree`) is enabled once phase 4 lands, for `d ≤ KD_MAX_DIM`. The cutoff is
-picked by benchmark. Upstream uses 30 as the switch to its approximate path, so 30 is the
-starting value. Above the cutoff, brute force is used. The result is the same exact MST either
-way, so the switch is a pure performance choice and never changes output on non-tie data.
+The KD route is implemented. `HdbscanSearch::Auto` (`fast-hdbscan/src/estimator.rs`,
+`HdbscanSearch::resolve`) selects it only on the complete-graph route (`MstGraph::Complete`) for
+resolved CPU or CUDA backends: 256..=2048 finite rows with at most 30 features and
+`min_samples <= 32`, or 2049..=4096 finite rows with at most 10 features and `min_samples <= 32`.
+Every other shape, including more than 4096 finite rows, uses brute force. The 2049..=4096 band is an
+interpolation policy, not a separately measured region. `HdbscanSearch::KdTree` and
+`HdbscanSearch::BruteForce` are explicit overrides. Upstream's 30-feature switch is historical context
+only; the thresholds above come from the port's own campaign. On non-tie data the result is the same
+exact MST either way, so the switch is a performance choice.
+
+Graph route. `MstGraph::KnnGraph` (the `Auto` default above 30 features) does not use S4 to S6. It
+takes exact common squared neighbors, or shared ANN when `KnnSource::Auto` selects it (finite rows
+above 4096 and effective width at most 60), then runs host `knn_kruskal`. See
+`hdbscan_phase6_plan.md`. The Complete route keeps the KD and brute-force rule above.
 
 ## Per-stage test matrix
 
