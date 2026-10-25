@@ -269,8 +269,8 @@ def _generate_input(path: Path, rows: int) -> None:
 
 
 def benchmark(binary: Path, rows: int, run_dir: Path, timeout: float) -> dict[str, Any]:
-    if rows not in (20_000, 100_000):
-        raise ValueError("rows must be 20000 or 100000")
+    if rows not in (20_000, 50_000, 100_000):
+        raise ValueError("rows must be 20000, 50000, or 100000")
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"profiling binary is not an executable file: {binary}")
     run_dir = run_dir.resolve()
@@ -429,7 +429,7 @@ def benchmark(binary: Path, rows: int, run_dir: Path, timeout: float) -> dict[st
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--rows", required=True, type=int, choices=(20_000, 100_000))
+    parser.add_argument("--rows", required=True, type=int, choices=(20_000, 50_000, 100_000))
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
     args = parser.parse_args()

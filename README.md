@@ -236,6 +236,7 @@ Systems (`nsys`), Nsight Compute (`ncu`), and GPU counter permissions.
 ```sh
 bash analyze_hdbscan_stages.sh --help
 bash analyze_hdbscan_stages.sh                     # 20,000 rows
+bash analyze_hdbscan_stages.sh --rows 50000
 bash analyze_hdbscan_stages.sh --rows 100000
 bash analyze_hdbscan_stages.sh --rows 20000 --output-dir artifacts/hdbscan_stages/my-run
 uv run --no-sync python analyze/summarize_hdbscan_stages.py \
@@ -255,7 +256,7 @@ clustering quality.
 
 Compilation is outside execution timeouts; runtime initialization and JIT are
 inside. At 20k, each native/profiler child has a 10-second deadline, not a
-10-second total-pipeline promise. At 100k, native children have 240 seconds and
+10-second total-pipeline promise. At 50k and 100k, native children have 240 seconds and
 each profiler capture 90 seconds. SQLite export has a separate 60-second limit.
 There are no automatic retries, timeout inflation, backend fallbacks, or skips.
 Failures retain diagnostics and return nonzero without a successful summary.

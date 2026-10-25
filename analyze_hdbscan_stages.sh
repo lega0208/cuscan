@@ -3,7 +3,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 usage() {
-    printf '%s\n' 'Usage: bash analyze_hdbscan_stages.sh [--rows 20000|100000] [--output-dir NEW_DIRECTORY]' \
+    printf '%s\n' 'Usage: bash analyze_hdbscan_stages.sh [--rows 20000|50000|100000] [--output-dir NEW_DIRECTORY]' \
         'Requires cargo, uv, nsys, ncu and working CPU/CUDA runtimes and counter permissions.' \
         'Default: 20000 rows; fresh directory under artifacts/hdbscan_stages.'
 }
@@ -20,7 +20,7 @@ while (($#)); do
         *) fail "Unknown argument: $1" ;;
     esac
 done
-case "$rows" in 20000) native_timeout=10; profile_timeout=10 ;; 100000) native_timeout=240; profile_timeout=90 ;; *) fail '--rows must be 20000 or 100000' ;; esac
+case "$rows" in 20000) native_timeout=10; profile_timeout=10 ;; 50000|100000) native_timeout=240; profile_timeout=90 ;; *) fail '--rows must be 20000, 50000 or 100000' ;; esac
 for tool in cargo uv nsys ncu; do command -v "$tool" >/dev/null || fail "Required tool not found: $tool"; done
 if [[ -n "$output" ]]; then
     [[ ! -e "$output" && ! -L "$output" ]] || fail "Output directory already exists: $output"

@@ -150,8 +150,8 @@ def _validate_identity(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, A
             )
         rows = workload.get("rows")
         _require(
-            isinstance(rows, int) and not isinstance(rows, bool) and rows in (20000, 100000),
-            f"{label}.workload.rows must be 20000 or 100000",
+            isinstance(rows, int) and not isinstance(rows, bool) and rows in (20000, 50000, 100000),
+            f"{label}.workload.rows must be 20000, 50000, or 100000",
         )
     assert baseline is not None
     return reports[0][1]

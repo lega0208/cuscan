@@ -145,7 +145,7 @@ def parse_ncu_csv(text: str, kernel_family: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--rows", required=True, type=int, choices=(20000, 100000))
+    parser.add_argument("--rows", required=True, type=int, choices=(20000, 50000, 100000))
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
     args = parser.parse_args()

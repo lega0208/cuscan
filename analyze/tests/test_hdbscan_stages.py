@@ -99,15 +99,15 @@ def invoke_shell(
 def test_shell_help_is_successful_without_dependencies(tmp_path: Path) -> None:
     result = invoke_shell("--help", cwd=tmp_path, path=str(shell_only_path(tmp_path)))
     assert result.returncode == 0
-    assert "--rows 20000|100000" in result.stdout
+    assert "--rows 20000|50000|100000" in result.stdout
     assert "--output-dir NEW_DIRECTORY" in result.stdout
 
 
 @pytest.mark.parametrize(
     "rows, native_timeout, profile_timeout",
-    [("20000", "10", "10"), ("100000", "240", "90")],
+    [("20000", "10", "10"), ("50000", "240", "90"), ("100000", "240", "90")],
 )
-def test_shell_cli_accepts_both_rows_and_resolves_paths_from_foreign_cwd(
+def test_shell_cli_accepts_supported_rows_and_resolves_paths_from_foreign_cwd(
     tmp_path: Path, rows: str, native_timeout: str, profile_timeout: str
 ) -> None:
     bin_dir, log = fake_tools(tmp_path)
@@ -146,7 +146,7 @@ def test_shell_rejects_unknown_rows_and_flags_before_preflight(tmp_path: Path) -
     shell_path = str(shell_only_path(tmp_path))
     result = invoke_shell("--rows", "30000", cwd=tmp_path, path=shell_path)
     assert result.returncode != 0
-    assert "--rows must be 20000 or 100000" in result.stderr
+    assert "--rows must be 20000, 50000 or 100000" in result.stderr
     unknown = invoke_shell("--nonsense", cwd=tmp_path, path=shell_path)
     assert unknown.returncode != 0
     assert "Unknown argument" in unknown.stderr
@@ -414,6 +414,16 @@ def synthetic_reports(
         },
     }
     return benchmark, kernels, counters
+
+
+@pytest.mark.parametrize("rows", [20_000, 50_000, 100_000])
+def test_summary_accepts_supported_row_counts(rows: int) -> None:
+    reports = synthetic_reports()
+    for report in reports:
+        report["workload"]["rows"] = rows
+    reports[0]["correctness"]["rows_compared"] = rows
+    result = summarize_reports(*reports)
+    assert result.startswith(f"HDBSCAN stage analysis — {rows:,} rows")
 
 
 def test_summary_selects_counter_families_from_kd_route() -> None:
@@ -931,6 +941,7 @@ def run_fake_benchmark(
     *,
     mismatch: bool = False,
     failure_backend: str | None = None,
+    rows: int = 20_000,
 ) -> dict[str, Any]:
     binary = run_dir / "profile-binary"
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -960,7 +971,7 @@ def run_fake_benchmark(
         stdout.write(json.dumps(synthetic_native_profile("Cpu" if backend == "cpu" else "Cuda(0)")))
         labels_path = Path(args[args.index("--labels-output") + 1])
         trace_path = Path(args[args.index("--trace-output") + 1])
-        labels = [0] * 20_000
+        labels = [0] * rows
         if mismatch and backend == "cuda":
             labels[9] = 1
         labels_path.write_text(json.dumps(labels), encoding="utf-8")
@@ -974,19 +985,20 @@ def run_fake_benchmark(
         }
 
     monkeypatch.setattr(benchmark_tools, "run_command", fake_run_command)
-    report = benchmark_tools.benchmark(binary, 20_000, run_dir, 10)
+    report = benchmark_tools.benchmark(binary, rows, run_dir, 10)
     assert [args[args.index("--backend") + 1] for args in calls] == ["cpu", "cuda"]
     return report
 
 
+@pytest.mark.parametrize("rows", [20_000, 50_000, 100_000])
 def test_benchmark_runs_cpu_then_cuda_and_persists_valid_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows: int
 ) -> None:
     run_dir = tmp_path / "benchmark success"
-    report = run_fake_benchmark(monkeypatch, run_dir)
+    report = run_fake_benchmark(monkeypatch, run_dir, rows=rows)
     persisted = json.loads((run_dir / "benchmark.json").read_text(encoding="utf-8"))
     assert persisted == report
-    assert report["correctness"] == {"labels_equal": True, "rows_compared": 20_000}
+    assert report["correctness"] == {"labels_equal": True, "rows_compared": rows}
     assert report["profiles"]["cpu"]["fit_seconds"] == [2.0, 2.1, 1.9]
     assert report["profiles"]["cuda"]["backend"] == "Cuda(0)"
 
