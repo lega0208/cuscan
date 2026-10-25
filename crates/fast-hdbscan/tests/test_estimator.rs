@@ -1906,7 +1906,7 @@ fn shared_and_reproducible_complete_kd_mst_bitwise_on_cuda() {
 }
 
 fn reproducible_kd_region_cases(backend: BackendChoice) {
-    // n=300, d=3, s=5 lies inside the Auto KD region (256..=2048 rows, d<=30, s<=32), so the
+    // n=300, d=3, s=5 lies inside the Auto KD region (>=256 rows, d<=30), so the
     // default search resolves to KdTree and the fit runs real Boruvka rounds.
     let input = seeded_tie_rows(7, 300, 3);
     let config = HdbscanConfig {
@@ -1934,6 +1934,64 @@ fn reproducible_kd_region_cases(backend: BackendChoice) {
     assert!(reproducible.config().reproducible);
     assert_eq!(reproducible.minimum_spanning_tree().len(), input.len() - 1);
     assert_fits_bitwise_equal(&shared, &reproducible, "KD region reproducible flag");
+}
+
+fn default_auto_routes_large_low_dimensional_inputs_to_kd(backend: BackendChoice) {
+    // Past the former 4096-row cap and with min_samples > 32: upstream still uses KD Boruvka.
+    // Continuous, tie-free values so neighbors and core distances are uniquely determined.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let input = (0..5000)
+        .map(|_| {
+            (0..3)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 40) as f32 / (1u64 << 24) as f32 * 100.0
+                })
+                .collect::<Vec<f32>>()
+        })
+        .collect::<Vec<_>>();
+    let config = HdbscanConfig {
+        min_cluster_size: 10,
+        min_samples: Some(40),
+        ..Default::default()
+    };
+    let fitted = HDBSCAN::new(config.clone(), backend).fit(&input).unwrap();
+    assert_eq!(fitted.search(), HdbscanSearch::KdTree);
+    let brute = HDBSCAN::new(config, backend)
+        .with_search(HdbscanSearch::BruteForce)
+        .fit(&input)
+        .unwrap();
+    assert_eq!(fitted.neighbors(), brute.neighbors());
+    for (kd, bf) in fitted.core_distances().iter().zip(brute.core_distances()) {
+        assert!((kd - bf).abs() <= 1e-4 * bf.max(1.0), "core {kd} vs {bf}");
+    }
+    let (kd_mst, bf_mst) = (
+        fitted.minimum_spanning_tree(),
+        brute.minimum_spanning_tree(),
+    );
+    assert_eq!(kd_mst.len(), input.len() - 1);
+    assert_eq!(kd_mst.len(), bf_mst.len());
+    let kd_total: f64 = kd_mst.iter().map(|edge| edge.weight).sum();
+    let bf_total: f64 = bf_mst.iter().map(|edge| edge.weight).sum();
+    assert!(
+        (kd_total - bf_total).abs() <= 1e-6 * bf_total,
+        "{kd_total} vs {bf_total}"
+    );
+    assert_eq!(fitted.labels(), brute.labels());
+}
+
+#[test]
+fn default_auto_routes_large_low_dimensional_inputs_to_kd_on_cpu() {
+    default_auto_routes_large_low_dimensional_inputs_to_kd(BackendChoice::Cpu);
+}
+
+#[test]
+fn default_auto_routes_large_low_dimensional_inputs_to_kd_on_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        default_auto_routes_large_low_dimensional_inputs_to_kd(backend);
+    }
 }
 
 #[test]

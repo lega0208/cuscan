@@ -135,6 +135,10 @@ def aggregate_kernels(db_path: str | Path, start_ns: int, end_ns: int) -> dict[s
         known_families = (
             "partial_kernel",
             "tile_candidates",
+            "kd_neighbors_kernel",
+            "kd_candidates_kernel",
+            "reset_component_bounds",
+            "stage_pass",
             "tile_pass",
             "reduce_tiles",
             "finish_pass",

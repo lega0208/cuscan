@@ -7,12 +7,20 @@ import argparse
 import csv
 import hashlib
 import io
+import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from hdbscan_stages_common import atomic_json, identity, run_command
+from hdbscan_stages_common import (
+    atomic_json,
+    identity,
+    route_kernel_families,
+    run_command,
+    uniform_route,
+)
 
 METRICS = (
     "gpu__time_duration.sum",
@@ -155,6 +163,15 @@ def main() -> int:
         or hashlib.sha256(input_path.read_bytes()).hexdigest() != ident["input_sha256"]
     ):
         raise ValueError("raw input is missing or does not match the run manifest SHA-256")
+    benchmark_path = args.run_dir / "benchmark.json"
+    if not benchmark_path.is_file():
+        raise ValueError(f"benchmark report {benchmark_path} is required to select kernels")
+    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    try:
+        cuda_routes = benchmark["profiles"]["cuda"]["resolved_search_per_fit"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("benchmark report lacks the CUDA resolved search route") from error
+    route = uniform_route(cuda_routes, "benchmark CUDA resolved_search_per_fit")
     reports: dict[str, Any] = {}
     captures: dict[str, Any] = {}
     version_stdout, version_stderr = raw / "ncu_version.stdout", raw / "ncu_version.stderr"
@@ -172,7 +189,7 @@ def main() -> int:
         "stdout": version_stdout.read_text(encoding="utf-8").strip(),
         "stderr": version_stderr.read_text(encoding="utf-8").strip(),
     }
-    for family in ("partial_kernel", "tile_candidates"):
+    for family in route_kernel_families(route):
         log = raw / f"ncu_{family}.csv"
         stdout = raw / f"ncu_{family}.stdout"
         stderr = raw / f"ncu_{family}.stderr"
@@ -213,6 +230,11 @@ def main() -> int:
             provenance = run_command(command, timeout=args.timeout, stdout=out, stderr=err)
         if provenance["timed_out"] or provenance["exit_status"] != 0:
             raise RuntimeError(f"Nsight Compute capture failed for {family}; diagnostics: {stderr}")
+        captured = re.search(
+            r'"resolved_search_per_fit"\s*:\s*(\[[^\]]*\])', stdout.read_text(encoding="utf-8")
+        )
+        if captured is None or json.loads(captured.group(1)) != [route]:
+            raise ValueError(f"{family} capture did not resolve the benchmark route {route}")
         record = parse_ncu_csv(log.read_text(encoding="utf-8", errors="replace"), family)
         record["command"] = provenance["argv"]
         record["sampling_scope"] = (
@@ -227,6 +249,7 @@ def main() -> int:
         report_path,
         {
             **ident,
+            "route": route,
             "kernels": reports,
             "captures": captures,
             "profiler_tools": {"ncu": ncu_version},

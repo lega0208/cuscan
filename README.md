@@ -269,7 +269,9 @@ artifacts; inspectable JSON/CSV/host traces remain available.
 Nsight Systems attributes only the measured fit using epoch markers and its own
 native stage timings. Summed device activity is not elapsed wall time, especially
 with overlapping kernels. Nsight Compute samples the first matching warmup
-launch separately for `partial_kernel` and `tile_candidates`, not whole-fit
+launch of the resolved CUDA route's neighbor and candidate kernels separately
+(`partial_kernel`/`tile_candidates` for brute force,
+`kd_neighbors_kernel`/`kd_candidates_kernel` for KD-tree), not whole-fit
 averages. Synchronization, instrumentation, replay, and cache behavior perturb
 measurements. Counter diagnoses are conditional hypotheses; they cannot establish
 CPU instruction bottlenecks or universal speedups. Independently computed medians
@@ -579,12 +581,11 @@ let labels = fitted.labels();
 
 | `BruteForce` and `KdTree` select exact Euclidean search at every dimension;
 neither is an approximate mode or a fallback after execution errors. On CPU and
-CUDA, `Auto` selects KD search for 256–2048 finite rows with at most 30 features,
-or 2049–4096 rows with at most 10 features, when resolved `min_samples <= 32`;
-otherwise it selects brute force. The low-dimensional/intermediate-size region
-is a conservative policy: the 2049–4096-row, at-most-10-feature extension is
-low-dimensional/`min_samples` interpolation, not a separately measured guarantee
-for every size or data distribution.
+CUDA, `Auto` selects KD search for at least 256 finite rows with at most 30 features,
+with no upper row or `min_samples` limit, matching upstream fast_hdbscan's KD-tree
+Borůvka route. Intentional deviations: fewer than 256 rows use brute force (small
+inputs showed no consistent KD win), and a forced `MstGraph::Complete` above 30
+features uses brute force where upstream would switch to approximate neighbors.
 Backend selection is independent: `BackendChoice::Auto` prefers usable CUDA,
 while explicit CPU/CUDA choices are strict. Input features are not rescaled.
 Nonfinite rows become noise in labels/probabilities and are remapped into the

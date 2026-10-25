@@ -203,7 +203,7 @@ pub fn run(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
 }
 
 // Full-fit reproducibility comparison on the complete-graph KD route. Every case lies inside the
-// Auto KD region (256..=2048 rows, <=30 features, min_samples <=32), so both toggles measure the
+// Auto KD region (>=256 rows, <=30 features), so both toggles measure the
 // same route that Auto would select for these shapes.
 fn run_kd_bound(c: &mut Criterion, backend: BackendChoice, backend_name: &str) {
     let mut group = c.benchmark_group(format!("kd_bound/{backend_name}"));

@@ -36,6 +36,29 @@ def identity(run_dir: str | os.PathLike[str]) -> dict[str, Any]:
     return {key: data[key] for key in required}
 
 
+# Representative counter kernels (neighbor search, Boruvka candidates) per resolved search route.
+ROUTE_KERNEL_FAMILIES: dict[str, tuple[str, str]] = {
+    "BruteForce": ("partial_kernel", "tile_candidates"),
+    "KdTree": ("kd_neighbors_kernel", "kd_candidates_kernel"),
+}
+
+
+def route_kernel_families(route: Any) -> tuple[str, str]:
+    """Return counter kernel families for a resolved route, rejecting unknown routes."""
+    if not isinstance(route, str) or route not in ROUTE_KERNEL_FAMILIES:
+        raise ValueError(f"unsupported resolved search route {route!r}")
+    return ROUTE_KERNEL_FAMILIES[route]
+
+
+def uniform_route(routes: Any, context: str) -> str:
+    """Return the single resolved route shared by every fit in ``routes``."""
+    if not isinstance(routes, list) or not routes or len(set(map(str, routes))) != 1:
+        raise ValueError(f"{context} must contain one consistent resolved search route")
+    route = routes[0]
+    route_kernel_families(route)
+    return route
+
+
 def atomic_json(path: str | os.PathLike[str], data: Any) -> None:
     """Atomically persist JSON, leaving an existing report intact on failure."""
     target = Path(path)

@@ -27,6 +27,9 @@ use crate::backend::{DeviceKdTree, HdbscanOps};
 
 pub(crate) const NEIGHBOR_BATCH_ROWS: usize = 256;
 const KNN_GRAPH_EXACT_MAX_ROWS: usize = 4096;
+/// Upstream's dimensionality boundary between exact KD-tree Borůvka and approximate neighbors.
+const KD_AUTO_MAX_FEATURES: usize = 30;
+const KD_AUTO_MIN_ROWS: usize = 256;
 
 /// Comparator policy for kNN graph construction.
 #[doc(hidden)]
@@ -60,7 +63,7 @@ pub struct KnnDiagnostics {
 
 pub(crate) fn resolve_graph(requested: MstGraph, features: usize) -> MstGraph {
     match requested {
-        MstGraph::Auto if features > 30 => MstGraph::KnnGraph,
+        MstGraph::Auto if features > KD_AUTO_MAX_FEATURES => MstGraph::KnnGraph,
         MstGraph::Auto => MstGraph::Complete,
         graph => graph,
     }
@@ -105,12 +108,11 @@ fn profile_sync(device: &Device) -> Result<()> {
 /// Search algorithm used by the estimator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HdbscanSearch {
-    /// Select KD-tree at 256..=2048 finite rows, up to 30 features, and min_samples <=32;
-    /// at 2049..=4096 rows, use the stricter 10-feature limit.
-    /// This conservative region follows the 38-case fixture/synthetic Criterion campaign
-    /// (100 samples, 95% confidence, three independent runs per CPU/CUDA case; evidence
-    /// recorded in artifact151). The 2049..=4096 range is a low-dimensional/min_samples
-    /// interpolation policy, not a separately measured region or speed guarantee.
+    /// Select KD-tree for at least 256 finite rows and at most 30 features, with no upper row
+    /// or `min_samples` cap, matching upstream fast_hdbscan's KD-tree Borůvka route for
+    /// Euclidean data up to 30 features. Intentional deviations: below 256 rows brute force is
+    /// used because small inputs did not show a consistent KD win, and a forced complete graph
+    /// above 30 features (upstream switches to approximate neighbors instead) uses brute force.
     #[default]
     Auto,
     /// Exact common squared-distance neighbors and brute-force Borůvka candidates.
@@ -120,33 +122,12 @@ pub enum HdbscanSearch {
 }
 
 impl HdbscanSearch {
-    fn resolve(
-        self,
-        finite_rows: usize,
-        n_features: usize,
-        min_samples: usize,
-        backend: BackendChoice,
-    ) -> Self {
+    fn resolve(self, finite_rows: usize, n_features: usize) -> Self {
         match self {
-            Self::Auto => match backend {
-                BackendChoice::Cpu | BackendChoice::Cuda { .. }
-                    if (256..=2048).contains(&finite_rows)
-                        && n_features <= 30
-                        && min_samples <= 32 =>
-                {
-                    Self::KdTree
-                }
-                BackendChoice::Cpu | BackendChoice::Cuda { .. }
-                    if (2049..=4096).contains(&finite_rows)
-                        && n_features <= 10
-                        && min_samples <= 32 =>
-                {
-                    Self::KdTree
-                }
-                BackendChoice::Cpu | BackendChoice::Cuda { .. } | BackendChoice::Auto => {
-                    Self::BruteForce
-                }
-            },
+            Self::Auto if finite_rows >= KD_AUTO_MIN_ROWS && n_features <= KD_AUTO_MAX_FEATURES => {
+                Self::KdTree
+            }
+            Self::Auto => Self::BruteForce,
             route => route,
         }
     }
@@ -947,8 +928,7 @@ impl HDBSCAN {
         let resolved_graph = plan.graph;
         let neighbor_width = plan.width;
         let resolved_search = if resolved_graph == MstGraph::Complete {
-            self.search
-                .resolve(n, features, min_samples, actual_backend)
+            self.search.resolve(n, features)
         } else {
             HdbscanSearch::BruteForce
         };
@@ -1371,68 +1351,52 @@ mod search_tests {
     use super::*;
 
     #[test]
-    fn auto_search_uses_the_bounded_dispatch_region() {
-        for backend in [BackendChoice::Cpu, BackendChoice::Cuda { device_index: 0 }] {
+    fn auto_search_uses_kd_tree_from_256_rows_up_to_30_features_without_row_cap() {
+        for (rows, features) in [
+            (256, 1),
+            (256, 30),
+            (2049, 11),
+            (4097, 2),
+            (20_000, 2),
+            (20_000, 30),
+            (1_000_000, 10),
+            (usize::MAX, 30),
+        ] {
             assert_eq!(
-                HdbscanSearch::Auto.resolve(255, 2, 5, backend),
-                HdbscanSearch::BruteForce
+                HdbscanSearch::Auto.resolve(rows, features),
+                HdbscanSearch::KdTree,
+                "rows={rows} features={features}"
             );
+        }
+        // Intentional deviations: tiny inputs and forced complete graphs above 30 features.
+        for (rows, features) in [(1, 2), (255, 2), (255, 30), (256, 31), (20_000, 31)] {
             assert_eq!(
-                HdbscanSearch::Auto.resolve(256, 2, 5, backend),
-                HdbscanSearch::KdTree
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(2048, 30, 32, backend),
-                HdbscanSearch::KdTree
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(2048, 31, 5, backend),
-                HdbscanSearch::BruteForce
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(2049, 10, 32, backend),
-                HdbscanSearch::KdTree
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(2049, 11, 5, backend),
-                HdbscanSearch::BruteForce
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(2049, 30, 5, backend),
-                HdbscanSearch::BruteForce
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(4096, 10, 32, backend),
-                HdbscanSearch::KdTree
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(4097, 2, 5, backend),
-                HdbscanSearch::BruteForce
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(4096, 11, 5, backend),
-                HdbscanSearch::BruteForce
-            );
-            assert_eq!(
-                HdbscanSearch::Auto.resolve(4096, 2, 33, backend),
-                HdbscanSearch::BruteForce
+                HdbscanSearch::Auto.resolve(rows, features),
+                HdbscanSearch::BruteForce,
+                "rows={rows} features={features}"
             );
         }
     }
 
     #[test]
+    fn auto_graph_matches_upstream_30_feature_boundary() {
+        assert_eq!(resolve_graph(MstGraph::Auto, 30), MstGraph::Complete);
+        assert_eq!(resolve_graph(MstGraph::Auto, 31), MstGraph::KnnGraph);
+        assert_eq!(resolve_graph(MstGraph::Complete, 31), MstGraph::Complete);
+        assert_eq!(resolve_graph(MstGraph::KnnGraph, 2), MstGraph::KnnGraph);
+    }
+
+    #[test]
     fn forced_search_routes_are_independent_of_auto_cutoff() {
-        for backend in [BackendChoice::Cpu, BackendChoice::Cuda { device_index: 0 }] {
-            for (rows, features, min_samples) in [(1, 50, 100), (255, 31, 33), (4096, 2, 5)] {
-                assert_eq!(
-                    HdbscanSearch::BruteForce.resolve(rows, features, min_samples, backend),
-                    HdbscanSearch::BruteForce,
-                );
-                assert_eq!(
-                    HdbscanSearch::KdTree.resolve(rows, features, min_samples, backend),
-                    HdbscanSearch::KdTree,
-                );
-            }
+        for (rows, features) in [(1, 50), (255, 31), (4096, 2), (20_000, 2)] {
+            assert_eq!(
+                HdbscanSearch::BruteForce.resolve(rows, features),
+                HdbscanSearch::BruteForce,
+            );
+            assert_eq!(
+                HdbscanSearch::KdTree.resolve(rows, features),
+                HdbscanSearch::KdTree,
+            );
         }
     }
 

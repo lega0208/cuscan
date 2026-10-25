@@ -200,7 +200,10 @@ def manifest() -> dict[str, object]:
     }
 
 
-def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], ...]:
+def synthetic_reports(
+    candidate_seconds: float = 0.95, route: str = "BruteForce"
+) -> tuple[dict[str, Any], ...]:
+    families = common_tools.route_kernel_families(route)
     identity_fields = {
         "schema_version": 1,
         "run_id": "synthetic-run",
@@ -290,7 +293,7 @@ def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], 
             "noise_counts": [2, 2, 2],
             "backend": "Cpu" if backend == "cpu" else "Cuda { device_index: 0 }",
             "search": "Auto",
-            "resolved_search_per_fit": ["brute_force"] * 3,
+            "resolved_search_per_fit": [route] * 3,
         }
     benchmark = {
         **identity_fields,
@@ -359,6 +362,7 @@ def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], 
     all_metrics = summary_tools.ALL_METRICS
     counters = {
         **identity_fields,
+        "route": route,
         "captures": {
             family: {
                 "argv": ["ncu", "--kernel-name", f"regex:{family}"],
@@ -367,7 +371,7 @@ def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], 
                 "timed_out": False,
                 "elapsed_seconds": 2.0,
             }
-            for family in ("partial_kernel", "tile_candidates")
+            for family in families
         },
         "kernels": {
             family: {
@@ -406,10 +410,41 @@ def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], 
                     for metric in all_metrics
                 },
             }
-            for family in ("partial_kernel", "tile_candidates")
+            for family in families
         },
     }
     return benchmark, kernels, counters
+
+
+def test_summary_selects_counter_families_from_kd_route() -> None:
+    benchmark, kernels, counters = synthetic_reports(route="KdTree")
+    assert set(counters["kernels"]) == {"kd_neighbors_kernel", "kd_candidates_kernel"}
+    for family in counters["kernels"]:
+        counters["kernels"][family]["metrics"][COUNTER_METRICS["occupancy"]]["normalized_value"] = 1
+        counters["kernels"][family]["metrics"][COUNTER_METRICS["occupancy"]]["value"] = 1
+    result = summarize_reports(benchmark, kernels, counters)
+    assert "CUDA route: KdTree, KdTree, KdTree" in result
+
+
+def test_summary_rejects_counter_route_mismatch_and_mixed_routes() -> None:
+    benchmark, kernels, counters = synthetic_reports(route="KdTree")
+    counters["route"] = "BruteForce"
+    with pytest.raises(ValueError, match=r"cuda_counters\.route must match"):
+        summarize_reports(benchmark, kernels, counters)
+    benchmark, kernels, counters = synthetic_reports()
+    benchmark["profiles"]["cuda"]["resolved_search_per_fit"] = ["BruteForce", "KdTree", "KdTree"]
+    with pytest.raises(ValueError, match="one consistent resolved search route"):
+        summarize_reports(benchmark, kernels, counters)
+
+
+def test_route_kernel_families_cover_both_routes_and_reject_unknown() -> None:
+    assert common_tools.route_kernel_families("BruteForce") == ("partial_kernel", "tile_candidates")
+    assert common_tools.route_kernel_families("KdTree") == (
+        "kd_neighbors_kernel",
+        "kd_candidates_kernel",
+    )
+    with pytest.raises(ValueError, match="unsupported resolved search route"):
+        common_tools.route_kernel_families("Auto")
 
 
 def test_summary_accepts_three_synthetic_reports_and_preserves_caveats() -> None:
@@ -798,7 +833,7 @@ def synthetic_native_profile(backend: str = "Cpu") -> dict[str, Any]:
         "noise_counts": [2, 2, 2],
         "backend": backend,
         "search": "Auto",
-        "resolved_search_per_fit": ["brute_force"] * 3,
+        "resolved_search_per_fit": ["BruteForce"] * 3,
     }
 
 
