@@ -343,3 +343,159 @@ directory (leader summary output 62). These small A/B observations include
 slowdowns; no threshold or throughput promise gates correctness. Follow-ups are
 measurement only: characterize early-round metadata overhead and giant late
 segments before considering vectorization, another hierarchy or adaptive routing.
+
+## Component-winner vectorization: approved execution
+
+The revision-2 component reducer plan was approved for execution. The user then
+explicitly narrowed performance work to the smallest relevant, bounded sample;
+correctness and generated-code proof obligations remain unchanged. Production
+implementation and runtime verification are complete; boundary review receipts
+are recorded separately in the durable execution ledger.
+
+### Immutable scalar baseline and bounded measurement policy
+
+- Baseline commit: `0f15ae765a0ad60ebe0b461601b2c80ce6a2cbcc`. Production scalar
+  kernels were unchanged when the report harness was added. The full baseline
+  source SHA256 is `5f0f84df03b5bb58dbfad2f6515d3f536170be1745d21e2f141a9653c52e1ddf`.
+  Source, environment provenance and copied Criterion baselines are preserved in
+  `.gjc/_session-01a17018-7636-7278-8dfa-a64c0b6a6745/ultragoal/scalar-baseline/`;
+  these are evidence, not retained production fallback kernels.
+- `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release
+  component_reduce_report -- --ignored --nocapture` passed on CPU and RTX 3080.
+  Exactly three cases, two backends, one warm-up and five measured calls give
+  **36 reducer invocations**, without adaptive repetition. Cases are ragged1..7
+  at n=28, uniform16 at n=16384, and giant+tiny at n=65536. Input/output digests
+  match across CPU/CUDA. The harness includes output synchronization/readback;
+  timings are end-to-end reducer calls, not isolated vector arithmetic.
+- Scalar samples in microseconds (five per cell; report-only, visibly noisy):
+
+| Case | CPU | CUDA |
+|---|---|---|
+| ragged1..7 | 282.092, 284.417, 161.545, 171.414, 136.477 | 250.207, 227.487, 659.512, 390.701, 302.741 |
+| uniform16 | 645.428, 414.061, 540.598, 313.825, 508.038 | 238.240, 384.345, 349.880, 591.726, 273.539 |
+| giant+tiny | 656.624, 466.118, 572.136, 390.421, 565.121 | 329.374, 290.475, 292.504, 331.622, 255.492 |
+
+- The initial broad Criterion run was cancelled: `FAST_HDBSCAN_BENCH_CASES`
+  does not filter `run_kd_bound`. A first attempted regex matched no cases and
+  supplies no timing evidence. The corrected bounded command uses
+  `FAST_HDBSCAN_BENCH_CASES=n64_d2_ms5 cargo bench -p fast-hdbscan --bench
+  hdbscan_cpu -- '(^hdbscan/cpu/synthetic/n64_d2_ms5/fit/|^kd_bound/cpu/1024x10_s16/)'
+  --sample-size 10 --warm-up-time 0.01 --measurement-time 0.01 --nresamples 1000
+  --save-baseline component_scalar_bounded_v2`. CUDA uses `hdbscan_cuda`, `cuda`
+  in the regex, and `FAST_UMAP_REQUIRE_CUDA=1`. Both executed four timings only;
+  no tree-build timing or other KD matrix cells ran. Criterion can extend the
+  requested measurement time to collect ten samples; these observations have
+  low statistical precision and are not speed gates.
+
+### Mechanism gate
+
+- Test-only u32x4 compare/select/masked-tail probes passed on actual CPU/CUDA;
+  the CUDA plane-tuple probe also passed and checks reported versus builtin
+  plane width. Only the available RTX 3080 geometry is runtime-tested.
+- Pinned CubeCL 0.11.1 supports `--features cubecl/pliron-dump` and
+  `CUBECL_DEBUG_PLIRON=<directory>`. Fresh `CUBECL_ENVIRONMENT` names plus
+  `CUBECL_ENVIRONMENT_RECORDS=full` were used; CUDA also used
+  `CUBECL_CUDA_DUMP_PTX`. Captures are archived under the session's
+  `ultragoal/mechanism-proof/`, not assumed from output equality.
+- CPU `llvm.opt.ll` contains `load <4 x i32>`, `llvm.umin.v4i32` and vector
+  select. CUDA PTX contains `ld.global.nc.v4.b32`; plane reduction contains
+  `shfl.sync.bfly.b32`. This satisfies the prerequisite probe gate, not yet
+  the final production-generated-code review. No host assembly claim is made.
+- Initial probe compilation rejected unsuffixed `insert` indices and the
+  unsupported CubeCL `wrapping_add` method. Using `usize` indices and bounded
+  ordinary addition fixed the probes without changing production semantics.
+- Extended independent integration oracle cases passed CPU and required CUDA
+  against the scalar baseline. First bad source wins across rows; numeric
+  precedence applies only when numeric and destination errors share that row.
+
+### Production implementation and verification
+
+`stage_pass` gathers original candidates into CSR-position order and writes four
+u32 SoA fields `(key,bits,source,bad)`. Invalid/absent rows use the complete winner
+identity; bad-row minima remain independent. Only signed zero is normalized in
+the key, never the payload. `fold_segment` shares lane-wise u32x4 lexicographic
+compare/select and bad-min between tile and finish, masking both unaligned ends
+before folding. Scalar horizontal extraction occurs only after the vector loop.
+The existing `store_winner` preserves final original-source/error decoding.
+
+CPU assigns contiguous task chunks to units; its compile-time specialization
+contains no plane operations, shared reduction storage or barriers. CUDA checks
+plane-operation support, uniform positive power-of-two width and legal full-plane
+cube/shared capacity using the selected client's properties. It passes checked
+width and plane count as specialization constants; a compile-time assertion
+preserves the width invariant, and builtin plane coordinates determine execution.
+The runtime smoke test checks builtin/report width agreement. Each
+plane writes one tuple; one cube barrier precedes unit-0 cross-plane folding.
+No scalar production fallback, routing change or explicit-CPU CUDA query was added.
+
+Eight padded scratch allocations use `16*(roundup4(n)+roundup4(p))` bytes before
+allocator alignment: 576, 262656 and 1050752 bytes for the three report cases.
+This replaces scalar partial scratch `12*p` bytes (84, 384, 1620 respectively).
+Host preflight additionally accounts for inputs, outputs and conservative copies
+of every input, checked alignment/page limits, stage batching and cube caps.
+Scratch figures exclude backend-private bookkeeping; no measured memory peak is
+claimed. Stage initializes all staged padding and disjoint partial padding;
+tile writes every live partial before finish. Empty outputs retain valid backing
+without launching kernels. Tests cover poisoned same-allocation reuse, spare
+capacity, forced one-cube batches and exact `[stage,tile,finish]` launch counts.
+
+Production-generated-code captures are archived beside the probes. CPU tile and
+finish each have 12 vector loads and 20 vector selects in optimized LLVM, with no
+barriers. CUDA tile and finish each have four `ld.global.nc.v4.b32` instructions,
+20 shuffle instructions and exactly one `bar.sync` in PTX. Staging's indirect
+scalar gathers are intentional. Both actual backend scratch-reuse capture runs
+passed. Runtime evidence covers the local CPU and RTX 3080, not other plane widths.
+
+Verification passed: backend-free core with `test-support` (63 tests), full
+`cargo test -p fast-hdbscan`, full `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p
+fast-hdbscan`, `cargo fmt --all -- --check`, and strict package all-target Clippy.
+Burn's existing future-incompatibility warnings remain visible. The ignored
+manual report was run explicitly. Final formatting and a lint-only replacement
+of `repeat().take()` with `repeat_n()` do not change report data or sampling;
+the measured optimized harness was byte-identical to the preserved baseline.
+
+### Bounded optimized observations
+
+The unchanged report command executed another 36 calls. All three input and
+output digests match the scalar baseline exactly on both backends. Optimized
+samples in microseconds are:
+
+| Case | CPU | CUDA |
+|---|---|---|
+| ragged1..7 | 392.549, 334.523, 564.079, 324.102, 314.357 | 748.452, 677.608, 733.299, 355.796, 392.571 |
+| uniform16 | 746.741, 587.575, 775.673, 577.911, 598.148 | 331.388, 271.783, 267.725, 277.450, 254.540 |
+| giant+tiny | 835.970, 1172.169, 917.591, 651.231, 573.580 | 240.674, 261.773, 238.690, 227.459, 237.508 |
+
+The bounded full-fit command used `--baseline component_scalar_bounded_v2`
+instead of `--save-baseline`, preserving historical scalar estimates. Means in
+milliseconds, with optimized/scalar ratios (not speedup promises):
+
+| Backend / fit | Scalar | Optimized | Ratio |
+|---|---:|---:|---:|
+| CPU n64 brute | 2.90661 | 4.63827 | 1.596 |
+| CPU n64 KD | 2.31129 | 2.31678 | 1.002 |
+| CPU 1024x10 s16 KD false | 4.27528 | 5.47043 | 1.280 |
+| CPU 1024x10 s16 KD true | 5.04346 | 7.18844 | 1.425 |
+| CUDA n64 brute | 3.01488 | 2.94467 | 0.977 |
+| CUDA n64 KD | 2.47636 | 2.77393 | 1.120 |
+| CUDA 1024x10 s16 KD false | 4.78929 | 4.86730 | 1.016 |
+| CUDA 1024x10 s16 KD true | 4.67818 | 5.16206 | 1.103 |
+
+These intentionally tiny, historical-before/current-after samples are noisy,
+not interleaved A/B. CPU reducer latency increased in these cells; CUDA's larger
+reducer cells decreased while tiny ragged cells increased. End-to-end fits show
+several regressions. SIMD/shuffle mechanism proof is **not** a universal speedup
+claim. Extra staging, scratch and launch overhead are plausible costs, not an
+isolated causal measurement. No performance threshold, adaptive fallback or
+further broad benchmark campaign was introduced. Follow-up measurement of
+staging versus arithmetic costs is deferred, not required for correctness.
+
+Boundary review corrections preserve ordinary CPU-only test availability: the
+new CUDA probes now skip explicitly when discovery confirms no device, fail
+when CUDA is required, and propagate discovery failures rather than masking
+them. The historical report's `rust=1.6.0` field was actually the crate version;
+the label is corrected to `crate_version` without changing inputs or timing
+loops. Additional all-absent, scattered-error, cross-plane tie and complete
+padding-identity assertions strengthen the adversarial coverage. Runtime
+reported/builtin geometry agreement is evidence from the selected CUDA smoke
+probe, not an extra production dispatch or an explicit-CPU capability query.

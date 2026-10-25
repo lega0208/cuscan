@@ -106,7 +106,57 @@ fn suite(device: &Device) {
     check(device, &[], &[], &[], 512);
     check(device, &[0], &[f32::INFINITY], &[-7], 512);
     check(device, &[0], &[-0.0], &[0], 512);
-    // Numeric errors precede index errors, even on absent/losing rows.
+    // Short and ragged segments include starts that are not tile-aligned,
+    // arbitrary root order, and singleton roots. Giant-versus-tiny shapes are
+    // covered by the larger matrix below. Keep this matrix deliberately small
+    // and deterministic.
+    for len in 1..=7 {
+        let labels = (0..len)
+            .map(|i| [4, 1, 6, 1, 4, 6, 4][i] as usize % len)
+            .map(|label| label as i32)
+            .collect::<Vec<_>>();
+        let values = (0..len)
+            .map(|i| {
+                [
+                    f32::from_bits(1),
+                    -0.0,
+                    f32::INFINITY,
+                    f32::MAX,
+                    0.0,
+                    2.0,
+                    f32::from_bits(2),
+                ][i]
+            })
+            .collect::<Vec<_>>();
+        let destinations = (0..len)
+            .map(|i| if i % 3 == 0 { -1 } else { (len - 1) as i32 })
+            .collect::<Vec<_>>();
+        for width in [1, 2, 3, 4, 5, 7, 8] {
+            check(device, &labels, &values, &destinations, width);
+        }
+    }
+    for len in [3, 4, 5, 7, 8, 9] {
+        let mut labels = vec![0; len];
+        labels[len - 1] = 1;
+        labels[0] = 2;
+        let mut values = vec![f32::MAX; len];
+        values[0] = f32::INFINITY; // valid infinity must beat absence.
+        values[len - 1] = f32::from_bits(1);
+        let mut destinations = vec![1; len];
+        destinations[0] = -9; // absent infinity, not a numeric error.
+        destinations[len - 1] = (len - 1) as i32;
+        if len > 3 {
+            values[2] = f32::NAN;
+            destinations[2] = len as i32;
+            values[3] = -1.0;
+            destinations[3] = -1;
+        }
+        for width in [3, 4, 5] {
+            check(device, &labels, &values, &destinations, width);
+        }
+    }
+    // Numeric errors precede destination errors on the same row, including
+    // absent/losing rows; across rows the earliest bad source wins.
     check(
         device,
         &[3, 1, 3, 1],
@@ -180,6 +230,64 @@ fn suite(device: &Device) {
             &indices,
             512,
         );
+    }
+    // Multirow all-absent components, each spanning several tiles at both
+    // widths. Interleaved roots group rows, so CSR positions differ from rows.
+    let n = 1100;
+    let labels = (0..n)
+        .map(|row| if row % 2 == 0 { 0 } else { (n - 1) as i32 })
+        .collect::<Vec<i32>>();
+    let weights = (0..n)
+        .map(|row| [-0.0, 0.0, f32::INFINITY, f32::MAX, f32::from_bits(1)][row % 5])
+        .collect::<Vec<f32>>();
+    let absent = vec![-1; n];
+    for width in [512, 129] {
+        check(device, &labels, &weights, &absent, width);
+    }
+    // Scattered invalid rows 1, 33, 129, and n-2 across interleaved roots.
+    // Each root's earliest bad source is chosen by original row order; root
+    // first-seen order is non-monotonic. Row n-2 is the only bad row of its
+    // root and sits in a later width-129 tile.
+    let n = 600;
+    let roots: [i32; 3] = [599, 0, 317];
+    let labels = (0..n).map(|row| roots[(row / 2) % 3]).collect::<Vec<i32>>();
+    let mut weights = (0..n)
+        .map(|row| [-0.0, 0.0, f32::INFINITY, f32::MAX, 1.0][row % 5])
+        .collect::<Vec<f32>>();
+    let mut indices = (0..n)
+        .map(|row| {
+            if row % 4 == 0 {
+                -1
+            } else {
+                ((row * 7 + 3) % n) as i32
+            }
+        })
+        .collect::<Vec<i32>>();
+    weights[1] = 0.5;
+    indices[1] = n as i32;
+    weights[33] = f32::NAN;
+    indices[33] = 4;
+    weights[129] = -2.0;
+    indices[129] = 7;
+    weights[n - 2] = 0.25;
+    indices[n - 2] = (n + 3) as i32;
+    for width in [512, 129] {
+        check(device, &labels, &weights, &indices, width);
+    }
+    // One component spanning several tiles. Other rows are 1.0. Signed zeros
+    // compare equal, so the tie resolves to the lowest source: 530 must win
+    // over the -0.0 at 690 and the +0.0 at 650 (a later width-129 tile).
+    let n = 700;
+    let labels = vec![0; n];
+    let mut weights = vec![1.0_f32; n];
+    weights[530] = -0.0;
+    weights[650] = 0.0;
+    weights[690] = -0.0;
+    let indices = (0..n)
+        .map(|row| ((row * 7 + 3) % n) as i32)
+        .collect::<Vec<i32>>();
+    for width in [512, 129] {
+        check(device, &labels, &weights, &indices, width);
     }
 }
 
