@@ -24,4 +24,6 @@ artifacts/**/reverse-*.json
 artifacts/**/harness.diff
 artifacts/**/*.stderr.txt
 
+analyze/hdbscan_hotspots
+
 .ignore

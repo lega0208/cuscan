@@ -99,10 +99,60 @@ const BORUVKA_ROUND_STAGES: [&str; 5] = [
     "boruvka_winner_readback",
     "boruvka_host_merge",
 ];
+const CORE_FINE_STAGES: [&str; 4] = [
+    "core_neighbor_kernel",
+    "core_extraction",
+    "core_neighbor_readback",
+    "core_final_assembly_readback",
+];
+
+fn core_fine_samples(
+    events: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let mut samples = Vec::new();
+    let mut start = None;
+    for (index, event) in events.iter().enumerate() {
+        if event["name"] != "core_distances" {
+            continue;
+        }
+        if event["ph"] == "B" {
+            if start.replace(index).is_some() {
+                return Err("nested core distance spans".into());
+            }
+        } else if event["ph"] == "E" {
+            let begin = start.take().ok_or("unbalanced core distance span")?;
+            let durations = named_seconds(&events[begin..=index], &CORE_FINE_STAGES)?;
+            let mut stages = BTreeMap::new();
+            for name in CORE_FINE_STAGES {
+                stages.insert(name, durations.get(name).cloned().unwrap_or_default());
+            }
+            samples.push(serde_json::json!({
+                "stage_seconds": stages,
+                "scope": "Neighbor kernel includes device synchronization; extraction is disjoint from kernel and readback; readback includes transfer and host conversion. Fine spans can repeat per brute-force batch. Assembly is host validation and core-distance/seed assembly. These disjoint scopes are nested within inclusive core_distances."
+            }));
+        }
+    }
+    if start.is_some() {
+        return Err("unclosed core distance span".into());
+    }
+    Ok(samples)
+}
+
+fn resolved_searches(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| {
+            (event["name"] == "mst" && event["ph"] == "B")
+                .then(|| event["args"]["search"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .collect()
+}
 
 fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
     let mut samples = Vec::new();
     let mut start = None;
+    let mut round_components = Vec::new();
     for (index, event) in events.iter().enumerate() {
         if event["name"] != "boruvka_total" {
             continue;
@@ -111,13 +161,28 @@ fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value
             if start.replace(index).is_some() {
                 return Err("nested Boruvka totals".into());
             }
+            round_components.clear();
         } else if event["ph"] == "E" {
             let begin = start.take().ok_or("unbalanced Boruvka total")?;
-            let names = ["boruvka_total", "boruvka_round"]
-                .into_iter()
-                .chain(BORUVKA_ROUND_STAGES)
-                .collect::<Vec<_>>();
+            let names = [
+                "boruvka_total",
+                "boruvka_round",
+                "boruvka_seed_init",
+                "boruvka_finalize",
+            ]
+            .into_iter()
+            .chain(BORUVKA_ROUND_STAGES)
+            .collect::<Vec<_>>();
             let durations = named_seconds(&events[begin..=index], &names)?;
+            for round in &events[begin..=index] {
+                if round["name"] == "boruvka_round" && round["ph"] == "B" {
+                    let count = round["args"]["component_count"]
+                        .as_str()
+                        .ok_or("Boruvka round lacks component_count")?
+                        .parse::<u64>()?;
+                    round_components.push(count);
+                }
+            }
             let total = durations["boruvka_total"][0];
             let rounds = durations.get("boruvka_round").cloned().unwrap_or_default();
             let mut stages = BTreeMap::new();
@@ -134,6 +199,9 @@ fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value
                 "round_count": rounds.len(),
                 "round_seconds": rounds,
                 "round_stage_seconds": stages,
+                "component_counts_per_round": round_components,
+                "seed_init_seconds": durations.get("boruvka_seed_init").cloned().unwrap_or_default(),
+                "finalize_seconds": durations.get("boruvka_finalize").cloned().unwrap_or_default(),
                 "seed_and_round_overhead_seconds": total - round_total,
                 "scope": "Round stages are disjoint host wall-clock scopes. Metadata includes labels, stable CSR and node-label preparation/uploads; candidate and reduction include profiling device synchronization; winner readback transfers compact outputs; host merge includes component recount. Total and round timings are inclusive; residual is seeding and work outside rounds, not isolated kernel time."
             }));
@@ -147,7 +215,10 @@ fn boruvka_samples(events: &[serde_json::Value]) -> Result<Vec<serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    use super::{BORUVKA_ROUND_STAGES, STAGES, boruvka_samples, exclude_warmup, stage_seconds};
+    use super::{
+        BORUVKA_ROUND_STAGES, CORE_FINE_STAGES, STAGES, boruvka_samples, core_fine_samples,
+        exclude_warmup, stage_seconds,
+    };
     use serde_json::json;
 
     #[test]
@@ -197,7 +268,7 @@ mod tests {
     fn separates_round_samples_and_accounts_for_driver_work() {
         let mut events = vec![
             json!({"name":"boruvka_total", "ph":"B", "ts":0.0}),
-            json!({"name":"boruvka_round", "ph":"B", "ts":1.0}),
+            json!({"name":"boruvka_round", "ph":"B", "ts":1.0, "args":{"component_count":"8"}}),
         ];
         for (index, stage) in BORUVKA_ROUND_STAGES.into_iter().enumerate() {
             events.push(json!({"name":stage, "ph":"B", "ts":1.0 + index as f64}));
@@ -210,6 +281,7 @@ mod tests {
         let samples = boruvka_samples(&events).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0]["round_count"], 1);
+        assert_eq!(samples[0]["component_counts_per_round"], json!([8]));
         assert_eq!(samples[0]["round_seconds"], json!([6e-6]));
         assert!(
             (samples[0]["seed_and_round_overhead_seconds"]
@@ -228,12 +300,41 @@ mod tests {
         assert!(boruvka_samples(&events).is_err());
     }
 
+    #[test]
+    fn aggregates_fine_core_spans_per_fit_and_round_component_metadata() {
+        let events = vec![
+            json!({"name":"core_distances", "tid":1, "ph":"B", "ts":0.0}),
+            json!({"name":"core_neighbor_kernel", "tid":1, "ph":"B", "ts":1.0}),
+            json!({"name":"core_neighbor_kernel", "tid":1, "ph":"E", "ts":3.0}),
+            json!({"name":"core_extraction", "tid":1, "ph":"B", "ts":3.0}),
+            json!({"name":"core_extraction", "tid":1, "ph":"E", "ts":4.0}),
+            json!({"name":"core_neighbor_readback", "tid":1, "ph":"B", "ts":4.0}),
+            json!({"name":"core_neighbor_readback", "tid":1, "ph":"E", "ts":7.0}),
+            json!({"name":"core_final_assembly_readback", "tid":1, "ph":"B", "ts":7.0}),
+            json!({"name":"core_final_assembly_readback", "tid":1, "ph":"E", "ts":8.0}),
+            json!({"name":"core_distances", "tid":1, "ph":"E", "ts":9.0}),
+        ];
+        let samples = core_fine_samples(&events).unwrap();
+        assert_eq!(samples.len(), 1);
+        for name in CORE_FINE_STAGES {
+            assert_eq!(
+                samples[0]["stage_seconds"][name].as_array().unwrap().len(),
+                1
+            );
+        }
+        assert_eq!(
+            samples[0]["stage_seconds"]["core_neighbor_kernel"],
+            json!([2e-6])
+        );
+    }
+
     fn traced_fit(backend: fast_hdbscan::BackendChoice) {
         use tracing_subscriber::layer::SubscriberExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("trace.json");
         let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(&path)
+            .include_args(true)
             .build();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new("warn,fast_hdbscan=info"))
@@ -269,9 +370,34 @@ mod tests {
                 .unwrap();
         let samples = boruvka_samples(&events).unwrap();
         assert_eq!(samples.len(), 2);
+        assert_eq!(super::resolved_searches(&events), ["BruteForce", "KdTree"]);
+        let core_samples = core_fine_samples(&events).unwrap();
+        assert_eq!(core_samples.len(), 2);
+        for (index, sample) in core_samples.into_iter().enumerate() {
+            for stage in CORE_FINE_STAGES {
+                let expected = if index == 0 && stage != "core_final_assembly_readback" {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    sample["stage_seconds"][stage].as_array().unwrap().len(),
+                    expected
+                );
+            }
+        }
         for sample in samples {
             let rounds = sample["round_count"].as_u64().unwrap() as usize;
             assert!(rounds > 0, "fixture must exercise component reduction");
+            assert_eq!(
+                sample["component_counts_per_round"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                rounds
+            );
+            assert_eq!(sample["seed_init_seconds"].as_array().unwrap().len(), 1);
+            assert_eq!(sample["finalize_seconds"].as_array().unwrap().len(), 1);
             for stage in BORUVKA_ROUND_STAGES {
                 assert_eq!(
                     sample["round_stage_seconds"][stage]
@@ -313,7 +439,7 @@ mod tests {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        return Err("usage: profile_hdbscan_stages INPUT_RAW ROWS FEATURES [--backend cpu|cuda] [--runs R] [--min-cluster-size N] [--min-samples N] [--cluster-selection-method eom|leaf] [--allow-single-cluster] [--search auto|brute-force|kd-tree]".into());
+        return Err("usage: profile_hdbscan_stages INPUT_RAW ROWS FEATURES [--backend cpu|cuda] [--runs R] [--min-cluster-size N] [--min-samples N] [--cluster-selection-method eom|leaf] [--allow-single-cluster] [--search auto|brute-force|kd-tree] [--labels-output PATH] [--trace-output PATH]".into());
     }
     let rows: usize = args[2].parse()?;
     let features: usize = args[3].parse()?;
@@ -325,6 +451,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut allow_single_cluster = false;
     let mut search = HdbscanSearch::Auto;
     let mut labels_output = None;
+    let mut trace_output = None;
     let mut i = 4;
     while i < args.len() {
         let flag = &args[i];
@@ -346,6 +473,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--min-cluster-size" => min_cluster_size = value.parse()?,
             "--min-samples" => min_samples = Some(value.parse()?),
             "--labels-output" => labels_output = Some(value.clone()),
+            "--trace-output" => trace_output = Some(value.clone()),
             "--cluster-selection-method" => {
                 selection = match value.as_str() {
                     "eom" => ClusterSelectionMethod::Eom,
@@ -384,6 +512,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ));
     let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
         .file(&trace_path)
+        .include_args(true)
         .build();
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry()
@@ -441,7 +570,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let events: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&trace_path)?)?;
     let mut stages = stage_seconds(&events)?;
     let mut boruvka = boruvka_samples(&events)?;
+    let mut core_fine = core_fine_samples(&events)?;
+    let mut resolved = resolved_searches(&events);
     exclude_warmup(&mut boruvka, runs)?;
+    exclude_warmup(&mut core_fine, runs)?;
+    exclude_warmup(&mut resolved, runs)?;
+    if core_fine.len() != runs || resolved.len() != runs {
+        return Err("fine timing or resolved-search sample count does not match run count".into());
+    }
     if stages.len() != STAGES.len()
         || STAGES.iter().any(|stage| {
             stages
@@ -454,6 +590,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     for values in stages.values_mut() {
         exclude_warmup(values, runs)?;
     }
+    if let Some(path) = trace_output {
+        std::fs::copy(&trace_path, path)?;
+    }
     std::fs::remove_file(&trace_path)?;
     println!(
         "{}",
@@ -461,11 +600,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "fit_seconds": fit_seconds,
             "warmup_seconds": warmup_seconds,
             "boruvka_samples": boruvka,
+            "core_distance_samples": core_fine,
             "stage_seconds": stages,
             "cluster_counts": cluster_counts,
             "noise_counts": noise_counts,
             "backend": format!("{backend:?}"),
             "search": format!("{search:?}"),
+            "resolved_search_per_fit": resolved,
         })
     );
     Ok(())

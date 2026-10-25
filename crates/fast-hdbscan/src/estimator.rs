@@ -419,13 +419,21 @@ fn core_distances(
     let (short_ids, short_distances, device_core_sq) = match search {
         HdbscanSearch::KdTree => {
             let tree = tree.expect("KD-tree route uploads the tree before neighbor search");
+            #[cfg(feature = "tracing")]
+            let neighbor_span = tracing::info_span!("core_neighbor_kernel").entered();
             let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
                 data.clone().into_dispatch(),
                 clone_device_kd_tree(tree),
                 k_width,
             );
+            #[cfg(feature = "tracing")]
+            profile_sync(&data.device())?;
+            #[cfg(feature = "tracing")]
+            drop(neighbor_span);
             let ids = Tensor::<2, Int>::from_dispatch(ids);
             let distances = Tensor::<2>::from_dispatch(distances);
+            #[cfg(feature = "tracing")]
+            let extraction_span = tracing::info_span!("core_extraction").entered();
             let core = if min_samples >= n {
                 Tensor::full([n], f32::INFINITY, &data.device())
             } else if min_samples == 1 {
@@ -436,6 +444,10 @@ fn core_distances(
                     .slice([0..n, (min_samples - 1)..min_samples])
                     .reshape([n])
             };
+            #[cfg(feature = "tracing")]
+            drop(extraction_span);
+            #[cfg(feature = "tracing")]
+            let readback_span = tracing::info_span!("core_neighbor_readback").entered();
             let [id_data, distance_data] = Transaction::default()
                 .register(ids)
                 .register(distances.clone())
@@ -451,6 +463,8 @@ fn core_distances(
             let distances_host = distance_data
                 .try_to_vec::<f32>()
                 .map_err(|error| HdbscanError::Numerical(error.to_string()))?;
+            #[cfg(feature = "tracing")]
+            drop(readback_span);
             (ids, distances_host, core)
         }
         HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
@@ -464,6 +478,8 @@ fn core_distances(
             for start in (0..n).step_by(block_rows) {
                 let end = start.saturating_add(block_rows).min(n);
                 let query = data.clone().slice([start..end, 0..data.dims()[1]]);
+                #[cfg(feature = "tracing")]
+                let neighbor_span = tracing::info_span!("core_neighbor_kernel").entered();
                 let (block_ids, block_distances) = common_neighbors::exact_neighbors(
                     query,
                     data.clone(),
@@ -472,7 +488,13 @@ fn core_distances(
                     u32::try_from(start).map_err(|_| HdbscanError::Overflow("query row offset"))?,
                     true,
                 );
+                #[cfg(feature = "tracing")]
+                profile_sync(&data.device())?;
+                #[cfg(feature = "tracing")]
+                drop(neighbor_span);
                 let block_rows_count = end - start;
+                #[cfg(feature = "tracing")]
+                let extraction_span = tracing::info_span!("core_extraction").entered();
                 let core = if min_samples >= n {
                     Tensor::full([block_rows_count], f32::INFINITY, &data.device())
                 } else if min_samples == 1 {
@@ -484,6 +506,10 @@ fn core_distances(
                         .reshape([block_rows_count])
                 };
                 core_blocks.push(core);
+                #[cfg(feature = "tracing")]
+                drop(extraction_span);
+                #[cfg(feature = "tracing")]
+                let readback_span = tracing::info_span!("core_neighbor_readback").entered();
                 let [id_data, distance_data] = Transaction::default()
                     .register(block_ids)
                     .register(block_distances)
@@ -503,10 +529,14 @@ fn core_distances(
                         .try_to_vec::<f32>()
                         .map_err(|error| HdbscanError::Numerical(error.to_string()))?,
                 );
+                #[cfg(feature = "tracing")]
+                drop(readback_span);
             }
             (ids, distances_host, Tensor::cat(core_blocks, 0))
         }
     };
+    #[cfg(feature = "tracing")]
+    let assembly_span = tracing::info_span!("core_final_assembly_readback").entered();
     checked_allocation_bytes(short_ids.len(), 4, None, "compact neighbor ID allocation")?;
     checked_allocation_bytes(
         short_distances.len(),
@@ -523,13 +553,16 @@ fn core_distances(
             .map(|row| short_distances[row * k + min_samples - 1])
             .collect()
     };
-    Ok(CoreDistances {
+    let result = CoreDistances {
         device_core_sq,
         seed_core_sq,
         neighbors: short_ids,
         knn_sq: short_distances,
         k,
-    })
+    };
+    #[cfg(feature = "tracing")]
+    drop(assembly_span);
+    Ok(result)
 }
 
 fn spanning_tree(
@@ -544,6 +577,8 @@ fn spanning_tree(
     let mut dsu = RankDsu::new(n);
     #[cfg(feature = "tracing")]
     let _boruvka_span = tracing::info_span!("boruvka_total").entered();
+    #[cfg(feature = "tracing")]
+    let seed_span = tracing::info_span!("boruvka_seed_init").entered();
     let mut edges = init_from_knn(
         &core.seed_core_sq,
         &core.neighbors,
@@ -551,6 +586,8 @@ fn spanning_tree(
         core.k,
         &mut dsu,
     )?;
+    #[cfg(feature = "tracing")]
+    drop(seed_span);
     drop(std::mem::take(&mut core.knn_sq));
     let mut component_count = (0..n)
         .map(|point| dsu.find(point))
@@ -707,7 +744,12 @@ fn spanning_tree(
             "Boruvka produced an incomplete spanning tree".into(),
         ));
     }
-    Ok(finalize_mst(edges))
+    #[cfg(feature = "tracing")]
+    let finalize_span = tracing::info_span!("boruvka_finalize").entered();
+    let result = finalize_mst(edges);
+    #[cfg(feature = "tracing")]
+    drop(finalize_span);
+    Ok(result)
 }
 
 fn public_neighbors(ids: &[i32], n: usize, width: usize, min_samples: usize) -> Result<Vec<i32>> {
