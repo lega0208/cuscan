@@ -1,0 +1,1125 @@
+from __future__ import annotations
+
+import csv
+import importlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+common_tools = importlib.import_module("analyze.hdbscan_stages_common")
+summary_tools = importlib.import_module("analyze.summarize_hdbscan_stages")
+kernel_tools = importlib.import_module("profile_hdbscan_kernels")
+counter_tools = importlib.import_module("profile_hdbscan_counters")
+benchmark_tools = importlib.import_module("benchmark_hdbscan_stages")
+atomic_json = common_tools.atomic_json
+identity = common_tools.identity
+require_fields = common_tools.require_fields
+run_command = common_tools.run_command
+CORE_SUBPHASES = summary_tools.CORE_SUBPHASES
+COUNTER_METRICS = summary_tools.COUNTER_METRICS
+ROUND_SUBPHASES = summary_tools.ROUND_SUBPHASES
+summarize_paths = summary_tools.summarize_paths
+summarize_reports = summary_tools.summarize_reports
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "analyze_hdbscan_stages.sh"
+SUMMARY_SCRIPT = ROOT / "analyze" / "summarize_hdbscan_stages.py"
+BASH = shutil.which("bash") or "/bin/bash"
+
+
+def fake_tools(
+    tmp_path: Path,
+    *,
+    missing: str | None = None,
+    uv_status: int = 0,
+    uv_failure: str | None = None,
+) -> tuple[Path, Path]:
+    bin_dir = tmp_path / "fake tools"
+    bin_dir.mkdir()
+    log = tmp_path / "commands.log"
+    for name in ("cargo", "uv", "nsys", "ncu"):
+        if name == missing:
+            continue
+        code = uv_status if name == "uv" else 0
+        executable = bin_dir / name
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(log)!r}).open('a').write("
+            f"{name!r} + ' ' + repr(sys.argv[1:]) + '\\n')\n"
+            f"sys.exit({code} if {uv_failure!r} is None or {uv_failure!r} "
+            "in ' '.join(sys.argv) else 0)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+    for utility in ("dirname", "mkdir"):
+        target = shutil.which(utility)
+        if target is not None:
+            (bin_dir / utility).symlink_to(target)
+    return bin_dir, log
+
+
+def shell_only_path(tmp_path: Path) -> Path:
+    bin_dir = tmp_path / "shell utilities"
+    bin_dir.mkdir()
+    for utility in ("dirname", "mkdir"):
+        target = shutil.which(utility)
+        if target is not None:
+            (bin_dir / utility).symlink_to(target)
+    return bin_dir
+
+
+def invoke_shell(
+    *args: str, cwd: Path, path: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    if path is not None:
+        env["PATH"] = path
+    return subprocess.run(
+        [BASH, str(SCRIPT), *args],
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_shell_help_is_successful_without_dependencies(tmp_path: Path) -> None:
+    result = invoke_shell("--help", cwd=tmp_path, path=str(shell_only_path(tmp_path)))
+    assert result.returncode == 0
+    assert "--rows 20000|100000" in result.stdout
+    assert "--output-dir NEW_DIRECTORY" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "rows, native_timeout, profile_timeout",
+    [("20000", "10", "10"), ("100000", "240", "90")],
+)
+def test_shell_cli_accepts_both_rows_and_resolves_paths_from_foreign_cwd(
+    tmp_path: Path, rows: str, native_timeout: str, profile_timeout: str
+) -> None:
+    bin_dir, log = fake_tools(tmp_path)
+    output = tmp_path / "evidence with spaces" / f"rows-{rows}"
+    result = invoke_shell(
+        "--rows", rows, "--output-dir", str(output), cwd=tmp_path, path=str(bin_dir)
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.is_dir()
+    assert (output / "raw").is_dir()
+    assert str(output) in result.stdout
+    commands = log.read_text(encoding="utf-8")
+    assert "cargo" in commands
+    assert "benchmark_hdbscan_stages.py" in commands
+    assert "--rows', '" + rows in commands
+    assert "--timeout', '" + native_timeout in commands
+    assert "profile_hdbscan_kernels.py" in commands
+    assert "profile_hdbscan_counters.py" in commands
+    assert "--timeout', '" + profile_timeout in commands
+    assert "summarize_hdbscan_stages.py" in commands
+
+
+def test_shell_rejects_existing_output_directory_without_modifying_it(tmp_path: Path) -> None:
+    bin_dir, _ = fake_tools(tmp_path)
+    output = tmp_path / "already exists"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    result = invoke_shell("--output-dir", str(output), cwd=tmp_path, path=str(bin_dir))
+    assert result.returncode != 0
+    assert "already exists" in result.stderr
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_shell_rejects_unknown_rows_and_flags_before_preflight(tmp_path: Path) -> None:
+    shell_path = str(shell_only_path(tmp_path))
+    result = invoke_shell("--rows", "30000", cwd=tmp_path, path=shell_path)
+    assert result.returncode != 0
+    assert "--rows must be 20000 or 100000" in result.stderr
+    unknown = invoke_shell("--nonsense", cwd=tmp_path, path=shell_path)
+    assert unknown.returncode != 0
+    assert "Unknown argument" in unknown.stderr
+
+
+def test_shell_reports_missing_dependency(tmp_path: Path) -> None:
+    bin_dir, _ = fake_tools(tmp_path, missing="nsys")
+    result = invoke_shell("--output-dir", str(tmp_path / "out"), cwd=tmp_path, path=str(bin_dir))
+    assert result.returncode != 0
+    assert "Required tool not found: nsys" in result.stderr
+    assert not (tmp_path / "out").exists()
+
+
+def test_shell_propagates_phase_failure_without_success_summary(tmp_path: Path) -> None:
+    bin_dir, log = fake_tools(tmp_path, uv_status=17)
+    output = tmp_path / "failed run"
+    result = invoke_shell("--output-dir", str(output), cwd=tmp_path, path=str(bin_dir))
+    assert result.returncode == 17
+    assert "Phase failed" in result.stderr
+    assert "No matching" not in result.stdout
+    assert log.read_text(encoding="utf-8").count("uv ") == 1
+    assert (output / "raw").is_dir()
+
+
+@pytest.mark.parametrize(
+    "failing_phase",
+    ["profile_hdbscan_kernels.py", "profile_hdbscan_counters.py"],
+)
+def test_shell_stops_on_profiler_failure_without_running_later_phases(
+    tmp_path: Path, failing_phase: str
+) -> None:
+    bin_dir, log = fake_tools(tmp_path, uv_failure=failing_phase, uv_status=19)
+    output = tmp_path / "profiler failure"
+    result = invoke_shell("--output-dir", str(output), cwd=tmp_path, path=str(bin_dir))
+    assert result.returncode == 19
+    assert "Phase failed" in result.stderr
+    commands = log.read_text(encoding="utf-8")
+    assert failing_phase in commands
+    if "profile_hdbscan_kernels.py" in failing_phase:
+        assert "profile_hdbscan_counters.py" not in commands
+    assert "summarize_hdbscan_stages.py" not in commands
+
+
+def manifest() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": "synthetic-run",
+        "workload": {"rows": 20_000, "features": 16},
+        "input_sha256": "a" * 64,
+        "provenance": {"source": "synthetic test"},
+    }
+
+
+def synthetic_reports(candidate_seconds: float = 0.95) -> tuple[dict[str, Any], ...]:
+    identity_fields = {
+        "schema_version": 1,
+        "run_id": "synthetic-run",
+        "workload": {
+            "rows": 20_000,
+            "features": 16,
+            "config": {
+                "min_samples": 5,
+                "min_cluster_size": 5,
+                "search": "auto",
+                "centers": 8,
+                "center_scale": 1.0,
+                "noise": 1.0,
+                "seed": 42,
+            },
+        },
+        "input_sha256": "b" * 64,
+        "provenance": {"source": "synthetic test"},
+    }
+    profiles = {}
+    for backend in ("cpu", "cuda"):
+        profiles[backend] = {
+            "fit_seconds": [2.0, 2.1, 1.9],
+            "warmup_seconds": 1.2,
+            "process_wall_seconds": 8.0,
+            "command_provenance": {
+                "argv": ["synthetic", backend],
+                "exit_status": 0,
+                "timed_out": False,
+                "timeout_seconds": 10,
+                "elapsed_seconds": 8.0,
+            },
+            "medians": {
+                "fit_seconds": 2.0,
+                "stage_seconds": {
+                    stage: 0.8 if stage == "core_distances" else 1.0 if stage == "mst" else 0.01
+                    for stage in summary_tools.STAGES
+                },
+            },
+            "stage_seconds": {
+                stage: (
+                    [0.8, 0.9, 0.7]
+                    if stage == "core_distances"
+                    else [1.0, 1.0, 1.0]
+                    if stage == "mst"
+                    else [0.01, 0.01, 0.01]
+                )
+                for stage in summary_tools.STAGES
+            },
+            "core_distance_samples": [
+                {
+                    "stage_seconds": {
+                        key: [0.5 if key == "core_extraction" else 0.1] for key in CORE_SUBPHASES
+                    },
+                    "scope": "one measured fit",
+                }
+                for _ in range(3)
+            ],
+            "boruvka_samples": [
+                {
+                    "round_count": 1,
+                    "round_seconds": [1.0],
+                    "component_counts_per_round": [4],
+                    "round_stage_seconds": {
+                        key: [
+                            candidate_seconds
+                            if key == "boruvka_candidate_kernel"
+                            else (
+                                0.8
+                                if candidate_seconds < 0.2 and key == "boruvka_host_merge"
+                                else (0.2 - candidate_seconds) / (len(ROUND_SUBPHASES) - 2)
+                                if candidate_seconds < 0.2
+                                else (1.0 - candidate_seconds) / (len(ROUND_SUBPHASES) - 1)
+                            )
+                        ]
+                        for key in ROUND_SUBPHASES
+                    },
+                    "total_seconds": 1.0,
+                    "seed_and_round_overhead_seconds": 0.1,
+                    "seed_init_seconds": [0.05],
+                    "finalize_seconds": [0.05],
+                    "scope": "one measured fit",
+                }
+                for _ in range(3)
+            ],
+            "cluster_counts": [4, 4, 4],
+            "noise_counts": [2, 2, 2],
+            "backend": "Cpu" if backend == "cpu" else "Cuda { device_index: 0 }",
+            "search": "Auto",
+            "resolved_search_per_fit": ["brute_force"] * 3,
+        }
+    benchmark = {
+        **identity_fields,
+        "profiles": profiles,
+        "correctness": {"labels_equal": True, "rows_compared": 20_000},
+    }
+    native = synthetic_native_profile()
+    native["fit_seconds"] = native["fit_seconds"][:1]
+    native["backend"] = "Cuda { device_index: 0 }"
+    native["stage_seconds"] = {key: values[:1] for key, values in native["stage_seconds"].items()}
+    native["core_distance_samples"] = native["core_distance_samples"][:1]
+    native["boruvka_samples"] = native["boruvka_samples"][:1]
+    for key in ("cluster_counts", "noise_counts", "resolved_search_per_fit"):
+        native[key] = native[key][:1]
+    kernels = {
+        **identity_fields,
+        "capture": {
+            "exit_status": 0,
+            "timeout_seconds": 10,
+            "timed_out": False,
+            "elapsed_seconds": 3.0,
+        },
+        "export": {
+            "argv": ["nsys", "export"],
+            "exit_status": 0,
+            "timeout_seconds": 60,
+            "timed_out": False,
+            "elapsed_seconds": 1.0,
+        },
+        "profiled_fit": {
+            "window": {
+                "start_unix_ns": 1100,
+                "end_unix_ns": 1200,
+                "start_ns": 100,
+                "end_ns": 200,
+            },
+            "native_profile": native,
+            "kernels": [
+                {
+                    "name": "tile_candidates_variant_abc",
+                    "family": "tile_candidates",
+                    "launch_count": 2,
+                    "device_seconds": 40e-9,
+                    "mean_seconds": 20e-9,
+                    "geometry": [{"block": [256, 1, 1], "grid": [32, 1, 1], "count": 2}],
+                    "launches": [
+                        {"start_ns": 110, "end_ns": 130, "duration_ns": 20},
+                        {"start_ns": 120, "end_ns": 140, "duration_ns": 20},
+                    ],
+                },
+                {
+                    "name": "unknown_future_kernel",
+                    "family": "unknown",
+                    "launch_count": 1,
+                    "device_seconds": 10e-9,
+                    "mean_seconds": 10e-9,
+                    "geometry": [{"block": [8, 1, 1], "grid": [1, 1, 1], "count": 1}],
+                    "launches": [{"start_ns": 150, "end_ns": 160, "duration_ns": 10}],
+                },
+            ],
+            "total_device_seconds": 50e-9,
+            "boundary_straddling_count": 1,
+            "overlapping_activity": True,
+        },
+    }
+    all_metrics = summary_tools.ALL_METRICS
+    counters = {
+        **identity_fields,
+        "captures": {
+            family: {
+                "argv": ["ncu", "--kernel-name", f"regex:{family}"],
+                "exit_status": 0,
+                "timeout_seconds": 10,
+                "timed_out": False,
+                "elapsed_seconds": 2.0,
+            }
+            for family in ("partial_kernel", "tile_candidates")
+        },
+        "kernels": {
+            family: {
+                "kernel_name": f"{family}_synthetic_hash",
+                "launch_id": "1",
+                "geometry": {"block": "(32, 1, 1)", "grid": "(8, 1, 1)"},
+                "command": ["ncu", "--kernel-name", family],
+                "sampling_scope": "first matching warmup launch",
+                "metrics": {
+                    metric: {
+                        "requested": True,
+                        "observed": True,
+                        "value": (
+                            5.0
+                            if metric in COUNTER_METRICS.values()
+                            else 3_000_000_000.0
+                            if metric == "gpu__time_duration.sum"
+                            else 3.0
+                        ),
+                        "unit": (
+                            "%"
+                            if metric in COUNTER_METRICS.values()
+                            else "ns"
+                            if metric == "gpu__time_duration.sum"
+                            else ""
+                        ),
+                        "normalized_value": 5.0 if metric in COUNTER_METRICS.values() else 3.0,
+                        "normalized_unit": (
+                            "%"
+                            if metric in COUNTER_METRICS.values()
+                            else "s"
+                            if metric == "gpu__time_duration.sum"
+                            else "count"
+                        ),
+                    }
+                    for metric in all_metrics
+                },
+            }
+            for family in ("partial_kernel", "tile_candidates")
+        },
+    }
+    return benchmark, kernels, counters
+
+
+def test_summary_accepts_three_synthetic_reports_and_preserves_caveats() -> None:
+    benchmark, kernels, counters = synthetic_reports()
+    result = summarize_reports(benchmark, kernels, counters)
+    assert result.startswith("HDBSCAN stage analysis — 20,000 rows")
+    assert "three measured fits per backend after one excluded warmup" in result
+    assert "Candidate generation accounts for" in result
+    assert "unknown_future_kernel" in result
+    assert "Nsight synchronization, replay, and cache behavior perturb captures" in result
+    assert "does not establish external-data clustering quality" in result
+
+
+@pytest.mark.parametrize(
+    "report_index,mutate,diagnostic",
+    [
+        (1, lambda report: report.update(run_id="other"), "identity mismatch"),
+        (2, lambda report: report.update(input_sha256="c" * 64), "identity mismatch"),
+        (1, lambda report: report.update(schema_version=2), "schema_version"),
+        (0, lambda report: report["workload"].update(rows=30_000), "workload.rows"),
+    ],
+)
+def test_summary_rejects_incompatible_identity(report_index, mutate, diagnostic) -> None:
+    reports = list(synthetic_reports())
+    mutate(reports[report_index])
+    with pytest.raises(ValueError, match=diagnostic):
+        summarize_reports(*reports)
+
+
+@pytest.mark.parametrize(
+    "profile_name,backend",
+    [("cpu", "Cuda { device_index: 0 }"), ("cuda", "Cpu")],
+)
+def test_summary_rejects_profile_backend_mismatch(profile_name: str, backend: str) -> None:
+    reports = list(synthetic_reports())
+    reports[0]["profiles"][profile_name]["backend"] = backend
+    with pytest.raises(ValueError, match="backend must identify"):
+        summarize_reports(*reports)
+
+
+@pytest.mark.parametrize("corruption", [float("nan"), float("inf"), -0.1])
+def test_summary_rejects_nonfinite_or_negative_durations(corruption: float) -> None:
+    reports = list(synthetic_reports())
+    reports[0]["profiles"]["cpu"]["fit_seconds"][1] = corruption
+    with pytest.raises(ValueError):
+        summarize_reports(*reports)
+
+
+def test_summary_changes_conclusion_when_bottleneck_changes() -> None:
+    candidate_reports = synthetic_reports(candidate_seconds=0.95)
+    host_reports = synthetic_reports(candidate_seconds=0.1)
+    candidate_summary = summarize_reports(*candidate_reports)
+    host_summary = summarize_reports(*host_reports)
+    assert "Candidate generation accounts for" in candidate_summary
+    assert "largest aligned CUDA Boruvka subphase is boruvka_host_merge" in host_summary
+
+
+def test_summary_rejects_label_mismatch_and_missing_counter_metric() -> None:
+    reports = list(synthetic_reports())
+    reports[0]["correctness"]["labels_equal"] = False
+    with pytest.raises(ValueError, match="labels differ"):
+        summarize_reports(*reports)
+    reports = list(synthetic_reports())
+    del reports[2]["kernels"]["partial_kernel"]["metrics"][COUNTER_METRICS["occupancy"]]
+    with pytest.raises(ValueError, match="missing required counter metric"):
+        summarize_reports(*reports)
+
+
+@pytest.mark.parametrize(
+    "metric,field,value,diagnostic",
+    [
+        (
+            "gpu__time_duration.sum",
+            "value",
+            1.0,
+            "normalized value is inconsistent",
+        ),
+        ("launch__grid_size", "value", 1.5, "positive integer count"),
+    ],
+)
+def test_summary_rejects_inconsistent_raw_counter_units_and_fractional_geometry(
+    metric: str, field: str, value: float, diagnostic: str
+) -> None:
+    reports = list(synthetic_reports())
+    reports[2]["kernels"]["partial_kernel"]["metrics"][metric][field] = value
+    if metric == "launch__grid_size":
+        reports[2]["kernels"]["partial_kernel"]["metrics"][metric]["normalized_value"] = value
+    with pytest.raises(ValueError, match=diagnostic):
+        summarize_reports(*reports)
+
+
+def test_summary_paths_and_cli_are_offline_and_report_invalid_inputs(tmp_path: Path) -> None:
+    reports = synthetic_reports()
+    paths = [tmp_path / f"report-{index}.json" for index in range(3)]
+    for path, report in zip(paths, reports, strict=True):
+        path.write_text(json.dumps(report), encoding="utf-8")
+    assert "Input SHA-256" in summarize_paths(*paths)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SUMMARY_SCRIPT),
+            "--benchmark",
+            str(paths[0]),
+            "--kernels",
+            str(paths[1]),
+            "--counters",
+            str(paths[2]),
+        ],
+        cwd=tmp_path,
+        env={"PATH": "", "PYTHONPATH": str(ROOT)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Input SHA-256" in result.stdout
+    paths[2].write_text("not json", encoding="utf-8")
+    bad = subprocess.run(
+        [
+            sys.executable,
+            str(SUMMARY_SCRIPT),
+            "--benchmark",
+            str(paths[0]),
+            "--kernels",
+            str(paths[1]),
+            "--counters",
+            str(paths[2]),
+        ],
+        cwd=tmp_path,
+        env={"PATH": "", "PYTHONPATH": str(ROOT)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert bad.returncode == 2
+    assert "cannot read cuda_counters report" in bad.stderr
+
+
+def test_marker_parser_requires_one_ordered_profile_pair() -> None:
+    assert kernel_tools.parse_markers(
+        "warmup marker\nprofile_run_start run=0 unix_ns=100\nprofile_run_end run=0 unix_ns=250\n"
+    ) == (100, 250)
+    for stderr in (
+        "",
+        "profile_run_start run=0 unix_ns=100",
+        "profile_run_end run=0 unix_ns=250\nprofile_run_start run=0 unix_ns=100",
+        "profile_run_start run=0 unix_ns=100\nprofile_run_end run=1 unix_ns=250",
+        "profile_run_start run=0 unix_ns=100\nprofile_run_end run=0 unix_ns=100",
+    ):
+        with pytest.raises(ValueError):
+            kernel_tools.parse_markers(stderr)
+
+
+def test_stdout_profile_parser_selects_only_one_schema_candidate() -> None:
+    profile = single_fit_profile()
+    profile["backend"] = "Cuda { device_index: 0 }"
+    profile = benchmark_tools._validate_profile(profile, "cuda", runs=1)
+    assert kernel_tools.select_profile(f"nsys message\n{json.dumps(profile)}\n") == profile
+    with pytest.raises(ValueError, match="found 0"):
+        kernel_tools.select_profile("nsys says no JSON here")
+    with pytest.raises(ValueError, match="found 2"):
+        kernel_tools.select_profile(f"{json.dumps(profile)}\n{json.dumps(profile)}")
+    incomplete = {"fit_seconds": [1], "stage_seconds": {}}
+    with pytest.raises(ValueError, match="found 0"):
+        kernel_tools.select_profile(json.dumps(incomplete))
+    wrong_backend = single_fit_profile()
+    wrong_backend["backend"] = "Cpu"
+    with pytest.raises(ValueError, match="backend"):
+        kernel_tools.select_profile(json.dumps(wrong_backend))
+
+
+def synthetic_nsys_db(path: Path, *, missing_table: bool = False) -> None:
+    import sqlite3
+
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE TARGET_INFO_SESSION_START_TIME (utcEpochNs INTEGER)")
+        db.execute("INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES (1000)")
+        db.execute("CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT)")
+        db.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [(1, "partial_kernel_hash"), (2, "tile_candidates_hash"), (3, "future_kernel")],
+        )
+        if not missing_table:
+            db.execute(
+                "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL ("
+                "start INTEGER, end INTEGER, demangledName INTEGER, "
+                "gridX INTEGER, gridY INTEGER, gridZ INTEGER, "
+                "blockX INTEGER, blockY INTEGER, blockZ INTEGER)"
+            )
+            db.executemany(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (100, 120, 1, 1, 1, 1, 32, 1, 1),
+                    (110, 140, 1, 1, 1, 1, 32, 1, 1),
+                    (150, 170, 2, 2, 1, 1, 256, 1, 1),
+                    (90, 110, 3, 1, 1, 1, 8, 1, 1),
+                    (190, 210, 3, 1, 1, 1, 8, 1, 1),
+                ],
+            )
+
+
+def test_sqlite_kernel_aggregation_aligns_window_excludes_warmup_and_groups_geometry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "synthetic.sqlite"
+    synthetic_nsys_db(path)
+    result = kernel_tools.aggregate_kernels(path, 1100, 1200)
+    assert result["window"] == {
+        "start_unix_ns": 1100,
+        "end_unix_ns": 1200,
+        "start_ns": 100,
+        "end_ns": 200,
+    }
+    assert result["boundary_straddling_count"] == 2
+    assert result["overlapping_activity"] is True
+    assert result["total_device_seconds"] == pytest.approx(70e-9)
+    kernels = {record["name"]: record for record in result["kernels"]}
+    assert kernels["partial_kernel_hash"]["launch_count"] == 2
+    assert kernels["partial_kernel_hash"]["family"] == "partial_kernel"
+    assert kernels["tile_candidates_hash"]["launch_count"] == 1
+    assert "future_kernel" not in kernels
+
+
+@pytest.mark.parametrize(
+    "start,end,diagnostic",
+    [(0, 1100, "invalid measured interval"), (900, 1000, "cannot be aligned")],
+)
+def test_sqlite_aggregation_rejects_invalid_alignment(
+    tmp_path: Path, start: int, end: int, diagnostic: str
+) -> None:
+    path = tmp_path / "synthetic.sqlite"
+    synthetic_nsys_db(path)
+    with pytest.raises(ValueError, match=diagnostic):
+        kernel_tools.aggregate_kernels(path, start, end)
+
+
+def test_sqlite_aggregation_rejects_missing_schema_and_empty_window(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.sqlite"
+    synthetic_nsys_db(missing, missing_table=True)
+    with pytest.raises(ValueError, match="missing tables"):
+        kernel_tools.aggregate_kernels(missing, 1100, 1200)
+    empty = tmp_path / "empty.sqlite"
+    synthetic_nsys_db(empty)
+    with pytest.raises(ValueError, match="no kernels fully contained"):
+        kernel_tools.aggregate_kernels(empty, 3000, 4000)
+
+
+def ncu_csv(*, family: str = "tile_candidates", launch_id: str = "7") -> str:
+    import csv
+
+    metrics = (
+        ("gpu__time_duration.sum", "ns", "360,215,648"),
+        ("launch__grid_size", "", "32,768"),
+        ("launch__block_size", "", "256"),
+        ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "99.18"),
+        ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", "10.89"),
+        ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "%", "18.71"),
+        ("l1tex__throughput.avg.pct_of_peak_sustained_elapsed", "%", "94.34"),
+        ("smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct", "%", "71.79"),
+        ("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct", "%", "24.72"),
+    )
+    header = [
+        "ID",
+        "Process ID",
+        "Process Name",
+        "Host Name",
+        "Kernel Name",
+        "Context",
+        "Stream",
+        "Block Size",
+        "Grid Size",
+        "Device",
+        "CC",
+        "Section Name",
+        "Metric Name",
+        "Metric Unit",
+        "Metric Value",
+    ]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["==PROF== fake preamble"])
+    writer.writerow(header)
+    for metric, unit, value in metrics:
+        writer.writerow(
+            [
+                launch_id,
+                "123",
+                "profile",
+                "host",
+                f"{family}_f32_hash",
+                "1",
+                "14",
+                "(256, 1, 1)",
+                "(32768, 1, 1)",
+                "0",
+                "8.6",
+                "metrics",
+                metric,
+                unit,
+                value,
+            ]
+        )
+    return output.getvalue()
+
+
+def test_ncu_parser_handles_preamble_quotes_numbers_and_normalizes_units() -> None:
+    result = counter_tools.parse_ncu_csv(ncu_csv(), "tile_candidates")
+    assert result["kernel_name"] == "tile_candidates_f32_hash"
+    assert result["launch_id"] == "7"
+    assert result["geometry"] == {"block": "(256, 1, 1)", "grid": "(32768, 1, 1)"}
+    duration = result["metrics"]["gpu__time_duration.sum"]
+    assert duration["normalized_value"] == pytest.approx(0.360215648)
+    assert duration["normalized_unit"] == "s"
+    assert result["metrics"]["launch__grid_size"]["normalized_value"] == 32768
+    assert result["metrics"]["launch__grid_size"]["normalized_unit"] == "count"
+
+
+def test_ncu_parser_rejects_missing_unknown_or_ambiguous_metric_records() -> None:
+    text = ncu_csv()
+    with pytest.raises(ValueError, match="no Nsight Compute launch matched"):
+        counter_tools.parse_ncu_csv(text, "partial_kernel")
+    with pytest.raises(ValueError, match="header was not found"):
+        counter_tools.parse_ncu_csv("unstructured output", "tile_candidates")
+    missing = "\n".join(line for line in text.splitlines() if "gpu__time_duration.sum" not in line)
+    with pytest.raises(ValueError, match=r"gpu__time_duration\.sum"):
+        counter_tools.parse_ncu_csv(missing, "tile_candidates")
+    lines = text.splitlines()
+    duration_row = next(i for i, line in enumerate(lines) if "gpu__time_duration.sum" in line)
+    fields = next(csv.reader([lines[duration_row]]))
+    fields[0] = "8"
+    output = io.StringIO()
+    csv.writer(output).writerow(fields)
+    duplicate_launch = text + output.getvalue()
+    with pytest.raises(ValueError, match="ambiguous Nsight Compute capture"):
+        counter_tools.parse_ncu_csv(duplicate_launch, "tile_candidates")
+
+
+def test_ncu_parser_rejects_bad_values_duplicate_metrics_and_geometry(tmp_path: Path) -> None:
+    text = ncu_csv()
+    malformed = text.replace("360,215,648", "not-a-number")
+    with pytest.raises(ValueError, match="invalid numeric"):
+        counter_tools.parse_ncu_csv(malformed, "tile_candidates")
+    duplicate_metric = (
+        text + next(line for line in text.splitlines() if "gpu__time_duration.sum" in line) + "\n"
+    )
+    with pytest.raises(ValueError, match=r"exactly one gpu__time_duration\.sum"):
+        counter_tools.parse_ncu_csv(duplicate_metric, "tile_candidates")
+    geometry = text.replace('"(256, 1, 1)","(32768, 1, 1)"', '"(128, 1, 1)","(32768, 1, 1)"', 1)
+    with pytest.raises(ValueError, match="inconsistent geometry"):
+        counter_tools.parse_ncu_csv(geometry, "tile_candidates")
+    with pytest.raises(ValueError, match="unsupported unit"):
+        counter_tools.normalize_metric("gpu__time_duration.sum", 12, "ticks")
+    with pytest.raises(ValueError, match="positive integer"):
+        counter_tools.normalize_metric("launch__grid_size", 1.5, "")
+    with pytest.raises(ValueError, match="unsupported unit"):
+        counter_tools.normalize_metric("launch__block_size", 32, "threads")
+
+
+def synthetic_native_profile(backend: str = "Cpu") -> dict[str, Any]:
+    return {
+        "fit_seconds": [2.0, 2.1, 1.9],
+        "warmup_seconds": 1.2,
+        "stage_seconds": {stage: [0.2, 0.3, 0.4] for stage in benchmark_tools.STAGES},
+        "core_distance_samples": [
+            {
+                "stage_seconds": {stage: [0.1] for stage in benchmark_tools.CORE_STAGES},
+                "scope": "one fit",
+            }
+            for _ in range(3)
+        ],
+        "boruvka_samples": [
+            {
+                "total_seconds": 1.0,
+                "round_count": 1,
+                "round_seconds": [0.8],
+                "round_stage_seconds": {stage: [0.16] for stage in benchmark_tools.BORUVKA_STAGES},
+                "component_counts_per_round": [5],
+                "seed_init_seconds": [0.1],
+                "finalize_seconds": [0.1],
+                "seed_and_round_overhead_seconds": 0.2,
+                "scope": "one fit",
+            }
+            for _ in range(3)
+        ],
+        "cluster_counts": [4, 4, 4],
+        "noise_counts": [2, 2, 2],
+        "backend": backend,
+        "search": "Auto",
+        "resolved_search_per_fit": ["brute_force"] * 3,
+    }
+
+
+def single_fit_profile() -> dict[str, Any]:
+    profile = synthetic_native_profile()
+    profile["fit_seconds"] = profile["fit_seconds"][:1]
+    profile["stage_seconds"] = {
+        name: values[:1] for name, values in profile["stage_seconds"].items()
+    }
+    for name in (
+        "core_distance_samples",
+        "boruvka_samples",
+        "cluster_counts",
+        "noise_counts",
+        "resolved_search_per_fit",
+    ):
+        profile[name] = profile[name][:1]
+    return profile
+
+
+def test_native_profile_parser_excludes_warmup_and_computes_sample_medians() -> None:
+    profile = synthetic_native_profile()
+    parsed = benchmark_tools._validate_profile(profile, "cpu")
+    assert parsed["medians"]["fit_seconds"] == 2.0
+    assert parsed["medians"]["stage_seconds"]["mst"] == 0.3
+    text = "profiler banner\n" + json.dumps(synthetic_native_profile()) + "\n"
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "native.stdout"
+        path.write_text(text, encoding="utf-8")
+        loaded = benchmark_tools._load_profile(path, "cpu")
+    assert loaded["fit_seconds"] == [2.0, 2.1, 1.9]
+    assert loaded["warmup_seconds"] == 1.2
+
+
+@pytest.mark.parametrize(
+    "mutate,diagnostic",
+    [
+        (lambda profile: profile.update(fit_seconds=[1.0]), "exactly 3 fit samples"),
+        (lambda profile: profile.update(search="BruteForce"), "requested automatic search"),
+        (lambda profile: profile.update(backend="Cuda"), "unexpected backend identity"),
+        (
+            lambda profile: profile["boruvka_samples"][0].update(component_counts_per_round=[]),
+            "component counts do not align",
+        ),
+        (
+            lambda profile: profile["stage_seconds"].update(mst=[0.1, float("inf"), 0.1]),
+            "finite and nonnegative",
+        ),
+    ],
+)
+def test_native_profile_parser_rejects_invalid_samples_and_identity(mutate, diagnostic) -> None:
+    profile = synthetic_native_profile()
+    mutate(profile)
+    with pytest.raises(ValueError, match=diagnostic):
+        benchmark_tools._validate_profile(profile, "cpu")
+
+
+def test_native_profile_parser_rejects_ambiguous_stdout_profiles(tmp_path: Path) -> None:
+    profile = json.dumps(synthetic_native_profile())
+    path = tmp_path / "mixed.stdout"
+    path.write_text(f"banner\n{profile}\n{profile}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly one native profile"):
+        benchmark_tools._load_profile(path, "cpu")
+
+
+def test_native_profile_parser_rejects_backend_mismatch() -> None:
+    with pytest.raises(ValueError, match="unexpected backend identity"):
+        benchmark_tools._validate_profile(synthetic_native_profile("Cuda(0)"), "cpu")
+    with pytest.raises(ValueError, match="unexpected backend identity"):
+        benchmark_tools._validate_profile(synthetic_native_profile("Cpu"), "cuda")
+
+
+def test_deterministic_input_matches_existing_generator_shape_bytes_and_hash(
+    tmp_path: Path,
+) -> None:
+    from comparison.compare_hdbscan_stages import make_input
+
+    generated = tmp_path / "generated.f32le"
+    reference = tmp_path / "reference.f32le"
+    benchmark_tools._generate_input(generated, 256)
+    make_input(256, 16, 1.0, 1.0, 42, reference)
+    generated_bytes = generated.read_bytes()
+    reference_bytes = reference.read_bytes()
+    assert generated_bytes == reference_bytes
+    assert len(generated_bytes) == 256 * 16 * 4
+    assert (
+        __import__("hashlib").sha256(generated_bytes).digest()
+        == __import__("hashlib").sha256(reference_bytes).digest()
+    )
+
+
+def run_fake_benchmark(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    *,
+    mismatch: bool = False,
+    failure_backend: str | None = None,
+) -> dict[str, Any]:
+    binary = run_dir / "profile-binary"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("synthetic executable", encoding="utf-8")
+    binary.chmod(0o755)
+
+    def write_input(path: Path, rows: int) -> None:
+        path.write_bytes(b"\0" * (rows * benchmark_tools.FEATURES * 4))
+
+    monkeypatch.setattr(benchmark_tools, "_generate_input", write_input)
+    monkeypatch.setattr(benchmark_tools, "_tool_version", lambda *args: {"available": False})
+    monkeypatch.setattr(benchmark_tools, "_repository_provenance", lambda: {"revision": "test"})
+    calls: list[list[str]] = []
+
+    def fake_run_command(argv, *, timeout, stdout, stderr):
+        args = list(argv)
+        calls.append(args)
+        backend = args[args.index("--backend") + 1]
+        if backend == failure_backend:
+            return {
+                "argv": args,
+                "exit_status": 9,
+                "timeout_seconds": timeout,
+                "timed_out": False,
+                "elapsed_seconds": 0.01,
+            }
+        stdout.write(json.dumps(synthetic_native_profile("Cpu" if backend == "cpu" else "Cuda(0)")))
+        labels_path = Path(args[args.index("--labels-output") + 1])
+        trace_path = Path(args[args.index("--trace-output") + 1])
+        labels = [0] * 20_000
+        if mismatch and backend == "cuda":
+            labels[9] = 1
+        labels_path.write_text(json.dumps(labels), encoding="utf-8")
+        trace_path.write_text("[]", encoding="utf-8")
+        return {
+            "argv": args,
+            "exit_status": 0,
+            "timeout_seconds": timeout,
+            "timed_out": False,
+            "elapsed_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(benchmark_tools, "run_command", fake_run_command)
+    report = benchmark_tools.benchmark(binary, 20_000, run_dir, 10)
+    assert [args[args.index("--backend") + 1] for args in calls] == ["cpu", "cuda"]
+    return report
+
+
+def test_benchmark_runs_cpu_then_cuda_and_persists_valid_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "benchmark success"
+    report = run_fake_benchmark(monkeypatch, run_dir)
+    persisted = json.loads((run_dir / "benchmark.json").read_text(encoding="utf-8"))
+    assert persisted == report
+    assert report["correctness"] == {"labels_equal": True, "rows_compared": 20_000}
+    assert report["profiles"]["cpu"]["fit_seconds"] == [2.0, 2.1, 1.9]
+    assert report["profiles"]["cuda"]["backend"] == "Cuda(0)"
+
+
+@pytest.mark.parametrize(
+    "mismatch,failure_backend,diagnostic",
+    [(True, None, "labels differ at row 9"), (False, "cuda", "benchmark exited 9")],
+)
+def test_benchmark_failures_never_write_success_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: bool,
+    failure_backend: str | None,
+    diagnostic: str,
+) -> None:
+    run_dir = tmp_path / "benchmark failed"
+    with pytest.raises((ValueError, RuntimeError), match=diagnostic):
+        run_fake_benchmark(
+            monkeypatch,
+            run_dir,
+            mismatch=mismatch,
+            failure_backend=failure_backend,
+        )
+    assert not (run_dir / "benchmark.json").exists()
+
+
+def test_identity_reads_only_valid_shared_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    manifest_path = run_dir / "raw" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(manifest()), encoding="utf-8")
+    result = identity(run_dir)
+    assert result == manifest()
+    for changed in (
+        {**manifest(), "schema_version": 2},
+        {**manifest(), "run_id": None},
+        {**manifest(), "input_sha256": "not-a-digest"},
+        {**manifest(), "workload": []},
+        {key: value for key, value in manifest().items() if key != "run_id"},
+    ):
+        manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(ValueError):
+            identity(run_dir)
+
+
+def test_identity_reports_missing_and_malformed_manifest(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cannot read run identity manifest"):
+        identity(tmp_path)
+    path = tmp_path / "raw" / "manifest.json"
+    path.parent.mkdir()
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot read run identity manifest"):
+        identity(tmp_path)
+
+
+def test_atomic_json_preserves_previous_report_on_serialization_error(tmp_path: Path) -> None:
+    path = tmp_path / "reports" / "report.json"
+    atomic_json(path, {"prior": True})
+    with pytest.raises(ValueError):
+        atomic_json(path, {"invalid": float("nan")})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"prior": True}
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("value,fields", [(None, ("x",)), ({}, ("x",))])
+def test_require_fields_rejects_nonobjects_and_missing_fields(value, fields) -> None:
+    with pytest.raises(ValueError):
+        require_fields(value, fields, "synthetic report")
+
+
+def test_run_command_records_success_and_nonzero_exit(tmp_path: Path) -> None:
+    for return_code in (0, 7):
+        stdout_path = tmp_path / f"stdout-{return_code}.txt"
+        stderr_path = tmp_path / f"stderr-{return_code}.txt"
+        with (
+            stdout_path.open("w", encoding="utf-8") as stdout,
+            stderr_path.open("w", encoding="utf-8") as stderr,
+        ):
+            result = run_command(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('out'); print('err', file=sys.stderr); "
+                    f"sys.exit({return_code})",
+                ],
+                timeout=3,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        assert result["exit_status"] == return_code
+        assert result["timed_out"] is False
+        assert result["timeout_seconds"] == 3
+        assert result["elapsed_seconds"] >= 0
+        assert stdout_path.read_text(encoding="utf-8").strip() == "out"
+        assert stderr_path.read_text(encoding="utf-8").strip() == "err"
+
+
+def test_run_command_rejects_invalid_executable_and_timeout(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="argv"):
+        run_command([], timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with pytest.raises(ValueError, match="timeout"):
+        run_command(
+            [sys.executable, "-c", "pass"],
+            timeout=0,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def test_run_command_timeout_kills_process_group_and_reaps_child(tmp_path: Path) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    child_code = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    parent_code = (
+        "import pathlib, signal, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        + repr(child_code)
+        + "]); pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    with (
+        (tmp_path / "runner.out").open("w", encoding="utf-8") as stdout,
+        (tmp_path / "runner.err").open("w", encoding="utf-8") as stderr,
+    ):
+        result = run_command(
+            [sys.executable, "-c", parent_code, str(child_pid_file)],
+            timeout=0.2,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    assert result["timed_out"] is True
+    assert result["exit_status"] is not None
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    proc_stat = Path(f"/proc/{child_pid}/stat")
+    deadline = time.monotonic() + 2
+    while proc_stat.exists() and time.monotonic() < deadline:
+        if proc_stat.read_text(encoding="utf-8").split()[2] == "Z":
+            break
+        time.sleep(0.02)
+    assert not proc_stat.exists() or proc_stat.read_text(encoding="utf-8").split()[2] == "Z"
+
+
+def test_run_command_interrupt_stops_and_reaps_process_group(tmp_path: Path, monkeypatch) -> None:
+    # Exercise cleanup on an exception from waiting without delivering a signal to pytest.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    real_wait = proc.wait
+    should_interrupt = True
+
+    def interrupt_once(timeout=None):
+        nonlocal should_interrupt
+        if should_interrupt:
+            should_interrupt = False
+            raise KeyboardInterrupt
+        return real_wait(timeout=timeout)
+
+    proc.wait = interrupt_once
+    monkeypatch.setattr(common_tools.subprocess, "Popen", lambda *args, **kwargs: proc)
+    with pytest.raises(KeyboardInterrupt):
+        run_command(
+            [sys.executable, "-c", "pass"],
+            timeout=1,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    assert proc.poll() is not None

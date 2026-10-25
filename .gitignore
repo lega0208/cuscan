@@ -23,6 +23,7 @@ artifacts/**/*.sqlite
 artifacts/**/reverse-*.json
 artifacts/**/harness.diff
 artifacts/**/*.stderr.txt
+artifacts/hdbscan_stages
 
 analyze/hdbscan_hotspots
 

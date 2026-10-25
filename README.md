@@ -218,12 +218,62 @@ uv run --no-sync python comparison/compare_hdbscan_stages.py --backend cpu \
   --html comparison/hdbscan_stages.html --json comparison/hdbscan_stages.json
 ```
 
-Stage scripts default to CPU; for CUDA, build the corresponding companion with
-`cuda,tracing` and pass `--backend cuda`. Each implementation runs in a separate
-subprocess. One fit is process-cold (persistent caches may still apply).
-`--rust-runs N` with N >= 2 compares the median of warmed native runs, excluding
-run 0; the UMAP reference still runs once. HDBSCAN also supports `--python-runs N`
-with the same cold/warmed rule for the reference.
+Stage scripts default to CPU; for CUDA, keep the `tracing` build above and pass
+`--backend cuda` (both backends are always compiled). Each implementation runs in
+a separate subprocess. UMAP's first fit is process-cold (persistent caches may
+still apply); `--rust-runs N` with N >= 2 compares warmed runs excluding run 0,
+while its reference runs once. HDBSCAN instead performs one excluded warmup then
+exactly `--rust-runs N` and `--python-runs N` measured fits respectively.
+For native-only hotspot attribution, see [HDBSCAN stage analysis](#hdbscan-stage-analysis).
+
+#### HDBSCAN stage analysis
+
+`analyze_hdbscan_stages.sh` analyzes native CPU/CUDA hotspots, not performance
+against reference `fast_hdbscan`. It requires Linux x86-64 (including WSL2), Cargo,
+a configured uv environment (`uv sync`), a working NVIDIA CUDA runtime, Nsight
+Systems (`nsys`), Nsight Compute (`ncu`), and GPU counter permissions.
+
+```sh
+bash analyze_hdbscan_stages.sh --help
+bash analyze_hdbscan_stages.sh                     # 20,000 rows
+bash analyze_hdbscan_stages.sh --rows 100000
+bash analyze_hdbscan_stages.sh --rows 20000 --output-dir artifacts/hdbscan_stages/my-run
+uv run --no-sync python analyze/summarize_hdbscan_stages.py \
+  --benchmark artifacts/hdbscan_stages/my-run/benchmark.json \
+  --kernels artifacts/hdbscan_stages/my-run/cuda_kernels.json \
+  --counters artifacts/hdbscan_stages/my-run/cuda_counters.json
+```
+
+Explicit output directories must not exist; omitted directories are unique.
+Invocation from another working directory is supported. The fixed workload has
+16 features, eight centers, center scale/noise 1.0, seed 42, min-samples and
+min-cluster-size 5, and Auto search. All captures share identical little-endian
+float32 input bytes and record their SHA-256. Native CPU and CUDA each perform
+one excluded warmup and three measured fits, serially, retaining raw samples and
+medians. Exact final-label agreement is required, not proof of external-data
+clustering quality.
+
+Compilation is outside execution timeouts; runtime initialization and JIT are
+inside. At 20k, each native/profiler child has a 10-second deadline, not a
+10-second total-pipeline promise. At 100k, native children have 240 seconds and
+each profiler capture 90 seconds. SQLite export has a separate 60-second limit.
+There are no automatic retries, timeout inflation, backend fallbacks, or skips.
+Failures retain diagnostics and return nonzero without a successful summary.
+
+The three canonical JSON files above suffice for offline summarization without
+CUDA or Nsight. `raw/` retains input, manifest, native profiles, traces, labels,
+stdout/stderr, Nsight reports, SQLite, and counter CSVs; allow substantial disk
+space. Existing ignore rules exclude raw `.f32le`, `.sqlite`, and `.nsys-rep`
+artifacts; inspectable JSON/CSV/host traces remain available.
+
+Nsight Systems attributes only the measured fit using epoch markers and its own
+native stage timings. Summed device activity is not elapsed wall time, especially
+with overlapping kernels. Nsight Compute samples the first matching warmup
+launch separately for `partial_kernel` and `tile_candidates`, not whole-fit
+averages. Synchronization, instrumentation, replay, and cache behavior perturb
+measurements. Counter diagnoses are conditional hypotheses; they cannot establish
+CPU instruction bottlenecks or universal speedups. Independently computed medians
+are not additive; stage shares use aligned per-fit samples.
 
 UMAP reports neighbor search, fuzzy graph, schedule, spectral graph export,
 initialization, and optimization; its `other` row is fit time outside measured

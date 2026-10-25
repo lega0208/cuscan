@@ -83,6 +83,15 @@ Burn/CubeCL requirements are declared once in `[workspace.dependencies]`; keep t
 
 ## Testing & QA
 
+Native HDBSCAN hotspot reproduction (strict CPU/CUDA, Nsight and counter access):
+`bash analyze_hdbscan_stages.sh --rows 20000`. After relevant changes, require
+`bash analyze_hdbscan_stages.sh --rows 100000` final validation. The fixed synthetic
+workload and per-child 10s feedback cap include runtime JIT, not Cargo compilation;
+compilation-only or skipped CUDA execution is not validation. See
+[HDBSCAN stage analysis](README.md#hdbscan-stage-analysis) for final-scale limits.
+Offline: `uv run --no-sync python analyze/summarize_hdbscan_stages.py --benchmark RUN/benchmark.json --kernels RUN/cuda_kernels.json --counters RUN/cuda_counters.json`.
+Focused QA: `uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py`.
+
 Rust uses `#[test]` integration/unit tests and Criterion benchmarks; Python uses pytest. Standard CPU tests use the CubeCL LLVM CPU runtime and do not require a GPU.
 
 For required CUDA coverage rather than silent hardware skips:
