@@ -1133,18 +1133,36 @@ mod tests {
 
     fn check_kd_neighbors_match_reference(device: &CubeDevice) {
         let mut cases = Vec::new();
-        for features in [1, 2, 3, 4, 5, 16, 29, 30] {
+        for features in [2, 16, 30] {
+            for k in 1..=17 {
+                cases.push((2000, features, k, None));
+            }
+            for k in [24, 30] {
+                cases.push((2000, features, k, None));
+            }
+        }
+        for features in [1, 3, 4, 5, 29] {
             for k in [1, 5, 16, 17] {
                 cases.push((2000, features, k, None));
             }
         }
-        for k in [5, 17] {
+        for k in [1, 5, 16] {
             cases.push((2000, 16, k, Some("duplicates")));
         }
-        cases.push((512, 3, 5, Some("grid")));
-        cases.push((257, 16, 5, None));
-        cases.push((9, 2, 12, None));
-        cases.push((1, 2, 4, None));
+        for k in [5, 16] {
+            cases.push((512, 3, k, Some("grid")));
+        }
+        for k in [1, 5, 16] {
+            cases.push((3, 2, k, Some("overflow")));
+        }
+        cases.extend([
+            (1, 2, 1, None),
+            (4, 2, 3, None),
+            (4, 2, 5, None),
+            (4, 2, 16, None),
+            (9, 2, 16, None),
+            (257, 16, 5, None),
+        ]);
 
         for (rows, features, k, special) in cases {
             let mut values = splitmix_values(rows, features);
@@ -1163,6 +1181,9 @@ mod tests {
                         values[row * features + 1] = ((row / 8) % 8) as f32;
                         values[row * features + 2] = ((row / 64) % 8) as f32;
                     }
+                }
+                Some("overflow") => {
+                    values = vec![f32::MAX, 0.0, -f32::MAX, 0.0, 0.0, f32::MAX];
                 }
                 _ => {}
             }

@@ -26,6 +26,7 @@ atomic_json = common_tools.atomic_json
 identity = common_tools.identity
 require_fields = common_tools.require_fields
 run_command = common_tools.run_command
+validate_min_samples = common_tools.validate_min_samples
 CORE_SUBPHASES = summary_tools.CORE_SUBPHASES
 COUNTER_METRICS = summary_tools.COUNTER_METRICS
 ROUND_SUBPHASES = summary_tools.ROUND_SUBPHASES
@@ -126,6 +127,7 @@ def test_shell_cli_accepts_supported_rows_and_resolves_paths_from_foreign_cwd(
     assert "--timeout', '" + native_timeout in commands
     assert "profile_hdbscan_kernels.py" in commands
     assert "profile_hdbscan_counters.py" in commands
+    assert "--min-samples', '5" in commands
     assert "--timeout', '" + profile_timeout in commands
     assert "summarize_hdbscan_stages.py" in commands
 
@@ -457,6 +459,31 @@ def test_route_kernel_families_cover_both_routes_and_reject_unknown() -> None:
         common_tools.route_kernel_families("Auto")
 
 
+def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel() -> None:
+    assert common_tools.route_kernel_families("KdTree")[0] == "kd_neighbors_kernel"
+
+
+@pytest.mark.parametrize("mismatch_source", ["manifest", "benchmark"])
+def test_counter_min_samples_rejects_configuration_mismatch(mismatch_source: str) -> None:
+    manifest_data = {"workload": {"config": {"min_samples": 16}}}
+    benchmark_data = {"workload": {"config": {"min_samples": 16}}}
+    target = manifest_data if mismatch_source == "manifest" else benchmark_data
+    target["workload"]["config"]["min_samples"] = 5
+    with pytest.raises(ValueError, match=f"does not match {mismatch_source}"):
+        validate_min_samples(manifest_data, benchmark_data, 16)
+
+
+@pytest.mark.parametrize("configured", [True, "16", 16.0, 0, -1])
+@pytest.mark.parametrize("source", ["manifest", "benchmark"])
+def test_counter_min_samples_rejects_malformed_configuration(configured, source: str) -> None:
+    manifest_data = {"workload": {"config": {"min_samples": 16}}}
+    benchmark_data = {"workload": {"config": {"min_samples": 16}}}
+    target = manifest_data if source == "manifest" else benchmark_data
+    target["workload"]["config"]["min_samples"] = configured
+    with pytest.raises(ValueError, match=f"{source} configuration has invalid min_samples"):
+        validate_min_samples(manifest_data, benchmark_data, 16)
+
+
 def test_summary_accepts_three_synthetic_reports_and_preserves_caveats() -> None:
     benchmark, kernels, counters = synthetic_reports()
     result = summarize_reports(benchmark, kernels, counters)
@@ -721,6 +748,8 @@ def ncu_csv(
         ("l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum", "sector", "4"),
         ("l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum", "sector", "12"),
         ("l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum", "", "3"),
+        ("l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum", "sector", "8"),
+        ("l1tex__t_requests_pipe_lsu_mem_global_op_st.sum", "", "2"),
         ("smsp__pcsamp_warps_issue_stalled_long_scoreboard", "warp", "2"),
         ("smsp__pcsamp_sample_count", "", "8"),
         ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "99.18"),
@@ -796,6 +825,10 @@ def test_ncu_parser_handles_preamble_quotes_numbers_and_normalizes_units() -> No
     assert ratio["status"] == "available"
     assert ratio["value"] == 4
     assert ratio["unit"] == "sector/request"
+    store_ratio = result["ratios"]["global_store_sectors_per_request"]
+    assert store_ratio["status"] == "available"
+    assert store_ratio["value"] == 4
+    assert store_ratio["unit"] == "sector/request"
     assert ratio["numerator"] == {
         "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
         "raw_value": 12,
@@ -891,6 +924,40 @@ def test_ncu_capture_rejects_preexisting_trace_without_modifying_it(tmp_path: Pa
     assert not any(path.exists() for path in expected[:3])
 
 
+def test_nsys_kernel_profiler_rejects_k16_manifest_before_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "k16 workload"
+    raw = run_dir / "raw"
+    raw.mkdir(parents=True)
+    run_manifest = manifest()
+    run_manifest["workload"] = {"rows": 20_000, "features": 16, "config": {"min_samples": 16}}
+    (raw / "manifest.json").write_text(json.dumps(run_manifest), encoding="utf-8")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(kernel_tools, "run_command", lambda argv, **kwargs: commands.append(argv))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "profile_hdbscan_kernels.py",
+            "--binary",
+            str(tmp_path / "profile-binary"),
+            "--rows",
+            "20000",
+            "--run-dir",
+            str(run_dir),
+            "--timeout",
+            "10",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="supports only min_samples=5"):
+        kernel_tools.main()
+
+    assert commands == []
+    assert not (run_dir / "cuda_kernels.json").exists()
+
+
 @pytest.mark.parametrize(
     "metric",
     [
@@ -900,6 +967,8 @@ def test_ncu_capture_rejects_preexisting_trace_without_modifying_it(tmp_path: Pa
         "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
         "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
         "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+        "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
         "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
         "smsp__pcsamp_sample_count",
         "sm__maximum_warps_per_active_cycle_pct",
@@ -1083,6 +1152,7 @@ def run_fake_benchmark(
     mismatch: bool = False,
     failure_backend: str | None = None,
     rows: int = 20_000,
+    min_samples: int = 5,
 ) -> dict[str, Any]:
     binary = run_dir / "profile-binary"
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -1126,7 +1196,7 @@ def run_fake_benchmark(
         }
 
     monkeypatch.setattr(benchmark_tools, "run_command", fake_run_command)
-    report = benchmark_tools.benchmark(binary, rows, run_dir, 10)
+    report = benchmark_tools.benchmark(binary, rows, run_dir, 10, min_samples)
     assert [args[args.index("--backend") + 1] for args in calls] == ["cpu", "cuda"]
     return report
 
@@ -1142,6 +1212,16 @@ def test_benchmark_runs_cpu_then_cuda_and_persists_valid_report(
     assert report["correctness"] == {"labels_equal": True, "rows_compared": rows}
     assert report["profiles"]["cpu"]["fit_seconds"] == [2.0, 2.1, 1.9]
     assert report["profiles"]["cuda"]["backend"] == "Cuda(0)"
+
+
+def test_benchmark_provisions_k16_and_records_manifest_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = run_fake_benchmark(monkeypatch, tmp_path / "k16", min_samples=16)
+    assert report["workload"]["config"]["min_samples"] == 16
+    for backend in ("cpu", "cuda"):
+        argv = report["profiles"][backend]["command_provenance"]["argv"]
+        assert argv[argv.index("--min-samples") + 1] == "16"
 
 
 @pytest.mark.parametrize(

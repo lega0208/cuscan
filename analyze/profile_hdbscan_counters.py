@@ -21,6 +21,7 @@ from hdbscan_stages_common import (
     route_kernel_families,
     run_command,
     uniform_route,
+    validate_min_samples,
 )
 
 METRICS = (
@@ -33,6 +34,8 @@ METRICS = (
     "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
     "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
     "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+    "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
     "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
     "smsp__pcsamp_sample_count",
     "sm__warps_active.avg.pct_of_peak_sustained_active",
@@ -93,6 +96,8 @@ def normalize_metric(name: str, value: float, unit: str) -> tuple[float, str]:
         "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
         "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
         "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+        "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
         "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
         "smsp__pcsamp_sample_count",
     }:
@@ -179,6 +184,12 @@ def parse_ncu_csv(text: str, kernel_family: str) -> dict[str, Any]:
             "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
             ("sector", "request"),
         ),
+        (
+            "global_store_sectors_per_request",
+            "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+            "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum",
+            ("sector", "request"),
+        ),
     ):
         numerator = parsed[numerator_name]
         denominator = parsed[denominator_name]
@@ -193,9 +204,7 @@ def parse_ncu_csv(text: str, kernel_family: str) -> dict[str, Any]:
                 if denominator_value != 0
                 else None
             ),
-            "unit": (
-                "sector/request" if ratio_name == "global_load_sectors_per_request" else "share"
-            ),
+            "unit": "sector/request",
             "numerator": {
                 "metric": numerator_name,
                 "raw_value": numerator["value"],
@@ -296,6 +305,7 @@ def main() -> int:
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--binary-label", required=True, choices=("baseline", "variant", "current"))
     parser.add_argument("--rows", required=True, type=int, choices=(20000, 50000, 100000))
+    parser.add_argument("--min-samples", required=True, type=int)
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
     args = parser.parse_args()
@@ -328,6 +338,7 @@ def main() -> int:
     for field in ("schema_version", "run_id", "workload", "input_sha256"):
         if benchmark.get(field) != ident.get(field):
             raise ValueError(f"benchmark report identity mismatch for {field}")
+    validate_min_samples(ident, benchmark, args.min_samples)
     for backend in ("cpu", "cuda"):
         try:
             provisioned_argv = benchmark["profiles"][backend]["command_provenance"]["argv"]
@@ -387,7 +398,7 @@ def main() -> int:
             "--min-cluster-size",
             "5",
             "--min-samples",
-            "5",
+            str(args.min_samples),
             "--search",
             "auto",
             "--trace-output",

@@ -228,6 +228,12 @@ def main() -> int:
     ident = identity(args.run_dir)
     if ident["workload"].get("rows") != args.rows:
         raise ValueError("--rows does not match the run manifest workload")
+    config = ident["workload"].get("config")
+    if not isinstance(config, dict) or config.get("min_samples") != 5:
+        raise ValueError(
+            "Nsight Systems kernel profiling supports only min_samples=5; "
+            "run manifest configuration does not match"
+        )
     report_path = args.run_dir / "cuda_kernels.json"
     if report_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report {report_path}")

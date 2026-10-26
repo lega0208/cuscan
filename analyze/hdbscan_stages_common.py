@@ -59,6 +59,21 @@ def uniform_route(routes: Any, context: str) -> str:
     return route
 
 
+def validate_min_samples(identity_data: Any, benchmark: Any, requested: int) -> None:
+    """Require counter-requested min_samples to match both provisioned identities."""
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+        raise ValueError("min_samples must be a positive integer")
+    for source, report in (("manifest", identity_data), ("benchmark", benchmark)):
+        try:
+            configured = report["workload"]["config"]["min_samples"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"{source} configuration lacks min_samples") from error
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+            raise ValueError(f"{source} configuration has invalid min_samples")
+        if configured != requested:
+            raise ValueError(f"requested min_samples does not match {source} configuration")
+
+
 def atomic_json(path: str | os.PathLike[str], data: Any) -> None:
     """Atomically persist JSON, leaving an existing report intact on failure."""
     target = Path(path)

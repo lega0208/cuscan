@@ -2,7 +2,7 @@
 
 This document details Phase 2 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). It depends on the Phase 1 harness (`cubecl_kernels_perf_plan_phase1.md`, Step 1), but not on the Phase 1 kernel edit being accepted. The source analysis is in [hdbscan_perf_report.md](hdbscan_perf_report.md), "Follow-ups", F2 (second part) and opportunity 5.
 
-**Status:** plan only. Nothing here has been compiled, run or measured. Line numbers refer to revision `2c3fc35fa2b2492f519c0adcb544779357f46dd8`; Phase 1 will shift them, so re-read before editing.
+**Status:** measured and rejected. The exact-comptime-`k` experiment passed output/diagnostic equivalence but failed mandatory decision rules 3, 4 and 6; the register-top-k kernel was reverted, the accepted Phase 1 root-cache heap remains in production, and the extended equivalence/profiling harness is retained. Evidence: [`artifacts/cubecl_kernels_perf/phase2/summary.json`](artifacts/cubecl_kernels_perf/phase2/summary.json), [`cold_start.json`](artifacts/cubecl_kernels_perf/phase2/cold_start.json), [`provenance.json`](artifacts/cubecl_kernels_perf/phase2/provenance.json), and [`measured_kernel.patch`](artifacts/cubecl_kernels_perf/phase2/measured_kernel.patch); full measured outcome: [hdbscan_perf_report.md](hdbscan_perf_report.md#phase-2-results-register-top-k-experiment-rejected). The instructions below are retained as the historical experimental design; they are not an implementation specification for production.
 
 ## Objective
 

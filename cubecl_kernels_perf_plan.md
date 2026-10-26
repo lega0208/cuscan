@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below; subsequent phases remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected; Phase 3 onward remain unimplemented and unmeasured.
 
 ## Baseline facts this plan relies on
 
@@ -58,17 +58,9 @@ The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measur
 
 ### Phase 2: Register top-k for small k (F2b), both backends
 
-**Change.**
-- Add `#[comptime] k_max` variants for `k <= 8` and `k <= 16`. Each holds a sorted register list of `(distance, id)` pairs, updated by fully unrolled compare-and-shift insertion keyed on the same total order (ties broken by smaller original ID).
-- Write the list to `out_*[row]` once at the end; this also removes the final heapsort (`:368–418`).
-- Keep the existing output-backed heap kernel as the path for `k > 16`.
-- The host selects the variant in `exact_neighbors_kd`.
+**Status:** measured and rejected; no register threshold retained. The experiment used an exact `#[comptime] k` specialization for each `k = 1..=16`, with sorted register-list insertion, and the output-backed Phase 1 heap otherwise. This replaces the earlier proposed `k_max ∈ {8,16}` bucket design; see the detailed plan's rationale. CPU/CUDA equivalence passed, but mandatory rules 3, 4 and 6 failed. No threshold revision was attempted. Production remains the accepted Phase 1 root-cache heap; extended equivalence/profiling harness retained. See [Phase 2 results](hdbscan_perf_report.md#phase-2-results-register-top-k-experiment-rejected) and [`summary.json`](artifacts/cubecl_kernels_perf/phase2/summary.json).
 
-**Why.** It eliminates global heap traffic and the heapsort. Every list index is comptime, so the list stays in registers, whereas a heap would spill to local memory because its sift uses dynamic indices.
-
-**Watch.** k=16 adds 32 live registers. Check spills and registers with H3.
-
-**Accept when** H1 passes, including k=16/17, and H2 and H3 show no spills and a core-time gain.
+**Experimental design (not retained).** Fully unrolled sorted insertion of `(distance, id)` pairs into an exact-comptime-`k` list for each `k = 1..=16`; write results once at row completion. The unchanged output-backed heap handles `k > 16`. This design was tested, not accepted as a production optimization.
 
 ### Phase 3: Padded vector data and register-resident query (F1), both backends
 

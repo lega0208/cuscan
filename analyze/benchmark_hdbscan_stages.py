@@ -268,9 +268,13 @@ def _generate_input(path: Path, rows: int) -> None:
         )
 
 
-def benchmark(binary: Path, rows: int, run_dir: Path, timeout: float) -> dict[str, Any]:
+def benchmark(
+    binary: Path, rows: int, run_dir: Path, timeout: float, min_samples: int = 5
+) -> dict[str, Any]:
     if rows not in (20_000, 50_000, 100_000):
         raise ValueError("rows must be 20000, 50000, or 100000")
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples <= 0:
+        raise ValueError("min_samples must be a positive integer")
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"profiling binary is not an executable file: {binary}")
     run_dir = run_dir.resolve()
@@ -292,7 +296,7 @@ def benchmark(binary: Path, rows: int, run_dir: Path, timeout: float) -> dict[st
         "rows": rows,
         "features": FEATURES,
         "config": {
-            "min_samples": 5,
+            "min_samples": min_samples,
             "min_cluster_size": 5,
             "search": "auto",
             "centers": 8,
@@ -350,7 +354,7 @@ def benchmark(binary: Path, rows: int, run_dir: Path, timeout: float) -> dict[st
             "--min-cluster-size",
             "5",
             "--min-samples",
-            "5",
+            str(min_samples),
             "--search",
             "auto",
             "--labels-output",
@@ -432,9 +436,10 @@ def main() -> int:
     parser.add_argument("--rows", required=True, type=int, choices=(20_000, 50_000, 100_000))
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
+    parser.add_argument("--min-samples", type=int, default=5)
     args = parser.parse_args()
     try:
-        benchmark(args.binary.resolve(), args.rows, args.run_dir, args.timeout)
+        benchmark(args.binary.resolve(), args.rows, args.run_dir, args.timeout, args.min_samples)
     except (OSError, RuntimeError, TimeoutError, ValueError) as error:
         print(f"benchmark_hdbscan_stages: {error}", file=sys.stderr)
         return 1
