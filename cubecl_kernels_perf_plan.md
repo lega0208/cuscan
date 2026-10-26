@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected; Phase 3 onward remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 onward remain unimplemented and unmeasured.
 
 ## Baseline facts this plan relies on
 
@@ -64,26 +64,21 @@ The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measur
 
 ### Phase 3: Padded vector data and register-resident query (F1), both backends
 
-**Change.**
-1. Build the padded data `[n, d_chunks]` as `Tensor<Vector<f32, Const<4>>>`, zero-padded, once per fit.
-   - First choice: a small device kernel or host-side pack at upload.
-   - Pack the bounds in the same layout.
-   - Extend `DeviceKdTree` with these fields and update `upload_kd_tree`, `clone_device_kd_tree`, `into_contiguous_tree`, `validate_tree`, the test constructors in `kernels/mod.rs`/`kdtree.rs`, and the fusion extension handling.
-   - `boruvka_candidates_kd` ignores the new fields in this plan.
-2. Pass `#[comptime] d_chunks` and drop the runtime `data.shape(1)` loop bound.
-3. Load the query once into `d_chunks` vectors. Use it in `box_lower_bound` (a vector variant) and in the point distances.
-4. Inside each chunk, accumulate lanes in feature order with `#[unroll]` `extract(lane)` (Invariant 1). Loads are 128-bit; the arithmetic stays in sequential order.
-5. Update resource sizing for the padded copy (`n * d_chunks * 16` bytes, e.g. 12.8 MB at 100k×32).
+**Status:** implemented and accepted. Detailed plan: [cubecl_kernels_perf_plan_phase3.md](cubecl_kernels_perf_plan_phase3.md). Bit-identical IDs, distances and diagnostics on CPU and CUDA; core stage −20% to −29% (CPU) and −62% to −70% (CUDA) in the primary cells. Two deviations from the literal decision rule are recorded: one 20k×2 CUDA campaign regression that did not replicate, and +0.16% local-load sectors at 2D (traversal stack, not spills). See [Phase 3 results](hdbscan_perf_report.md#phase-3-results-padded-vector-data-and-register-resident-query) and [`summary.json`](artifacts/cubecl_kernels_perf/phase3/summary.json).
 
-**Register budget (sm_86).** At 32-thread cubes the 16-blocks/SM limit means up to ~128 registers per thread cost no occupancy, so 16–32 extra query registers on top of 71 are free at the current geometry.
+**Change (as implemented).**
+1. **Per-call pack, not `DeviceKdTree` fields.** `launch_kd_neighbors` packs `data`, `bounds_min` and `bounds_max` with `pad_rows` into contiguous 1D f32 buffers of `rows · 4⌈d/4⌉` values with `+0.0` tail lanes, and passes them as `Tensor<Vector<f32, Const<4>>>` views. `DeviceKdTree`, `HdbscanOps::exact_neighbors_kd` and `boruvka_candidates_kd` are unchanged.
+2. **One layout for every `d`.** The kernel takes runtime `d_chunks` and an exact `#[comptime] reg_features`: for `d ≤ KD_REGISTER_QUERY_MAX_FEATURES = 32` the query is loaded once into registers and the register path sums exactly `d` real lanes (pads skipped); for `d > 32` (`reg_features = 0`) a runtime chunk loop reads the query from global memory and also adds the neutral pad lanes. The exact feature count replaced an initial `reg_chunks` specialization after the 20k×2 guard cell (Step 5 rule).
+3. Per-lane arithmetic and feature order are unchanged; vectors are load containers only (`extract(lane)` with comptime lanes).
+4. Sizing: `(n + 2·nodes) · 4⌈d/4⌉ · 4` bytes are added to the KD branch of `core_search_memory`, with three 1D `check_device_allocation` calls.
 
-**Accept when** H1 is bit-identical for all `d` in the list, including `d = 1, 3, 29, 30` (padding tails), and H2 improves. Include padding/upload time in full-fit numbers.
+**Final register threshold.** 32 features. Registers per thread at 20k: 34 (2D), 106 (16D), 128 (30D), against 75 for the baseline; 30D sits exactly at the 128-register budget of the 32-thread geometry.
 
 ### Phase 4: Compact node records (F3), both backends
 
 **Change.**
 - Replace the separate `starts`/`ends`/`is_leaf` reads in the KD neighbor path with one `Vector<u32, Const<4>>` record per node: `(start, end, is_leaf, 0)`.
-- Interleave padded bounds per node as `[min chunks | max chunks]`, so sibling children are adjacent and each box bound reads one contiguous span.
+- Interleave padded bounds per node as `[min chunks | max chunks]`, so sibling children are adjacent and each box bound reads one contiguous span. The interleaved bounds are produced by the Phase 3 per-call pack site in `launch_kd_neighbors` (`pad_rows`), not stored in `DeviceKdTree`.
 - Keep the leaf flag; small-`n` trees can have early leaves (`fast-hdbscan-core/src/kdtree.rs:107`).
 - Replacing the flag with a `first_leaf` scalar is allowed only if it is proven from the builder for the KD route and validated on the host.
 

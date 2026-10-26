@@ -280,6 +280,7 @@ fn core_search_memory(
     min_samples: usize,
     search: HdbscanSearch,
     tree_bytes: usize,
+    kd_pack_bytes: usize,
     brute_force_scratch_bytes: usize,
 ) -> Result<CoreSearchMemory> {
     let k = min_samples.min(n.saturating_sub(1));
@@ -310,7 +311,9 @@ fn core_search_memory(
         HdbscanSearch::KdTree => input
             .checked_add(core)
             .and_then(|v| v.checked_add(compact))
-            .and_then(|v| v.checked_add(tree_bytes)),
+            .and_then(|v| v.checked_add(tree_bytes))
+            // Zero-padded data/bound copies live alongside the tree during neighbor search.
+            .and_then(|v| v.checked_add(kd_pack_bytes)),
         HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
             // Input/core, bounded query view, batch ID/distance outputs, extracted core and
             // the final concatenated core coexist at the most conservative cat boundary.
@@ -1095,12 +1098,17 @@ impl HDBSCAN {
                             .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
                     })
                 })?;
+                let kd_pack_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
+                    crate::kernels::kd_padded_bytes(n, tree.starts.len(), features)
+                        .ok_or(HdbscanError::Overflow("KD-tree padded live bytes"))
+                })?;
                 let memory = core_search_memory(
                     n,
                     features,
                     min_samples,
                     resolved_search,
                     tree_bytes,
+                    kd_pack_bytes,
                     brute_force_scratch_bytes,
                 )?;
                 if memory.device_bytes > isize::MAX as usize
@@ -1138,6 +1146,25 @@ impl HDBSCAN {
                         allocation_limit,
                         "KD-tree node-component allocation",
                     )?;
+                    // Neighbor search packs 1D zero-padded copies (not row-pitched).
+                    let padded_width = crate::kernels::kd_padded_width(features)
+                        .ok_or(HdbscanError::Overflow("KD-tree padded width"))?;
+                    for (rows, subject) in [
+                        (n, "KD-tree padded data allocation"),
+                        (
+                            tree.starts.len(),
+                            "KD-tree padded minimum-bounds allocation",
+                        ),
+                        (
+                            tree.starts.len(),
+                            "KD-tree padded maximum-bounds allocation",
+                        ),
+                    ] {
+                        let elements = rows
+                            .checked_mul(padded_width)
+                            .ok_or(HdbscanError::Overflow(subject))?;
+                        check_device_allocation(elements, 4, allocation_limit, subject)?;
+                    }
                 }
                 #[cfg(feature = "tracing")]
                 drop(_tree_build_span);
@@ -1434,15 +1461,31 @@ mod search_tests {
 
     #[test]
     fn core_search_memory_accounts_for_bounded_and_full_routes() {
-        let brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 4096).unwrap();
-        let cpu_brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 0).unwrap();
-        let kd = core_search_memory(1024, 8, 5, HdbscanSearch::KdTree, 4096, 0).unwrap();
+        let brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 0, 4096).unwrap();
+        let cpu_brute = core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, 0, 0).unwrap();
+        let kd = core_search_memory(1024, 8, 5, HdbscanSearch::KdTree, 4096, 0, 0).unwrap();
+        // 1024 rows and 63 nodes at 5 features pad to 8 lanes: (1024 + 2*63) * 8 * 4 bytes.
+        let pack = crate::kernels::kd_padded_bytes(1024, 63, 5).unwrap();
+        assert_eq!(pack, 36_800);
+        let packed_kd =
+            core_search_memory(1024, 8, 5, HdbscanSearch::KdTree, 4096, pack, 0).unwrap();
         assert_eq!(brute.device_bytes, 65_536);
         assert_eq!(cpu_brute.device_bytes, 61_440);
         assert_eq!(kd.device_bytes, 81_920);
+        assert_eq!(packed_kd.device_bytes, 81_920 + 36_800);
+        assert_eq!(packed_kd.host_bytes, kd.host_bytes);
+        assert_eq!(
+            core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, pack, 0)
+                .unwrap()
+                .device_bytes,
+            cpu_brute.device_bytes
+        );
+        assert!(
+            core_search_memory(1024, 8, 5, HdbscanSearch::KdTree, 4096, usize::MAX, 0).is_err()
+        );
         assert!(brute.device_bytes < kd.device_bytes);
         assert_eq!(brute.host_bytes, kd.host_bytes);
-        assert!(core_search_memory(usize::MAX, 8, 5, HdbscanSearch::BruteForce, 0, 0).is_err());
+        assert!(core_search_memory(usize::MAX, 8, 5, HdbscanSearch::BruteForce, 0, 0, 0).is_err());
     }
 
     #[test]

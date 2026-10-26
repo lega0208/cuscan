@@ -380,3 +380,47 @@ Fresh-process first-fit evidence, in seconds, includes JIT and is reported as `w
 **Final post-rollback verification:** [`review_fix_python.log`](artifacts/cubecl_kernels_perf/phase2/logs/review_fix_python.log) records 91 Python tests passed; [`final_runner.stderr`](artifacts/cubecl_kernels_perf/phase2/logs/final_runner.stderr) records the optimized campaign unittest. [`review_fix_hdbscan_full.log`](artifacts/cubecl_kernels_perf/phase2/logs/review_fix_hdbscan_full.log) records required-CUDA HDBSCAN tests, with 95 passes across suites, 8 pre-existing manual/campaign ignores, and no runtime CUDA skips. [`review_fix_profiler.log`](artifacts/cubecl_kernels_perf/phase2/logs/review_fix_profiler.log) records tracing example tests; `review_fix_clippy.stderr` and `review_fix_100000.stderr` preserve clippy and pipeline diagnostics. Formatting check and clippy succeeded; clippy emitted pre-existing warnings. The eight ignored tests were not run. The production and frozen-reference source prefix is byte-identical to HEAD. The final strict 100k pipeline passed at [`artifacts/hdbscan_stages/run-100000-LiDYNAjq/`](artifacts/hdbscan_stages/run-100000-LiDYNAjq), with exact CPU/CUDA label equality and retained Nsight Systems and Nsight Compute evidence (`raw/nsys_trace.json`, `cuda_kernels.json`, `cuda_counters.json`, and raw reports). The production kernel remains the accepted Phase 1 root-cache heap, and the extended equivalence/profiling harness is retained. No threshold revision was attempted, and Phase 3 was not implemented.
 
 Boundary review also closed a configuration-identity gap: the fixed-k5 Nsight Systems consumer now rejects non-k5 provisioned manifests before profiler execution instead of recording a k5 capture under a k16 identity. Counter provisioning remains parameterized for k16. A regression test covers rejection before launch/report creation; inherited ordinary KD feature dimensions 1, 3, 4, 5 and 29 remain covered alongside the new exhaustive width sweep.
+
+
+## Phase 3 results: padded vector data and register-resident query
+
+**Decision: accepted**, with two recorded deviations from the literal Step 5 rule (below). Plan: [cubecl_kernels_perf_plan_phase3.md](cubecl_kernels_perf_plan_phase3.md). Evidence: [`artifacts/cubecl_kernels_perf/phase3/`](artifacts/cubecl_kernels_perf/phase3/) (`summary.json`, `provenance.json`, `alternation_records.json`, `cuda_counters.json`, `cold_start.json`, `logs/`, `generated/`). Scope: the measured cells and backends below on this host (RTX 3080, Ryzen 7 9800X3D), k = 5.
+
+**Change.** `launch_kd_neighbors` packs the data and both bound arrays per call into 1D zero-padded f32 buffers (`pad_rows`) and passes them to `kd_neighbors_kernel` as `Vector<f32, Const<4>>` views. For `d ≤ 32` the query is loaded once per row into registers and every candidate/box evaluation issues `⌈d/4⌉` (resp. `2⌈d/4⌉`) 16-byte loads; the register path is specialized on the exact comptime feature count, so pad lanes are skipped. `d > 32` uses a runtime chunk loop over the same layout. Arithmetic per lane and its feature order are unchanged. `DeviceKdTree`, the public API and Borůvka are unchanged. Sizing adds `(n + 2·nodes)·4⌈d/4⌉·4` bytes to the KD core-search plan.
+
+**Correctness.** With `FAST_UMAP_REQUIRE_CUDA=1`, every Step 3 command passed with no hardware skips. The extended harness (d ∈ 1–5, 8, 12, 16, 20, 24, 28–30, 32, 33, 40; k ∈ 1, 5, 16, 17 and more; duplicates, integer grids, `f32::MAX` overflow inputs, n = 257 and tiny n) is bit-identical to the frozen reference kernel in IDs, distance bits and per-row diagnostics on CPU and CUDA. The pack test checks `+0` pad bits exactly. Final labels were equal in every benchmark process. The copied runner is byte-identical to the Phase 1 runner.
+
+**Timing** (process medians of 3 measured fits; order B,V,V,B,B,V; `alternation_records.json`):
+
+| Cell | Backend | Core baseline, ms [min–max] | Core variant, ms [min–max] | Change | Full fit B → V, ms | Labels equal |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20k×16 | CPU | 292.5 [290.7–295.2] | 206.7 [203.1–211.5] | -29.3% | 351.6 → 264.7 | yes |
+| 20k×16 | CUDA | 66.2 [65.8–66.4] | 19.7 [19.5–20.0] | -70.3% | 142.3 → 95.9 | yes |
+| 50k×16 | CPU | 1431.9 [1420.5–1443.7] | 1048.3 [1045.3–1083.6] | -26.8% | 1634.5 → 1260.1 | yes |
+| 50k×16 | CUDA | 304.7 [300.6–306.7] | 99.5 [97.2–100.2] | -67.3% | 564.4 → 356.1 | yes |
+| 50k×30 | CPU | 3964.0 [3911.3–4019.8] | 2999.7 [2990.5–3000.1] | -24.3% | 4889.2 → 3854.7 | yes |
+| 50k×30 | CUDA | 639.9 [634.5–640.1] | 241.3 [240.3–242.1] | -62.3% | 1312.7 → 900.2 | yes |
+| 20k×30 | CPU | 652.6 [646.3–681.4] | 489.8 [488.3–516.7] | -25.0% | 847.6 → 682.6 | yes |
+| 20k×30 | CUDA | 93.2 [91.5–94.0] | 34.3 [34.3–35.6] | -63.2% | 259.2 → 199.2 | yes |
+| 20k×8 | CPU | 38.7 [35.1–39.9] | 29.5 [27.2–35.1] | -23.8% | 64.7 → 55.0 | yes |
+| 20k×8 | CUDA | 13.3 [11.7–14.6] | 10.3 [8.8–10.7] | -22.3% | 57.1 → 54.0 | yes |
+| 20k×2 | CPU | 3.9 [3.2–4.0] | 3.4 [3.3–3.8] | -10.7% | 21.7 → 21.5 | yes |
+| 20k×2 | CUDA | 1.6 [1.4–1.8] | 1.9 [1.7–1.9] | +17.0% | 17.1 → 16.8 | yes |
+
+All four primary cells improve on both backends, and the variant maximum is below the baseline median in 4/4 cells on each backend. 50k×30 does not regress.
+
+**Regression guards.** 20k×8 improves on both backends. At 20k×2 on CUDA the core stage is about 1.5–2.8 ms with bimodal per-fit samples. The first campaign (a `reg_chunks` specialization, kept in `attempt1_reg_chunks/`) and the main campaign (exact feature count) both put the variant median above the baseline maximum (by 0.58 ms and 0.06 ms; +37% and +17% versus the baseline medians). A replication of the guard cells with identical binaries (`artifacts/cubecl_kernels_perf/phase3_d2_replicate/`) showed no regression beyond spread: 1.7 ms variant vs 1.8 ms baseline core, 17.5 vs 18.1 ms full fit. Deviation 1: rule 3 was not met in two of three campaigns at 20k×2 CUDA. The effect is sub-millisecond and did not replicate.
+
+**CUDA counters** (ncu, first `kd_neighbors_kernel` launch = warmup fit, 20k rows):
+
+| d | Registers B → V | Global load requests B → V | Local load sectors B → V | Local store sectors B → V | Kernel time B → V |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 75 → 106 | 8.20e8 → 1.28e8 | 7,798,943 → 7,785,545 | 11,047,614 → 11,045,114 | 82.0 → 24.0 ms |
+| 30 | 75 → 128 | 1.48e9 → 2.24e8 | 6,307,809 → 6,302,296 | 9,255,624 → 9,253,124 | 113.8 → 36.1 ms |
+| 2 | 75 → 34 | 3.49e6 → 2.04e6 | 136,300 → 136,520 | 332,412 → 329,912 | 0.455 → 0.400 ms |
+
+Global load requests fall about 6.4× (16D) and 6.6× (30D), in line with the source-level count. Deviation 2: 2D local-load sectors rise by 220 (+0.16%), while local stores fall in every cell. The generated kernel (`generated/kd_neighbors_kernel_cuda_d2.ll`) has only the two 33-entry traversal-stack allocas. Query and candidate arrays are scalarized into `align 16` `<4 x float>` global loads, so the rise is stack traffic, not a scalarization failure. Long-scoreboard stall share rises (61 → 67% at 16D, 61 → 74% at 30D) because fewer, wider loads remain on the critical path. Achieved occupancy is unchanged (about 18–19%). The data `pad_rows_kernel` launch takes 9 µs (16D) and 16 µs (30D), under 0.1% of the CUDA core stage. On CPU, packing is inside the measured neighbor scope, so the gains above are net of it.
+
+**Cold start** (`cold_start.json`, first fit including runtime JIT, median of 3 fresh processes): the variant is not slower in any of d ∈ 2, 16, 30 on CPU or CUDA (−0.001 to −0.075 s). The extra JIT for the pack kernel and the specialization is smaller than the faster first fit.
+
+**Final pipeline validation.** `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000` both passed with the variant (logs in `artifacts/cubecl_kernels_perf/phase3/logs/analyze_*.log`). At 100k×16 the CUDA `core_neighbor_kernel` median is 381.7 ms (1.18 s in the baseline facts), and the CPU median is 3.34 s (4.66 s). The three `pad_rows_kernel` launches total 43.8 µs. CPU/CUDA labels agree exactly. These are single runs, not interleaved comparisons.

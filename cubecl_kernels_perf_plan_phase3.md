@@ -2,7 +2,7 @@
 
 This document details Phase 3 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). It depends on the Phase 1 harness (`cubecl_kernels_perf_plan_phase1.md`, Step 1). It does not depend on Phase 1 or Phase 2 being accepted; it applies on top of whichever top-k container is in production. The source analysis is in [hdbscan_perf_report.md](hdbscan_perf_report.md), "Follow-ups", F1.
 
-**Status:** plan only. Nothing here has been compiled, run or measured. Line numbers refer to revision `2c3fc35fa2b2492f519c0adcb544779357f46dd8`; Phases 1–2 will shift them, so re-read before editing.
+**Status:** implemented, measured and accepted (see [Phase 3 results](hdbscan_perf_report.md#phase-3-results-padded-vector-data-and-register-resident-query) and `artifacts/cubecl_kernels_perf/phase3/summary.json`). The register path uses the Step 5 exact comptime feature count. Line numbers below refer to revision `2c3fc35`/`59877db` and are historical.
 
 ## Objective
 
@@ -25,7 +25,7 @@ These are instruction counts from source reading, not measured traffic. The quer
 
 - fewer issued load instructions;
 - fewer dependent load chains, which matter because the report measured 70–79% long-scoreboard stalls on CUDA;
-- the scan's share of the core stage: 74% at 16D and 96.5% at 30D.
+- the scan's weight: the share of the all-pairs domain scanned is 74% at 16D and 96.5% at 30D, and the neighbor scope is more than 99% (CPU) / about 99% (CUDA) of the core stage.
 
 The size of the gain is a hypothesis to measure. On CPU, LLVM may already keep the query in registers after unrolling, so the CPU result may be smaller.
 
@@ -90,7 +90,7 @@ In `kdtree.rs` `mod tests`, extend `check_kd_neighbors_match_reference`. Every c
 
 | Case | Purpose |
 | --- | --- |
-| n = 2,000; d ∈ {1, 2, 3, 4, 5, 8, 16, 29, 30, 32}; k ∈ {1, 5, 16, 17} | every register chunk count 1..=8; tails of 3/2/1/0 pad lanes; the 32-feature edge; both top-k paths if Phase 2 is accepted |
+| n = 2,000; d ∈ {1, 2, 3, 4, 5, 8, 12, 16, 20, 24, 28, 29, 30, 32}; k ∈ {1, 5, 16, 17} | every register chunk count 1..=8 (c = 1,1,1,1,2,2,3,4,5,6,7,8,8,8); tails of 3/2/1/0 pad lanes; the 32-feature edge; both top-k paths if Phase 2 is accepted |
 | n = 2,000; d ∈ {33, 40}; k = 5 | non-register path (`reg_chunks = 0`), runtime chunk loop including a padded tail |
 | duplicate-heavy (50 distinct points × 40), d ∈ {3, 16}, k ∈ {5, 17} | ties under the padded layout |
 | integer grid, d ∈ {2, 3}, k = 5 | exact ties with pad lanes present |
@@ -122,7 +122,7 @@ fn pad_rows_kernel<F: Float>(
 - Host helper: `fn pad_rows(source: &CubeTensor, rows: usize, d: usize) -> CubeTensor`.
   - It allocates a contiguous 1D `[rows * 4c]` f32 buffer through `client.empty`, the same pattern as `allocate_diagnostics` (`:645–663`). A 1D shape avoids CUDA row pitch.
   - It launches the kernel with `kd_launch_geometry`-style legal dims.
-- `exact_neighbors_kd`, after `validate_tree`, calls `pad_rows` three times: once for `data` (`n` rows) and once each for `bounds_min` and `bounds_max` (`nodes` rows).
+- `launch_kd_neighbors`, after its `validate_tree` call, calls `pad_rows` three times (so `exact_neighbors_kd` and the Step 1 harness both exercise pack plus dispatch): once for `data` (`n` rows) and once each for `bounds_min` and `bounds_max` (`nodes` rows).
 - All work is on the same client and stream as the search launch, so no extra synchronization is needed.
 
 ### 2b. Vector views
@@ -173,7 +173,9 @@ Confine the comptime branch to three small `#[cube]` helpers, as in Phase 2. The
   - first fallback: hold the query as `Array<F>` of `4·reg_chunks` scalars, filled from extracted lanes;
   - second fallback: a separate register-path kernel that shares the top-k helpers.
 
-  Compiling decides between these, not the plan.
+  - third fallback: concretize the padded path to `Tensor<Vector<f32, Const<4>>>`; the KD route is F32-only (`kdtree.rs:848–851` at post-Phase-1 HEAD `59877db`), and the cited view precedent is `u32`-only.
+
+  Compiled evidence for `&mut Array` helpers and a length-1 placeholder exists in Phase 2's `measured_kernel.patch:20–31, 239–240`. Compiling decides between these, not the plan.
 
 ### 2e. Traversal edits
 
@@ -205,7 +207,10 @@ FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release --test test_kdtree
 FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release -- --nocapture
 FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release --features tracing \
   --example profile_hdbscan_stages -- --nocapture
+uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py
 ```
+
+Also byte-diff the copied Step 4a runner against the Phase 1 original and record the result.
 
 **Gate.** Everything passes on CPU and CUDA with no hardware skips. Every Step 1 case shows identical outputs **and** diagnostics. Logs go to `artifacts/cubecl_kernels_perf/phase3/logs/`.
 
@@ -224,15 +229,17 @@ FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release --features tracing
 - Copy the Phase 1 runner to `artifacts/cubecl_kernels_perf/phase3/run_alternating.py` and use the native command form `<binary> <input.f32le> <rows> <features> --backend {cpu|cuda} --runs 3 --min-samples 5`.
 - Matrix, each cell on {cpu, cuda}:
   - 20k×16 and 50k×16: `baseline_{20000,50000}/raw/input.f32le`. These are the primary cells.
+  - 50k×30: `artifacts/cubecl_kernels_perf/inputs/input_50000_30.f32le`, k = 5. A primary cell inherited from the master-plan H2 contract and Phases 1–2.
   - 20k×30: `artifacts/hdbscan_core_investigation/dim30.f32le` (20k rows). This is the widest register query.
   - 20k×8 and 20k×2: `dim8.f32le`, `dim2.f32le` (20k rows each). These are regression guards: at d = 2, half the lane arithmetic is padding, and the vector load is 16 B instead of 8 B. Low-dimensional HDBSCAN, such as clustering a UMAP embedding, is a common use case.
   - If Phase 2 is accepted: 20k×30 at `--min-samples 16`, the register-budget corner (Step 4b).
 - Order: `B,V,V,B,B,V` per cell, cells serial, with input hashes recorded.
+- All medians, ranges and Step 5 comparisons use process medians as defined in Phase 1 Step 4a.
 - Record core-stage and neighbor-scope medians and [min–max], the full-fit median, and label equality. Pack time is inside the measured neighbor scope, so every reported gain is net of packing.
 
 ### 4b. CUDA counters (H3)
 
-Run the Phase 1 extension of `analyze/profile_hdbscan_counters.py` on 20k×16, 20k×30 and 20k×2 for both binaries. Required readings:
+Run the Phase 1 extension of `analyze/profile_hdbscan_counters.py` on 20k×16, 20k×30 and 20k×2 for both binaries, plus 20k×30 at `--min-samples 16` if Phase 2 is accepted. Required readings:
 
 - **Registers per thread.** Expect up to `4c` more (32 at 30D), plus the Phase 2 list if accepted. Above about 128, occupancy drops at the 32-thread geometry (16 blocks/SM × 32 threads ⇒ 128 registers each on 64K).
 - **Local-memory load and store sectors.** These must not increase. An increase means the query or candidate array did not scalarize.
@@ -249,7 +256,7 @@ Measure the first fit in a fresh process for d ∈ {2, 16, 30}, on CPU and CUDA,
 Accept Phase 3 when:
 
 1. Every Step 3 gate passes and labels are equal end-to-end.
-2. The core-stage median improves at 20k×16, 50k×16 and 20k×30 on at least one backend, with range separation: the variant's max is below the baseline's median in at least two of those three cells.
+2. The core-stage median improves at 20k×16, 50k×16, 50k×30 and 20k×30 on at least one backend, with range separation: the variant's max is below the baseline's median in at least three of those four cells. 50k×30 must not regress on either backend beyond the baseline spread.
 3. 20k×2 and 20k×8 do not regress on either backend beyond the baseline spread.
 4. Local-memory sectors do not increase in any profiled cell.
 5. Cold-start cost is reported and judged acceptable.

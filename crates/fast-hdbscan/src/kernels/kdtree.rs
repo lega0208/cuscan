@@ -15,6 +15,204 @@ use burn_cubecl::ops::into_data_sync;
 
 const KD_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 const KD_STACK_LEN: usize = 33;
+/// Lanes per padded KD vector chunk.
+const KD_VECTOR_LANES: usize = 4;
+/// Widest feature count whose query is held in registers by `kd_neighbors_kernel`.
+const KD_REGISTER_QUERY_MAX_FEATURES: usize = 32;
+
+type KdVector<F> = Vector<F, Const<4>>;
+
+/// Returns `(d_chunks, reg_features)`: the padded chunk count per row and the exact
+/// comptime register-query feature count (`0` selects the runtime chunk loop).
+fn kd_vector_chunks(features: usize) -> (usize, usize) {
+    let chunks = features.div_ceil(KD_VECTOR_LANES);
+    let register = if features <= KD_REGISTER_QUERY_MAX_FEATURES {
+        features
+    } else {
+        0
+    };
+    (chunks, register)
+}
+
+/// Scalar width of one zero-padded KD row: `4⌈features/4⌉`.
+pub(crate) fn kd_padded_width(features: usize) -> Option<usize> {
+    features
+        .div_ceil(KD_VECTOR_LANES)
+        .checked_mul(KD_VECTOR_LANES)
+}
+
+/// Device bytes of the zero-padded KD data and bound copies made per neighbor search.
+pub(crate) fn kd_padded_bytes(rows: usize, nodes: usize, features: usize) -> Option<usize> {
+    let width = kd_padded_width(features)?;
+    nodes
+        .checked_mul(2)?
+        .checked_add(rows)?
+        .checked_mul(width)?
+        .checked_mul(DType::F32.size())
+}
+
+#[cube(launch)]
+fn pad_rows_kernel<F: Float>(
+    source: &Tensor<F>,
+    padded: &mut Tensor<F>,
+    rows: u32,
+    d: u32,
+    padded_width: u32,
+    #[define(F)] _dtype: ElemType,
+) {
+    let total = rows as usize * padded_width as usize;
+    let stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
+    let mut position = ABSOLUTE_POS_X as usize;
+    while position < total {
+        let row = position / padded_width as usize;
+        let feature = position % padded_width as usize;
+        if feature < d as usize {
+            padded[position] = source[row * d as usize + feature];
+        } else {
+            padded[position] = F::new(0.0f32);
+        }
+        position += stride;
+    }
+}
+
+#[cube]
+fn load_query<F: Float>(
+    data_v: &Tensor<KdVector<F>>,
+    row: usize,
+    d_chunks: usize,
+    query: &mut Array<KdVector<F>>,
+    #[comptime] reg_features: usize,
+) {
+    #[unroll]
+    for chunk in 0..reg_features.div_ceil(4) {
+        query[chunk] = data_v[row * d_chunks + chunk];
+    }
+}
+
+/// Adds the first `lanes` squared lane differences, in lane order.
+#[cube]
+fn chunk_distance<F: Float>(
+    query: KdVector<F>,
+    candidate: KdVector<F>,
+    distance: F,
+    #[comptime] lanes: usize,
+) -> F {
+    let mut distance = distance;
+    #[unroll]
+    for lane in 0..lanes {
+        let delta = query.extract(lane) - candidate.extract(lane);
+        distance += delta * delta;
+    }
+    distance
+}
+
+/// Adds the first `lanes` squared point-to-box lane gaps, in lane order.
+#[cube]
+fn chunk_box_bound<F: Float>(
+    query: KdVector<F>,
+    minimum: KdVector<F>,
+    maximum: KdVector<F>,
+    sum: F,
+    #[comptime] lanes: usize,
+) -> F {
+    let mut sum = sum;
+    #[unroll]
+    for lane in 0..lanes {
+        let point = query.extract(lane);
+        let delta = F::max(
+            F::max(minimum.extract(lane) - point, point - maximum.extract(lane)),
+            F::new(0.0f32),
+        );
+        sum += delta * delta;
+    }
+    sum
+}
+
+// The register path sums exactly `reg_features` real lanes; the runtime path also adds the
+// tail pad lanes, whose `+0` terms leave every sum bit-unchanged.
+#[cube]
+fn point_distance<F: Float>(
+    data_v: &Tensor<KdVector<F>>,
+    query: &Array<KdVector<F>>,
+    row: usize,
+    candidate: usize,
+    d_chunks: usize,
+    #[comptime] reg_features: usize,
+) -> F {
+    let mut distance = F::new(0.0f32);
+    if comptime![reg_features > 0] {
+        let chunks = comptime![reg_features.div_ceil(4)];
+        let mut values = Array::<KdVector<F>>::new(chunks);
+        #[unroll]
+        for chunk in 0..chunks {
+            values[chunk] = data_v[candidate * d_chunks + chunk];
+        }
+        #[unroll]
+        for chunk in 0..chunks {
+            distance = chunk_distance::<F>(
+                query[chunk],
+                values[chunk],
+                distance,
+                comptime![(reg_features - chunk * 4).min(4)],
+            );
+        }
+    } else {
+        for chunk in 0..d_chunks {
+            distance = chunk_distance::<F>(
+                data_v[row * d_chunks + chunk],
+                data_v[candidate * d_chunks + chunk],
+                distance,
+                4usize,
+            );
+        }
+    }
+    distance
+}
+
+#[cube]
+fn padded_box_lower_bound<F: Float>(
+    bounds_min_v: &Tensor<KdVector<F>>,
+    bounds_max_v: &Tensor<KdVector<F>>,
+    data_v: &Tensor<KdVector<F>>,
+    query: &Array<KdVector<F>>,
+    row: usize,
+    node: usize,
+    d_chunks: usize,
+    #[comptime] reg_features: usize,
+) -> F {
+    let mut sum = F::new(0.0f32);
+    if comptime![reg_features > 0] {
+        let chunks = comptime![reg_features.div_ceil(4)];
+        let mut minima = Array::<KdVector<F>>::new(chunks);
+        let mut maxima = Array::<KdVector<F>>::new(chunks);
+        #[unroll]
+        for chunk in 0..chunks {
+            minima[chunk] = bounds_min_v[node * d_chunks + chunk];
+            maxima[chunk] = bounds_max_v[node * d_chunks + chunk];
+        }
+        #[unroll]
+        for chunk in 0..chunks {
+            sum = chunk_box_bound::<F>(
+                query[chunk],
+                minima[chunk],
+                maxima[chunk],
+                sum,
+                comptime![(reg_features - chunk * 4).min(4)],
+            );
+        }
+    } else {
+        for chunk in 0..d_chunks {
+            sum = chunk_box_bound::<F>(
+                data_v[row * d_chunks + chunk],
+                bounds_min_v[node * d_chunks + chunk],
+                bounds_max_v[node * d_chunks + chunk],
+                sum,
+                4usize,
+            );
+        }
+    }
+    sum
+}
 
 #[cube]
 fn box_lower_bound<F: Float>(
@@ -424,15 +622,18 @@ fn kd_neighbors_reference_kernel<F: Float, I: Int>(
 
 #[cube(launch)]
 fn kd_neighbors_kernel<F: Float, I: Int>(
-    data: &Tensor<F>,
+    data_v: &Tensor<KdVector<F>>,
     indices: &Tensor<I>,
     starts: &Tensor<I>,
     ends: &Tensor<I>,
     is_leaf: &Tensor<I>,
-    bounds_min: &Tensor<F>,
-    bounds_max: &Tensor<F>,
+    bounds_min_v: &Tensor<KdVector<F>>,
+    bounds_max_v: &Tensor<KdVector<F>>,
     row_count: u32,
+    n: u32,
     k: u32,
+    d_chunks: u32,
+    #[comptime] reg_features: usize,
     #[comptime] diagnostics_enabled: bool,
     out_indices: &mut Tensor<I>,
     out_distances: &mut Tensor<F>,
@@ -442,9 +643,10 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
     let mut local_row = ABSOLUTE_POS_X as usize;
     let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
     while local_row < row_count as usize {
-        if local_row < data.shape(0) {
+        if local_row < n as usize {
             let row = local_row;
-            let n = data.shape(0);
+            let n = n as usize;
+            let d_chunks = d_chunks as usize;
             let width = k as usize;
             for slot in 0..width {
                 out_indices[row * width + slot] = I::cast_from(n);
@@ -456,7 +658,18 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
             let mut stack = Array::<u32>::new(KD_STACK_LEN);
             let mut bound_stack = Array::<F>::new(KD_STACK_LEN);
             stack[0] = 0;
-            bound_stack[0] = box_lower_bound(data, bounds_min, bounds_max, row, 0);
+            let mut query = Array::<KdVector<F>>::new(comptime![reg_features.div_ceil(4).max(1)]);
+            load_query::<F>(data_v, row, d_chunks, &mut query, reg_features);
+            bound_stack[0] = padded_box_lower_bound::<F>(
+                bounds_min_v,
+                bounds_max_v,
+                data_v,
+                &query,
+                row,
+                0,
+                d_chunks,
+                reg_features,
+            );
             let mut stack_len = 1usize;
             let mut nodes_popped = 0i32;
             let mut leaf_positions_scanned = 0i32;
@@ -477,13 +690,14 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                             }
                             let candidate = u32::cast_from(indices[position]) as usize;
                             if candidate != row {
-                                let d = data.shape(1);
-                                let mut distance = F::new(0.0f32);
-                                for feature in 0..d {
-                                    let delta =
-                                        data[row * d + feature] - data[candidate * d + feature];
-                                    distance += delta * delta;
-                                }
+                                let distance = point_distance::<F>(
+                                    data_v,
+                                    &query,
+                                    row,
+                                    candidate,
+                                    d_chunks,
+                                    reg_features,
+                                );
                                 if distance < worst_distance
                                     || (distance == worst_distance && candidate < worst_index)
                                 {
@@ -539,8 +753,26 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                     } else {
                         let left = 2 * node + 1;
                         let right = left + 1;
-                        let left_bound = box_lower_bound(data, bounds_min, bounds_max, row, left);
-                        let right_bound = box_lower_bound(data, bounds_min, bounds_max, row, right);
+                        let left_bound = padded_box_lower_bound::<F>(
+                            bounds_min_v,
+                            bounds_max_v,
+                            data_v,
+                            &query,
+                            row,
+                            left,
+                            d_chunks,
+                            reg_features,
+                        );
+                        let right_bound = padded_box_lower_bound::<F>(
+                            bounds_min_v,
+                            bounds_max_v,
+                            data_v,
+                            &query,
+                            row,
+                            right,
+                            d_chunks,
+                            reg_features,
+                        );
                         if left_bound <= right_bound {
                             if right_bound <= worst_distance {
                                 stack[stack_len] = right as u32;
@@ -818,7 +1050,7 @@ fn launch_kd_neighbors(
     let data = into_contiguous(data);
     let tree = into_contiguous_tree(tree);
     validate_tree(&data, &tree);
-    let [n, _] = data.shape().dims::<2>();
+    let [n, features] = data.shape().dims::<2>();
     assert!(k > 0, "KD neighbor count must be positive");
     let output_len = n
         .checked_mul(k as usize)
@@ -827,20 +1059,28 @@ fn launch_kd_neighbors(
     let output_distances = allocate_float_2d(&data, n, k as usize, output_len);
     let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
     let client = data.client.clone();
+    let [nodes] = tree.starts.shape().dims::<1>();
+    let (d_chunks, reg_features) = kd_vector_chunks(features);
+    let data_padded = pad_rows(&data, n, features);
+    let bounds_min_padded = pad_rows(&tree.bounds_min, nodes, features);
+    let bounds_max_padded = pad_rows(&tree.bounds_max, nodes, features);
     let (cube_count, dim) = kd_launch_geometry(&client, n);
     kd_neighbors_kernel::launch(
         &client,
         cube_count,
         dim,
-        data.clone().into_tensor_arg(),
+        padded_vector_view(&data_padded, n, d_chunks),
         tree.indices.clone().into_tensor_arg(),
         tree.starts.clone().into_tensor_arg(),
         tree.ends.clone().into_tensor_arg(),
         tree.is_leaf.clone().into_tensor_arg(),
-        tree.bounds_min.clone().into_tensor_arg(),
-        tree.bounds_max.clone().into_tensor_arg(),
+        padded_vector_view(&bounds_min_padded, nodes, d_chunks),
+        padded_vector_view(&bounds_max_padded, nodes, d_chunks),
+        u32::try_from(n).expect("validated KD row count"),
         u32::try_from(n).expect("validated KD row count"),
         k,
+        u32::try_from(d_chunks).expect("KD feature chunk count must fit u32"),
+        reg_features,
         diagnostics_enabled,
         output_indices.clone().into_tensor_arg(),
         output_distances.clone().into_tensor_arg(),
@@ -900,6 +1140,52 @@ fn exact_neighbors_kd_reference(
         ],
     );
     (output_indices, output_distances, diagnostics)
+}
+
+/// Copies a contiguous `[rows, features]` f32 tensor into a 1D buffer of
+/// `rows * 4⌈features/4⌉` values whose tail lanes hold `+0.0`.
+fn pad_rows(
+    source: &FloatTensor<CubeBackend>,
+    rows: usize,
+    features: usize,
+) -> FloatTensor<CubeBackend> {
+    assert_eq!(source.shape().dims::<2>(), [rows, features]);
+    let width = kd_padded_width(features).expect("KD padded width overflow");
+    let len = rows
+        .checked_mul(width)
+        .expect("KD padded element count overflow");
+    u32::try_from(len).expect("KD padded element count must fit u32");
+    let padded = allocate_float(source, len);
+    let client = source.client.clone();
+    let (cube_count, dim) = kd_launch_geometry(&client, len);
+    pad_rows_kernel::launch(
+        &client,
+        cube_count,
+        dim,
+        source.clone().into_tensor_arg(),
+        padded.clone().into_tensor_arg(),
+        u32::try_from(rows).expect("KD padded row count must fit u32"),
+        u32::try_from(features).expect("KD feature count must fit u32"),
+        u32::try_from(width).expect("KD padded width must fit u32"),
+        dtype_to_storage_type(DType::F32),
+    );
+    padded
+}
+
+/// Views a `pad_rows` buffer as `rows * d_chunks` four-lane vectors.
+fn padded_vector_view(tensor: &CubeTensor, rows: usize, d_chunks: usize) -> TensorArg {
+    let vectors = rows
+        .checked_mul(d_chunks)
+        .expect("KD padded vector count overflow");
+    assert_eq!(
+        tensor.shape().dims::<1>(),
+        [vectors * KD_VECTOR_LANES],
+        "KD padded buffer length mismatch"
+    );
+    // SAFETY: `pad_rows` returns a fresh contiguous f32 allocation with exactly
+    // vectors*4 scalar slots; the view uses unit vector stride, and the kernel
+    // bounds every access with scalar `n`/`d_chunks` arguments, never view shapes.
+    unsafe { TensorArg::from_raw_parts(tensor.handle.clone(), [1].into(), [vectors].into()) }
 }
 
 fn kd_diagnostics_enabled() -> bool {
@@ -1141,19 +1427,34 @@ mod tests {
                 cases.push((2000, features, k, None));
             }
         }
-        for features in [1, 3, 4, 5, 29] {
+        for features in [1, 3, 4, 5, 8, 12, 20, 24, 28, 29, 32] {
             for k in [1, 5, 16, 17] {
                 cases.push((2000, features, k, None));
             }
         }
+        // Runtime chunk-loop path (`reg_features == 0`), including a padded tail.
+        for features in [33, 40] {
+            cases.push((2000, features, 5, None));
+        }
         for k in [1, 5, 16] {
             cases.push((2000, 16, k, Some("duplicates")));
+        }
+        for features in [3, 16] {
+            for k in [5, 17] {
+                cases.push((2000, features, k, Some("duplicates")));
+            }
         }
         for k in [5, 16] {
             cases.push((512, 3, k, Some("grid")));
         }
+        cases.push((512, 2, 5, Some("grid")));
         for k in [1, 5, 16] {
             cases.push((3, 2, k, Some("overflow")));
+        }
+        for features in [1, 2, 3, 5] {
+            for k in [1, 5] {
+                cases.push((9, features, k, Some("overflow")));
+            }
         }
         cases.extend([
             (1, 2, 1, None),
@@ -1177,13 +1478,20 @@ mod tests {
                 }
                 Some("grid") => {
                     for row in 0..rows {
-                        values[row * features] = (row % 8) as f32;
-                        values[row * features + 1] = ((row / 8) % 8) as f32;
-                        values[row * features + 2] = ((row / 64) % 8) as f32;
+                        for feature in 0..features {
+                            values[row * features + feature] = ((row >> (3 * feature)) % 8) as f32;
+                        }
                     }
                 }
-                Some("overflow") => {
+                Some("overflow") if rows == 3 && features == 2 => {
                     values = vec![f32::MAX, 0.0, -f32::MAX, 0.0, 0.0, f32::MAX];
+                }
+                Some("overflow") => {
+                    // Values near f32::MAX give +inf partial sums before the pad terms.
+                    for (index, value) in values.iter_mut().enumerate() {
+                        *value =
+                            [f32::MAX, 0.0, -f32::MAX, 0.5 * f32::MAX][(index * 7 + index / 3) % 4];
+                    }
                 }
                 _ => {}
             }
@@ -1277,6 +1585,102 @@ mod tests {
     }
 
     #[test]
+    fn kd_vector_chunks_dispatches_register_and_runtime_paths() {
+        for features in 1..=KD_REGISTER_QUERY_MAX_FEATURES {
+            let chunks = features.div_ceil(4);
+            assert_eq!(
+                kd_vector_chunks(features),
+                (chunks, features),
+                "d={features}"
+            );
+        }
+        assert_eq!(kd_vector_chunks(33), (9, 0));
+        assert_eq!(kd_vector_chunks(40), (10, 0));
+        assert_eq!(kd_vector_chunks(41), (11, 0));
+    }
+
+    #[test]
+    fn kd_padded_bytes_counts_data_and_both_bounds() {
+        assert_eq!(kd_padded_bytes(100_000, 0, 30), Some(12_800_000));
+        assert_eq!(kd_padded_bytes(10, 3, 5), Some((10 + 6) * 8 * 4));
+        assert_eq!(kd_padded_bytes(usize::MAX, 1, 1), None);
+    }
+
+    fn check_pad_rows(device: &CubeDevice) {
+        for features in [1usize, 4, 5, 30, 33] {
+            let rows = 37usize;
+            // Includes -0.0 so a pad written as a copy of real data would be caught.
+            let mut values = splitmix_values(rows, features);
+            values[0] = -0.0;
+            let source = into_contiguous(CubeBackend::float_from_data(
+                TensorData::new(values.clone(), [rows, features]),
+                device,
+            ));
+            let padded = into_data_sync(pad_rows(&source, rows, features))
+                .try_to_vec::<f32>()
+                .unwrap();
+            let width = features.div_ceil(4) * 4;
+            assert_eq!(padded.len(), rows * width, "d={features}");
+            for row in 0..rows {
+                for lane in 0..width {
+                    let bits = padded[row * width + lane].to_bits();
+                    if lane < features {
+                        assert_eq!(
+                            bits,
+                            values[row * features + lane].to_bits(),
+                            "d={features}"
+                        );
+                    } else {
+                        assert_eq!(bits, 0x0000_0000, "pad lane d={features} row={row}");
+                    }
+                }
+            }
+            // Bounds are packed by the same helper from the device tree buffers.
+            let host = fast_hdbscan_core::kdtree::KdTree::build(&values, rows, features).unwrap();
+            let nodes = host.starts.len();
+            for bounds in [&host.bounds_min, &host.bounds_max] {
+                let tensor = into_contiguous(CubeBackend::float_from_data(
+                    TensorData::new(bounds.clone(), [nodes, features]),
+                    device,
+                ));
+                let packed = into_data_sync(pad_rows(&tensor, nodes, features))
+                    .try_to_vec::<f32>()
+                    .unwrap();
+                for node in 0..nodes {
+                    for lane in 0..width {
+                        let expected = if lane < features {
+                            bounds[node * features + lane].to_bits()
+                        } else {
+                            0
+                        };
+                        assert_eq!(packed[node * width + lane].to_bits(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pad_rows_copies_bits_and_zeroes_tail_cpu() {
+        check_pad_rows(&CubeDevice::Cpu(Default::default()));
+    }
+
+    #[test]
+    fn pad_rows_copies_bits_and_zeroes_tail_cuda() {
+        let count =
+            fast_cubecl_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if count == 0 {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
+            );
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        check_pad_rows(&CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
+    }
+
+    #[test]
     fn kd_diagnostic_distribution_reports_totals_and_bounds() {
         assert_eq!(
             summarize_counts(&[0, 3, 7, 3]),
@@ -1357,6 +1761,11 @@ mod tests {
         let enabled_counts = allocate_diagnostics(&input, rows, true);
         let client = input.client.clone();
         let (cube_count, dim) = kd_launch_geometry(&client, rows);
+        let nodes = host_tree.starts.len();
+        let (d_chunks, reg_features) = kd_vector_chunks(features);
+        let input_padded = pad_rows(&input, rows, features);
+        let bounds_min_padded = pad_rows(&bounds_min, nodes, features);
+        let bounds_max_padded = pad_rows(&bounds_max, nodes, features);
         let launch = |diagnostics_enabled,
                       output_indices: &CubeTensor,
                       output_distances: &CubeTensor,
@@ -1365,15 +1774,18 @@ mod tests {
                 &client,
                 cube_count.clone(),
                 dim,
-                input.clone().into_tensor_arg(),
+                padded_vector_view(&input_padded, rows, d_chunks),
                 indices.clone().into_tensor_arg(),
                 starts.clone().into_tensor_arg(),
                 ends.clone().into_tensor_arg(),
                 leaves.clone().into_tensor_arg(),
-                bounds_min.clone().into_tensor_arg(),
-                bounds_max.clone().into_tensor_arg(),
+                padded_vector_view(&bounds_min_padded, nodes, d_chunks),
+                padded_vector_view(&bounds_max_padded, nodes, d_chunks),
+                rows as u32,
                 rows as u32,
                 k as u32,
+                d_chunks as u32,
+                reg_features,
                 diagnostics_enabled,
                 output_indices.clone().into_tensor_arg(),
                 output_distances.clone().into_tensor_arg(),
