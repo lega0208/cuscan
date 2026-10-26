@@ -41,7 +41,7 @@ Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in par
 
 ## Phases
 
-The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measured with H2 (plus H3 on CUDA), before the next phase starts. A phase that fails to improve its target backend within its interleaved batch is reverted and recorded as a negative result; it is not stacked under later phases.
+The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measured with H2 (plus H3 on CUDA), before the next phase starts. Performance acceptance and rejection rules are decision guidelines, not absolute vetoes, especially for potentially noisy timings. Normally, a phase without a demonstrated benefit is reverted and recorded as a negative result rather than stacked under later phases. Where the evidence supports a reasonable trade-off, make a judgement call: weigh timing variability, absolute and relative effects, backend/workload scope, counters, and implementation/resource costs. Document any departure from the stated rules, the supporting and contrary evidence, the cost accepted and why the trade-off is worthwhile in the phase summary and `hdbscan_perf_report.md`. Do not describe an inconclusive timing as a proven gain or selectively discard unfavorable samples. Correctness, error-contract invariants and required CPU/CUDA verification remain mandatory; this discretion does not relax them or retroactively change recorded phase decisions.
 
 ### Phase 1: Register-cached heap root (F2a), both backends
 
@@ -76,13 +76,15 @@ The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measur
 
 ### Phase 4: Compact node records (F3), both backends
 
+**Status:** planned, not implemented. Detailed plan: [cubecl_kernels_perf_plan_phase4.md](cubecl_kernels_perf_plan_phase4.md).
+
 **Change.**
 - Replace the separate `starts`/`ends`/`is_leaf` reads in the KD neighbor path with one `Vector<u32, Const<4>>` record per node: `(start, end, is_leaf, 0)`.
 - Interleave padded bounds per node as `[min chunks | max chunks]`, so sibling children are adjacent and each box bound reads one contiguous span. The interleaved bounds are produced by the Phase 3 per-call pack site in `launch_kd_neighbors` (`pad_rows`), not stored in `DeviceKdTree`.
 - Keep the leaf flag; small-`n` trees can have early leaves (`fast-hdbscan-core/src/kdtree.rs:107`).
 - Replacing the flag with a `first_leaf` scalar is allowed only if it is proven from the builder for the KD route and validated on the host.
 
-**Accept when** H1 passes and H2 shows a gain. Otherwise revert and record the result; this phase is expected to be minor.
+**Accept when** H1 passes and H2 shows a gain, using the detailed plan's default performance criteria. This phase is expected to be minor: noisy or mixed timing evidence is not an automatic rejection when a reasonable, evidence-backed trade-off justifies acceptance. Apply the judgement and documentation policy above and the detailed plan's Step 5; otherwise revert and record the result.
 
 ### Phase 5: Launch-geometry sweep (CUDA)
 
