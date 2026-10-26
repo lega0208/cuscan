@@ -24,6 +24,8 @@ artifacts/**/reverse-*.json
 artifacts/**/harness.diff
 artifacts/**/*.stderr.txt
 artifacts/hdbscan_stages
+artifacts/cubecl_kernels_perf
+artifacts/hdbscan_core_investigation
 
 analyze/hdbscan_hotspots
 

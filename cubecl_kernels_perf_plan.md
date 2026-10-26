@@ -1,0 +1,187 @@
+# Plan: CubeCL kernel optimizations for HDBSCAN `core_distances`
+
+## Goal
+
+Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
+
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below; subsequent phases remain unimplemented and unmeasured.
+
+## Baseline facts this plan relies on
+
+- **Route:** complete-graph search resolves to KD-tree for at least 256 finite rows and at most 30 features (`crates/fast-hdbscan/src/estimator.rs:124–133`). Above 30 features the kNN/ANN path applies instead, and this plan does not cover it.
+- **Kernel:** `kd_neighbors_kernel` and `box_lower_bound` in `crates/fast-hdbscan/src/kernels/kdtree.rs:19–39, 221–422`. Launch geometry is in `kd_launch_geometry` (`:429–447`): CPU uses one cube with `num_cpu_cores` units and cyclic query assignment; CUDA uses 32-thread cubes, one query per unit.
+- **Host:** `exact_neighbors_kd` (`kdtree.rs:586–636`) is called from `core_distances` (`estimator.rs:384–547`). The tree is uploaded by `upload_kd_tree` (`estimator.rs:344`) into `DeviceKdTree` (`crates/fast-hdbscan/src/backend.rs:11–21`), which is a fusion `ExtensionType` that `boruvka_candidates_kd` also consumes.
+- **Tree:** balanced implicit layout (`crates/fast-hdbscan-core/src/kdtree.rs:52–128`), with children of node `i` at `2i+1` and `2i+2`. `LEAF_SIZE = 40` determines the level count; a leaf holds roughly 40–80 points. Every leaf is a contiguous range of `tree.indices`.
+- **Measured baseline (16D, k5, RTX 3080 / Ryzen 9800X3D):**
+  - Core time: 20k is 0.272 s CPU / 0.074 s CUDA; 100k is 4.66 s CPU / 1.18 s CUDA.
+  - Each query scans 74% of all pairs.
+  - CUDA counters: 71 registers per thread, 33% theoretical and 18.5% achieved occupancy (the 16-blocks/SM limit binds), 70–79% long-scoreboard stalls.
+- **Pinned versions:** Burn 0.22.1, CubeCL 0.11.1 (from `Cargo.lock`). `Vector<T, Const<N>>`, `Shared::new_slice`, and `plane_any`/`plane_min`/`plane_ballot`/`plane_broadcast` exist in 0.11.1. For the in-repo pattern of fixed-width vector tensors with `#[unroll]` lane extraction, see `crates/fast-hdbscan/src/kernels/component_reduce.rs`.
+
+## Invariants (apply to every phase)
+
+1. **Bit-identical output.** Neighbor IDs and squared distances must match the current kernel bit for bit. Each `(query, candidate)` distance is the f32 sum over `feature = 0..d` taken in that sequential order. Never reorder this sum: no horizontal vector reductions over features, no `plane_sum` over features, no `|q|²+|r|²−2q·r`.
+2. **Visit order is free.** The result is the k smallest `(distance², original ID)` keys under a total order, with pruning `lower <= worst`. Node, leaf, candidate and query visit order may therefore change freely; this is what allows reordering, tiling and vectorizing across candidates or queries.
+3. **Zero padding is neutral.** Padding features to a multiple of 4 with `0.0` in both points, and `min = max = 0` in bounds, adds `+0.0` terms and leaves every sum bit-identical. Because `d <= 30` on this route, padded widths are limited to `d_chunks ∈ 1..=8` vectors of 4.
+4. **Original IDs everywhere.** Self-exclusion, tie keys and output rows use original row IDs. Packed or leaf-ordered positions are only a memory layout. Never permute public input or downstream arrays (the whole-input permutation probe changed final partitions; see the report).
+5. **FMA contraction.** Vector and scalar code may contract differently. Bit-equality must be tested against the current kernel, never assumed.
+6. **Error contract.** Preserve the existing assertion and validation behavior (`validate_tree`, overflow checks). New buffers get `checked_*` sizing and must be counted in the existing allocation and resource sizing (`CoreSearchMemory`, device allocation checks).
+
+## Reference harness (built before any optimization)
+
+- **H1. Golden-output test.** In `crates/fast-hdbscan/tests/test_kdtree_search.rs`, add a test that runs both the current kernel and the variant under test and asserts bit-equality of IDs and of `f32::to_bits` distances, for:
+  - feature counts `d ∈ {1, 2, 3, 4, 5, 16, 29, 30}`;
+  - `k ∈ {1, 5, 16, 17}`, where 17 exercises the large-k fallback path;
+  - inputs with duplicate rows, exact distance ties, `n` just above 256, and sizes that are not multiples of the vector width or `PLANE_DIM`;
+  - both CPU and CUDA, with CUDA mandatory under `FAST_UMAP_REQUIRE_CUDA=1`.
+
+  Keep the current kernel callable from tests (a `#[cfg(test)]` reference entry point) until the final phase removes it.
+- **H2. Interleaved benchmark protocol.** Use the existing `analyze/benchmark_hdbscan_stages.py` with `profile_hdbscan_stages`, at 20k and 50k rows, 16D and 30D, k5, alternating baseline and variant processes in `O,V,V,O,O,V` order (the method in the report). Record core-stage and full-fit medians and ranges, and compare only within a batch.
+- **H3. CUDA counter capture.** Use `analyze/profile_hdbscan_counters.py` and add these metrics: registers per thread, local-memory load/store (spills and stacks), `l1tex` sectors per request, long-scoreboard stall share, and achieved/theoretical occupancy.
+
+## Phases
+
+The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measured with H2 (plus H3 on CUDA), before the next phase starts. A phase that fails to improve its target backend within its interleaved batch is reverted and recorded as a negative result; it is not stacked under later phases.
+
+### Phase 1: Register-cached heap root (F2a), both backends
+
+**Status:** implemented and accepted; CPU/CUDA bitwise and diagnostics gates pass. Eight-cell interleaved timing rules pass (CUDA gain); cache retained. Complete H3 counters captured, including sampled-stall share and theoretical occupancy. Evidence: `artifacts/cubecl_kernels_perf/phase1/summary.json` and report "Phase 1 results".
+
+**Change.** In `kd_neighbors_kernel`, keep `worst_distance` and `worst_index` in registers:
+- Candidate admission (`kdtree.rs:281–285`) and child pushes (`:339–359`) compare against the registers.
+- After an admission and sift, reload the root once to refresh them.
+- Global `out_*` is touched only on admission.
+
+**Why.** This removes 2–3 dependent global loads per scanned candidate and up to 3 per internal node. Semantics do not change.
+
+**Accept when** H1 is bit-identical and CPU or CUDA core time improves in H2 without the other backend regressing beyond the batch's noise range.
+
+### Phase 2: Register top-k for small k (F2b), both backends
+
+**Change.**
+- Add `#[comptime] k_max` variants for `k <= 8` and `k <= 16`. Each holds a sorted register list of `(distance, id)` pairs, updated by fully unrolled compare-and-shift insertion keyed on the same total order (ties broken by smaller original ID).
+- Write the list to `out_*[row]` once at the end; this also removes the final heapsort (`:368–418`).
+- Keep the existing output-backed heap kernel as the path for `k > 16`.
+- The host selects the variant in `exact_neighbors_kd`.
+
+**Why.** It eliminates global heap traffic and the heapsort. Every list index is comptime, so the list stays in registers, whereas a heap would spill to local memory because its sift uses dynamic indices.
+
+**Watch.** k=16 adds 32 live registers. Check spills and registers with H3.
+
+**Accept when** H1 passes, including k=16/17, and H2 and H3 show no spills and a core-time gain.
+
+### Phase 3: Padded vector data and register-resident query (F1), both backends
+
+**Change.**
+1. Build the padded data `[n, d_chunks]` as `Tensor<Vector<f32, Const<4>>>`, zero-padded, once per fit.
+   - First choice: a small device kernel or host-side pack at upload.
+   - Pack the bounds in the same layout.
+   - Extend `DeviceKdTree` with these fields and update `upload_kd_tree`, `clone_device_kd_tree`, `into_contiguous_tree`, `validate_tree`, the test constructors in `kernels/mod.rs`/`kdtree.rs`, and the fusion extension handling.
+   - `boruvka_candidates_kd` ignores the new fields in this plan.
+2. Pass `#[comptime] d_chunks` and drop the runtime `data.shape(1)` loop bound.
+3. Load the query once into `d_chunks` vectors. Use it in `box_lower_bound` (a vector variant) and in the point distances.
+4. Inside each chunk, accumulate lanes in feature order with `#[unroll]` `extract(lane)` (Invariant 1). Loads are 128-bit; the arithmetic stays in sequential order.
+5. Update resource sizing for the padded copy (`n * d_chunks * 16` bytes, e.g. 12.8 MB at 100k×32).
+
+**Register budget (sm_86).** At 32-thread cubes the 16-blocks/SM limit means up to ~128 registers per thread cost no occupancy, so 16–32 extra query registers on top of 71 are free at the current geometry.
+
+**Accept when** H1 is bit-identical for all `d` in the list, including `d = 1, 3, 29, 30` (padding tails), and H2 improves. Include padding/upload time in full-fit numbers.
+
+### Phase 4: Compact node records (F3), both backends
+
+**Change.**
+- Replace the separate `starts`/`ends`/`is_leaf` reads in the KD neighbor path with one `Vector<u32, Const<4>>` record per node: `(start, end, is_leaf, 0)`.
+- Interleave padded bounds per node as `[min chunks | max chunks]`, so sibling children are adjacent and each box bound reads one contiguous span.
+- Keep the leaf flag; small-`n` trees can have early leaves (`fast-hdbscan-core/src/kdtree.rs:107`).
+- Replacing the flag with a `first_leaf` scalar is allowed only if it is proven from the builder for the KD route and validated on the host.
+
+**Accept when** H1 passes and H2 shows a gain. Otherwise revert and record the result; this phase is expected to be minor.
+
+### Phase 5: Launch-geometry sweep (CUDA)
+
+**Change.** Parameterize the CUDA cube size of the KD neighbor kernel and sweep 32, 64 and 128 threads on top of Phases 1–4. Register growth from Phase 3 interacts with this:
+- At ~72 registers, 64-thread cubes allow ~58% theoretical occupancy.
+- At ~104 registers, they allow ~40%.
+
+Choose the setting from H2/H3 at 20k and 50k. The 20k case has only ~625 warps of work, so larger cubes are not expected to help it. Keep `legal_cube_dim` and the `max_cube_count` limits.
+
+**Accept when** the chosen geometry beats 32 threads in an interleaved batch at 50k and does not regress 20k beyond noise. Otherwise keep 32.
+
+### Phase 6: CPU leaf-packed SoA kernel, vectorized across candidates (F4)
+
+**Change.** A separate CPU kernel behind the same `exact_neighbors_kd` host signature, chosen once from client properties:
+1. **Layout.** Store each leaf as a transposed block `leaf_soa[leaf][feature][slot]` from `tree.indices`, with slots padded to `W`.
+   - `W` comes from `client.io_optimized_vector_sizes(4)` and is passed as comptime.
+   - Padded slots are masked out explicitly.
+   - Carry a parallel `slot → original ID` array.
+2. **Distances.** Each `Vector<f32, W>` lane is a different candidate and accumulates features `0..d` in order (Invariant 1 holds without a feature-axis tail).
+3. **Admission.** Compare a whole vector against the broadcast `worst`, then do unrolled per-lane scalar checks and insert using the original ID.
+4. **Query order.** Each unit takes a contiguous chunk of leaf-ordered queries (iterating `tree.indices`) and writes to `out[original_row]`. Cyclic assignment is replaced.
+5. **Isolation.** Benchmark the packed candidates (steps 1–3) separately from query ordering (step 4), then combined. The report's ordering experiment could not separate these effects.
+6. **No shared memory or barriers** in this kernel; `PLANE_DIM` is 1 on the CPU runtime.
+
+**Also measure** a plain Rust/Rayon exact baseline over host data, to expose CubeCL CPU runtime overhead.
+
+**Accept when** H1 passes at every `W` the host can select, not only the widest, and H2 shows a CPU gain over Phases 1–4 including packing cost.
+
+### Phase 7: CUDA plane-cooperative leaf-tile kernel (F5)
+
+**Change.** A separate CUDA kernel, gated on `features.plane` and the queried `plane_size_min`, behind the same host signature. The per-query kernel remains the non-plane path.
+1. **Tiles.** One plane owns `PLANE_DIM` consecutive leaf-ordered queries. Each lane keeps its own query in registers (Phase 3) and its own register top-k (Phase 2).
+2. **Traversal.** Use a cube-uniform traversal stack in `Shared`:
+   - each lane computes `lower(q, node) <= worst(q)`;
+   - `plane_any` decides whether the tile visits the node;
+   - children are ordered by `plane_min` of the lower bounds.
+
+   Control flow is uniform, so `sync_cube()` is never inside a masked branch.
+3. **Candidate staging.** Stage leaf candidates in `Shared` in chunks of `PLANE_DIM × d_chunks` vectors (≤ 4 KB at 32×8×16 B):
+   - each lane loads one contiguous padded candidate row from leaf-packed storage;
+   - `sync_cube()`, then each lane computes in-order distances against every staged candidate (broadcast reads);
+   - `sync_cube()` again before the next overwrite (write-after-read).
+4. **Output.** Each lane writes its sorted top-k to `out[original_row]` once.
+5. **Diagnostics.** Counters now mean tile visits; document this in the diagnostics output.
+6. **Resources.** Size `Shared` against `max_shared_memory_size` on the host. Try multiple planes per cube to clear the 16-blocks/SM limit.
+7. **Later.** Double-buffering via `memcpy_async` is deferred until its API is verified in CubeCL 0.11.1.
+
+**Accept when** H1 passes on CUDA, which requires a GPU run because CPU tests never execute plane logic. H2/H3 must show a CUDA gain over the best of Phases 1–5 at both 20k and 50k, and full-fit CPU/CUDA label equality must be preserved.
+
+### Phase 8: Cleanup and documentation
+
+- Remove superseded kernel variants and the `#[cfg(test)]` reference entry point once its role is covered by the host oracle tests. No dead aliases.
+- Update `AGENTS.md`/`README.md` wherever they describe KD traversal, the device-tree layout or resource sizing.
+- Append the measured results, including negative ones, to `hdbscan_perf_report.md`.
+
+## Out of scope / rejected
+
+- **Feature-order-changing reductions** (`plane_sum`, vector horizontal sums, matmul-form distances). Rejected under Invariant 1 by decision.
+- **Core extraction or readback fusion.** The measured share is negligible.
+- **Atomics or single-pass inter-cube merging.** Each query's top-k belongs to one unit or plane, so no cross-cube merge exists.
+- **Whole-input permutation.** It changes final partitions.
+- **`kd_candidates_kernel` (Borůvka) and the >30-feature kNN/ANN path.** Phase 7's structure may carry over to `kd_candidates_kernel` later, subject to its component-bound atomics.
+- **Routing threshold changes.** No evidence supports them.
+
+## Verification commands (per phase)
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test -p fast-hdbscan-core
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release -- --nocapture
+cargo build -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
+uv run --no-sync python analyze/benchmark_hdbscan_stages.py \
+  --binary target/release/examples/profile_hdbscan_stages \
+  --rows 20000 --run-dir artifacts/cubecl_kernels_perf/<phase>_20000 --timeout 120
+```
+
+Repeat the benchmark at 50k, and on CUDA phases run `profile_hdbscan_counters.py`. Use a fresh run directory per batch.
+
+## Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| FMA contraction or codegen changes distance bits | H1 bit-equality on both backends at every phase |
+| Register growth (Phases 2, 3, 7) causes spills or lower occupancy | H3 registers/local-memory metrics; Phase 5 sweep |
+| Comptime variant count increases JIT time (CPU LLVM especially) | Limit to `d_chunks ≤ 8` × `k_max ∈ {8, 16}` (× `W` on CPU); measure first-fit compile time separately from warm fits |
+| `DeviceKdTree` extension breaks fusion or Borůvka paths | Update all constructors; run the full `fast-hdbscan` test suite each phase |
+| Plane path untested on CPU | Required-CUDA tests; per-query kernel stays the non-plane path |
+| Gains don't hold on other distributions | Report the 16D/30D Gaussian scope explicitly; add a uniform/duplicate-heavy run before claiming generality |

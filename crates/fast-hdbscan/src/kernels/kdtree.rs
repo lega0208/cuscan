@@ -218,8 +218,9 @@ fn kd_candidates_kernel<F: Float, I: Int>(
     }
 }
 
+#[cfg(test)]
 #[cube(launch)]
-fn kd_neighbors_kernel<F: Float, I: Int>(
+fn kd_neighbors_reference_kernel<F: Float, I: Int>(
     data: &Tensor<F>,
     indices: &Tensor<I>,
     starts: &Tensor<I>,
@@ -353,6 +354,211 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                                 stack_len += 1;
                             }
                             if right_bound <= out_distances[row * width] {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if comptime![diagnostics_enabled] {
+                diagnostics[row * 2] = I::cast_from(nodes_popped);
+                diagnostics[row * 2 + 1] = I::cast_from(leaf_positions_scanned);
+            }
+            // In-place heapsort turns the output-backed max-heap into ascending order.
+            let mut heap_len = width;
+            while heap_len > 1 {
+                let root = row * width;
+                let last = row * width + heap_len - 1;
+                let root_distance = out_distances[root];
+                let root_index = out_indices[root];
+                out_distances[root] = out_distances[last];
+                out_indices[root] = out_indices[last];
+                out_distances[last] = root_distance;
+                out_indices[last] = root_index;
+                heap_len -= 1;
+
+                let mut parent = 0usize;
+                let mut heap = true;
+                while heap && parent < heap_len / 2 {
+                    let left = parent * 2 + 1;
+                    let right = left + 1;
+                    let mut largest = left;
+                    if right < heap_len {
+                        let left_at = row * width + left;
+                        let right_at = row * width + right;
+                        let left_index = u32::cast_from(out_indices[left_at]) as usize;
+                        let right_index = u32::cast_from(out_indices[right_at]) as usize;
+                        if out_distances[right_at] > out_distances[left_at]
+                            || (out_distances[right_at] == out_distances[left_at]
+                                && right_index > left_index)
+                        {
+                            largest = right;
+                        }
+                    }
+                    let parent_at = row * width + parent;
+                    let child_at = row * width + largest;
+                    let parent_index = u32::cast_from(out_indices[parent_at]) as usize;
+                    let child_index = u32::cast_from(out_indices[child_at]) as usize;
+                    if out_distances[parent_at] > out_distances[child_at]
+                        || (out_distances[parent_at] == out_distances[child_at]
+                            && parent_index >= child_index)
+                    {
+                        heap = false;
+                    } else {
+                        let parent_distance = out_distances[parent_at];
+                        let parent_index = out_indices[parent_at];
+                        out_distances[parent_at] = out_distances[child_at];
+                        out_indices[parent_at] = out_indices[child_at];
+                        out_distances[child_at] = parent_distance;
+                        out_indices[child_at] = parent_index;
+                        parent = largest;
+                    }
+                }
+            }
+        }
+        local_row += row_stride;
+    }
+}
+
+#[cube(launch)]
+fn kd_neighbors_kernel<F: Float, I: Int>(
+    data: &Tensor<F>,
+    indices: &Tensor<I>,
+    starts: &Tensor<I>,
+    ends: &Tensor<I>,
+    is_leaf: &Tensor<I>,
+    bounds_min: &Tensor<F>,
+    bounds_max: &Tensor<F>,
+    row_count: u32,
+    k: u32,
+    #[comptime] diagnostics_enabled: bool,
+    out_indices: &mut Tensor<I>,
+    out_distances: &mut Tensor<F>,
+    diagnostics: &mut Tensor<I>,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let mut local_row = ABSOLUTE_POS_X as usize;
+    let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
+    while local_row < row_count as usize {
+        if local_row < data.shape(0) {
+            let row = local_row;
+            let n = data.shape(0);
+            let width = k as usize;
+            for slot in 0..width {
+                out_indices[row * width + slot] = I::cast_from(n);
+                out_distances[row * width + slot] = F::new(f32::INFINITY);
+            }
+            let root = row * width;
+            let mut worst_distance = F::new(f32::INFINITY);
+            let mut worst_index = n;
+            let mut stack = Array::<u32>::new(KD_STACK_LEN);
+            let mut bound_stack = Array::<F>::new(KD_STACK_LEN);
+            stack[0] = 0;
+            bound_stack[0] = box_lower_bound(data, bounds_min, bounds_max, row, 0);
+            let mut stack_len = 1usize;
+            let mut nodes_popped = 0i32;
+            let mut leaf_positions_scanned = 0i32;
+            while stack_len > 0 {
+                stack_len -= 1;
+                if comptime![diagnostics_enabled] {
+                    nodes_popped += 1i32;
+                }
+                let node = stack[stack_len] as usize;
+                let lower = bound_stack[stack_len];
+                if lower <= worst_distance {
+                    if is_leaf[node] != I::cast_from(0) {
+                        let start = u32::cast_from(starts[node]) as usize;
+                        let end = u32::cast_from(ends[node]) as usize;
+                        for position in start..end {
+                            if comptime![diagnostics_enabled] {
+                                leaf_positions_scanned += 1i32;
+                            }
+                            let candidate = u32::cast_from(indices[position]) as usize;
+                            if candidate != row {
+                                let d = data.shape(1);
+                                let mut distance = F::new(0.0f32);
+                                for feature in 0..d {
+                                    let delta =
+                                        data[row * d + feature] - data[candidate * d + feature];
+                                    distance += delta * delta;
+                                }
+                                if distance < worst_distance
+                                    || (distance == worst_distance && candidate < worst_index)
+                                {
+                                    out_distances[root] = distance;
+                                    out_indices[root] = I::cast_from(candidate);
+                                    let mut parent = 0usize;
+                                    let mut heap = true;
+                                    while heap && parent < width / 2 {
+                                        let left = parent * 2 + 1;
+                                        let right = left + 1;
+                                        let mut largest = left;
+                                        if right < width {
+                                            let left_at = row * width + left;
+                                            let right_at = row * width + right;
+                                            let left_index =
+                                                u32::cast_from(out_indices[left_at]) as usize;
+                                            let right_index =
+                                                u32::cast_from(out_indices[right_at]) as usize;
+                                            if out_distances[right_at] > out_distances[left_at]
+                                                || (out_distances[right_at]
+                                                    == out_distances[left_at]
+                                                    && right_index > left_index)
+                                            {
+                                                largest = right;
+                                            }
+                                        }
+                                        let parent_at = row * width + parent;
+                                        let child_at = row * width + largest;
+                                        let parent_index =
+                                            u32::cast_from(out_indices[parent_at]) as usize;
+                                        let child_index =
+                                            u32::cast_from(out_indices[child_at]) as usize;
+                                        if out_distances[parent_at] > out_distances[child_at]
+                                            || (out_distances[parent_at] == out_distances[child_at]
+                                                && parent_index >= child_index)
+                                        {
+                                            heap = false;
+                                        } else {
+                                            let parent_distance = out_distances[parent_at];
+                                            let parent_index = out_indices[parent_at];
+                                            out_distances[parent_at] = out_distances[child_at];
+                                            out_indices[parent_at] = out_indices[child_at];
+                                            out_distances[child_at] = parent_distance;
+                                            out_indices[child_at] = parent_index;
+                                            parent = largest;
+                                        }
+                                    }
+                                    worst_distance = out_distances[root];
+                                    worst_index = u32::cast_from(out_indices[root]) as usize;
+                                }
+                            }
+                        }
+                    } else {
+                        let left = 2 * node + 1;
+                        let right = left + 1;
+                        let left_bound = box_lower_bound(data, bounds_min, bounds_max, row, left);
+                        let right_bound = box_lower_bound(data, bounds_min, bounds_max, row, right);
+                        if left_bound <= right_bound {
+                            if right_bound <= worst_distance {
+                                stack[stack_len] = right as u32;
+                                bound_stack[stack_len] = right_bound;
+                                stack_len += 1;
+                            }
+                            if left_bound <= worst_distance {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                        } else {
+                            if left_bound <= worst_distance {
+                                stack[stack_len] = left as u32;
+                                bound_stack[stack_len] = left_bound;
+                                stack_len += 1;
+                            }
+                            if right_bound <= worst_distance {
                                 stack[stack_len] = right as u32;
                                 bound_stack[stack_len] = right_bound;
                                 stack_len += 1;
@@ -588,6 +794,27 @@ pub(super) fn exact_neighbors_kd(
     tree: DeviceKdTree<CubeBackend>,
     k: u32,
 ) -> (IntTensor<CubeBackend>, FloatTensor<CubeBackend>) {
+    let diagnostics_enabled = kd_diagnostics_enabled();
+    let node_count = tree.starts.shape().dims::<1>()[0];
+    let (output_indices, output_distances, diagnostics) =
+        launch_kd_neighbors(data, tree, k, diagnostics_enabled);
+    if diagnostics_enabled {
+        let n = output_indices.shape().dims::<2>()[0];
+        emit_kd_diagnostics("kd_neighbors", diagnostics, n, node_count);
+    }
+    (output_indices, output_distances)
+}
+
+fn launch_kd_neighbors(
+    data: FloatTensor<CubeBackend>,
+    tree: DeviceKdTree<CubeBackend>,
+    k: u32,
+    diagnostics_enabled: bool,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
     let data = into_contiguous(data);
     let tree = into_contiguous_tree(tree);
     validate_tree(&data, &tree);
@@ -598,7 +825,6 @@ pub(super) fn exact_neighbors_kd(
         .expect("KD neighbor output size overflow");
     let output_indices = allocate_int_2d(&data, n, k as usize, output_len);
     let output_distances = allocate_float_2d(&data, n, k as usize, output_len);
-    let diagnostics_enabled = kd_diagnostics_enabled();
     let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
     let client = data.client.clone();
     let (cube_count, dim) = kd_launch_geometry(&client, n);
@@ -624,15 +850,56 @@ pub(super) fn exact_neighbors_kd(
             dtype_to_storage_type(DType::I32),
         ],
     );
-    if diagnostics_enabled {
-        emit_kd_diagnostics(
-            "kd_neighbors",
-            diagnostics,
-            n,
-            tree.starts.shape().dims::<1>()[0],
-        );
-    }
-    (output_indices, output_distances)
+    (output_indices, output_distances, diagnostics)
+}
+
+#[cfg(test)]
+fn exact_neighbors_kd_reference(
+    data: FloatTensor<CubeBackend>,
+    tree: DeviceKdTree<CubeBackend>,
+    k: u32,
+    diagnostics_enabled: bool,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
+    let data = into_contiguous(data);
+    let tree = into_contiguous_tree(tree);
+    validate_tree(&data, &tree);
+    let [n, _] = data.shape().dims::<2>();
+    assert!(k > 0, "KD neighbor count must be positive");
+    let output_len = n
+        .checked_mul(k as usize)
+        .expect("KD neighbor output size overflow");
+    let output_indices = allocate_int_2d(&data, n, k as usize, output_len);
+    let output_distances = allocate_float_2d(&data, n, k as usize, output_len);
+    let diagnostics = allocate_diagnostics(&data, n, diagnostics_enabled);
+    let client = data.client.clone();
+    let (cube_count, dim) = kd_launch_geometry(&client, n);
+    kd_neighbors_reference_kernel::launch(
+        &client,
+        cube_count,
+        dim,
+        data.clone().into_tensor_arg(),
+        tree.indices.clone().into_tensor_arg(),
+        tree.starts.clone().into_tensor_arg(),
+        tree.ends.clone().into_tensor_arg(),
+        tree.is_leaf.clone().into_tensor_arg(),
+        tree.bounds_min.clone().into_tensor_arg(),
+        tree.bounds_max.clone().into_tensor_arg(),
+        u32::try_from(n).expect("validated KD row count"),
+        k,
+        diagnostics_enabled,
+        output_indices.clone().into_tensor_arg(),
+        output_distances.clone().into_tensor_arg(),
+        diagnostics.clone().into_tensor_arg(),
+        [
+            dtype_to_storage_type(DType::F32),
+            dtype_to_storage_type(DType::I32),
+        ],
+    );
+    (output_indices, output_distances, diagnostics)
 }
 
 fn kd_diagnostics_enabled() -> bool {
@@ -801,6 +1068,192 @@ mod tests {
     use burn::backend::ops::{FloatTensorOps, IntTensorOps};
     use burn::tensor::TensorData;
     use burn_cubecl::{CubeDevice, ops::into_data_sync};
+
+    fn splitmix_values(rows: usize, features: usize) -> Vec<f32> {
+        let mut state = 0x5eed_cafe_d15c_a11u64;
+        (0..rows * features)
+            .map(|index| {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^= value >> 31;
+                let unit = (value >> 40) as f32 / (1u32 << 24) as f32;
+                let cluster = ((index / features) % 7) as f32 - 3.0;
+                (unit * 8.0 - 4.0) + cluster * 0.125
+            })
+            .collect()
+    }
+
+    fn make_neighbor_inputs(
+        values: &[f32],
+        rows: usize,
+        features: usize,
+        device: &CubeDevice,
+    ) -> (FloatTensor<CubeBackend>, DeviceKdTree<CubeBackend>) {
+        let host = fast_hdbscan_core::kdtree::KdTree::build(values, rows, features).unwrap();
+        let data = into_contiguous(CubeBackend::float_from_data(
+            TensorData::new(values.to_vec(), [rows, features]),
+            device,
+        ));
+        let tree = DeviceKdTree {
+            indices: into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(host.indices.clone(), [rows]),
+                device,
+            )),
+            starts: into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(host.starts.clone(), [host.starts.len()]),
+                device,
+            )),
+            ends: into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(host.ends.clone(), [host.ends.len()]),
+                device,
+            )),
+            is_leaf: into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(host.is_leaf.clone(), [host.is_leaf.len()]),
+                device,
+            )),
+            bounds_min: into_contiguous(CubeBackend::float_from_data(
+                TensorData::new(host.bounds_min.clone(), [host.starts.len(), features]),
+                device,
+            )),
+            bounds_max: into_contiguous(CubeBackend::float_from_data(
+                TensorData::new(host.bounds_max.clone(), [host.starts.len(), features]),
+                device,
+            )),
+            node_components: into_contiguous(CubeBackend::int_from_data(
+                TensorData::new(vec![-1; host.starts.len()], [host.starts.len()]),
+                device,
+            )),
+            n_levels: host.n_levels,
+            n_features: features,
+        };
+        (data, tree)
+    }
+
+    fn check_kd_neighbors_match_reference(device: &CubeDevice) {
+        let mut cases = Vec::new();
+        for features in [1, 2, 3, 4, 5, 16, 29, 30] {
+            for k in [1, 5, 16, 17] {
+                cases.push((2000, features, k, None));
+            }
+        }
+        for k in [5, 17] {
+            cases.push((2000, 16, k, Some("duplicates")));
+        }
+        cases.push((512, 3, 5, Some("grid")));
+        cases.push((257, 16, 5, None));
+        cases.push((9, 2, 12, None));
+        cases.push((1, 2, 4, None));
+
+        for (rows, features, k, special) in cases {
+            let mut values = splitmix_values(rows, features);
+            match special {
+                Some("duplicates") => {
+                    let points = splitmix_values(50, features);
+                    for row in 0..rows {
+                        values[row * features..(row + 1) * features].copy_from_slice(
+                            &points[(row % 50) * features..(row % 50 + 1) * features],
+                        );
+                    }
+                }
+                Some("grid") => {
+                    for row in 0..rows {
+                        values[row * features] = (row % 8) as f32;
+                        values[row * features + 1] = ((row / 8) % 8) as f32;
+                        values[row * features + 2] = ((row / 64) % 8) as f32;
+                    }
+                }
+                _ => {}
+            }
+            let (reference_data, reference_tree) =
+                make_neighbor_inputs(&values, rows, features, device);
+            let (reference_ids, reference_distances, reference_diagnostics) =
+                exact_neighbors_kd_reference(reference_data, reference_tree, k, true);
+            let (data, tree) = make_neighbor_inputs(&values, rows, features, device);
+            let (production_ids, production_distances, production_diagnostics) =
+                launch_kd_neighbors(data, tree, k, true);
+            let ref_ids = into_data_sync(reference_ids).try_to_vec::<i32>().unwrap();
+            let ref_distances = into_data_sync(reference_distances)
+                .try_to_vec::<f32>()
+                .unwrap();
+            let ref_diagnostics = into_data_sync(reference_diagnostics)
+                .try_to_vec::<i32>()
+                .unwrap();
+            assert_eq!(
+                into_data_sync(production_ids.clone())
+                    .try_to_vec::<i32>()
+                    .unwrap(),
+                ref_ids,
+                "neighbor IDs, n={rows}, d={features}, k={k}, {special:?}"
+            );
+            assert_eq!(
+                into_data_sync(production_distances.clone())
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                ref_distances
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "neighbor distance bits, n={rows}, d={features}, k={k}, {special:?}"
+            );
+            assert_eq!(
+                into_data_sync(production_diagnostics)
+                    .try_to_vec::<i32>()
+                    .unwrap(),
+                ref_diagnostics,
+                "diagnostics, n={rows}, d={features}, k={k}, {special:?}"
+            );
+            let (disabled_data, disabled_tree) =
+                make_neighbor_inputs(&values, rows, features, device);
+            let (disabled_ids, disabled_distances, _) =
+                launch_kd_neighbors(disabled_data, disabled_tree, k, false);
+            assert_eq!(
+                into_data_sync(disabled_ids).try_to_vec::<i32>().unwrap(),
+                into_data_sync(production_ids).try_to_vec::<i32>().unwrap(),
+                "disabled diagnostics IDs, n={rows}, d={features}, k={k}"
+            );
+            assert_eq!(
+                into_data_sync(disabled_distances)
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                into_data_sync(production_distances)
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn kd_neighbors_match_frozen_reference_cpu() {
+        check_kd_neighbors_match_reference(&CubeDevice::Cpu(Default::default()));
+    }
+
+    #[test]
+    fn kd_neighbors_match_frozen_reference_cuda() {
+        let count =
+            fast_cubecl_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if count == 0 {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
+            );
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        check_kd_neighbors_match_reference(&CubeDevice::Cuda(cubecl::device::CudaDevice {
+            index: 0,
+        }));
+    }
 
     #[test]
     fn kd_diagnostic_distribution_reports_totals_and_bounds() {

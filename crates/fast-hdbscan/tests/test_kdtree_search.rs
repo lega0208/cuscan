@@ -236,6 +236,77 @@ fn check_kd_oracle(device: &Device) {
     }
 }
 
+fn check_kd_oracle_high_dim(device: &Device) {
+    let rows = 1_000usize;
+    for features in [16usize, 30] {
+        let values = (0..rows)
+            .flat_map(|row| {
+                (0..features).map(move |feature| {
+                    // Three base-11 digits make every row unique; all integer
+                    // coordinates keep squared distances exactly representable.
+                    let coordinate = if feature < 3 {
+                        let mut code = row;
+                        for _ in 0..feature {
+                            code /= 11;
+                        }
+                        (code % 11) as i32 - 5
+                    } else {
+                        ((row * 1_103 + feature * 7_919 + row * feature * 31) % 17) as i32 - 8
+                    };
+                    coordinate as f32
+                })
+            })
+            .collect::<Vec<_>>();
+        let tree = KdTree::build(&values, rows, features).unwrap();
+        let (neighbors, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
+            Tensor::<2>::from_data(TensorData::new(values.clone(), [rows, features]), device)
+                .into_dispatch(),
+            make_device_tree(&tree, &vec![-1; rows], device),
+            5,
+        );
+        let neighbors = Tensor::<2, Int>::from_dispatch(neighbors)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        let distances = Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        for row in 0..rows {
+            let mut candidates = Vec::with_capacity(rows - 1);
+            for candidate in 0..rows {
+                if row == candidate {
+                    continue;
+                }
+                let mut distance = 0.0f32;
+                for feature in 0..features {
+                    let delta =
+                        values[row * features + feature] - values[candidate * features + feature];
+                    distance += delta * delta;
+                }
+                candidates.push((distance, candidate as i32));
+            }
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for slot in 0..5 {
+                let offset = row * 5 + slot;
+                assert_eq!(
+                    neighbors[offset], candidates[slot].1,
+                    "row {row}, d={features}"
+                );
+                assert_eq!(
+                    distances[offset].to_bits(),
+                    candidates[slot].0.to_bits(),
+                    "distance bits at row {row}, d={features}, slot {slot}"
+                );
+                assert!(
+                    candidates[slot].0 > 0.0,
+                    "selected distance must exercise accumulation at row {row}, d={features}, slot {slot}"
+                );
+            }
+        }
+    }
+}
+
 fn check_small_neighbor_boundaries(device: &Device) {
     let cases = [
         vec![vec![2.0f32, -1.0]],
@@ -412,6 +483,11 @@ fn kd_traversals_match_exact_host_oracles_cpu() {
 }
 
 #[test]
+fn kd_high_dimensional_neighbors_match_exact_host_oracle_cpu() {
+    check_kd_oracle_high_dim(&Device::cpu());
+}
+
+#[test]
 fn kd_traversals_match_exact_host_oracles_cuda() {
     let device = cuda_device();
     if let Some(device) = device {
@@ -419,6 +495,14 @@ fn kd_traversals_match_exact_host_oracles_cuda() {
         check_small_neighbor_boundaries(&device);
         check_permuted_tree_row_oracles(&device);
         check_overflow_distances(&device, BackendChoice::Cuda { device_index: 0 });
+    }
+}
+
+#[test]
+fn kd_high_dimensional_neighbors_match_exact_host_oracle_cuda() {
+    let device = cuda_device();
+    if let Some(device) = device {
+        check_kd_oracle_high_dim(&device);
     }
 }
 

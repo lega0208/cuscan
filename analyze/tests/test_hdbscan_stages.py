@@ -702,17 +702,32 @@ def test_sqlite_aggregation_rejects_missing_schema_and_empty_window(tmp_path: Pa
         kernel_tools.aggregate_kernels(empty, 3000, 4000)
 
 
-def ncu_csv(*, family: str = "tile_candidates", launch_id: str = "7") -> str:
+def ncu_csv(
+    *,
+    family: str = "tile_candidates",
+    launch_id: str = "7",
+    metric_overrides: dict[str, tuple[str, str]] | None = None,
+) -> str:
     import csv
 
+    metric_overrides = metric_overrides or {}
     metrics = (
         ("gpu__time_duration.sum", "ns", "360,215,648"),
         ("launch__grid_size", "", "32,768"),
         ("launch__block_size", "", "256"),
+        ("launch__registers_per_thread", "register/thread", "48"),
+        ("launch__occupancy_limit_warps", "block", "4"),
+        ("l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum", "sector", "0"),
+        ("l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum", "sector", "4"),
+        ("l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum", "sector", "12"),
+        ("l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum", "", "3"),
+        ("smsp__pcsamp_warps_issue_stalled_long_scoreboard", "warp", "2"),
+        ("smsp__pcsamp_sample_count", "", "8"),
         ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "99.18"),
         ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", "10.89"),
         ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "%", "18.71"),
         ("l1tex__throughput.avg.pct_of_peak_sustained_elapsed", "%", "94.34"),
+        ("sm__maximum_warps_per_active_cycle_pct", "%", "42.5"),
         ("smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct", "%", "71.79"),
         ("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct", "%", "24.72"),
     )
@@ -737,7 +752,8 @@ def ncu_csv(*, family: str = "tile_candidates", launch_id: str = "7") -> str:
     writer = csv.writer(output)
     writer.writerow(["==PROF== fake preamble"])
     writer.writerow(header)
-    for metric, unit, value in metrics:
+    for metric, default_unit, default_value in metrics:
+        unit, value = metric_overrides.get(metric, (default_unit, default_value))
         writer.writerow(
             [
                 launch_id,
@@ -770,6 +786,71 @@ def test_ncu_parser_handles_preamble_quotes_numbers_and_normalizes_units() -> No
     assert duration["normalized_unit"] == "s"
     assert result["metrics"]["launch__grid_size"]["normalized_value"] == 32768
     assert result["metrics"]["launch__grid_size"]["normalized_unit"] == "count"
+    assert (
+        result["metrics"]["l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum"]["normalized_value"] == 0
+    )
+    registers = result["metrics"]["launch__registers_per_thread"]
+    assert registers["normalized_value"] == 48
+    assert registers["normalized_unit"] == "register/thread"
+    ratio = result["ratios"]["global_load_sectors_per_request"]
+    assert ratio["status"] == "available"
+    assert ratio["value"] == 4
+    assert ratio["unit"] == "sector/request"
+    assert ratio["numerator"] == {
+        "metric": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+        "raw_value": 12,
+        "raw_unit": "sector",
+        "value": 12,
+        "unit": "sector",
+    }
+    assert ratio["denominator"] == {
+        "metric": "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+        "raw_value": 3,
+        "raw_unit": "",
+        "value": 3,
+        "unit": "request",
+    }
+    sample_ratio = result["ratios"]["long_scoreboard_share"]
+    assert sample_ratio["value"] == 0.25
+    assert sample_ratio["status"] == "available"
+    assert sample_ratio["unavailable_reason"] is None
+    assert sample_ratio["numerator"]["metric"] == (
+        "smsp__pcsamp_warps_issue_stalled_long_scoreboard"
+    )
+    assert sample_ratio["denominator"] == {
+        "metric": "smsp__pcsamp_sample_count",
+        "raw_value": 8,
+        "raw_unit": "",
+        "value": 8,
+        "unit": "sampled warp",
+    }
+    theoretical = result["ratios"]["theoretical_occupancy"]
+    assert theoretical["status"] == "available"
+    assert theoretical["value"] == 42.5
+    assert theoretical["achieved"]["value"] == 99.18
+    assert theoretical["theoretical"]["metric"] == "sm__maximum_warps_per_active_cycle_pct"
+    assert theoretical["source"] == "Nsight Compute Occupancy.section header metric"
+
+
+def test_ncu_parser_zero_denominators_are_explicitly_unavailable() -> None:
+    result = counter_tools.parse_ncu_csv(
+        ncu_csv(
+            metric_overrides={
+                "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum": ("", "0"),
+                "smsp__pcsamp_sample_count": ("", "0"),
+            }
+        ),
+        "tile_candidates",
+    )
+    ratio = result["ratios"]["global_load_sectors_per_request"]
+    assert ratio["value"] is None
+    assert ratio["status"] == "unavailable"
+    assert ratio["unavailable_reason"] == "zero denominator"
+    assert ratio["denominator"]["value"] == 0
+    sample_ratio = result["ratios"]["long_scoreboard_share"]
+    assert sample_ratio["value"] is None
+    assert sample_ratio["status"] == "unavailable"
+    assert sample_ratio["unavailable_reason"] == "zero denominator"
 
 
 def test_ncu_parser_rejects_missing_unknown_or_ambiguous_metric_records() -> None:
@@ -792,11 +873,55 @@ def test_ncu_parser_rejects_missing_unknown_or_ambiguous_metric_records() -> Non
         counter_tools.parse_ncu_csv(duplicate_launch, "tile_candidates")
 
 
+def test_ncu_capture_rejects_preexisting_trace_without_modifying_it(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    family = "kd_neighbors_kernel"
+    trace = raw / f"ncu_{family}.trace.json"
+    trace.write_text("preserve existing trace\n", encoding="utf-8")
+    expected = (
+        raw / f"ncu_{family}.csv",
+        raw / f"ncu_{family}.stdout",
+        raw / f"ncu_{family}.stderr",
+        trace,
+    )
+    with pytest.raises(FileExistsError, match="refusing to overwrite profiler evidence"):
+        counter_tools._require_fresh_capture_paths(raw, family)
+    assert trace.read_text(encoding="utf-8") == "preserve existing trace\n"
+    assert not any(path.exists() for path in expected[:3])
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "launch__occupancy_limit_warps",
+        "launch__registers_per_thread",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+        "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+        "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
+        "smsp__pcsamp_sample_count",
+        "sm__maximum_warps_per_active_cycle_pct",
+    ],
+)
+def test_ncu_parser_rejects_missing_expanded_metrics(metric: str) -> None:
+    text = ncu_csv()
+    missing = "\n".join(line for line in text.splitlines() if metric not in line)
+    with pytest.raises(ValueError, match="expected exactly one"):
+        counter_tools.parse_ncu_csv(missing, "tile_candidates")
+
+
 def test_ncu_parser_rejects_bad_values_duplicate_metrics_and_geometry(tmp_path: Path) -> None:
     text = ncu_csv()
     malformed = text.replace("360,215,648", "not-a-number")
     with pytest.raises(ValueError, match="invalid numeric"):
         counter_tools.parse_ncu_csv(malformed, "tile_candidates")
+    fractional_sector = ncu_csv(
+        metric_overrides={"l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum": ("sector", "1.5")}
+    )
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        counter_tools.parse_ncu_csv(fractional_sector, "tile_candidates")
     duplicate_metric = (
         text + next(line for line in text.splitlines() if "gpu__time_duration.sum" in line) + "\n"
     )
@@ -811,6 +936,22 @@ def test_ncu_parser_rejects_bad_values_duplicate_metrics_and_geometry(tmp_path: 
         counter_tools.normalize_metric("launch__grid_size", 1.5, "")
     with pytest.raises(ValueError, match="unsupported unit"):
         counter_tools.normalize_metric("launch__block_size", 32, "threads")
+    assert counter_tools.normalize_metric(
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum", 0, "sector"
+    ) == (0, "sector")
+    with pytest.raises(ValueError, match="unsupported unit"):
+        counter_tools.normalize_metric(
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum", 1, "request"
+        )
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        counter_tools.normalize_metric(
+            "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum", 1.5, "sector"
+        )
+    assert counter_tools.normalize_metric(
+        "launch__registers_per_thread", 72, "register/thread"
+    ) == (72, "register/thread")
+    with pytest.raises(ValueError, match="positive integer"):
+        counter_tools.normalize_metric("launch__registers_per_thread", 0, "register/thread")
 
 
 def synthetic_native_profile(backend: str = "Cpu") -> dict[str, Any]:

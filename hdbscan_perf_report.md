@@ -1,0 +1,347 @@
+# HDBSCAN core-distance performance investigation
+
+## Conclusions
+
+1. **Optimize the KD neighbor traversal, not core extraction or readback.** The current 16-feature Auto route is KD-tree on both CPU and CUDA. At 100k, core distances take **4.657 s CPU / 1.177 s CUDA**, respectively 88% / 65% of the traced fit. More than 99% of the CPU core stage and about 99% of the CUDA core stage is the synchronized neighbor-search scope.
+2. **Pruning effectiveness is the dominant algorithmic warning.** At 20k x 16, each query scans an average 14,821 leaf positions: **74.1% of the all-pairs domain**. At 30 features it scans 96.5%; at 2 features only 0.63%. KD is not inherently subquadratic on these workloads.
+3. **The best supported CPU opportunity is spatial locality with original IDs preserved.** Alternating input-order experiments reduce core time by 17% at 20k and 22% at 50k. This is evidence of sensitivity, not a delivered implementation. The experiment simultaneously changes query and candidate layout/order; those effects remain unseparated.
+4. **CUDA needs latency hiding and a better access pattern, not merely fewer launches.** Current KD uses one neighbor launch per fit, not the tens of thousands of brute-force launches in the older timing notes. Counters show substantial long-scoreboard stalls, low active warps and high L1/TEX utilization. Larger blocks and cooperative leaf evaluation are concrete prototypes to test, not measured speedups.
+5. **Do not deploy the experimental whole-input permutation.** After undoing it, public core distances and neighbor IDs agree exactly at 20k and 50k on both backends, but final clustering partitions differ. Internal scheduling/layout must preserve original IDs throughout MST and extraction.
+
+No production algorithm or configuration was changed. This investigation delivers a pre-experiment plan, measurements, semantic checks and ranked optimization designs—not an optimized kernel.
+
+## Scope, provenance and methodology
+
+The source-only plan was written first: [hdbscan_perf_investigation.md](hdbscan_perf_investigation.md). Experiments followed it, adding lower-dimensional controls and a semantic probe when input-order sensitivity appeared.
+
+- Revision: `2c3fc35fa2b2492f519c0adcb544779357f46dd8`. Initial working tree clean; production-source diff remains empty. Benchmark manifests say dirty because the requested plan and generated evidence were untracked.
+- Burn **0.22.1**, CubeCL **0.11.1**, CubeK **0.3.1** from `Cargo.lock`. Installed CubeCL 0.11.1 CPU threadpool source was inspected, rather than assuming the skill's 0.11.2 examples apply unchanged.
+- CPU: AMD Ryzen 7 9800X3D, 15 logical processors exposed to WSL2. CUDA: **NVIDIA GeForce RTX 3080, 10,240 MiB**, driver **617.14**. Both backends actually executed.
+- Release tracing example, one excluded warmup and three measured fits per process. CPU/CUDA runs and experiments were serial, not competing benchmark lanes. Native scopes synchronize the neighbor operation. They include dispatch, allocation and synchronization; they are not isolated device-kernel times.
+- Fixed standard input: 8 Gaussian centers, 16 features, center/noise scales 1, seed 42, contiguous f32. `min_samples=5`, `min_cluster_size=5`, default graph/search Auto. At 20k, 19,138 points are noise: this is a heavily overlapping/high-noise workload, not a benchmark of well-separated clusters.
+- Iteration used 20k, confirmation used 50k; 100k was used only for final baseline/scaling validation. All recorded benchmark/profile processes completed without timeout.
+- Nsight Systems **2026.1.3** measures device launches in one measured fit. Nsight Compute **2026.2.1** samples the first matching, excluded-warmup launch with replay; its counters are representative, not averages over measured fits. Profiler timing is kept separate from baseline wall timing.
+
+Evidence root: [`artifacts/hdbscan_core_investigation/`](artifacts/hdbscan_core_investigation/). It contains raw input, labels, traces, stdout/stderr, Nsight databases/CSV, scripts, `provenance.json`, `evidence_summary.json`, and the permutation semantic probe. These are local untracked artifacts; the two requested Markdown files are the primary deliverables. Provenance includes exact source/binary SHA-256 values, compiler/tool identities and an explicitly post-experiment source receipt.
+
+## What this stage actually does
+
+Relevant implementation:
+
+| Source | Responsibility |
+| --- | --- |
+| `crates/fast-hdbscan/src/estimator.rs:124–133` | Resolve complete-graph neighbor search: KD for >=256 finite rows and <=30 features |
+| `estimator.rs:384–547` | Exact neighbor search, device core extraction, host neighbor/distance transfer and seed-core assembly |
+| `estimator.rs:549–572` | Consume compact neighbor IDs/distances for MST seeding |
+| `crates/fast-hdbscan/src/kernels/kdtree.rs:221–422` | Single-unit-per-query near-first traversal, output-backed max-heap and final heapsort |
+| `kdtree.rs:429–447,586–635` | CPU/CUDA launch geometry and allocations |
+| `crates/fast-hdbscan-core/src/kdtree.rs:52–125` | Balanced implicit tree, widest-axis partitions and deterministic original-ID tie keys |
+| `crates/fast-cubecl-common/src/kernels/neighbors.rs` | Exact brute-force CPU path and squared CUDA partial-list/merge path |
+
+The KD kernel reads contiguous row-major feature vectors through `tree.indices`; points belonging to a leaf are not packed into a contiguous data region. Query threads follow input order. Every thread maintains private 33-entry node/bound stacks, computes scalar feature distances and child-box bounds, and updates a heap in its global output row. CPU uses one cube with reported CPU-core-count units and cyclic query assignment. CUDA uses 32-thread blocks, one query per thread.
+
+The tree's `LEAF_SIZE=40` determines level count, not a strict maximum population. At 20k the tree has 511 nodes and 256 leaves, averaging about 78 points per leaf. Traversing 404 nodes and scanning 14,821 positions per query therefore represents weak pruning, not a tiny residual search.
+
+Core extraction selects squared-distance column `min_samples-1`; special cases produce zero for `min_samples==1` and infinity for `min_samples>=n`. The host needs all compact neighbors/distances for MST seeds and public neighbor output. Replacing this stage with just a kth-distance reduction would remove required work, not optimize equivalent behavior.
+
+Tree construction and upload are outside `core_distances`. Extraction is an asynchronous tensor slice; realization may be charged to a later readback. Fine timings are disjoint wall scopes nested inside the inclusive core stage, not additive to it. Above 30 features, default graph routing instead selects the separate kNN/ANN path, so these findings must not be generalized to that path.
+
+## Baseline scaling
+
+Median seconds, three measured fits after warmup:
+
+| Rows | CPU fit | CPU core [min–max] | CUDA fit | CUDA core [min–max] |
+| ---: | ---: | ---: | ---: | ---: |
+| 20,000 | 0.3430 | 0.2724 [0.2624–0.2943] | 0.1625 | 0.07421 [0.07402–0.07521] |
+| 50,000 | 1.5949 | 1.3936 [1.2900–1.3983] | 0.6626 | 0.38625 [0.38427–0.38705] |
+| 100,000 | 5.2866 | 4.6565 [4.3844–4.7280] | 1.8090 | 1.17654 [1.17548–1.19866] |
+
+Increasing rows fivefold increases core time approximately 17.1x CPU / 15.9x CUDA. This is poor scaling consistent with substantial scan work; three sizes on one distribution do not establish an asymptotic complexity law.
+
+Fine-stage medians in milliseconds:
+
+| Rows/backend | Neighbor operation + sync | Extraction enqueue | Neighbor readback/conversion | Final host assembly |
+| --- | ---: | ---: | ---: | ---: |
+| 20k CPU | 271.344 | 0.024 | 0.556 | 0.020 |
+| 20k CUDA | 73.318 | 0.012 | 0.477 | 0.018 |
+| 100k CPU | 4654.905 | 0.026 | 0.878 | 0.082 |
+| 100k CUDA | 1169.090 | 0.026 | 6.653 | 0.082 |
+
+Independent medians need not sum exactly to the inclusive median; span-boundary overhead also remains. At 100k/k5, compact readback is only 4 MB of IDs plus distances. Transfer/extraction optimization cannot materially address multi-second traversal time on this workload.
+
+The benchmark runner verified **exact CPU/CUDA final-label equality at all three sizes**.
+
+## Discriminating experiments
+
+### KD versus the current exact brute-force comparator
+
+20k, same generator/configuration, median core and full-fit seconds:
+
+| Features/backend | KD core | Brute core | KD fit | Brute fit |
+| --- | ---: | ---: | ---: | ---: |
+| 16 CPU | 0.2724 | 0.3140 | 0.3430 | 1.3818 |
+| 16 CUDA | 0.07421 | 0.54023 | 0.1625 | 0.7557 |
+| 30 CPU | 0.6425 | 0.6112 | — | 2.9368 |
+| 30 CUDA | 0.10605 | 0.76074 | — | 1.2456 |
+
+CPU repeat baseline at 16D was 0.2898 s core; its advantage over brute force is modest and variable. At 30D the brute-force core is only about 5% faster in this single comparison, not sufficient evidence to change routing. Forced search also changes **MST search**, making full-fit ratios unsuitable as isolated core-distance speedups. KD/brute final labels agree for both feature counts and both backends.
+
+CUDA's approximately 7x KD advantage over the current brute comparator does **not** mean KD prunes well. Brute batches 256 queries, does a transaction per batch and launches partial/merge kernels. A well-tiled brute implementation remains a different, unmeasured comparator. Source and measurements do not justify making brute force the current default.
+
+### Dimensionality and k sensitivity
+
+20k, Auto/KD, k5; diagnostic work counts collected separately from timing:
+
+| Features | CPU core (s) | CUDA core (s) | Mean nodes popped / 511 | Mean leaf positions | Leaf positions / n² |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 0.00239 | 0.00182 | 18.3 | 126 | 0.63% |
+| 8 | 0.03710 | 0.01746 | 124.6 | 3,490 | 17.45% |
+| 16 | 0.27241 | 0.07421 | 404.5 | 14,821 | 74.10% |
+| 30 | 0.64249 | 0.10605 | 498.5 | 19,301 | 96.50% |
+
+These use the same generator parameters/seed at different feature counts, not nested feature subsets. Low-dimensional pruning works extremely well; the 16D result is not universal. CPU/CUDA labels match exactly for each dimensional workload.
+
+At 16D, k5 -> k15 -> k30 core medians are **0.272 -> 0.322 -> 0.330 s CPU** and **0.0742 -> 0.0798 -> 0.0869 s CUDA**. k30 scans 86.69% of leaf positions and pops 458.3 nodes/query, versus 74.10% and 404.5 at k5. CPU/CUDA diagnostic totals agree exactly for k5 and k30. k changes clustering semantics; label equality with k5 is neither expected nor required.
+
+This does not isolate heap cost: a larger k also weakens pruning. A sixfold heap width increase produces a much smaller timing increase, so the global heap is **not demonstrated to be the main bottleneck**. Instrument admissions/sift steps or benchmark a local-heap prototype before prioritizing it above traversal/locality.
+
+Splitting original diagnostic leaf work by `row % 15` yields max/mean work **1.012 at k5**, **1.007 at k30**. This is a work-count proxy, not per-thread elapsed time or a direct runtime-core-count capture. It does not support a large CPU load-imbalance problem. Installed CubeCL 0.11.1 `threadpool/mod.rs:90–106` submits one task per unit; adding CPU cube count alone does not create more unit tasks.
+
+### Spatial ordering: supported CPU opportunity, limited CUDA result
+
+The experiment recursively sorts by widest-axis medians, packs the same points in that order and runs the unchanged estimator. It changes both query coherence and candidate memory/within-leaf ordering. It does not isolate either mechanism.
+
+A follow-up alternated original/spatial processes in `O,S,S,O,O,S` order. Each process had its own excluded warmup and three measured fits: nine samples/order/backend, across three process groups. Samples within a process are correlated; these are not nine independent statistical trials.
+
+Core-stage medians and ranges in milliseconds:
+
+| Rows/backend | Original | Spatial | Median reduction |
+| --- | ---: | ---: | ---: |
+| 20k CPU | 266.47 [256.50–285.61] | 221.53 [216.70–228.83] | 16.9% |
+| 50k CPU | 1356.07 [1244.84–1444.37] | 1054.72 [1031.02–1169.99] | 22.2% |
+| 20k CUDA | 61.72 [61.06–63.56] | 56.22 [55.65–57.47] | 8.9% |
+| 50k CUDA | 319.73 [313.65–331.33] | 312.24 [297.59–329.89] | 2.3%, overlapping ranges |
+
+The initial unpaired 50k CUDA ordering comparison was actually slower (0.3999 vs 0.3862 s). The paired confirmation shows only a small, noisy difference. **A robust CUDA ordering win at 50k is not established.** Later baseline timings also differ from the initial scaling campaign; compare candidates within their interleaved batch, not against whichever historical baseline gives the largest ratio.
+
+At 20k, original and ordered diagnostics have **identical total nodes popped and leaf positions scanned**: 8,089,849 and 296,417,695. The timing difference is not explained by reduced aggregate traversal. Cache locality, lane coherence and heap-admission ordering remain possible mechanisms.
+
+Permutation construction plus materializing ordered input took **25.6 ms at 20k / 59.7 ms at 50k**, excluding file IO. The CUDA 20k core saving is only 5.5 ms, less than that preparation cost. CPU savings exceed this Python preparation cost, but neither comparison is an end-to-end, output-preserving implementation benchmark. A production design can reuse the already-built KD permutation rather than rebuild it in Python.
+
+**Semantic probe:** on CPU and CUDA at both 20k and 50k, after undoing row permutation and remapping neighbor IDs, there are **zero mismatched neighbor slots and zero bitwise mismatches in public Euclidean core distances**. This establishes stage-output equality for these inputs, not equality of every internal squared-distance bit.
+
+Nevertheless final partitions have ARI **0.99997165 at 20k** and **0.75024177 at 50k** versus the original order. CPU/CUDA agree for the ordered input. These comparisons and exact source-label paths are recorded in [`partition_comparison.json`](artifacts/hdbscan_core_investigation/partition_comparison.json). Since public core/neighbor outputs match, the discrepancy is downstream of those observable outputs, not evidence of a core-search error. The precise downstream tie/order mechanism was not localized. Therefore whole-input reordering is **rejected as a semantics-preserving production optimization**. Keep original IDs and all downstream indexing intact in any internal-layout prototype.
+
+## CUDA profiling: what the counters do and do not show
+
+Nsight Systems sees **one** KD-neighbor launch per measured fit:
+
+| Rows | Grid x block | Neighbor device time |
+| ---: | --- | ---: |
+| 20k | 625 x 32 | 74.07 ms |
+| 50k | 1563 x 32 | 387.57 ms |
+| 100k | 3125 x 32 | 1184.95 ms |
+
+Representative Nsight Compute percentages:
+
+| Rows | Active warps | SM throughput | DRAM throughput | L1/TEX throughput | Long-scoreboard stalls |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20k | 18.53 | 22.30 | 1.36 | 83.68 | 69.77 |
+| 50k | 27.89 | 24.37 | 4.84 | 80.82 | 74.27 |
+| 100k | 31.68 | 27.22 | 32.73 | 86.52 | 79.07 |
+
+At 20k, additional LaunchStats/Occupancy capture reports **71 registers/thread**, a **16-block/SM limit**, **33.33% theoretical occupancy**, **18.53% achieved occupancy**, and **0.57 waves/SM**. One-warp blocks encounter the block residency limit well before the warp limit. At 20k, the total of only 625 warps also limits device-wide parallelism; increasing block size alone does not create more query work or warps. At larger sizes, grouping multiple planes per block could raise the block-limit occupancy ceiling, subject to register allocation and scheduling.
+
+Together, these measurements support a memory-dependency/latency-hiding investigation. They do **not** prove a single cause:
+
+- High L1/TEX and scoreboard stalls are not direct measurements of coalescing, cache hit rate or stack spilling. Sector/request and local-memory spill metrics were not collected.
+- Low DRAM throughput at 20k does not imply kernel-launch overhead; one long kernel performs the search. DRAM utilization also rises substantially at 100k.
+- Packing rows into leaf order helps within-thread/cache locality but does not automatically make different CUDA lanes load adjacent addresses. Query coherence or a cooperative candidate mapping is needed to address that separately.
+
+The old [hdbscan_timing_findings.md](hdbscan_timing_findings.md) explicitly describes Auto resolving to brute force. Its launch-count diagnosis is historical and **does not describe the current default stage**.
+
+## Ranked optimization opportunities
+
+All proposed kernel changes below are **unimplemented/unbenchmarked**. Priorities reflect the evidence, not promised speedups.
+
+### 1. CPU: packed leaf storage and internally ordered queries
+
+Maintain `packed[position, feature] = data[tree.indices[position], feature]`, plus original-ID mapping. Query via a work-order permutation, but write output row `original_query_id` and compare heap/tie keys using **original candidate IDs**, never packed positions. Retain existing tree bounds and original-index downstream arrays. Do not permute estimator input/public finite-row indexing.
+
+Start with packed candidates only, then query ordering only, then combine: the current experiment cannot separate them. Keep the CPU grid bounded; compare cyclic and contiguous query chunks only after layout is coherent. Extra packed input is 6.4 MB at 100k x 16, plus mapping/work-order arrays. Include packing/allocation/upload cost in fit comparisons and update resource sizing before delivery. Reuse existing KD construction; do not add a second tree builder.
+
+**Evidence:** repeatable CPU sensitivity, equal public core/neighbor outputs, unchanged aggregate search counts at 20k. **Risk:** original-ID ties, self exclusion, output scatter and downstream component/MST indexing. No guaranteed equivalent speedup from this design has been measured.
+
+### 2. CPU first, CUDA separately: reuse query values and vectorize feature IO
+
+Prototype fixed/specialized feature-width paths that load query features once per query and reuse them in point and box distances. Select legal vector widths from the actual pinned API/device and dense layout; preserve explicit scalar tails for dimensions such as 3 or 30. Keep a generic scalar path for arbitrary features.
+
+On CPU, SIMD is a credible target for contiguous feature arithmetic; compare a plain Rust/Rayon exact baseline over host-resident data to expose JIT/buffer/scheduling costs. On CUDA, test narrower vector loads independently: wider live vectors can worsen an already 71-register/thread kernel. Preserve sequential scalar accumulation when bitwise distance/tie behavior requires it; an unordered vector or plane sum is not automatically numerically equivalent. Generated-code inspection is needed to establish which loads LLVM/CUDA already hoist.
+
+**Evidence:** hundreds of millions of scalar point comparisons and source-level repeated query/bounds accesses. **Limit:** no SIMD/cache-reuse variant was compiled or benchmarked here.
+
+### 3. CUDA: multi-plane blocks, then cooperative leaf evaluation
+
+First sweep 32/64/128-thread blocks without changing query semantics, at 20k and 50k. Measure theoretical/achieved occupancy, registers, spills, device time and full fit. Do not assume a block-size increase helps the underfilled 20k case.
+
+If memory dependencies remain dominant, prototype a subgroup/coherent query-tile formulation: parallelize candidate rows within a leaf, compute deterministic `(distance, original ID)` partial top-k lists, then merge explicitly. Preserve scalar feature reduction order or define/test numerical tolerances before changing it. This offers actual extra work-level parallelism rather than merely repackaging the same warps. Cache/stage leaf feature blocks only where multiple queries can reuse them; not as unconditional shared-memory overhead.
+
+Plane features/width must be queried, not assumed 32 for every backend. CUDA cooperative code should remain distinct from CPU's barrier-free per-query formulation. Use separate dispatches for any cross-cube combining; no counter-only publication/spin protocol.
+
+**Evidence:** occupancy ceiling, 70–79% long-scoreboard stalls, weak pruning. **Risk:** register/shared-memory pressure, deterministic merging and GPU-specific synchronization. CPU correctness alone cannot validate this design.
+
+### 4. Both: optimize bounds/search strategy for weak-pruning regimes
+
+Measure a leaf-size/depth sweep: smaller leaves mean more node-bound work but fewer unnecessary point scans. At 16–30D either tradeoff can lose. A cheap split-plane lower bound is safe only as an actual lower bound; a looser bound preserves correctness but may increase visits. Replacing tight boxes or incrementally updating bounds needs a proof against the actual tight-box representation, not an assumption that only one coordinate changes.
+
+Compare against a **new tiled exact distance + top-k** baseline when scan fractions approach 75–97%. Reuse reference tiles and keep only bounded partial top-k lists; do not materialize an n² distance tensor. On CUDA, increase useful query/reference parallelism and reduce per-256-row dispatch/readback cycles. Keep shared neighbor functionality in `fast-cubecl-common`, not a dependency on UMAP.
+
+**Evidence:** dimensionality sweep and near parity of CPU KD/brute core at 16–30D. **Limit:** no evidence supports changing the current routing thresholds yet; dimensionality alone cannot predict pruning, and current CUDA brute is much worse.
+
+### 5. Both: local small-k heaps, only after isolating their share
+
+Prototype comptime small-k local arrays and a cached heap root, writing sorted IDs/distances once. Retain a dynamic-width path for unrestricted `min_samples`. Measure admissions, sift depth, registers and spills. This is a plausible reduction in global heap traffic, but k sensitivity does not establish it as the leading cost and CUDA's existing private stacks/register demand make indiscriminate caching risky.
+
+### Low priority / rejected as primary fixes
+
+- KD readback or core-extraction fusion: tiny measured share; all seed neighbors are still needed.
+- More CPU cubes or dynamic scheduling to cure presumed imbalance: no supporting work-count evidence.
+- Launch reduction for the current KD neighbor kernel: already one launch.
+- Host Burn sort/all-pairs tensor composition as a presumed GPU primitive: it neither supplies the KD access pattern nor removes n² storage/selection costs. A custom access-pattern kernel is justified here, but new scan/sort APIs must be verified in the pinned dependencies rather than invented.
+
+## Follow-ups: CubeCL kernel patterns for `core_distances`
+
+**Status: source analysis only.** I compiled, ran, profiled and inspected generated code for none of the items below. They refine opportunities 1, 2, 3 and 5 above using CubeCL kernel-engineering practice. The analysis read `kd_neighbors_kernel` and `box_lower_bound` (`crates/fast-hdbscan/src/kernels/kdtree.rs:19–39, 221–447`), `core_distances` (`estimator.rs:384–547`), tree construction (`fast-hdbscan-core/src/kdtree.rs:52–128`) and the pinned CubeCL **0.11.1** frontend. The 0.11.1 source provides `Vector`, `Shared::new_slice`, and `plane_any`, `plane_min`, `plane_ballot`, `plane_broadcast` and `plane_shuffle`. The repo already uses fixed-width `Tensor<Vector<u32, Const<4>>>` buffers with `#[unroll]` lane extraction in `kernels/component_reduce.rs`; new vector code should follow that pattern.
+
+### Invariants every variant must keep
+
+- **The result is independent of visit order, but distance bits are not guaranteed.** The heap keeps the k smallest `(squared distance, original candidate ID)` keys under a total order, and pruning uses `lower <= worst`. Changing the order in which nodes, leaves or candidates are visited therefore cannot change the output, provided each pairwise distance has the same bits. That makes query reordering, tile traversal and candidate vectorization semantically safe. Reordering the sum over **features** is not safe, because exact-equality tie-breaks and the bitwise host-oracle tests depend on the sequential `feature = 0..d` f32 accumulation. Plane/vector horizontal sums over features are excluded unless a tolerance contract is adopted and documented. FMA contraction can also differ between the scalar and vector code paths. Check bitwise equality against the current kernel; do not assume it.
+- **Zero-padding features is bitwise-neutral.** If both points pad unused features with `0.0`, each padded term adds `(0 - 0)^2 = +0.0` to a non-negative partial sum. Padded box features with `min = max = point = 0` likewise add `+0.0`. The KD route only accepts `d <= 30`, so padding to a multiple of 4 gives at most **8 `Vector<f32, 4>` chunks**. That bounded set of comptime specializations covers every KD-routed input.
+- Keep original IDs for self-exclusion, tie keys and output rows (see opportunity 1 and the permutation probe). Packed positions are a memory layout only.
+
+### Source-level traffic accounting (why latency, not FLOPs, dominates)
+
+The counts below are global/L1 loads per scanned leaf position at 16D, read from the source. They are not measured:
+
+| Load | Count | Needed? |
+| --- | ---: | --- |
+| `indices[position]` | 1 | yes; it is the gather that the packed layout removes |
+| query features `data[row*d + f]` | 16 | **no**: the values are the same for the whole query |
+| candidate features | 16 | yes |
+| heap root `out_distances[root]`, `out_indices[root]` | 2 (+1 on equality) | **no**: the value changes only on admission |
+
+About half of the loads in the leaf loop are therefore redundant. Each internal-node pop adds `is_leaf[node]`, two child lower bounds of `16 query + 32 bound` loads each, and up to three more reads of the global heap root (`kdtree.rs:339–359`). The feature loop bound is the runtime `data.shape(1)`, so the loop cannot be unrolled or kept in registers. The generated code was not inspected. Unless it marks the buffers no-alias, stores into `out_distances`/`out_indices` can prevent the compiler from hoisting `data` reads across heap updates. On CUDA, all of these loads are L1TEX dependencies, and that is consistent with the measured 70–79% long-scoreboard stalls. Dynamically indexed `stack`/`bound_stack` arrays normally live in local memory, which is also L1TEX. Treat this as a hypothesis until `local_load`/spill and sectors-per-request counters are collected.
+
+### F1. Both backends: register-resident query, comptime feature width (lowest risk)
+
+Add a `#[comptime] d_chunks: usize` (1..=8) specialization over a zero-padded `Tensor<Vector<f32, Const<4>>>` copy of the data, padded bounds and an unpadded original-ID view. Load the query once into `d_chunks` vectors and use it for both `box_lower_bound` and the point distances. Inside each chunk, accumulate lanes in feature order with `#[unroll]` `extract(lane)`, so 128-bit loads do not reorder the sum. Keep the current generic kernel for the scalar/test path or remove it once the padded path covers all KD inputs. KD inputs are already restricted to `d <= 30`, so the generic kernel may become dead code.
+
+Register budget on the RTX 3080 (sm_86: 64K registers, 16 blocks/SM, 1536 threads/SM). At 32-thread blocks, the 16-block cap limits residency to 512 threads/SM. That allows up to about 128 registers/thread **with no occupancy loss**, so 16–32 extra query registers on top of the measured 71 cost nothing at the current geometry. Larger blocks change this. At 71 registers (allocated as 72 per thread, 2,304 per warp), 64-thread blocks reach about 28 warps (~58% theoretical occupancy). At about 104 registers, the ceiling falls to about 19 warps (~40%). Sweep F1 and the block size together, not independently. The `cubecl-cpu` backend runs each unit as a host task, so register-resident vectors map directly to SIMD registers there.
+
+### F2. Both backends: cache the heap root and use a register top-k
+
+This step is cheaper than the full local-heap redesign in opportunity 5. Keep `worst_distance`/`worst_index` in registers, compare candidates and child bounds against the registers, and touch the output heap only on admission. After a sift, the root is the new worst entry. This removes two dependent global loads per scanned candidate and up to three per internal node without changing semantics.
+
+Next, for comptime `K <= 16` (current benchmarks use k5), replace the heap with a sorted register list that uses unrolled compare-and-shift insertion keyed by `(distance, id)`. Write the list to `out_*[original_row]` once at the end, which also removes the final heapsort. Every index into the list is comptime, so it stays in registers. A heap with dynamic sift indices would go to local memory. Keep the existing output-backed heap as the fallback for large/unrestricted `min_samples`. Measure registers and spills on CUDA, because K=16 adds 32 live values.
+
+### F3. Both backends: compact node records and implicit tree arithmetic
+
+Each node pop reads `is_leaf`, `starts` and `ends` from three separate buffers, and the bounds live in two `[nodes, d]` arrays. Pack `(start, end, is_leaf, pad)` into one `Vector<u32, Const<4>>` record, which is a single 16-byte load. Interleave the padded bounds per node as `[min chunks | max chunks]`, so the box bound for a node reads one contiguous span. Sibling children `2i+1`/`2i+2` are then adjacent as well. For KD-routed inputs (`n >= 256`), `LEAF_SIZE = 40` means every internal node holds at least 2 points, so leaves are exactly the last level. Derive this from the builder, not by assumption. The tree must still support the small-`n` early leaves at `kdtree.rs:107`, so keep the flag unless a validated `first_leaf` scalar replaces it on the KD route.
+
+### F4. CPU: SoA leaf blocks, vectorized across candidates
+
+This extends opportunity 1 (packed leaves). Store each leaf as a transposed block `leaf_soa[leaf][feature][slot]`, with the slot count padded to the selected width `W`. Take `W` from `client.io_optimized_vector_sizes(4)` at setup, not from `load_width / 32`, and pass it as comptime. Each `Vector<f32, W>` lane is a different candidate and accumulates its own features `0..d` in order. This vectorizes the distance computation **without reordering any pair's sum**, so the bitwise invariant holds. It also needs no feature-axis tail for `d = 3` or `30`. Tails go on the candidate axis. Either give padded slots an explicit validity mask, or give them ID `n` with an infinite distance. A sentinel is not admitted under the current `(distance, id)` comparisons, but an explicit mask is clearer. For admission, run one vector compare against the broadcast `worst`, then do an unrolled per-lane scalar check. Once the heap fills, admissions should be rare relative to the 14,821 positions scanned per query, so most vectors would take the cheap reject path. This is expected, not measured; the admission instrumentation from opportunity 5 would confirm it. Packing costs `n * d_padded * 4` bytes, or 12.8 MB at 100k x 32-padded. Charge the packing build to the fit.
+
+Also replace cyclic query assignment (`local_row += CUBE_DIM * CUBE_COUNT`) with contiguous chunks of **leaf-ordered** queries, iterating `tree.indices` and writing to `out[original_row]`. The skill's CPU guidance is "one unit per contiguous slice of queries; sorting queries still helps the cache." Consecutive queries then share their traversal paths and hot leaf blocks in each core's L1/L2. Benchmark this separately from F4, as opportunity 1 requires. Shared memory has no on-chip advantage on the CPU runtime, and `PLANE_DIM` is 1, so the CPU kernel should stay barrier-free and per-query.
+
+### F5. CUDA: plane-cooperative leaf-tile traversal (largest change)
+
+The current kernel runs 32 incoherent per-thread traversals per warp. The data shows three related costs: divergent stacks, uncoalesced gathers through `indices` and repeated L1 misses on the same leaves. At a 74–97% scan fraction, almost every warp lane visits most leaves anyway. The proposed **separate kernel**, gated on `features.plane` and the queried `plane_size_min`, works as follows:
+
+1. **Tile:** one plane (one cube of one plane at first) owns `PLANE_DIM` consecutive queries in leaf order, i.e. consecutive positions in `tree.indices`. Each lane keeps its own query in registers (F1) and its own register top-k (F2).
+2. **Uniform traversal:** the stack is cube-uniform and held in `Shared`. For each node, every lane computes its own `lower(q, node) <= worst(q)`, and `plane_any` decides whether to visit. Children are ordered by the plane-min lower bound (`plane_min`). Control flow and barriers are uniform, so `sync_cube()` is never masked. Some extra leaves are visited, which costs time but does not change results (see the visit-order invariant).
+3. **Staged candidates:** copy each visited leaf into `Shared` in chunks of `PLANE_DIM` candidates × `d_chunks` vectors (32 × 8 × 16 B = 4 KB). Each lane loads one candidate's contiguous padded row, so a warp reads contiguous leaf-packed memory. Synchronize, then each lane loops over the staged candidates. Every lane reads the same shared address, which is a broadcast with no bank conflicts, and accumulates in feature order. Synchronize again before the next chunk overwrites the buffer, to avoid a write-after-read race. Each staged candidate is reused `PLANE_DIM` times instead of being re-gathered per lane. Double-buffering with `memcpy_async`/barriers is a later step and needs the 0.11.1 API checked first.
+4. **Output:** each lane writes its sorted top-k to `out[original_row]` once. Scattered row writes happen once per query, so they are negligible.
+
+This kernel needs a cooperative launch geometry, which can include several planes per cube to clear the 16-block/SM cap. Size `Shared` against `max_shared_memory_size`. It also needs a GPU test, because CPU tests run with `PLANE_DIM = 1` and never exercise the cooperative logic. No cross-cube communication is required. Diagnostics change meaning in this mode (tile visits rather than per-query visits) and must be documented as such. If F5 wins, the same structure applies to `kd_candidates_kernel` in Borůvka. That kernel is outside `core_distances`, and its component-bound atomics add constraints.
+
+### F6. Rejected or low-value patterns for this stage
+
+- **Matmul-style distances (`|q|^2 + |r|^2 - 2 q·r`, CubeK matmul).** Rejected for the exact path. The form changes rounding, causes cancellation near ties and breaks bitwise oracle/tie semantics. It is acceptable only as an approximate or pre-filter path with exact rescoring.
+- **`plane_sum`/vector horizontal sums over features.** These reorder the accumulation (see invariants). They are also unnecessary, because vectorizing across candidates (F4) or across queries (F5) keeps the order.
+- **Shared memory or barriers in the CPU kernel.** No on-chip benefit, and barriers create a risk of spin cliffs on the CPU runtime.
+- **Atomics or single-pass inter-cube merging.** Each query's top-k belongs to one unit or one plane, so nothing needs publishing across cubes.
+- **Core extraction or readback fusion.** Already ruled out above. The slice is asynchronous, and readback is under 1% of the stage.
+
+### Suggested order and acceptance
+
+F2 (root caching only) → F1 → F3 are local edits to the existing kernel and apply to both backends. Benchmark each one in interleaved batches. F4 on CPU and F5 on CUDA are new kernels behind the existing `exact_neighbors_kd` host signature, chosen once per client from device properties. For every variant, the acceptance checks are:
+
+- bitwise-equal neighbor IDs and distances against the current kernel and the host oracle, including ties, duplicates, `d` in {1, 3, 4, 16, 30} and padded tails;
+- tests at every vector width the host can select, not only the CPU's widest;
+- a required-CUDA run for any plane path;
+- registers and spills from Nsight Compute;
+- core-stage and full-fit timing at 20k and 50k against an interleaved baseline.
+
+## Verification, limitations and reproduction
+
+Executed with required CUDA, no hardware skips:
+
+```sh
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release --features tracing \
+  --test test_kdtree_search -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release --features tracing \
+  --example profile_hdbscan_stages -- --nocapture
+```
+
+**4/4 KD tests and 7/7 profiler tests passed.** KD tests cover exact host-oracle comparisons, ties, indirection/permuted trees, padding/small boundaries and overflow cases on CPU and CUDA. Profiler tests cover parser/sample boundaries and real CPU/CUDA span counts. Raw logs: `kdtree_tests.log`, `profile_tests.log`. Cargo warns that upstream `burn-cubecl` and `burn-cubecl-fusion` contain future-incompatible code; these warnings were not suppressed.
+
+Baseline reproduction (use a fresh run directory):
+
+```sh
+cargo build -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
+uv run --no-sync python analyze/benchmark_hdbscan_stages.py \
+  --binary target/release/examples/profile_hdbscan_stages \
+  --rows 20000 --run-dir artifacts/hdbscan_core_investigation/NEW_RUN --timeout 120
+uv run --no-sync python analyze/profile_hdbscan_kernels.py \
+  --binary target/release/examples/profile_hdbscan_stages \
+  --rows 20000 --run-dir artifacts/hdbscan_core_investigation/NEW_RUN --timeout 120
+uv run --no-sync python analyze/profile_hdbscan_counters.py \
+  --binary target/release/examples/profile_hdbscan_stages --binary-label current \
+  --rows 20000 --run-dir artifacts/hdbscan_core_investigation/NEW_RUN --timeout 120
+```
+
+The component scripts were used directly rather than the all-in-one shell driver to allow longer bounded process deadlines and independent targeted experiments. `run_experiments.py`, `run_sensitivity.py`, `experiments.json`, `sensitivity.json`, `alternating.json`, `alternating50.json`, and `dimension30_comparator.json` preserve configurations/raw samples; alternating records include the exact native commands. `dump_core_outputs.rs`, `probe_build.jsonl`, `probe_build_command.json`, `compare_permutation.py` and `permutation_semantics.json` preserve the public-output semantic check. Run harnesses only in a fresh evidence directory or after adapting their output paths; unlike the benchmark runner, the small exploratory helpers overwrite their own named outputs.
+
+Limitations: one host/GPU; synthetic Gaussian workloads, no real datasets; no uniform/duplicate-heavy performance campaign; no prototype kernel speedups; no spill/coalescing counters; no full-workspace test claim. The 100k results validate current-baseline scaling and backend agreement, not a hypothetical optimized implementation. The downstream permutation-sensitive clustering mechanism remains unresolved and is not presented as a diagnosed defect.
+
+**Recommended first implementation experiment:** an original-ID-preserving packed-candidate path on CPU, benchmarked independently from query reordering; on CUDA, a launch-resource sweep followed by cooperative leaf evaluation only if counters justify it. Validate exact neighbors/core outputs first, then full MST/clustering outputs and total fit cost.
+
+## Phase 1 results
+
+Register-cached KD heap root implemented against `2c3fc35fa2b2492f519c0adcb544779357f46dd8`, on Ryzen 9800X3D / RTX 3080, Rust/Burn/CubeCL identities in `artifacts/cubecl_kernels_perf/phase1/provenance.json`. Baseline and variant release tracing binaries are preserved with SHA-256. No subsequent optimization phase is included.
+
+Each cell ran serial B,V,V,B,B,V processes, three measured fits after warmup per process. Values below are **core-stage seconds**, median [min–max] of three process medians per binary, not nine independent fits. `summary.json` retains all fit samples, process grouping, neighbor-operation-plus-sync and full-fit distributions. Every one of the 48 processes' final-fit label vectors matches its cell's baseline exactly.
+
+| Rows / dimensions / backend | Baseline | Variant |
+| --- | --- | --- |
+| 20k / 16 / CPU | 0.274719 [0.273299–0.283516] | 0.276343 [0.274420–0.278630] |
+| 20k / 16 / CUDA | 0.062015 [0.061393–0.063803] | 0.060967 [0.059383–0.062536] |
+| 20k / 30 / CPU | 0.642068 [0.613602–0.669521] | 0.641285 [0.638788–0.674744] |
+| 20k / 30 / CUDA | 0.086227 [0.085676–0.086515] | 0.082826 [0.082734–0.083026] |
+| 50k / 16 / CPU | 1.302675 [1.270986–1.318149] | 1.336367 [1.325411–1.339078] |
+| 50k / 16 / CUDA | 0.317111 [0.314820–0.317113] | 0.267245 [0.267160–0.270133] |
+| 50k / 30 / CPU | 3.641410 [3.586260–3.656764] | 3.618289 [3.597900–3.664402] |
+| 50k / 30 / CUDA | 0.803226 [0.784221–0.807848] | 0.592493 [0.590486–0.594431] |
+
+**Decision:** retain the root cache. CUDA core medians improve at both required 16D scales, with the 50k variant maximum below the baseline median. All eight median regressions are bounded by their baseline process-median range. CPU is not a demonstrated speedup; its 50k×16 median increases about 2.6%, within the plan's noise bound. No generalization beyond these cells is warranted.
+
+**Correctness:** the frozen test-only reference is verbatim HEAD kernel; production and reference were tested before the edit. Required-CUDA golden tests compare IDs, distance bits and per-row traversal diagnostics across the complete planned matrix, including ties and padding sentinels; diagnostics-disabled outputs also match. High-dimensional random host-oracle data exposed an existing one-bit difference on **both** CPU and CUDA before optimization (retained failing log). The strict host-oracle fixture therefore uses exactly representable bounded integer data at 16D/30D; no tolerance or backend exclusion was introduced. Random inputs remain covered by the frozen-kernel comparison.
+
+**H3:** four fresh baseline/variant 20k/50k×16 captures retain raw CSV, matching input/run/route identities and selected binary hashes. All required evidence was collected with Nsight Compute 2026.2.1. Global-load request totals decline 866,955,776→819,526,249 at 20k and 4,982,334,074→4,712,480,345 at 50k. Sectors/request rise slightly, 12.117→12.223 and 10.160→10.242. Allocated registers/thread rise **71→75**, below the phase's approximate128 ceiling. Local-load sectors rise 7,796,729→7,799,494 and 71,764,852→71,864,591; local-store sectors remain 11,047,614 and 97,001,130. Existing stack/local traffic is not claimed eliminated.
+
+Sampled long-scoreboard share (queried stalled-warp numerator divided by `smsp__pcsamp_sample_count`, with raw units/counts retained) falls **68.85→59.59%** at 20k and **71.85→39.69%** at 50k. Achieved occupancy is 18.53→17.83% and 27.88→30.39%; theoretical occupancy stays **33.33%**. These are first matching **warmup** launch captures, not whole-fit averages. Sampling/replay perturb execution; these shares are not the existing non-sampled stall percentage. Strict fixtures cover required missing metrics, malformed values/units, nonnegative integer counts including zero, positive registers, and zero-denominator unavailable ratios.
+
+The first capability assessment was wrong: broad query output omitted specialized launch/occupancy/warp-sampling/source collections. Full raw queries and command/status/tool/device identity are now retained in `metric_queries/`; they confirm the exact `.sum` counters, allocated-register metric, occupancy and compatible sampled numerator/denominator. Initial average-only captures and the earlier parser failure remain archived for audit, but are superseded by the complete exact-metric captures above. No unavailable metric is silently replaced by a different ratio.
+
+Evidence root: `artifacts/cubecl_kernels_perf/phase1/`; the initial fractional-parser failure and original random host-oracle failure are retained, not suppressed. Final 100k strict CPU/CUDA stage-analysis pipeline completed successfully; its evidence path is in `logs/final_scale_100000_retry.log`. README/AGENTS are unchanged because public behavior, API and layout are unchanged.

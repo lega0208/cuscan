@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -26,10 +27,19 @@ METRICS = (
     "gpu__time_duration.sum",
     "launch__grid_size",
     "launch__block_size",
+    "launch__registers_per_thread",
+    "launch__occupancy_limit_warps",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+    "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
+    "smsp__pcsamp_sample_count",
     "sm__warps_active.avg.pct_of_peak_sustained_active",
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__maximum_warps_per_active_cycle_pct",
     "smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct",
     "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
 )
@@ -60,12 +70,48 @@ def normalize_metric(name: str, value: float, unit: str) -> tuple[float, str]:
             raise ValueError(f"unsupported unit {unit!r} for {name}")
         factor, normalized = factors[unit]
         return value * factor, normalized
+    if name == "launch__registers_per_thread":
+        if unit not in ("register/thread", "registers/thread"):
+            raise ValueError(f"unsupported unit {unit!r} for {name}")
+        if value <= 0 or not value.is_integer():
+            raise ValueError(f"{name} must be a positive integer")
+        return value, "register/thread"
+    if name == "launch__occupancy_limit_warps":
+        if unit not in ("block", "blocks", "count"):
+            raise ValueError(f"unsupported unit {unit!r} for {name}")
+        if not value.is_integer():
+            raise ValueError(f"{name} must be a nonnegative integer")
+        return value, "block"
     if name.startswith("launch__"):
         if unit not in ("", "#", "count"):
             raise ValueError(f"unsupported unit {unit!r} for {name}")
         if value <= 0 or not value.is_integer():
             raise ValueError(f"{name} must be a positive integer")
         return value, "count"
+    if name in {
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum",
+        "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+        "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+        "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
+        "smsp__pcsamp_sample_count",
+    }:
+        expected = "sector" if "sectors" in name else "request" if "requests" in name else "warp"
+        valid_units = {
+            "sector": {"sector", "sectors"},
+            "request": {"", "request", "requests"},
+            "warp": {"", "warp", "warps"},
+        }[expected]
+        if unit not in valid_units:
+            raise ValueError(f"unsupported unit {unit!r} for {name}")
+        if not value.is_integer():
+            raise ValueError(f"{name} must be a nonnegative integer count")
+        normalized_unit = {
+            "sector": "sector",
+            "request": "request",
+            "warp": "sampled warp",
+        }[expected]
+        return value, normalized_unit
     if unit not in ("%", "percent"):
         raise ValueError(f"unsupported unit {unit!r} for {name}")
     if value > 100:
@@ -125,6 +171,95 @@ def parse_ncu_csv(text: str, kernel_family: str) -> dict[str, Any]:
             "normalized_value": normalized,
             "normalized_unit": normalized_unit,
         }
+    ratios: dict[str, Any] = {}
+    for ratio_name, numerator_name, denominator_name, units in (
+        (
+            "global_load_sectors_per_request",
+            "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+            "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+            ("sector", "request"),
+        ),
+    ):
+        numerator = parsed[numerator_name]
+        denominator = parsed[denominator_name]
+        compatible = (numerator["normalized_unit"], denominator["normalized_unit"]) == units
+        if not compatible:
+            raise ValueError(f"incompatible units for {ratio_name}")
+        denominator_value = denominator["normalized_value"]
+        ratios[ratio_name] = {
+            "status": "unavailable" if denominator_value == 0 else "available",
+            "value": (
+                numerator["normalized_value"] / denominator_value
+                if denominator_value != 0
+                else None
+            ),
+            "unit": (
+                "sector/request" if ratio_name == "global_load_sectors_per_request" else "share"
+            ),
+            "numerator": {
+                "metric": numerator_name,
+                "raw_value": numerator["value"],
+                "raw_unit": numerator["unit"],
+                "value": numerator["normalized_value"],
+                "unit": numerator["normalized_unit"],
+            },
+            "denominator": {
+                "metric": denominator_name,
+                "raw_value": denominator["value"],
+                "raw_unit": denominator["unit"],
+                "value": denominator_value,
+                "unit": denominator["normalized_unit"],
+            },
+            "unavailable_reason": "zero denominator" if denominator_value == 0 else None,
+        }
+    stall_numerator = parsed["smsp__pcsamp_warps_issue_stalled_long_scoreboard"]
+    stall_denominator = parsed["smsp__pcsamp_sample_count"]
+    if stall_numerator["normalized_unit"] != stall_denominator["normalized_unit"]:
+        raise ValueError("incompatible units for long_scoreboard_share")
+    stall_denominator_value = stall_denominator["normalized_value"]
+    ratios["long_scoreboard_share"] = {
+        "status": "unavailable" if stall_denominator_value == 0 else "available",
+        "value": (
+            stall_numerator["normalized_value"] / stall_denominator_value
+            if stall_denominator_value != 0
+            else None
+        ),
+        "unit": "share",
+        "definition": "long-scoreboard sampled warps / sampled warp-state count",
+        "numerator": {
+            "metric": "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
+            "raw_value": stall_numerator["value"],
+            "raw_unit": stall_numerator["unit"],
+            "value": stall_numerator["normalized_value"],
+            "unit": stall_numerator["normalized_unit"],
+        },
+        "denominator": {
+            "metric": "smsp__pcsamp_sample_count",
+            "raw_value": stall_denominator["value"],
+            "raw_unit": stall_denominator["unit"],
+            "value": stall_denominator_value,
+            "unit": stall_denominator["normalized_unit"],
+        },
+        "unavailable_reason": "zero denominator" if stall_denominator_value == 0 else None,
+    }
+    ratios["theoretical_occupancy"] = {
+        "status": "available",
+        "value": parsed["sm__maximum_warps_per_active_cycle_pct"]["normalized_value"],
+        "unit": "%",
+        "achieved": {
+            "metric": "sm__warps_active.avg.pct_of_peak_sustained_active",
+            "value": parsed["sm__warps_active.avg.pct_of_peak_sustained_active"][
+                "normalized_value"
+            ],
+            "unit": "%",
+        },
+        "theoretical": {
+            "metric": "sm__maximum_warps_per_active_cycle_pct",
+            "value": parsed["sm__maximum_warps_per_active_cycle_pct"]["normalized_value"],
+            "unit": "%",
+        },
+        "source": "Nsight Compute Occupancy.section header metric",
+    }
     geometry = {"block": records[0].get("Block Size"), "grid": records[0].get("Grid Size")}
     if not geometry["block"] or not geometry["grid"]:
         raise ValueError(f"{kernel_family} record lacks launch geometry")
@@ -139,12 +274,27 @@ def parse_ncu_csv(text: str, kernel_family: str) -> dict[str, Any]:
         "launch_id": launch_id,
         "geometry": geometry,
         "metrics": parsed,
+        "ratios": ratios,
     }
+
+
+def _require_fresh_capture_paths(raw: Path, family: str) -> tuple[Path, Path, Path, Path]:
+    paths = (
+        raw / f"ncu_{family}.csv",
+        raw / f"ncu_{family}.stdout",
+        raw / f"ncu_{family}.stderr",
+        raw / f"ncu_{family}.trace.json",
+    )
+    stale = next((path for path in paths if path.exists()), None)
+    if stale is not None:
+        raise FileExistsError(f"refusing to overwrite profiler evidence: {stale}")
+    return paths
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--binary-label", required=True, choices=("baseline", "variant", "current"))
     parser.add_argument("--rows", required=True, type=int, choices=(20000, 50000, 100000))
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
@@ -152,6 +302,14 @@ def main() -> int:
     raw = args.run_dir / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     ident = identity(args.run_dir)
+    binary = args.binary.resolve(strict=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError(f"profiling binary is not executable: {binary}")
+    binary_provenance = {
+        "label": args.binary_label,
+        "path": str(binary),
+        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
     report_path = args.run_dir / "cuda_counters.json"
     if report_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report {report_path}")
@@ -167,6 +325,20 @@ def main() -> int:
     if not benchmark_path.is_file():
         raise ValueError(f"benchmark report {benchmark_path} is required to select kernels")
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    for field in ("schema_version", "run_id", "workload", "input_sha256"):
+        if benchmark.get(field) != ident.get(field):
+            raise ValueError(f"benchmark report identity mismatch for {field}")
+    for backend in ("cpu", "cuda"):
+        try:
+            provisioned_argv = benchmark["profiles"][backend]["command_provenance"]["argv"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"benchmark report lacks the {backend} provisioning command"
+            ) from error
+        if not provisioned_argv or Path(provisioned_argv[0]).resolve() != binary:
+            raise ValueError(
+                f"benchmark {backend} profile was not provisioned with selected binary"
+            )
     try:
         cuda_routes = benchmark["profiles"]["cuda"]["resolved_search_per_fit"]
     except (KeyError, TypeError) as error:
@@ -190,12 +362,7 @@ def main() -> int:
         "stderr": version_stderr.read_text(encoding="utf-8").strip(),
     }
     for family in route_kernel_families(route):
-        log = raw / f"ncu_{family}.csv"
-        stdout = raw / f"ncu_{family}.stdout"
-        stderr = raw / f"ncu_{family}.stderr"
-        stale = [path for path in (log, stdout, stderr) if path.exists()]
-        if stale:
-            raise FileExistsError(f"refusing to overwrite profiler evidence: {stale[0]}")
+        log, stdout, stderr, trace = _require_fresh_capture_paths(raw, family)
         command = [
             "ncu",
             "--target-processes",
@@ -224,7 +391,7 @@ def main() -> int:
             "--search",
             "auto",
             "--trace-output",
-            str(raw / f"ncu_{family}.trace.json"),
+            str(trace),
         ]
         with stdout.open("w", encoding="utf-8") as out, stderr.open("w", encoding="utf-8") as err:
             provenance = run_command(command, timeout=args.timeout, stdout=out, stderr=err)
@@ -249,6 +416,7 @@ def main() -> int:
         report_path,
         {
             **ident,
+            "binary": binary_provenance,
             "route": route,
             "kernels": reports,
             "captures": captures,
