@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 onward remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phases 4 and 5 were implemented, measured and rejected. Phase 6 onward remain unimplemented and unmeasured.
 
 ## Baseline facts this plan relies on
 
@@ -88,9 +88,9 @@ The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measur
 
 ### Phase 5: Launch-geometry sweep (CUDA)
 
-**Change.** Parameterize the CUDA cube size of the KD neighbor kernel and sweep 32, 64 and 128 threads on top of Phases 1–4. Register growth from Phase 3 interacts with this:
-- At ~72 registers, 64-thread cubes allow ~58% theoretical occupancy.
-- At ~104 registers, they allow ~40%.
+**Status:** measured and rejected; retain 32 threads and unchanged CPU policy on the accepted Phase 3 baseline (not cumulative Phases 1–4). Detailed protocol: [cubecl_kernels_perf_plan_phase5.md](cubecl_kernels_perf_plan_phase5.md). [Phase 5 results](hdbscan_perf_report.md#phase-5-results-cuda-neighbor-launch-geometry-rejected) and `artifacts/cubecl_kernels_perf/phase5/pooled_summary.json` preserve both complete timing matrices. Widths 64/128 improve 50k CUDA core by roughly 9–19%, but regress 20k×30 CUDA core by 3.62%/16.74%; 128 also fails CPU-control and full-fit screens. No exception was taken.
+
+**Experiment (not retained).** Fixed neighbor-only preferred widths 32, 64 and 128, legalized against actual device limits. Observed registers per thread differ with geometry: 16D 106/64/50; 30D 128/72/72. Earlier occupancy estimates were hypotheses, not universal resource ceilings. Frozen-reference and capped grid-stride tests remain; experiment binaries and diffs are preserved outside production.
 
 Choose the setting from H2/H3 at 20k and 50k. The 20k case has only ~625 warps of work, so larger cubes are not expected to help it. Keep `legal_cube_dim` and the `max_cube_count` limits.
 

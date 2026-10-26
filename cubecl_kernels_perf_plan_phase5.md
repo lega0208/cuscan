@@ -1,6 +1,6 @@
 # Phase 5 detailed plan: tune CUDA KD-query launch geometry
 
-This document details Phase 5 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). **Status: planning only; unimplemented and unmeasured.** Phase 2 and Phase 4 were rejected. The accepted Phase 3 kernel, not a cumulative Phase 1–4 implementation, is the production baseline. This plan reconstructs the intended experiment from current repository sources; it is not a verbatim copy of the earlier draft.
+This document details Phase 5 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). **Status: implemented and measured; larger geometries rejected, 32 retained.** Phase 2 and Phase 4 were rejected. The accepted Phase 3 kernel, not a cumulative Phase 1–4 implementation, is the production baseline. The protocol below is preserved as the experiment contract. Measured results and verification are recorded in [the performance report](hdbscan_perf_report.md#phase-5-results-cuda-neighbor-launch-geometry-rejected) and `artifacts/cubecl_kernels_perf/phase5/`.
 
 ## Objective and scope
 

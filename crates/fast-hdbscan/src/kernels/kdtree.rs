@@ -860,8 +860,30 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
 }
 
 fn launch_count(rows: usize, dim: u32, max_cubes: u32) -> u32 {
+    assert!(dim > 0, "KD cube width must be positive");
+    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
     u32::try_from(rows.div_ceil(dim as usize).min(max_cubes as usize))
         .expect("bounded KD launch count")
+}
+
+#[cfg(test)]
+fn distinct_legal_widths(
+    client: &cubecl::client::Client,
+    requested: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let mut seen = Vec::new();
+    requested
+        .into_iter()
+        .filter(|width| {
+            let dim = fast_cubecl_common::legal_cube_dim(client, CubeDim::new_1d(*width));
+            if seen.contains(&(dim.x, dim.y, dim.z)) {
+                false
+            } else {
+                seen.push((dim.x, dim.y, dim.z));
+                true
+            }
+        })
+        .collect()
 }
 
 fn kd_launch_geometry(client: &cubecl::client::Client, rows: usize) -> (CubeCount, CubeDim) {
@@ -878,6 +900,31 @@ fn kd_launch_geometry(client: &cubecl::client::Client, rows: usize) -> (CubeCoun
         )
     };
     assert!(max_cubes > 0, "device reports no legal KD launch capacity");
+    assert!(dim.x > 0, "device reports no legal KD cube width");
+    (
+        CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
+        dim,
+    )
+}
+
+#[cfg(test)]
+fn kd_neighbors_launch_geometry(
+    client: &cubecl::client::Client,
+    rows: usize,
+    width: u32,
+    max_cubes_override: Option<u32>,
+) -> (CubeCount, CubeDim) {
+    assert!(width > 0, "preferred KD cube width must be positive");
+    let hardware = &client.properties().hardware;
+    if hardware.num_cpu_cores.is_some() {
+        return kd_launch_geometry(client, rows);
+    }
+    let dim = fast_cubecl_common::legal_cube_dim(client, CubeDim::new_1d(width));
+    let max_cubes = max_cubes_override.map_or(hardware.max_cube_count.0, |cap| {
+        cap.min(hardware.max_cube_count.0)
+    });
+    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
+    assert!(dim.x > 0, "device reports no legal KD cube width");
     (
         CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
         dim,
@@ -1047,6 +1094,51 @@ fn launch_kd_neighbors(
     FloatTensor<CubeBackend>,
     IntTensor<CubeBackend>,
 ) {
+    #[cfg(test)]
+    {
+        launch_kd_neighbors_impl(data, tree, k, diagnostics_enabled, 32, None)
+    }
+    #[cfg(not(test))]
+    {
+        launch_kd_neighbors_impl(data, tree, k, diagnostics_enabled)
+    }
+}
+
+#[cfg(test)]
+fn launch_kd_neighbors_with_width(
+    data: FloatTensor<CubeBackend>,
+    tree: DeviceKdTree<CubeBackend>,
+    k: u32,
+    diagnostics_enabled: bool,
+    preferred_width: u32,
+    max_cubes_override: Option<u32>,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
+    launch_kd_neighbors_impl(
+        data,
+        tree,
+        k,
+        diagnostics_enabled,
+        preferred_width,
+        max_cubes_override,
+    )
+}
+
+fn launch_kd_neighbors_impl(
+    data: FloatTensor<CubeBackend>,
+    tree: DeviceKdTree<CubeBackend>,
+    k: u32,
+    diagnostics_enabled: bool,
+    #[cfg(test)] preferred_width: u32,
+    #[cfg(test)] max_cubes_override: Option<u32>,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
     let data = into_contiguous(data);
     let tree = into_contiguous_tree(tree);
     validate_tree(&data, &tree);
@@ -1064,6 +1156,10 @@ fn launch_kd_neighbors(
     let data_padded = pad_rows(&data, n, features);
     let bounds_min_padded = pad_rows(&tree.bounds_min, nodes, features);
     let bounds_max_padded = pad_rows(&tree.bounds_max, nodes, features);
+    #[cfg(test)]
+    let (cube_count, dim) =
+        kd_neighbors_launch_geometry(&client, n, preferred_width, max_cubes_override);
+    #[cfg(not(test))]
     let (cube_count, dim) = kd_launch_geometry(&client, n);
     kd_neighbors_kernel::launch(
         &client,
@@ -1499,9 +1595,6 @@ mod tests {
                 make_neighbor_inputs(&values, rows, features, device);
             let (reference_ids, reference_distances, reference_diagnostics) =
                 exact_neighbors_kd_reference(reference_data, reference_tree, k, true);
-            let (data, tree) = make_neighbor_inputs(&values, rows, features, device);
-            let (production_ids, production_distances, production_diagnostics) =
-                launch_kd_neighbors(data, tree, k, true);
             let ref_ids = into_data_sync(reference_ids).try_to_vec::<i32>().unwrap();
             let ref_distances = into_data_sync(reference_distances)
                 .try_to_vec::<f32>()
@@ -1509,62 +1602,228 @@ mod tests {
             let ref_diagnostics = into_data_sync(reference_diagnostics)
                 .try_to_vec::<i32>()
                 .unwrap();
-            assert_eq!(
-                into_data_sync(production_ids.clone())
-                    .try_to_vec::<i32>()
-                    .unwrap(),
-                ref_ids,
-                "neighbor IDs, n={rows}, d={features}, k={k}, {special:?}"
-            );
-            assert_eq!(
-                into_data_sync(production_distances.clone())
-                    .try_to_vec::<f32>()
-                    .unwrap()
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                ref_distances
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                "neighbor distance bits, n={rows}, d={features}, k={k}, {special:?}"
-            );
-            assert_eq!(
-                into_data_sync(production_diagnostics)
-                    .try_to_vec::<i32>()
-                    .unwrap(),
-                ref_diagnostics,
-                "diagnostics, n={rows}, d={features}, k={k}, {special:?}"
-            );
-            let (disabled_data, disabled_tree) =
-                make_neighbor_inputs(&values, rows, features, device);
-            let (disabled_ids, disabled_distances, _) =
-                launch_kd_neighbors(disabled_data, disabled_tree, k, false);
-            assert_eq!(
-                into_data_sync(disabled_ids).try_to_vec::<i32>().unwrap(),
-                into_data_sync(production_ids).try_to_vec::<i32>().unwrap(),
-                "disabled diagnostics IDs, n={rows}, d={features}, k={k}"
-            );
-            assert_eq!(
-                into_data_sync(disabled_distances)
-                    .try_to_vec::<f32>()
-                    .unwrap()
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                into_data_sync(production_distances)
-                    .try_to_vec::<f32>()
-                    .unwrap()
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>()
-            );
+            let (probe, _) = make_neighbor_inputs(&values, rows, features, device);
+            let client = probe.client.clone();
+            let widths = if matches!(device, CubeDevice::Cuda(_)) {
+                let hardware = &client.properties().hardware;
+                eprintln!(
+                    "KD geometry hardware: max_cube_dim={:?}, max_units_per_cube={}, plane_size_min={}, max_cube_count={:?}",
+                    hardware.max_cube_dim,
+                    hardware.max_units_per_cube,
+                    hardware.plane_size_min,
+                    hardware.max_cube_count
+                );
+                for width in [32, 64, 128] {
+                    let dim = fast_cubecl_common::legal_cube_dim(&client, CubeDim::new_1d(width));
+                    eprintln!(
+                        "KD width requested={width}, actual=({},{},{}), max_cube_count={:?}",
+                        dim.x, dim.y, dim.z, hardware.max_cube_count
+                    );
+                }
+                distinct_legal_widths(&client, [32, 64, 128])
+            } else {
+                vec![32]
+            };
+            for width in widths {
+                let (data, tree) = make_neighbor_inputs(&values, rows, features, device);
+                let (production_ids, production_distances, production_diagnostics) =
+                    launch_kd_neighbors_with_width(data, tree, k, true, width, None);
+                assert_eq!(
+                    into_data_sync(production_ids.clone())
+                        .try_to_vec::<i32>()
+                        .unwrap(),
+                    ref_ids,
+                    "neighbor IDs, n={rows}, d={features}, k={k}, {special:?}"
+                );
+                assert_eq!(
+                    into_data_sync(production_distances.clone())
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    ref_distances
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "neighbor distance bits, n={rows}, d={features}, k={k}, {special:?}"
+                );
+                assert_eq!(
+                    into_data_sync(production_diagnostics)
+                        .try_to_vec::<i32>()
+                        .unwrap(),
+                    ref_diagnostics,
+                    "diagnostics, n={rows}, d={features}, k={k}, {special:?}"
+                );
+                let (disabled_data, disabled_tree) =
+                    make_neighbor_inputs(&values, rows, features, device);
+                let (disabled_ids, disabled_distances, _) = launch_kd_neighbors_with_width(
+                    disabled_data,
+                    disabled_tree,
+                    k,
+                    false,
+                    width,
+                    None,
+                );
+                assert_eq!(
+                    into_data_sync(disabled_ids).try_to_vec::<i32>().unwrap(),
+                    into_data_sync(production_ids).try_to_vec::<i32>().unwrap(),
+                    "disabled diagnostics IDs, n={rows}, d={features}, k={k}"
+                );
+                assert_eq!(
+                    into_data_sync(disabled_distances)
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    into_data_sync(production_distances)
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 
     #[test]
     fn kd_neighbors_match_frozen_reference_cpu() {
         check_kd_neighbors_match_reference(&CubeDevice::Cpu(Default::default()));
+    }
+
+    #[test]
+    fn kd_neighbor_geometry_count_boundaries_and_cpu_independence() {
+        for width in [32u32, 64, 128] {
+            for rows in [
+                1usize,
+                width as usize - 1,
+                width as usize,
+                width as usize + 1,
+            ] {
+                let count = launch_count(rows, width, u32::MAX);
+                assert_eq!(count, rows.div_ceil(width as usize) as u32);
+            }
+            assert_eq!(launch_count(width as usize * 9 + 1, width, 3), 3);
+        }
+        assert_eq!(launch_count(usize::MAX, 1, u32::MAX), u32::MAX);
+        assert!(std::panic::catch_unwind(|| launch_count(1, 1, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| launch_count(1, 0, 1)).is_err());
+        let (data, _) = make_neighbor_inputs(&[0.0], 1, 1, &CubeDevice::Cpu(Default::default()));
+        let hw = &data.client.properties().hardware;
+        for width in [32, 64, 128] {
+            let legal = fast_cubecl_common::legal_cube_dim(&data.client, CubeDim::new_1d(width));
+            assert!(legal.x > 0 && legal.y > 0 && legal.z > 0);
+            assert!(legal.x <= hw.max_cube_dim.0 && legal.y <= hw.max_cube_dim.1);
+            assert!(legal.z <= hw.max_cube_dim.2);
+            assert!(
+                u64::from(legal.x) * u64::from(legal.y) * u64::from(legal.z)
+                    <= u64::from(hw.max_units_per_cube)
+            );
+            let (count, dim) = kd_neighbors_launch_geometry(&data.client, 129, width, Some(1));
+            let (base_count, base_dim) = kd_launch_geometry(&data.client, 129);
+            assert_eq!((dim.x, dim.y, dim.z), (base_dim.x, base_dim.y, base_dim.z));
+            let (count_x, count_y, count_z) = match count {
+                CubeCount::Static(x, y, z) => (x, y, z),
+                _ => panic!("KD launch geometry must be static"),
+            };
+            let (base_x, base_y, base_z) = match base_count {
+                CubeCount::Static(x, y, z) => (x, y, z),
+                _ => panic!("KD launch geometry must be static"),
+            };
+            assert_eq!((count_x, count_y, count_z), (base_x, base_y, base_z));
+        }
+        let candidate_dims = [32, 64, 128]
+            .into_iter()
+            .map(|width| {
+                let dim = fast_cubecl_common::legal_cube_dim(&data.client, CubeDim::new_1d(width));
+                (dim.x, dim.y, dim.z)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let distinct_widths = distinct_legal_widths(&data.client, [32, 64, 128]);
+        assert_eq!(distinct_widths.len(), candidate_dims.len());
+        assert!(distinct_widths.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn kd_neighbors_capped_grid_stride_matches_reference_cuda() {
+        let count =
+            fast_cubecl_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if count == 0 {
+            assert!(
+                std::env::var_os("FAST_UMAP_REQUIRE_CUDA").is_none(),
+                "FAST_UMAP_REQUIRE_CUDA is set, but no CUDA device is available"
+            );
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let device = CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 });
+        let (probe, _) = make_neighbor_inputs(&[0.0], 1, 1, &device);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                kd_neighbors_launch_geometry(&probe.client, 1, 32, Some(0))
+            }))
+            .is_err()
+        );
+        for requested_width in [32, 64, 128] {
+            let actual_width =
+                fast_cubecl_common::legal_cube_dim(&probe.client, CubeDim::new_1d(requested_width))
+                    .x as usize;
+            let cap_capacity = 2 * actual_width;
+            let mut row_counts = vec![
+                1,
+                actual_width - 1,
+                actual_width,
+                actual_width + 1,
+                cap_capacity - 1,
+                cap_capacity,
+                cap_capacity + 1,
+                5 * actual_width + 3,
+            ];
+            row_counts.sort_unstable();
+            row_counts.dedup();
+            for rows in row_counts {
+                let values = splitmix_values(rows, 3);
+                let (reference_data, reference_tree) =
+                    make_neighbor_inputs(&values, rows, 3, &device);
+                let (reference_ids, reference_distances, reference_diagnostics) =
+                    exact_neighbors_kd_reference(reference_data, reference_tree, 5, true);
+                let ref_ids = into_data_sync(reference_ids).try_to_vec::<i32>().unwrap();
+                let ref_distance_bits = into_data_sync(reference_distances)
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                let ref_diagnostics = into_data_sync(reference_diagnostics)
+                    .try_to_vec::<i32>()
+                    .unwrap();
+                let (data, tree) = make_neighbor_inputs(&values, rows, 3, &device);
+                let (ids, distances, diagnostics) =
+                    launch_kd_neighbors_with_width(data, tree, 5, true, requested_width, Some(2));
+                assert_eq!(
+                    into_data_sync(ids).try_to_vec::<i32>().unwrap(),
+                    ref_ids,
+                    "capped grid-stride IDs at requested width {requested_width}, actual {actual_width}, rows {rows}"
+                );
+                assert_eq!(
+                    into_data_sync(distances)
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>(),
+                    ref_distance_bits,
+                    "capped grid-stride distances at requested width {requested_width}, actual {actual_width}, rows {rows}"
+                );
+                assert_eq!(
+                    into_data_sync(diagnostics).try_to_vec::<i32>().unwrap(),
+                    ref_diagnostics,
+                    "capped grid-stride diagnostics at requested width {requested_width}, actual {actual_width}, rows {rows}"
+                );
+            }
+        }
     }
 
     #[test]
