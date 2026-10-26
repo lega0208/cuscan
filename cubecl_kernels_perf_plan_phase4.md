@@ -2,7 +2,7 @@
 
 This document details Phase 4 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md) (F3 in [hdbscan_perf_report.md](hdbscan_perf_report.md), "Follow-ups"). It builds on the accepted Phase 3 production kernel (commit `3e885a7`): the per-call pack site in `launch_kd_neighbors`, the padded `Vector<f32, Const<4>>` views and the exact-comptime register query. Line numbers refer to `3e885a7`.
 
-**Status:** planned; not implemented or measured.
+**Status:** implemented, measured and rejected. Production and removed-code-only tests were restored to Phase 3. The fixed two-batch campaign found zero qualifying primary gains, a repeatable 20k×16 CPU regression (+3.395%, +7.209 ms, 6/6 paired ratios above 1), and a small 16D local-load-sector increase. See [Phase 4 results](hdbscan_perf_report.md#phase-4-results-compact-node-layout-rejected) and `artifacts/cubecl_kernels_perf/phase4/summary.json`; `experiment.diff` and both hashed binaries retain the measured implementation. No additional timing batches were selected or run.
 
 ## Objective
 

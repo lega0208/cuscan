@@ -424,3 +424,55 @@ Global load requests fall about 6.4× (16D) and 6.6× (30D), in line with the so
 **Cold start** (`cold_start.json`, first fit including runtime JIT, median of 3 fresh processes): the variant is not slower in any of d ∈ 2, 16, 30 on CPU or CUDA (−0.001 to −0.075 s). The extra JIT for the pack kernel and the specialization is smaller than the faster first fit.
 
 **Final pipeline validation.** `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000` both passed with the variant (logs in `artifacts/cubecl_kernels_perf/phase3/logs/analyze_*.log`). At 100k×16 the CUDA `core_neighbor_kernel` median is 381.7 ms (1.18 s in the baseline facts), and the CPU median is 3.34 s (4.66 s). The three `pad_rows_kernel` launches total 43.8 µs. CPU/CUDA labels agree exactly. These are single runs, not interleaved comparisons.
+
+## Phase 4 results: compact node layout rejected
+
+**Decision: reject; retain Phase 3 production.** Compact `u32` node records and interleaved min/max bounds were implemented and tested, then removed under the detailed plan's rejection rule. The leaf flag remained data (including `2`, `-1` and early leaves); `first_leaf` and batched sibling loads were not pursued. Arithmetic, the frozen reference and the existing equivalence harness were unchanged. The measured implementation remains in `artifacts/cubecl_kernels_perf/phase4/experiment.diff` and the preserved variant binary.
+
+**Provenance/method.** Clean HEAD `f407b4b` differs from `3e885a7` only in planning documents. Fresh baseline SHA-256 `14ca624faa0fb72074d582c5cf16bdeeb2ea4ee61a9b8e51f1f2d47608906c62` matches the Phase 3 variant. Inputs retain Phase 3 hashes. Two predeclared serial matrices (A then B), each B,V,V,B,B,V per cell, give six process medians per arm; each process measures three fits. No further timing batches were run. All 144 process labels agree within their benchmark cells. Full per-arm ranges, both batches, six adjacent-pair ratios, core/neighbor/full-fit samples and medians are retained in `summary.json` and `batch_{A,B}/`. The following core-stage timings include packing, not isolated kernel speedups.
+
+| Cell | Backend | Pooled core B → V ms | Pooled Δ | Six paired V/B range | Screen |
+| --- | --- | --- | --- | --- | --- |
+| 20k×16 | CPU | 212.374 → 219.583 | +3.40% | 1.0175–1.0403 | regression |
+| 20k×16 | CUDA | 20.854 → 20.140 | −3.42% | 0.9567–1.1322 | no effect |
+| 50k×16 | CPU | 1095.460 → 1126.597 | +2.84% | 0.9872–1.0497 | no effect |
+| 50k×16 | CUDA | 101.519 → 99.902 | −1.59% | 0.9757–0.9991 | no effect |
+| 20k×30 | CPU | 517.719 → 522.466 | +0.92% | 0.9953–1.0545 | no effect |
+| 20k×30 | CUDA | 36.551 → 36.127 | −1.16% | 0.9434–1.0367 | no effect |
+| 50k×30 | CPU | 3103.270 → 3095.563 | −0.25% | 0.9774–1.0233 | no effect |
+| 50k×30 | CUDA | 247.964 → 246.917 | −0.42% | 0.9907–1.0541 | no effect |
+| 20k×8 | CPU | 29.544 → 28.834 | −2.41% | 0.8247–1.2323 | no effect |
+| 20k×8 | CUDA | 9.134 → 9.155 | +0.23% | 0.9665–1.0399 | no effect |
+| 20k×2 | CPU | 3.261 → 3.402 | +4.31% | 0.8499–1.7660 | no effect |
+| 20k×2 | CUDA | 2.064 → 2.036 | −1.36% | 0.6833–1.2596 | no effect |
+
+**Acceptance criteria and judgement.** (1) Correctness passed on CPU and required CUDA, including exact-bit pack tests, early-leaf traversal and diagnostics; benchmark labels agree. (2) Failed: zero primary cells on either backend meet the −2% plus 5-of-6 gain screen. (3) Failed: 20k×16 CPU regresses +3.395% (+7.209 ms), with all six pairs above 1; neighbor scope also regresses +3.371%. (4) Global requests decrease in all profiled cells and registers remain within 128, but 16D local-load sectors increase by 279 (+0.00358%). No exception is taken.
+
+CUDA point estimates favor the variant, but 20k×16 has only four favorable pairs and opposing batch effects. All 50k×16 CUDA pairs improve, but the pooled core effect is only −1.59%. CPU 16D costs are repeatable; CPU 30D effects are small/mixed. Guard cells, especially 2D, are noisy, not evidence of equivalence or reliable regression. These measurements do not justify extra record allocation/packing and eight extra registers at 16D/2D. Without a defensible net benefit, reject rather than stacking an unsupported optimization under Phase 5.
+
+**Conditional CUDA counters.** NCU first matching warmup launches, not whole-fit averages; raw CSVs and all metrics, including sectors/request, long-scoreboard stall share and achieved/theoretical occupancy, are in `cuda_counters.json` and `counters/`.
+
+| d | Registers B → V | Global requests B → V | Local load sectors B → V | Local store sectors B → V |
+| --- | --- | --- | --- | --- |
+| 16 | 106 → 114 | 128,376,127 → 127,771,285 | 7,785,712 → 7,785,991 | 11,045,114 → 11,045,114 |
+| 30 | 128 → 128 | 223,896,822 → 223,305,948 | 6,302,618 → 6,302,366 | 9,253,124 → 9,253,124 |
+| 2 | 34 → 42 | 2,042,570 → 2,031,136 | 136,560 → 136,558 | 329,912 → 329,912 |
+
+The tiny 16D local-load increase, unchanged stores and registers below budget do not establish a new major spill regime; nevertheless the strict default fails. No demonstrated benefit warrants retaining or further tuning the resource cost.
+
+**Aligned pack share.** One Nsight Systems timeline per binary/cell, restricted to its single measured fit, sums all pack launches and the KD neighbor launch. Pack/(pack+KD) is 0.0620% → 0.0665% at 16D, 0.0496% → 0.0523% at 30D, and 1.4688% → 1.6041% at 2D. `pack_share_raw.json` and `timelines/` preserve commands, fit windows, individual launches and SQLite/report files. These reporting-only shares never divide replayed NCU durations by unrelated medians.
+
+**Cold first fits**, median of three fresh-process whole warmup fits, caches not cleared. These include runtime JIT and cannot isolate per-kernel compilation cost. First-minus-warm uses the same binary's pooled H2 full-fit medians, with sources in `summary.json`.
+
+| d | Backend | First fit B → V ms | First-minus-warm B → V ms |
+| --- | --- | --- | --- |
+| 2 | CPU | 187.342 → 211.863 | 164.536 → 190.191 |
+| 2 | CUDA | 294.668 → 295.050 | 276.903 → 277.305 |
+| 16 | CPU | 500.900 → 484.319 | 226.034 → 206.237 |
+| 16 | CUDA | 374.310 → 385.136 | 276.651 → 287.589 |
+| 30 | CPU | 934.917 → 929.152 | 217.641 → 193.953 |
+| 30 | CUDA | 495.150 → 511.054 | 290.279 → 306.280 |
+
+**Verification/rollback.** Variant Step 3 logs are in `variant_logs/` and `variant_verification.json`: formatting, workspace clippy, core tests, required-CUDA KD/estimator/integration/full HDBSCAN suites, tracing example and 91 Python profiling tests passed. Existing manual ignored tests remain ignored; hardware skips are not counted as validation. An initial test-only nonexistent `DeviceKdTree::clone` compile error was corrected before the successful campaign. Only the three owned implementation/test source files were restored byte-for-byte to Phase 3, preserving unrelated work. Final restored-source gates passed again (`logs/`, `verification.json`), as did strict 20k and 100k analysis pipelines with CPU/CUDA label equality and real Nsight captures. Existing Burn future-incompatibility notices and clippy warnings were not suppressed. README/AGENTS are unchanged because public API/semantics are unchanged and neither enumerates these internal buffers.
+
+Evidence root: `artifacts/cubecl_kernels_perf/phase4/`. `summary.json` records each unmet criterion, supporting/contrary evidence and the reject judgement. This is a completed negative experiment, not an accepted optimization.

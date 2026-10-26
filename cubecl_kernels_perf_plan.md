@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 onward remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 onward remain unimplemented and unmeasured.
 
 ## Baseline facts this plan relies on
 
@@ -76,13 +76,13 @@ The phases run in order. Each phase must pass H1 on CPU and CUDA, then be measur
 
 ### Phase 4: Compact node records (F3), both backends
 
-**Status:** planned, not implemented. Detailed plan: [cubecl_kernels_perf_plan_phase4.md](cubecl_kernels_perf_plan_phase4.md).
+**Status:** implemented, measured and rejected. Detailed plan: [cubecl_kernels_perf_plan_phase4.md](cubecl_kernels_perf_plan_phase4.md). [Phase 4 results](hdbscan_perf_report.md#phase-4-results-compact-node-layout-rejected) and `artifacts/cubecl_kernels_perf/phase4/summary.json` preserve the fixed two-batch evidence. Production remains Phase 3: no primary cell meets the gain screen, and 20k×16 CPU regresses 3.40% with all six paired ratios above 1.
 
 **Change.**
 - Replace the separate `starts`/`ends`/`is_leaf` reads in the KD neighbor path with one `Vector<u32, Const<4>>` record per node: `(start, end, is_leaf, 0)`.
-- Interleave padded bounds per node as `[min chunks | max chunks]`, so sibling children are adjacent and each box bound reads one contiguous span. The interleaved bounds are produced by the Phase 3 per-call pack site in `launch_kd_neighbors` (`pad_rows`), not stored in `DeviceKdTree`.
-- Keep the leaf flag; small-`n` trees can have early leaves (`fast-hdbscan-core/src/kdtree.rs:107`).
-- Replacing the flag with a `first_leaf` scalar is allowed only if it is proven from the builder for the KD route and validated on the host.
+- The rejected experiment interleaved padded bounds per node as `[min chunks | max chunks]`, using `pack_node_bounds_kernel` at the per-call pack site, not fields in `DeviceKdTree`. Phase 3 production still uses separate `pad_rows` bounds.
+- Keep the leaf flag as data, including non-0/1 flags and arbitrary early leaves in public `DeviceKdTree` inputs.
+- `first_leaf` was not pursued: the flag occupies an otherwise unused lane in the `u32` record, so removing it saves no record load and introduces a host proof obligation. Both the record and interleave experiment were removed after rejection.
 
 **Accept when** H1 passes and H2 shows a gain, using the detailed plan's default performance criteria. This phase is expected to be minor: noisy or mixed timing evidence is not an automatic rejection when a reasonable, evidence-backed trade-off justifies acceptance. Apply the judgement and documentation policy above and the detailed plan's Step 5; otherwise revert and record the result.
 
