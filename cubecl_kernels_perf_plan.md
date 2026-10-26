@@ -100,18 +100,22 @@ Choose the setting from H2/H3 at 20k and 50k. The 20k case has only ~625 warps o
 
 **Status:** rejected at the mandatory correctness gate, before acceptance timing; no selected arm or width cap. Detailed plan: [cubecl_kernels_perf_plan_phase6.md](cubecl_kernels_perf_plan_phase6.md); [results](hdbscan_perf_report.md#phase-6-results-correctness-rejection-before-acceptance-timing). The experiment used position-tiled SoA, block-cyclic query blocks of 64 and first-occurrence row ownership, with P/O/C isolation configurations and initial cap 16. Every host width (16/8/4/2/1) passed the prerequisite vector probe. New malformed-input cases exposed a baseline/reference contradiction, so all experimental production code was removed; the full diff and evidence remain in `artifacts/cubecl_kernels_perf/phase6/`. The Rust/Rayon measurement example is retained. No CPU speedup or regression is established, and Phase 5 CUDA geometry remains unchanged.
 
+**Approved prospective retry (documents only).** Phase 6 now requires finite data and valid builder-produced trees (or equivalent low-level caller preconditions), not malformed-tree semantics. The builder rejects nonfinite input, initializes permutation `0..n` and partitions ranges; estimator upload is unchanged. No runtime scan/readback/content validation, owner map, owner launch, absent-row pass or owner memory is planned. Add builder invariant/failure tests and retain all-width/all-arm valid-tree bitwise and diagnostics coverage. The original G001 is completed as rejection; implementation requires a separate user execution request/new goal. Inspect actual HEAD/working diffs without reverting user work; preserve the host example/Rayon dependency and accepted CUDA64 baseline binary before rebuilding. Use fresh `phase6_valid_trees/` evidence, never overwrite or blindly reapply historical `phase6/`. The detailed plan supplies restart tasks and unchanged balanced selection/acceptance/final-gate protocols. No retry implementation or timings exist.
+
 **Change.** A separate CPU kernel behind the same `exact_neighbors_kd` host signature, chosen once from client properties:
+The existing host tool/dependency are tracked at known HEAD `d8faeab5d0e825e4d93c6c1478e35b4d1f15721a` (`phase 6 failure`); `d030b7eb0a1f2a4edccc41fea01671ca9b16f092` identifies the original production baseline, not a required future HEAD. Recheck actual status on restart. If ignored historical artifacts are missing, establish fresh evidence from tracked source, never infer prior tests/timings. The detailed handoff records exact six input paths/hashes, code/test symbol map and isolated LLVM diagnostic capture. B remains the preserved original binary; only P/O/C share the new CPU kernel. Frozen reference stays unchanged; CUDA production source stays untouched during measurement except the separately gated Step 6 O-only finalization fold.
+
 1. **Layout.** Tile the position axis of `tree.indices` globally as `soa[tile][feature][lane]`, masking positions outside each leaf range.
    - `W` comes from `client.io_optimized_vector_sizes(4)` and is passed as comptime.
    - Padded slots are masked out explicitly.
    - Carry a parallel `slot → original ID` array.
 2. **Distances.** Each `Vector<f32, W>` lane is a different candidate and accumulates features `0..d` in order (Invariant 1 holds without a feature-axis tail).
 3. **Admission.** Compare a whole vector against the broadcast `worst`, then do unrolled per-lane scalar checks and insert using the original ID.
-4. **Query order.** Units take block-cyclic blocks of 64 leaf-ordered positions and write to `out[original_row]`. A first-occurrence owner map plus an absent-row tail pass gives each output row one writer even for non-permutation indices.
+4. **Query order.** Units take block-cyclic blocks of 64 leaf-ordered positions over `0..n` and write to `out[original_row]`. Valid permutation indices guarantee one writer per row without ownership machinery.
 5. **Isolation.** Benchmark the packed candidates (steps 1–3) separately from query ordering (step 4), then combined. The report's ordering experiment could not separate these effects.
 6. **No shared memory or barriers** in this kernel; `PLANE_DIM` is 1 on the CPU runtime.
 
-**Also measure** a plain Rust/Rayon exact baseline over host data, to expose CubeCL CPU runtime overhead.
+**Also measure** the retained Rust/Rayon host traversal as reporting-only. Its primary-cell verification has zero ID mismatches but many distance-bit mismatches (unfused Rust versus observed LLVM `fmuladd`); it is not an exact oracle or an isolated runtime-overhead measurement.
 
 **Accept when** H1 passes at every `W` the host can select, not only the widest, and H2 shows a CPU gain over Phases 1–4 including packing cost.
 
