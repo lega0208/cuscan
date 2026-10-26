@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 was measured and accepted at width 64 by explicit user override of the default regression screen. Phase 6 onward remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 was measured and accepted at width 64 by explicit user override of the default regression screen. Phase 6 was implemented experimentally and rejected at its correctness gate before acceptance timing; Phase 7 onward remain unimplemented and unmeasured.
 
 ## Baseline facts this plan relies on
 
@@ -98,16 +98,16 @@ Choose the setting from H2/H3 at 20k and 50k. The 20k case has only ~625 warps o
 
 ### Phase 6: CPU leaf-packed SoA kernel, vectorized across candidates (F4)
 
-**Status:** planned. Detailed plan: [cubecl_kernels_perf_plan_phase6.md](cubecl_kernels_perf_plan_phase6.md) (position-tiled SoA, block-cyclic leaf order with a row-ownership map, P/O/C isolation arms).
+**Status:** rejected at the mandatory correctness gate, before acceptance timing; no selected arm or width cap. Detailed plan: [cubecl_kernels_perf_plan_phase6.md](cubecl_kernels_perf_plan_phase6.md); [results](hdbscan_perf_report.md#phase-6-results-correctness-rejection-before-acceptance-timing). The experiment used position-tiled SoA, block-cyclic query blocks of 64 and first-occurrence row ownership, with P/O/C isolation configurations and initial cap 16. Every host width (16/8/4/2/1) passed the prerequisite vector probe. New malformed-input cases exposed a baseline/reference contradiction, so all experimental production code was removed; the full diff and evidence remain in `artifacts/cubecl_kernels_perf/phase6/`. The Rust/Rayon measurement example is retained. No CPU speedup or regression is established, and Phase 5 CUDA geometry remains unchanged.
 
 **Change.** A separate CPU kernel behind the same `exact_neighbors_kd` host signature, chosen once from client properties:
-1. **Layout.** Store each leaf as a transposed block `leaf_soa[leaf][feature][slot]` from `tree.indices`, with slots padded to `W`.
+1. **Layout.** Tile the position axis of `tree.indices` globally as `soa[tile][feature][lane]`, masking positions outside each leaf range.
    - `W` comes from `client.io_optimized_vector_sizes(4)` and is passed as comptime.
    - Padded slots are masked out explicitly.
    - Carry a parallel `slot → original ID` array.
 2. **Distances.** Each `Vector<f32, W>` lane is a different candidate and accumulates features `0..d` in order (Invariant 1 holds without a feature-axis tail).
 3. **Admission.** Compare a whole vector against the broadcast `worst`, then do unrolled per-lane scalar checks and insert using the original ID.
-4. **Query order.** Each unit takes a contiguous chunk of leaf-ordered queries (iterating `tree.indices`) and writes to `out[original_row]`. Cyclic assignment is replaced.
+4. **Query order.** Units take block-cyclic blocks of 64 leaf-ordered positions and write to `out[original_row]`. A first-occurrence owner map plus an absent-row tail pass gives each output row one writer even for non-permutation indices.
 5. **Isolation.** Benchmark the packed candidates (steps 1–3) separately from query ordering (step 4), then combined. The report's ordering experiment could not separate these effects.
 6. **No shared memory or barriers** in this kernel; `PLANE_DIM` is 1 on the CPU runtime.
 

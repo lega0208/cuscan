@@ -2923,6 +2923,7 @@ dependencies = [
  "cubecl",
  "fast-cubecl-common",
  "fast-hdbscan-core",
+ "rayon",
  "serde_json",
  "tempfile",
  "tracing",

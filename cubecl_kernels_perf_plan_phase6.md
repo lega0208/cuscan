@@ -2,7 +2,7 @@
 
 This document details Phase 6 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md) (F4 and the "leaf-ordered queries" part of opportunity 1 in [hdbscan_perf_report.md](hdbscan_perf_report.md), "Follow-ups"). It builds on the accepted Phase 3 production kernel; Phase 4 was rejected and removed. Line numbers refer to HEAD `24adb89` (Phase 3 production plus planning documents and the Phase 4 negative result).
 
-**Status:** planned; not implemented or measured.
+**Status:** experiment implemented, then rejected at the mandatory correctness gate before acceptance timing. The new malformed-tree cases contradict the unchanged baseline/frozen-reference contract: an out-of-range candidate already differs between those kernels, and `end > n` faults inside the frozen reference on CPU and CUDA. Production changes were removed under Step 5; the Rayon example and full experimental diff/evidence are retained. No arm or width was selected. See [Phase 6 results](hdbscan_perf_report.md#phase-6-results-correctness-rejection-before-acceptance-timing) and `artifacts/cubecl_kernels_perf/phase6/summary.json`. The design below records the attempted contract, not validated malformed-input semantics; correcting that contract requires a separate decision.
 
 ## Objective
 
