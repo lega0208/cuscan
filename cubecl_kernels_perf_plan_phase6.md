@@ -19,7 +19,7 @@ Measured CPU starting point (Phase 4 pooled baseline, core stage, includes packi
 
 ## Ordering relative to Phase 5
 
-The master plan runs phases in order. Phase 5 (CUDA launch-geometry sweep) is unimplemented. It touches only the CUDA branch of `kd_launch_geometry` (`kdtree.rs:867–885`) and CUDA timing; Phase 6 touches only the CPU route. Neither phase's decision depends on the other's measurements. Phase 6 may therefore be executed before or after Phase 5; whichever lands second rebases onto the first and re-runs its own Step 3 gate. If Phase 5 lands first, the Phase 6 baseline binary is the post-Phase-5 HEAD, and the CPU baseline is still the Phase 3 kernel (Phase 5 does not change CPU code).
+Phase 5 (CUDA launch-geometry sweep) is implemented; the user selected a fixed 64-thread CUDA neighbor preference by explicit override of the default regression screen. Unrelated KD launches and the frozen reference retain 32, and CPU policy remains unchanged. Phase 6 must start from the post-override Phase 5 baseline, preserve that CUDA neighbor geometry, and run its own Step 3 gate. The CPU baseline remains the accepted Phase 3 kernel; Phase 5 does not change its algorithm or launch policy. Phase 6's CPU decision must not silently retune the accepted CUDA geometry.
 
 ## Changes from the master plan
 

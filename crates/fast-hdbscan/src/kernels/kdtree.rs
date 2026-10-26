@@ -14,6 +14,7 @@ use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 use burn_cubecl::ops::into_data_sync;
 
 const KD_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
+const KD_NEIGHBORS_CUBE_DIM: CubeDim = CubeDim::new_1d(64);
 const KD_STACK_LEN: usize = 33;
 /// Lanes per padded KD vector chunk.
 const KD_VECTOR_LANES: usize = 4;
@@ -887,6 +888,15 @@ fn distinct_legal_widths(
 }
 
 fn kd_launch_geometry(client: &cubecl::client::Client, rows: usize) -> (CubeCount, CubeDim) {
+    kd_launch_geometry_with_width(client, rows, KD_CUBE_DIM, None)
+}
+
+fn kd_launch_geometry_with_width(
+    client: &cubecl::client::Client,
+    rows: usize,
+    preferred_dim: CubeDim,
+    max_cubes_override: Option<u32>,
+) -> (CubeCount, CubeDim) {
     let hardware = &client.properties().hardware;
     let (dim, max_cubes) = if let Some(cores) = hardware.num_cpu_cores {
         (
@@ -895,8 +905,10 @@ fn kd_launch_geometry(client: &cubecl::client::Client, rows: usize) -> (CubeCoun
         )
     } else {
         (
-            fast_cubecl_common::legal_cube_dim(client, KD_CUBE_DIM),
-            hardware.max_cube_count.0,
+            fast_cubecl_common::legal_cube_dim(client, preferred_dim),
+            max_cubes_override.map_or(hardware.max_cube_count.0, |cap| {
+                cap.min(hardware.max_cube_count.0)
+            }),
         )
     };
     assert!(max_cubes > 0, "device reports no legal KD launch capacity");
@@ -915,20 +927,7 @@ fn kd_neighbors_launch_geometry(
     max_cubes_override: Option<u32>,
 ) -> (CubeCount, CubeDim) {
     assert!(width > 0, "preferred KD cube width must be positive");
-    let hardware = &client.properties().hardware;
-    if hardware.num_cpu_cores.is_some() {
-        return kd_launch_geometry(client, rows);
-    }
-    let dim = fast_cubecl_common::legal_cube_dim(client, CubeDim::new_1d(width));
-    let max_cubes = max_cubes_override.map_or(hardware.max_cube_count.0, |cap| {
-        cap.min(hardware.max_cube_count.0)
-    });
-    assert!(max_cubes > 0, "device reports no legal KD launch capacity");
-    assert!(dim.x > 0, "device reports no legal KD cube width");
-    (
-        CubeCount::Static(launch_count(rows, dim.x, max_cubes), 1, 1),
-        dim,
-    )
+    kd_launch_geometry_with_width(client, rows, CubeDim::new_1d(width), max_cubes_override)
 }
 
 fn validate_tree(data: &FloatTensor<CubeBackend>, tree: &DeviceKdTree<CubeBackend>) {
@@ -1096,7 +1095,14 @@ fn launch_kd_neighbors(
 ) {
     #[cfg(test)]
     {
-        launch_kd_neighbors_impl(data, tree, k, diagnostics_enabled, 32, None)
+        launch_kd_neighbors_impl(
+            data,
+            tree,
+            k,
+            diagnostics_enabled,
+            KD_NEIGHBORS_CUBE_DIM.x,
+            None,
+        )
     }
     #[cfg(not(test))]
     {
@@ -1160,7 +1166,7 @@ fn launch_kd_neighbors_impl(
     let (cube_count, dim) =
         kd_neighbors_launch_geometry(&client, n, preferred_width, max_cubes_override);
     #[cfg(not(test))]
-    let (cube_count, dim) = kd_launch_geometry(&client, n);
+    let (cube_count, dim) = kd_launch_geometry_with_width(&client, n, KD_NEIGHBORS_CUBE_DIM, None);
     kd_neighbors_kernel::launch(
         &client,
         cube_count,
@@ -1760,6 +1766,20 @@ mod tests {
         }
         let device = CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 });
         let (probe, _) = make_neighbor_inputs(&[0.0], 1, 1, &device);
+        assert_eq!(KD_NEIGHBORS_CUBE_DIM.x, 64);
+        assert_eq!(KD_CUBE_DIM.x, 32);
+        for preferred in [KD_NEIGHBORS_CUBE_DIM, KD_CUBE_DIM] {
+            let (count, actual) =
+                kd_launch_geometry_with_width(&probe.client, 129, preferred, None);
+            let expected = fast_cubecl_common::legal_cube_dim(&probe.client, preferred);
+            assert_eq!(
+                (actual.x, actual.y, actual.z),
+                (expected.x, expected.y, expected.z)
+            );
+            assert!(
+                matches!(count, CubeCount::Static(x, 1, 1) if x == 129u32.div_ceil(expected.x))
+            );
+        }
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 kd_neighbors_launch_geometry(&probe.client, 1, 32, Some(0))

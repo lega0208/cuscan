@@ -1,6 +1,6 @@
 # Phase 5 detailed plan: tune CUDA KD-query launch geometry
 
-This document details Phase 5 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). **Status: implemented and measured; larger geometries rejected, 32 retained.** Phase 2 and Phase 4 were rejected. The accepted Phase 3 kernel, not a cumulative Phase 1–4 implementation, is the production baseline. The protocol below is preserved as the experiment contract. Measured results and verification are recorded in [the performance report](hdbscan_perf_report.md#phase-5-results-cuda-neighbor-launch-geometry-rejected) and `artifacts/cubecl_kernels_perf/phase5/`.
+This document details Phase 5 of [cubecl_kernels_perf_plan.md](cubecl_kernels_perf_plan.md). **Status: implemented and measured; 64 selected by explicit user override on 2026-10-26.** Both larger widths failed the default regression screen; the user accepts the 64-thread 20k×30 cost (+1.443 ms core, +3.62%; full fit +1.37%) in exchange for the measured 50k CUDA gains (−19.35% core at 16D, −9.95% at 30D; full fit −5.77%/−2.72%). Larger row counts are the intended practical workload; these measurements do not establish gains at every larger size. Width 128 remains rejected. Phase 2 and Phase 4 were rejected. The experiment baseline is the accepted Phase 3 kernel, not cumulative Phases 1–4. The protocol below is preserved as the original experiment contract, not a claim that its default screen passed. Measured results, resources and validation are recorded in [the performance report](hdbscan_perf_report.md#phase-5-results-cuda-neighbor-launch-geometry-64-selected-by-override) and `artifacts/cubecl_kernels_perf/phase5/`; `override_64.json` supersedes the original `decision.json` policy without rewriting raw evidence.
 
 ## Objective and scope
 
@@ -8,7 +8,7 @@ Compare CUDA cube widths 32, 64 and 128 for `kd_neighbors_kernel`. Retain 32 unl
 
 Only the neighbor launch geometry changes. Preserve CPU geometry, padded vector packing, exact-feature register-query specialization, traversal, top-k admission, feature order, diagnostics and output layout. Do not revive Phase 2 register top-k or Phase 4 compact nodes. Do not change `kd_candidates_kernel`, routing thresholds, public APIs, allocation sizing, the frozen reference, query ordering, or plane cooperation. Phase 6 and Phase 7 are separate experiments.
 
-## Current implementation and file-level plan
+## Pre-experiment implementation and file-level plan
 
 The relevant implementation is `crates/fast-hdbscan/src/kernels/kdtree.rs`:
 
