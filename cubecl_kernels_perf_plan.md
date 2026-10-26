@@ -98,6 +98,8 @@ Choose the setting from H2/H3 at 20k and 50k. The 20k case has only ~625 warps o
 
 ### Phase 6: CPU leaf-packed SoA kernel, vectorized across candidates (F4)
 
+**Status:** planned. Detailed plan: [cubecl_kernels_perf_plan_phase6.md](cubecl_kernels_perf_plan_phase6.md) (position-tiled SoA, block-cyclic leaf order with a row-ownership map, P/O/C isolation arms).
+
 **Change.** A separate CPU kernel behind the same `exact_neighbors_kd` host signature, chosen once from client properties:
 1. **Layout.** Store each leaf as a transposed block `leaf_soa[leaf][feature][slot]` from `tree.indices`, with slots padded to `W`.
    - `W` comes from `client.io_optimized_vector_sizes(4)` and is passed as comptime.
