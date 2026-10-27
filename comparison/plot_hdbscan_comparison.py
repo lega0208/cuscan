@@ -9,7 +9,7 @@ import polars as pl
 from plotly.subplots import make_subplots
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "embeddings_2d.parquet"
+DEFAULT_INPUT = SCRIPT_DIR / "embeddings.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "hdbscan_comparison.html"
 SAMPLE_SEED = 42
 
@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare reference fast_hdbscan and fast_umap on one data sample."
     )
-    parser.add_argument("--cluster-on", choices=("2d", "full"), default="2d")
+    parser.add_argument("--cluster-on", choices=("2d", "16d"), default="16d")
     parser.add_argument("--sample-size", type=int, default=1_000_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -53,14 +53,14 @@ def _matrix(values: list[object], rows: int, column: str) -> np.ndarray:
 
 
 def load_sample(
-    path: Path, sample_size: int, cluster_on: str = "2d"
+    path: Path, sample_size: int, cluster_on: str = "16d"
 ) -> tuple[np.ndarray, np.ndarray]:
     if sample_size <= 0:
         raise ValueError("--sample-size must be positive")
-    if cluster_on not in ("2d", "full"):
-        raise ValueError("--cluster-on must be '2d' or 'full'")
+    if cluster_on not in ("2d", "16d"):
+        raise ValueError("--cluster-on must be '2d' or '16d'")
 
-    columns = ["embedding_2d", "embedding"] if cluster_on == "full" else ["embedding_2d"]
+    columns = ["embedding_2d", "embedding_16d"] if cluster_on == "16d" else ["embedding_2d"]
     data = pl.scan_parquet(path).select(columns).collect()
     if data.height == 0:
         raise ValueError("input must contain at least one row")
@@ -74,11 +74,11 @@ def load_sample(
     )
     if visualization.shape[1] != 2:
         raise ValueError("embedding_2d must have exactly two dimensions")
-    source_column = "embedding_2d" if cluster_on == "2d" else "embedding"
+    source_column = "embedding_2d" if cluster_on == "2d" else "embedding_16d"
     clustering = (
         visualization
         if source_column == "embedding_2d"
-        else _matrix(sample.get_column("embedding").to_list(), sample.height, "embedding")
+        else _matrix(sample.get_column("embedding_16d").to_list(), sample.height, "embedding_16d")
     )
     return clustering, visualization
 

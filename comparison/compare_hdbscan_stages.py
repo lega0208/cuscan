@@ -209,7 +209,7 @@ def load_parquet(path: Path, sample_size: int, cluster_on: str, seed: int) -> An
     import numpy as np
     import polars as pl
 
-    column = "embedding_2d" if cluster_on == "2d" else "embedding"
+    column = "embedding_2d" if cluster_on == "2d" else "embedding_16d"
     try:
         data = pl.scan_parquet(path).select(column).collect()
     except Exception as error:
@@ -466,7 +466,7 @@ def fmt(value: float | None, suffix: str = "") -> str:
     return "n/a" if value is None else f"{value:,.1f}{suffix}"
 
 
-def print_table(title: str, rows: list[dict[str, Any]]) -> None:
+def print_table(title: str, rows: list[dict[str, Any]], *, skip_python: bool = False) -> None:
     headers = ("Stage", "Native (ms)", "Native %", "Python (ms)", "Native faster (%)")
     body = [
         (
@@ -478,6 +478,9 @@ def print_table(title: str, rows: list[dict[str, Any]]) -> None:
         )
         for r in rows
     ]
+    if skip_python:
+        headers = headers[:3]
+        body = [cells[:3] for cells in body]
     widths = [max(len(str(cell)) for cell in col) for col in zip(headers, *body, strict=False)]
     print(
         f"\n{title}\n"
@@ -566,13 +569,18 @@ def main() -> int:
     parser.add_argument("--noise", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--input", type=Path, help="optional parquet with embedding_2d or embedding column"
+        "--input", type=Path, help="optional parquet with embedding_2d or embedding_16d column"
     )
-    parser.add_argument("--cluster-on", choices=("2d", "full"), default="2d")
+    parser.add_argument("--cluster-on", choices=("2d", "16d"), default="16d")
     parser.add_argument("--sample-size", type=positive_int, default=1_000_000)
     parser.add_argument("--backend", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--rust-runs", type=positive_int, default=1)
     parser.add_argument("--python-runs", type=positive_int, default=1)
+    parser.add_argument(
+        "--skip-python",
+        action="store_true",
+        help="run only native fits, skipping Python warmup and fits",
+    )
     parser.add_argument("--min-cluster-size", type=positive_int, default=5)
     parser.add_argument("--min-samples", type=positive_int)
     parser.add_argument("--cluster-selection-method", choices=("eom", "leaf"), default="eom")
@@ -683,24 +691,38 @@ def main() -> int:
         ]
         py_cmd += ["--min-samples", str(resolved_min_samples)]
         python_labels_path = None
-        if args.labels_dir:
+        if args.labels_dir and not args.skip_python:
             python_labels_path = args.labels_dir / "python-labels.json"
             py_cmd += ["--_worker-labels-output", str(python_labels_path)]
         if args.allow_single_cluster:
             py_cmd.append("--allow-single-cluster")
-        reference = run(py_cmd, "fast_hdbscan")
+        reference = None if args.skip_python else run(py_cmd, "fast_hdbscan")
     native_indices = range(args.rust_runs)
     python_indices = range(args.python_runs)
     comparison = comparison_rows(
-        summarize(native, native_indices), summarize(reference, python_indices)
+        summarize(native, native_indices),
+        summarize(reference, python_indices)
+        if reference is not None
+        else dict.fromkeys((*STAGES, "unattributed", "total")),
     )
     search_ref = "pynndescent" if features > 30 else "kd-tree-boruvka"
     title = (
         f"fast-hdbscan {args.backend} vs fast_hdbscan 0.3.2: {rows:,}x{features}, "
         f"{args.cluster_selection_method}, native {args.search}, reference {search_ref}"
     )
+    if args.skip_python:
+        search_ref = None
+        title = (
+            f"fast-hdbscan {args.backend}: {rows:,}x{features}, "
+            f"{args.cluster_selection_method}, native {args.search} (Python skipped)"
+        )
     print(title)
-    print_table("Native and Python: measured fits after one excluded warmup", comparison)
+    implementations = "Native only" if args.skip_python else "Native and Python"
+    print_table(
+        f"{implementations}: measured fits after one excluded warmup",
+        comparison,
+        skip_python=args.skip_python,
+    )
     if args.json:
         metadata = {
             "input_sha256": digest,
@@ -720,7 +742,8 @@ def main() -> int:
             "search": args.search,
             "reference_search": search_ref,
             "rust_runs": args.rust_runs,
-            "python_runs": args.python_runs,
+            "python_runs": 0 if args.skip_python else args.python_runs,
+            "skip_python": args.skip_python,
             "warm_semantics": (
                 "one excluded warmup followed by exactly runs measured fits per implementation"
             ),
@@ -729,12 +752,16 @@ def main() -> int:
             ),
             "versions": {
                 "python": sys.version.split()[0],
-                "fast_hdbscan": importlib.metadata.version("fast-hdbscan"),
-                "numba": importlib.metadata.version("numba"),
+                "fast_hdbscan": None
+                if args.skip_python
+                else importlib.metadata.version("fast-hdbscan"),
+                "numba": None if args.skip_python else importlib.metadata.version("numba"),
             },
             "thread_metadata": {
-                "numba_threads": reference["numba_threads"],
-                "numba_threading_layer": reference["numba_threading_layer"],
+                "numba_threads": reference["numba_threads"] if reference is not None else None,
+                "numba_threading_layer": reference["numba_threading_layer"]
+                if reference is not None
+                else None,
                 "native_cpu_count": os.cpu_count(),
                 "available_affinity_count": (
                     len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
@@ -744,8 +771,8 @@ def main() -> int:
                 {
                     "native_path": str(native_labels_path),
                     "native_sha256": native["labels_sha256"],
-                    "python_path": str(python_labels_path),
-                    "python_sha256": reference["labels_sha256"],
+                    "python_path": str(python_labels_path) if python_labels_path else None,
+                    "python_sha256": reference["labels_sha256"] if reference is not None else None,
                     "scope": (
                         "labels exported from each implementation's last measured fit; "
                         "warmup excluded"

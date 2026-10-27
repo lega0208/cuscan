@@ -165,9 +165,8 @@ built extension. The reference implementations are **umap-learn 0.5.12** and
   sampled `embedding` rows from `comparison/feedback_clustered.parquet`.
   Points are colored by the input `topic_global` column. The default output is
   `comparison/umap_comparison.html`.
-- `comparison/save_2d_embeddings.py` reads that same input file, computes local
-  UMAP coordinates, and writes `comparison/embeddings_2d.parquet`, preserving
-  the original columns and adding `embedding_2d`. It processes the entire file
+- `comparison/save_embeddings.py` reads that same input file and writes `embedding_2d`
+  and `embedding_16d` to `comparison/embeddings.parquet`. It processes the entire file
   and has no CLI options.
 - `comparison/plot_hdbscan_comparison.py` reads the saved parquet and compares
   reference and local HDBSCAN labels. `--cluster-on 2d` (default) clusters
@@ -179,7 +178,7 @@ built extension. The reference implementations are **umap-learn 0.5.12** and
 
 ```sh
 uv run --no-sync python comparison/plot_comparison.py --device cpu --sample-size 10000
-uv run --no-sync python comparison/save_2d_embeddings.py
+uv run --no-sync python comparison/save_embeddings.py
 uv run --no-sync python comparison/plot_hdbscan_comparison.py \
   --device cpu --cluster-on 2d --sample-size 10000
 uv run --no-sync python comparison/plot_hdbscan_comparison.py \
@@ -214,7 +213,7 @@ cargo build -p fast-hdbscan --release --features tracing --example profile_hdbsc
 uv run --no-sync python comparison/compare_stages.py --backend cpu \
   --html comparison/umap_stages.html --json comparison/umap_stages.json
 uv run --no-sync python comparison/compare_hdbscan_stages.py --backend cpu \
-  --input comparison/embeddings_2d.parquet --cluster-on 2d --sample-size 10000 \
+  --input comparison/embeddings.parquet --cluster-on 2d --sample-size 10000 \
   --html comparison/hdbscan_stages.html --json comparison/hdbscan_stages.json
 ```
 
