@@ -1098,9 +1098,11 @@ impl HDBSCAN {
                             .ok_or(HdbscanError::Overflow("KD-tree live bytes"))
                     })
                 })?;
+                let DispatchDevice::Cube(cube_device) = device.as_dispatch();
+                let kd_plan = crate::kernels::kd_neighbor_plan(&cube_device.client());
                 let kd_pack_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
-                    crate::kernels::kd_padded_bytes(n, tree.starts.len(), features)
-                        .ok_or(HdbscanError::Overflow("KD-tree padded live bytes"))
+                    crate::kernels::kd_neighbor_pack_bytes(kd_plan, n, tree.starts.len(), features)
+                        .ok_or(HdbscanError::Overflow("KD-tree neighbor pack live bytes"))
                 })?;
                 let memory = core_search_memory(
                     n,
@@ -1164,6 +1166,22 @@ impl HDBSCAN {
                             .checked_mul(padded_width)
                             .ok_or(HdbscanError::Overflow(subject))?;
                         check_device_allocation(elements, 4, allocation_limit, subject)?;
+                    }
+                    if let crate::kernels::KdCandidateLayout::LeafSoa { lanes } = kd_plan.layout {
+                        let slots = n
+                            .div_ceil(lanes)
+                            .checked_mul(lanes)
+                            .ok_or(HdbscanError::Overflow("KD-tree SoA slot elements"))?;
+                        let soa_elements = slots
+                            .checked_mul(features)
+                            .ok_or(HdbscanError::Overflow("KD-tree SoA data elements"))?;
+                        for (elements, subject) in [
+                            (soa_elements, "KD-tree SoA data allocation"),
+                            (slots, "KD-tree SoA slot allocation"),
+                        ] {
+                            u32::try_from(elements).map_err(|_| HdbscanError::Overflow(subject))?;
+                            check_device_allocation(elements, 4, allocation_limit, subject)?;
+                        }
                     }
                 }
                 #[cfg(feature = "tracing")]
@@ -1474,6 +1492,26 @@ mod search_tests {
         assert_eq!(kd.device_bytes, 81_920);
         assert_eq!(packed_kd.device_bytes, 81_920 + 36_800);
         assert_eq!(packed_kd.host_bytes, kd.host_bytes);
+        let (device, _) = selected_device(BackendChoice::Cpu).unwrap();
+        let DispatchDevice::Cube(cube_device) = device.as_dispatch();
+        let plan = crate::kernels::kd_neighbor_plan(&cube_device.client());
+        let cpu_pack = crate::kernels::kd_neighbor_pack_bytes(plan, 1000, 63, 5).unwrap();
+        let expected_pack = 36_032
+            + match plan.layout {
+                crate::kernels::KdCandidateLayout::PaddedRows => 0,
+                crate::kernels::KdCandidateLayout::LeafSoa { lanes } => {
+                    1000usize.div_ceil(lanes) * lanes * 6 * 4
+                }
+            };
+        assert_eq!(cpu_pack, expected_pack);
+        let cpu_kd = core_search_memory(1000, 5, 5, HdbscanSearch::KdTree, 4096, 0, 0).unwrap();
+        let cpu_packed_kd =
+            core_search_memory(1000, 5, 5, HdbscanSearch::KdTree, 4096, cpu_pack, 0).unwrap();
+        assert_eq!(
+            cpu_packed_kd.device_bytes,
+            cpu_kd.device_bytes + expected_pack
+        );
+        assert_eq!(cpu_packed_kd.host_bytes, cpu_kd.host_bytes);
         assert_eq!(
             core_search_memory(1024, 8, 5, HdbscanSearch::BruteForce, 0, pack, 0)
                 .unwrap()

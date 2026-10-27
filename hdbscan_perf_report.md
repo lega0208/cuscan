@@ -548,3 +548,59 @@ The preceding rejection and measurements remain historical facts. The user subse
 The revised [detailed plan](cubecl_kernels_perf_plan_phase6.md) retains position-tiled SoA, fixed block64 query order, P/O/C isolation, ordered arithmetic, checked sizing, balanced width/performance protocols and rejection options. It requires builder tests for permutation, range coverage/partition, reachable topology, enclosing bounds and level limits, meaningful builder input failures, and full valid-tree bitwise/all-width/all-arm/diagnostics coverage. Preserve Phase 5 CUDA neighbor64, unrelated32 and frozen kernels. Prior partial normal-case passes are not this revised validation proof; rerun all required original gates, including actual required CUDA and final 20k/100k pipelines, against any new implementation.
 
 This amendment authorizes documents only, not execution. Original G001 is complete as an authorized rejection, not an accepted optimization; a new implementation needs a separate user execution request/new goal. Known HEAD at amendment is `d8faeab5d0e825e4d93c6c1478e35b4d1f15721a` (`phase 6 failure`), with the retained host example/Rayon dependency tracked. Inspect actual future HEAD/status and preserve user work, rather than assuming uncommitted tool changes or requiring HEAD equality. Original production baseline is `d030b7eb0a1f2a4edccc41fea01671ca9b16f092`; production `kdtree.rs`, `kernels/mod.rs` and `estimator.rs` were restored to it. Verify actual source anew. Historical `phase6/` retains `experiment.diff`, provenance, summaries, gates, integration, Rayon and QA boundary reports, and failure IR/logs. Do not blindly reapply that obsolete diff or overwrite evidence. If ignored artifacts are missing, do not assume tests/timing evidence or reconstruct unsupported claims: establish fresh evidence from tracked source. Use a fresh directory such as `phase6_valid_trees/`, establish provenance and preserve the accepted CUDA64 baseline binary before rebuilding. The detailed plan lists exact six input paths/hashes, affected code/test symbols and isolated diagnostic-build instructions. Width probe `[16,8,4,2,1]` and 15 units are prior findings, not a selected cap; initial cap16 was never selected, and no P/O/C timing exists. The host tool remains reporting-only, not a bitwise oracle. No retry gains, implementation or new gate results are claimed here.
+
+## Phase 6 valid-tree retry results: C16 accepted
+
+**Status:** execution authorized, implementation completed, acceptance code **C16** (SoA candidates plus leaf-block queries, cap16). Independent review receipts are maintained separately in the ultragoal ledger. The historical malformed-tree rejection above remains unchanged and is not new acceptance evidence.
+
+**Scope and evidence:** all retry evidence is in [`artifacts/cubecl_kernels_perf/phase6_valid_trees/`](artifacts/cubecl_kernels_perf/phase6_valid_trees/). Finite data and unchanged builder-produced valid trees (or equivalent low-level permutation, leaf-partition, topology/levels and enclosing-bounds preconditions) are required. Public finite-row compaction/remapping is unchanged; no runtime content scan, ownership map or absent-row pass is added. These fixed k5 workloads on this Ryzen 9800X3D/CubeCL LLVM host do not establish general workload/platform speedups. CUDA neighbor64 and unrelated/frozen32 are preserved.
+
+### Retry width and selection
+
+`provenance.json` directly queried **15 CPU cores/units**, `hardware.load_width=512`, widths **[16,8,4,2,1]**; all widths passed the typed vector probe. Source concurrency evidence is not measured simultaneous occupancy. Batch **S**, reported separately and never pooled into acceptance, chose cap16 (`width_selection.json`): core medians at 20k×16 / 20k×30 were X16 **0.038808 / 0.093683 s**, Y8 **0.041840 / 0.099793 s**, Z4 **0.055731 / 0.138602 s**. Y/X ratios 1.07815 / 1.06522 and Z/X 1.43609 / 1.47948 fail the narrower-width ≥2% improvement in both cells rule.
+
+`acceptance_summary.json` pools the two predeclared direction-balanced A/B batches (eight process medians per arm/cell). P (SoA only) and C each have **four primary core gains and no regression cells**; O (ordering only) has zero primary gains and is ineligible. **G=C**, primary geometric mean 0.152794381 s versus P 0.153396097 s. P fails the +2% per-cell near-best rule at 20k×16: 0.039347995/0.038212973 = **1.02970**. The exact default rule therefore selects C16 without override. The summary's pending-external-gates field is a timing-stage record, not a correctness waiver.
+
+### Retry warm measurements
+
+[`summary.json`](artifacts/cubecl_kernels_perf/phase6_valid_trees/summary.json) derives the acceptance decision, first-minus-warm differences, Rayon comparisons and pipeline label proof from the underlying receipts. Its decision is `accept`, with no unmet acceptance criteria. Independent review receipts are maintained separately in the ultragoal ledger. Acceptance samples use archived measurement binaries. Finalization removes unselected branches without changing selected C's algorithm; final-source verification is separate and is not pooled into acceptance timing.
+
+Seconds; B baseline, P packed/cyclic, O padded/leaf-block, C packed/leaf-block. Δ compares pooled medians to B; paired ratios are median [min,max]. All-arm ranges and per-batch effects for every metric remain in `acceptance_summary.json`.
+
+| Cell | Core B / P / O / C (s) | C pooled Δ; batch A / B Δ | C paired core ratio [range] |
+| --- | --- | --- | --- |
+| 20k×16 | .203527 / .039348 / .201191 / .038213 | −81.22%; −81.35% / −80.48% | .1881 [.1799,.2132] |
+| 50k×16 | 1.044663 / .245888 / 1.022576 / .246394 | −76.41%; −76.41% / −76.72% | .2345 [.2192,.2554] |
+| 20k×30 | .488497 / .092948 / .488041 / .093392 | −80.88%; −80.77% / −80.94% | .1916 [.1765,.2314] |
+| 50k×30 | 2.879559 / .615681 / 2.855542 / .619836 | −78.47%; −78.74% / −78.04% | .2135 [.2059,.2270] |
+| 20k×8 | .028158 / .011078 / .026245 / .010659 | −62.14%; −63.76% / −60.35% | .3822 [.2850,.4317] |
+| 20k×2 | .003473 / .003375 / .003228 / .003459 | −.41%; −.58% / −6.56% | .9557 [.6136,1.2507] |
+
+| Cell | Synchronized neighbor B → C | Full fit B → C; pooled Δ | Full-fit batch A / B Δ; paired median [range] |
+| --- | --- | --- | --- |
+| 20k×16 | .202454 → .037243 | .260531 → .097523; −62.57% | −63.01% / −62.15%; .3744 [.3574,.3995] |
+| 50k×16 | 1.043565 → .245341 | 1.241712 → .448006; −63.92% | −63.81% / −64.44%; .3588 [.3245,.3854] |
+| 20k×30 | .487422 → .092482 | .677496 → .282036; −58.37% | −58.93% / −57.36%; .4140 [.4003,.4787] |
+| 50k×30 | 2.878350 → .616742 | 3.711688 → 1.420763; −61.72% | −61.89% / −61.68%; .3800 [.3722,.4137] |
+| 20k×8 | .027032 → .009656 | .053880 → .034656; −35.68% | −33.89% / −37.12%; .6423 [.5672,.7384] |
+| 20k×2 | .002605 → .001986 | .022062 → .021778; −1.29% | +1.62% / −4.00%; .9716 [.8642,1.0885] |
+
+Packing is included in core timing. Primary C core gains are −76.41% to −81.22%; 20k×8 is also a gain. Noisy 20k×2 core/full-fit results are **no effect**, not equivalence or demonstrated speedup.
+
+### Retry memory, host comparator and first fit
+
+Additional C16 device memory beyond existing padded data/bounds is `ceil(n/16)·16·(d+1)·4` bytes (SoA plus slot IDs), with checked sizing/allocation checks: 20k/50k×16 **1,360,000 / 3,400,000 bytes**; 20k/50k×30 **2,480,000 / 6,200,000 bytes**; 20k×8/2 **720,000 / 240,000 bytes**. No ownership allocation exists.
+
+The existing `kd_host_baseline` Rust/Rayon tool and dev-dependency are retained. Reporting-only `rayon_baseline.json`: 15 threads, one warmup, five runs/process, three processes. Median-of-process medians are **.286200 / 1.459307 / .633810 / 4.277110 s** for 20k×16, 50k×16, 20k×30, 50k×30. Verification has zero ID mismatches but **31,111 / 79,019 / 33,674 / 81,495 distance-bit mismatches**, respectively. It is neither a bitwise oracle nor an isolated runtime-overhead measurement. Ordered unfused Rust versus observed LLVM FMA is a supported explanation, not proof of equality.
+
+`cold_start.json`: first-fit medians from three fresh processes, including runtime JIT, B→C **.189786→.252638 s** at 20k×2 (+.062852 s), **.423338→.345365 s** at 20k×16 (−.077973 s), **.887035→.560610 s** at 20k×30 (−.326424 s). Warm C full-fit medians above are .021778 / .097523 / .282036 s. **On-disk compilation cache was not cleared**: fresh-process first fits are not guaranteed cache-cold compilations.
+
+### Retry gates and observed code generation
+
+`summary.json` derives B/C first-minus-warm full-fit differences of **.167724/.230859 s** at 20k×2, **.162807/.247842 s** at 20k×16 and **.209539/.278575 s** at 20k×30. These are differences across measurement groups, not isolated compilation costs.
+
+All **11 experimental and 11 final-clean Step 3 gates passed**, with required CUDA on designated CUDA gates (`experiment_gates.json`, `final_clean_gates.json`). Experimental coverage includes all arms/host widths; final-clean coverage includes selected production at every host width and retained CUDA coverage. Bitwise IDs/distances and diagnostics are checked under the valid-tree contract. `integration_clean.json` records final `analyze_hdbscan_stages.sh` exits **0** at **20k and 100k**; both `pipeline_clean_20000/benchmark.json` and `pipeline_clean_100000/benchmark.json` have `correctness.labels_equal=true` (checked directly). Earlier `final_gates.json`, `integration.json`, pipeline outputs and logs are retained as earlier receipts, not substituted for this clean-boundary verification.
+
+The full `all_cuda` campaign retains pre-existing unrelated ignored hardware-campaign tests; these are not required KD CUDA runtime skips. The final KD suite reports **16 passed, 0 ignored**. Initial final clippy introduced warnings despite exit0; these were corrected before the clean rerun. `logs/final_clean_clippy.log` retains only pre-existing seed-literal grouping, integration-oracle range-loop and dependency future-incompatibility warnings; no introduced warning remains and no warning suppression is claimed. `summary.json` records that README/AGENTS were searched: neither enumerates the changed CPU query schedule or resource buffers, so no guidance update was needed; mandatory 20k/100k guidance remains applicable.
+
+`codegen_evidence.json` links hashed optimized LLVM IR from reporting-only 257-row d16 diagnostic probes, not timing binaries. Selected IR has **16 `load <16 x float>`**, **16 `fsub <16 x float>`**, **17 `llvm.fmuladd.v16f32`** matches; baseline has zero of these and **33 scalar `llvm.fmuladd.f32`** matches versus selected **17**. These textual counts include declarations, not dynamic instruction counts or assembly/ISA proof. Observed vector FMA supports candidate-axis vectorization but independently proves neither correctness nor the entire speedup. Independent review receipts are maintained separately in the ultragoal ledger.

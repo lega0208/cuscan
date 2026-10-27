@@ -5,7 +5,11 @@ mod kdtree;
 pub const COMPONENT_REDUCTION_TILE_WIDTH: usize = 512;
 
 pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
-pub(crate) use kdtree::{kd_padded_bytes, kd_padded_width};
+#[cfg(test)]
+pub(crate) use kdtree::kd_padded_bytes;
+pub(crate) use kdtree::{
+    KdCandidateLayout, kd_neighbor_pack_bytes, kd_neighbor_plan, kd_padded_width,
+};
 
 use burn::backend::{
     TensorMetadata,

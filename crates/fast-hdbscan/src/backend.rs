@@ -6,6 +6,16 @@ use burn::backend::{
 };
 
 /// Uploaded KD-tree buffers consumed by exact traversal operations.
+///
+/// Callers must supply a valid tree built by `fast_hdbscan_core::kdtree::KdTree::build`
+/// for the same finite data, uploaded unchanged, or an equivalent valid tree/data
+/// pair. Indices must be exactly a permutation of `0..n`; reachable leaf ranges
+/// must partition `0..n` without gaps or overlap. Reachable heap children must
+/// exist and partition their parent's range, terminate at leaves within the
+/// builder's level/stack limits, and have bounds enclosing their assigned points
+/// and child bounds. Data and tree contents must remain unchanged together during
+/// traversal. These content preconditions are not checked by runtime scans or
+/// readbacks; shape/dtype validation and checked sizing do not establish them.
 #[derive(ExtensionType)]
 #[extension_type(fusion)]
 pub struct DeviceKdTree<B: Backend> {
@@ -70,6 +80,13 @@ pub trait HdbscanOps: Backend {
     })]
     /// Exact squared-distance neighbors, ordered by `(distance², point index)`.
     /// Self is excluded and absent neighbors are padded with `(inf, n)`.
+    ///
+    /// Requires finite `data` and an unchanged builder-produced (or equivalent
+    /// valid) tree for that same data, satisfying the permutation, partition,
+    /// topology, bounds and level/stack preconditions on [`DeviceKdTree`]. No
+    /// runtime tree-content validation is performed. Estimator calls meet this
+    /// contract after finite-row compaction; nonfinite-row handling and original
+    /// row remapping belong to the estimator, not this operation.
     fn exact_neighbors_kd(
         data: FloatTensor<Self>,
         #[extension_type] tree: DeviceKdTree<Self>,
