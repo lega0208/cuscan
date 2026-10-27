@@ -123,6 +123,8 @@ The existing host tool/dependency are tracked at known HEAD `d8faeab5d0e825e4d93
 
 ### Phase 7: CUDA plane-cooperative leaf-tile kernel (F5)
 
+**Status:** planned; not implemented, measured or authorized. Detailed plan: [cubecl_kernels_perf_plan_phase7.md](cubecl_kernels_perf_plan_phase7.md). It supersedes points 1, 2 and 3 below: independent planes using `sync_plane`, the Phase 1 heap instead of register top-k, and leaf-ordered padded rows (AoS). It also adds a flat brute-force control arm, a dimension gate and measurements at 100k–300k rows.
+
 **Change.** A separate CUDA kernel, gated on `features.plane` and the queried `plane_size_min`, behind the same host signature. The per-query kernel remains the non-plane path.
 1. **Tiles.** One plane owns `PLANE_DIM` consecutive leaf-ordered queries. Each lane keeps its own query in registers (Phase 3) and its own register top-k (Phase 2).
 2. **Traversal.** Use a cube-uniform traversal stack in `Shared`:
