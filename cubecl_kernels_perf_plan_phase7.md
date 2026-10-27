@@ -37,7 +37,7 @@ All master-plan invariants apply unchanged. These are the ones this phase depend
 
    The CPU C16 SoA pack is not reused.
 
-4. **Flat control arm.** A comptime `traverse = false` configuration of the same kernel scans all positions in staged chunks, with no tree. It shows whether the tree still pays for itself on GPU at 16–30D. It is also the strictest correctness check: it does no pruning, so a mismatch against the reference would expose inexact pruning in the reference or baseline. Stop and report such a mismatch; do not relax any test.
+4. **Flat control arm.** A comptime `traverse = false` configuration of the same kernel scans all positions in staged chunks, with no tree. It shows whether the tree still pays for itself on GPU at 16–30D. It is also the strictest correctness check: it does no pruning, so a mismatch against the reference may expose an experimental-arm defect or inexact reference pruning. Isolate the cause before attribution. Stop and report such a mismatch; do not relax any test.
 5. **Dimension gate selected in advance.** Union traversal visits a leaf when any lane needs it. Step 0's tile simulation at 20k gives staged work of 1.6× (2D) and 1.7× (8D) the baseline warp maximum, with 25–32% lane utilization, so the predicted gate is 16 for both arms. A selection batch, kept separate from acceptance batches, sets the smallest dimension that uses the tile kernel for T. F's gate is fixed at 16 without measurement, because at 2D/8D it stages every position while only 0.6–17% are useful. Lower dimensions keep the per-query kernel.
 6. **Experimental cells: 50k and 300k only (user decision, 2026-10-27).** 300k is where the motivating crossover lies and where Step 0 measured the strongest cache degradation, so experimental arms are measured there to show how they scale. 50k is the smaller reference size. Acceptance timing is 16D only, and there are no guard cells. To keep run time down, experimental arms are not timed at 20k, 100k, 200k or 30D. 30D and other dimensions at or above the gate are covered by the Step 2 correctness gates but have no performance measurement. Step 0 data at the other sizes remains baseline-only evidence. Speedups may be size-dependent through staging overhead and cache residency. Acceptance and rejection apply to the measured cells only; performance between or above them is unmeasured. Do not add further sizes to rescue a failed phase.
 7. **Still deferred.** Double-buffered staging (`memcpy_async`) and the Borůvka `kd_candidates_kernel`.
@@ -136,6 +136,8 @@ Meanings change in this kernel. Document them in `emit_kd_diagnostics` output an
 - `leaf_positions_scanned` counts positions the lane actually evaluated (`own`);
 - under `traverse = false`, `nodes_popped = 0` and `leaf_positions_scanned = n`.
 
+Add a diagnostics-only `staged_positions` buffer with one counter per query tile. Accumulate each copied chunk's actual `len` once per tile, excluding padding, and have lane 0 write the tile's total. Grid-stride planes write separate slots for each tile they process, not one overwritten slot per plane. Emit the sum across tiles for the matching neighbor launch. For F this sum is `n · ceil(n/T)`; for T it measures actual union-traversal staging rather than evaluated pairs or simulation estimates. Keep this buffer and its checked allocation/accounting diagnostics-only; acceptance timing disables diagnostics.
+
 Diagnostics-enabled and diagnostics-disabled runs must give identical IDs and distances.
 
 ### Shared memory and resources
@@ -180,7 +182,7 @@ All gates run with `FAST_UMAP_REQUIRE_CUDA=1`; CUDA tests must not be skipped.
    - `d ∈ {1, 2, 3, 4, 5, 8, 16, 29, 30, 32}`, with `d = 32` exercising the largest register path;
    - `k ∈ {1, 5, 16, 17}`;
    - `n ∈ {257, 1000, 4109}` plus `n ≡ 1` and `n ≡ 31 (mod 32)`;
-   - duplicate rows, exact ties, and leaves longer than `T` (multi-chunk), including F's unaligned final global chunk at `n = 4109`, which begins at 4108, and a T case whose final leaf ends mid-chunk (T chunks are leaf-relative); assert bounded loads and consumption below `len`;
+   - duplicate rows, exact ties, and leaves longer than `T` (multi-chunk), including F's partial final global chunk at `n = 4109`, `[4096, 4109)` with `len = 13`, and a T case whose final leaf ends mid-chunk (T chunks are leaf-relative); assert bounded loads and consumption below `len`;
    - default and capped grid strides.
 2. **Diagnostics.** Outputs with diagnostics disabled must equal the enabled outputs. Check the diagnostics invariants: popped counts are tile-uniform, `scanned ≤ n`, and the flat arm reports `scanned = n`.
 3. **Pack.** Bit equality with gathered `pad_rows` output, zero tail, and checked-overflow sizing cases.
@@ -188,12 +190,12 @@ All gates run with `FAST_UMAP_REQUIRE_CUDA=1`; CUDA tests must not be skipped.
 5. **Routing.** The tile plan is never selected on CPU, for `d > 32`, below the gate, or when shared memory does not fit. C16 CPU outputs are unchanged.
 6. **Existing suites.** `cargo test -p fast-hdbscan-core`, then `FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --release -- --nocapture`, then `cargo test -p fast-hdbscan`. Also `cargo clippy --workspace --all-targets` and `cargo fmt --all -- --check`.
 
-Any mismatch blocks timing. A mismatch only in F means pruning is inexact; report it as a contract finding.
+Any mismatch blocks timing. A mismatch only in F is a contract finding requiring investigation of staging, arithmetic, heap logic and reference pruning; do not attribute it to inexact pruning before isolating the cause.
 
 ### Step 3: Selection batch S (separate from acceptance)
 
 - **Design.** Three measured fits per process; use their median as one observation. For plane-count selection, run blocks `(B,T1,T2,T4,F1,F2,F4)`, `(T1,T2,T4,F1,F2,F4,B)`, `(T2,T4,F1,F2,F4,B,T1)`, followed by those three blocks in reverse block order and reversed within each block. This gives six process medians per arm and cell. Never count fits within one process as independent observations.
-- **Planes per cube.** Evaluate at 50k×16 and 300k×16. Separately for T and F, choose the smallest `planes_per_cube` whose pooled core median at 300k×16 is within 2% of that family's best arm. Larger sizes take priority, so 50k×16 breaks ties only among candidates that qualify at 300k. Choosing the smallest qualifying count always yields a selection.
+- **Planes per cube.** Evaluate at 50k×16 and 300k×16. Separately for T and F, choose the smallest `planes_per_cube` whose pooled core median at 300k×16 is within 2% of that family's best arm. This is the complete deterministic selection rule; 50k×16 is reporting-only for plane-count selection. Choosing the smallest qualifying count always yields a selection.
 - **Dimension gates.** F's gate is fixed at 16 (Changes §5). This is the only experimental timing outside 16D, and it exists so the replacement does not silently regress low-dimensional data. Evaluate selected T against B at 300k×{2, 8, 16}, using blocks `(B,T)`, `(T,B)`, `(B,T)`, then their reverse block order with each block reversed. Generate the 300k×2 and 300k×8 inputs with the Step 0.2 generator and record their hashes. T's gate is the smallest `d` among {2, 8, 16} for which its pooled core median at 300k is less than 3% slower than B at that dimension and every larger tested dimension. Record Step 0's prediction (gate = 16) before running. T failing at 300k×16 makes T ineligible. The assumption that the gate generalizes between tested dimensions and above 16D is explicit, not measured evidence. Each arm retains its own gate through acceptance and final routing.
 
 Selection results are reported separately and are never pooled into acceptance.
@@ -208,7 +210,7 @@ Selection results are reported separately and are never pooled into acceptance.
 - **Thresholds (Phase 6 rules):** a gain is a pooled `Δ ≤ −2%` with at least 7 of 8 paired ratios below 1; a regression is a pooled `Δ ≥ +3%` with at least 7 of 8 above 1; anything between is "no effect".
 - **H3 counters (explanatory, not vetoes):** at 50k×16 and 300k×16, for B and each tile arm.
   - Collect the Step 0.5 metric set (`run_l2_counters.py`): L2/L1 hit rates, `dram__bytes_read.sum`, `lts__t_sectors_srcunit_tex_op_read.sum`, sectors/request, threads per instruction, long-scoreboard share, occupancy, registers and local memory. Add shared-memory bytes per block and branch efficiency.
-  - Normalize B by leaf positions scanned and the tile arms by staged positions × 32.
+  - Normalize B by leaf positions scanned and the tile arms by the matching launch's emitted `staged_positions` sum × `T` (32 on this CUDA device), multiplying by tile width exactly once. Collect diagnostics in a separate matching-input run with the same arm and launch geometry, never in acceptance timing. Include capped-grid aggregation checks; do not substitute simulation totals or per-lane evaluated counts. This denominator represents nominal broadcast opportunities, not actual active-lane pair evaluations.
   - At 50k×16, attribute gains to L1/LSU traffic, not L2 (the baseline L2 hit rate is 98%).
 - **Reporting only:**
   - repeat the CPU C16 versus selected-CUDA comparison from Step 0.3 at 300k×16 to show whether the 16D crossover moves;
@@ -229,10 +231,10 @@ Selection results are reported separately and are never pooled into acceptance.
 ### Step 6: Finalization
 
 - **On accept:**
-  - remove the unselected arm and the test-only arm overrides;
+  - remove the unselected arm and measurement-only arm overrides; retain a narrowly scoped test-only override for the selected kernel's below-gate correctness coverage, without exposing runtime production routing controls;
   - fix the selected arm's `planes_per_cube` and its own gate as constants;
   - keep `kd_neighbors_kernel` as the non-plane, `d > 32` and below-gate CUDA path, and keep the frozen reference unchanged.
-- **Final gates.** Re-run Step 2 on the final source, then the integration runs `bash analyze_hdbscan_stages.sh --rows 20000` and `bash analyze_hdbscan_stages.sh --rows 100000`. Both require real CPU and CUDA execution, exit 0 and exact label equality. Update the route-aware kernel families in `analyze/` beforehand so CUDA kernel timing finds the dispatched kernel; keep `uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py` passing.
+- **Final gates.** Re-run Step 2 on the final source for the retained kernel and its fixed plane count, including forced below-gate dimensions through the test-only override, plus production fallback routing. Preserve archived all-arm experimental H1 evidence; removed arms are not rerun. All retained pack, diagnostics, sizing, generated-code and existing-suite gates still apply. Then run `bash analyze_hdbscan_stages.sh --rows 20000` and `bash analyze_hdbscan_stages.sh --rows 100000`. Both require real CPU and CUDA execution, exit 0 and exact label equality. Update the route-aware kernel families in `analyze/` beforehand so CUDA kernel timing finds the dispatched kernel; keep `uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py` passing.
 - **On reject:** remove all experimental production code. Keep diffs, binaries' hashes and evidence under `artifacts/cubecl_kernels_perf/phase7/`.
 
 ### Step 7: Deliverables
