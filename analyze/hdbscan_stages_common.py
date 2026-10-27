@@ -12,6 +12,10 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
+# Row counts accepted by the standalone benchmark and counter tools. 200k/300k are for
+# baseline-only investigations; the integrated campaign script stays at 20k/50k/100k.
+EXTENDED_ROWS = (20_000, 50_000, 100_000, 200_000, 300_000)
+
 
 def identity(run_dir: str | os.PathLike[str]) -> dict[str, Any]:
     """Load and validate the shared identity written to ``raw/manifest.json``."""

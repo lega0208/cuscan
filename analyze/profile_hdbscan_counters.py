@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from hdbscan_stages_common import (
+    EXTENDED_ROWS,
     atomic_json,
     identity,
     route_kernel_families,
@@ -304,7 +305,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--binary-label", required=True, choices=("baseline", "variant", "current"))
-    parser.add_argument("--rows", required=True, type=int, choices=(20000, 50000, 100000))
+    parser.add_argument("--rows", required=True, type=int, choices=EXTENDED_ROWS)
     parser.add_argument("--min-samples", required=True, type=int)
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)

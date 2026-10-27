@@ -1201,7 +1201,7 @@ def run_fake_benchmark(
     return report
 
 
-@pytest.mark.parametrize("rows", [20_000, 50_000, 100_000])
+@pytest.mark.parametrize("rows", [20_000, 50_000, 100_000, 200_000, 300_000])
 def test_benchmark_runs_cpu_then_cuda_and_persists_valid_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows: int
 ) -> None:
@@ -1212,6 +1212,28 @@ def test_benchmark_runs_cpu_then_cuda_and_persists_valid_report(
     assert report["correctness"] == {"labels_equal": True, "rows_compared": rows}
     assert report["profiles"]["cpu"]["fit_seconds"] == [2.0, 2.1, 1.9]
     assert report["profiles"]["cuda"]["backend"] == "Cuda(0)"
+
+
+def test_benchmark_rejects_unsupported_rows(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="rows must be one of"):
+        benchmark_tools.benchmark(tmp_path / "missing", 400_000, tmp_path / "run", 10)
+
+
+@pytest.mark.parametrize("script", ["benchmark_hdbscan_stages.py", "profile_hdbscan_counters.py"])
+@pytest.mark.parametrize("rows", ["200000", "300000", "400000"])
+def test_standalone_tools_accept_extended_rows(tmp_path: Path, script: str, rows: str) -> None:
+    argv = [sys.executable, str(ROOT / "analyze" / script), "--binary", str(tmp_path / "none")]
+    if script == "profile_hdbscan_counters.py":
+        argv += ["--binary-label", "current", "--min-samples", "5"]
+    argv += ["--rows", rows, "--run-dir", str(tmp_path / "run"), "--timeout", "1"]
+    result = subprocess.run(argv, capture_output=True, text=True, cwd=tmp_path, check=False)
+    assert result.returncode != 0
+    if rows == "400000":
+        assert result.returncode == 2
+        assert "invalid choice" in result.stderr
+    else:
+        assert result.returncode == 1
+        assert "invalid choice" not in result.stderr
 
 
 def test_benchmark_provisions_k16_and_records_manifest_configuration(

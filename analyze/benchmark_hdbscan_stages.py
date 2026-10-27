@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from hdbscan_stages_common import atomic_json, require_fields, run_command
+from hdbscan_stages_common import EXTENDED_ROWS, atomic_json, require_fields, run_command
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURES = 16
@@ -271,8 +271,8 @@ def _generate_input(path: Path, rows: int) -> None:
 def benchmark(
     binary: Path, rows: int, run_dir: Path, timeout: float, min_samples: int = 5
 ) -> dict[str, Any]:
-    if rows not in (20_000, 50_000, 100_000):
-        raise ValueError("rows must be 20000, 50000, or 100000")
+    if rows not in EXTENDED_ROWS:
+        raise ValueError(f"rows must be one of {', '.join(map(str, EXTENDED_ROWS))}")
     if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples <= 0:
         raise ValueError("min_samples must be a positive integer")
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -433,7 +433,7 @@ def benchmark(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--rows", required=True, type=int, choices=(20_000, 50_000, 100_000))
+    parser.add_argument("--rows", required=True, type=int, choices=EXTENDED_ROWS)
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--timeout", required=True, type=float)
     parser.add_argument("--min-samples", type=int, default=5)
