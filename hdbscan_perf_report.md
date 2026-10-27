@@ -604,3 +604,120 @@ All **11 experimental and 11 final-clean Step 3 gates passed**, with required CU
 The full `all_cuda` campaign retains pre-existing unrelated ignored hardware-campaign tests; these are not required KD CUDA runtime skips. The final KD suite reports **16 passed, 0 ignored**. Initial final clippy introduced warnings despite exit0; these were corrected before the clean rerun. `logs/final_clean_clippy.log` retains only pre-existing seed-literal grouping, integration-oracle range-loop and dependency future-incompatibility warnings; no introduced warning remains and no warning suppression is claimed. `summary.json` records that README/AGENTS were searched: neither enumerates the changed CPU query schedule or resource buffers, so no guidance update was needed; mandatory 20k/100k guidance remains applicable.
 
 `codegen_evidence.json` links hashed optimized LLVM IR from reporting-only 257-row d16 diagnostic probes, not timing binaries. Selected IR has **16 `load <16 x float>`**, **16 `fsub <16 x float>`**, **17 `llvm.fmuladd.v16f32`** matches; baseline has zero of these and **33 scalar `llvm.fmuladd.f32`** matches versus selected **17**. These textual counts include declarations, not dynamic instruction counts or assembly/ISA proof. Observed vector FMA supports candidate-axis vectorization but independently proves neither correctness nor the entire speedup. Independent review receipts are maintained separately in the ultragoal ledger.
+## Phase 7 results: CUDA flat plane kernel F2 accepted
+
+**Decision:** accept **F2**, fixed **two planes per cube**, dimension gate **16**, **no row-count gate**. CPU C16 is unchanged. CUDA retains the per-query kernel below 16 features, above 32, on non-plane devices and with insufficient launch/shared-memory resources. This is pre-launch routing, not execution-error recovery. F scans all candidates, staging leaf-ordered padded rows for plane broadcasts, retaining original IDs/output rows, the output-backed heap and ordered scalar feature arithmetic. Experimental arms/measurement overrides are removed in finalization; below-gate forcing is test-only.
+
+Evidence: `artifacts/cubecl_kernels_perf/phase7/summary.json`, `experiments/{selection-planes,selection-gate,acceptance,cold,crossover}/observations.json`, and `arm_counters/summary.json`. Experimental H1 and existing release/debug gates passed. **Final retained-source verification and strict real-CPU/CUDA 20k/100k integration passed** (receipts below). Independent review status/receipts are tracked separately in the Ultragoal ledger. Experimental gates are not substituted for final-source proof.
+
+### Acceptance A/B
+
+Four interleaved blocks in A and four reversed blocks in B yield **eight process medians per arm/cell**, each reducing three measured fits. Pairing is within block; fits within one process are not independent observations. Core includes packing. No guard cells were run. Values below are seconds: median [minimum, maximum] across process medians, not confidence intervals. Exact labels agree in each comparison cell.
+
+| Cell | Arm | Processes | Core seconds | Full-fit seconds |
+| --- | --- | ---: | --- | --- |
+| 50k×16 | B | 8 | .081274975 [.079497385,.081589532] | .344502836 [.338933851,.350434888] |
+| 50k×16 | T2 | 8 | .020770730 [.020288903,.021904879] | .282018535 [.277249858,.301995144] |
+| 50k×16 | F2 | 8 | .019142247 [.018906253,.020449292] | .282762217 [.279065369,.290641309] |
+| 300k×16 | B | 8 | 5.458147029 [5.406012669,5.505541137] | 8.148663046 [8.083295341,8.214601698] |
+| 300k×16 | T2 | 8 | .488467727 [.480982227,.493652909] | 3.182441613 [3.128015232,3.209343435] |
+| 300k×16 | F2 | 8 | .476285891 [.468212442,.480946523] | 3.171553079 [3.155536712,3.218120805] |
+
+F2 core Δ: **−76.44755% / −91.27385%**, with **8/8 paired ratios below 1** at 50k/300k. T2 also gains: **−74.44388% / −91.05067%**, 8/8 each. F2 is accepted by the **large-size override** and also satisfies **standard eligibility**. No 50k regression is ignored and there is **no judgment departure**. Full-fit F2 Δ: **−17.92166% / −61.07885%**; T2: **−18.13753% / −60.94523%**. These are scoped full-fit results, not isolated neighbor-kernel speedups.
+
+### Selection S, separate from acceptance
+
+S uses six process medians per arm/cell, each from three measured fits, **never pooled with A/B**. At 300k×16, the smallest plane count within 2% of its family's best selects **T2 and F2**. Core medians at 50k / 300k: B .080915468 / 5.473774395; T1 .027557338 / .621755854; T2 .020418030 / .485891982; T4 .020969542 / .490142895; F1 .023531956 / .568501482; F2 .018763580 / .476576222; F4 .019995508 / .500840791 seconds. The finalists are within 2% at 300k; F2 wins the 50k comparison by more than 2%.
+
+T gate selection uses separate six-process groups at 300k×2/8/16: B core medians .011764237/.311471664/5.494453881 s; T2 .019636370/.071913957/.489031505 s. Thus T's selected gate is **8**, not the predicted 16; 2D fails. **T2 is not retained. F's fixed gate is 16**, not inherited from T. Raw S core/full-fit medians and ranges are tabulated below.
+
+| S planes cell | Arm | Processes | Core seconds | Full-fit seconds |
+| --- | --- | ---: | --- | --- |
+| 50000×16 | B | 6 | .080915468 [.079364360,.082346767] | .344954763 [.334696385,.353197455] |
+| 50000×16 | F1 | 6 | .023531956 [.022177004,.024165243] | .282584847 [.278557993,.286498762] |
+| 50000×16 | F2 | 6 | .018763580 [.018331581,.019365160] | .277636557 [.271683756,.280519361] |
+| 50000×16 | F4 | 6 | .019995508 [.019621459,.021091858] | .280526630 [.278251591,.286034875] |
+| 50000×16 | T1 | 6 | .027557338 [.026900096,.028034268] | .288563656 [.281932998,.302113999] |
+| 50000×16 | T2 | 6 | .020418030 [.020027070,.021780674] | .281473519 [.276166356,.284225358] |
+| 50000×16 | T4 | 6 | .020969542 [.020357486,.021761711] | .282009726 [.275594258,.289706449] |
+| 300000×16 | B | 6 | 5.473774395 [5.445902474,5.481680337] | 8.147657364 [8.125146821,8.189191907] |
+| 300000×16 | F1 | 6 | .568501482 [.565934748,.569244336] | 3.245857948 [3.237674011,3.259044396] |
+| 300000×16 | F2 | 6 | .476576222 [.475044167,.480683666] | 3.151467626 [3.149414248,3.190279835] |
+| 300000×16 | F4 | 6 | .500840791 [.495101261,.504383897] | 3.181553553 [3.160859505,3.196365693] |
+| 300000×16 | T1 | 6 | .621755854 [.618925151,.624836905] | 3.299158210 [3.273621430,3.308667082] |
+| 300000×16 | T2 | 6 | .485891982 [.483647490,.491700598] | 3.152823881 [3.142802097,3.168609457] |
+| 300000×16 | T4 | 6 | .490142895 [.485945593,.490798814] | 3.148546950 [3.139007290,3.164783162] |
+
+| S gate cell | Arm | Processes | Core seconds | Full-fit seconds |
+| --- | --- | ---: | --- | --- |
+| 300000×2 | B | 6 | .011764237 [.011310006,.012632526] | .200977907 [.196996622,.204125473] |
+| 300000×2 | T2 | 6 | .019636370 [.018960290,.020064999] | .210581808 [.206515663,.216234925] |
+| 300000×8 | B | 6 | .311471664 [.309335683,.313060663] | .777289958 [.769647988,.782020752] |
+| 300000×8 | T2 | 6 | .071913957 [.070629623,.073216825] | .539097727 [.538067510,.544797206] |
+| 300000×16 | B | 6 | 5.494453881 [5.475897269,5.530640062] | 8.182252261 [8.157842485,8.236976192] |
+| 300000×16 | T2 | 6 | .489031505 [.486256728,.490875794] | 3.176813347 [3.173110644,3.183297610] |
+
+### H3: all seven arms × two cells
+
+Counters sample the **first warmup neighbor launch**, not full-fit timing. Separate matching-input/arm/geometry diagnostics supply emitted counts, not simulation or acceptance instrumentation. Nsight replay defaults flush caches and use base clocks. B's denominator is **leaf positions scanned**; tile denominators are **summed staged positions ×32 exactly once**, representing **nominal broadcast opportunities**, not active-lane evaluated pairs. F reports zero node pops and n scanned positions per query including self; staging is n·ceil(n/32).
+
+In the table: DRAM is raw read bytes, B/op and L2 sectors/op use those denominators, L1 s/r is global-load sectors/request, occupancy is achieved active-warps %, LS is long-scoreboard stall %, local is load/store sectors, shared is dynamic bytes/block (static zero throughout). Raw names, units and provenance remain in the counter summary.
+
+| Arm | Rows | Denominator | DRAM bytes | B/op | L2 sectors/op | L1 s/r | L2 hit % | L1 throughput % | Registers | Occupancy % | LS % | Local ld/st sectors | Shared bytes | Branch uniform % | Threads/instruction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| B | 50000 | 1364757656 | 2406746240 | 1.7635 | 2.6703 | 10.1028 | 98.11 | 81.07 | 64 | 46.05 | 77.27 | 71821777/96994880 | 0 | 98.01 | 10.32 |
+| B | 300000 | 29377727608 | 1933837973504 | 65.8267 | 2.8270 | 8.4880 | 29.64 | 28.72 | 64 | 63.41 | 94.68 | 1195111370/1554076006 | 0 | 98.77 | 8.57 |
+| T1 | 50000 | 2456784320 | 257896192 | .1050 | .0781 | 3.9816 | 96.10 | 35.94 | 114 | 24.86 | 14.12 | 25312674/25716696 | 2176 | 97.76 | 19.76 |
+| T1 | 300000 | 79270631488 | 119892487680 | 1.5124 | .0754 | 4.8576 | 44.41 | 43.32 | 114 | 31.21 | 17.02 | 560563512/562963512 | 2176 | 97.79 | 14.37 |
+| T2 | 50000 | 2456784320 | 418921856 | .1705 | .0846 | 3.9945 | 94.77 | 50.55 | 63 | 42.07 | 15.51 | 25312674/25716696 | 4352 | 97.76 | 19.78 |
+| T2 | 300000 | 79270631488 | 128738542720 | 1.6240 | .0782 | 4.8820 | 42.19 | 57.74 | 63 | 60.14 | 15.71 | 560563512/562963512 | 4352 | 97.79 | 14.44 |
+| T4 | 50000 | 2456784320 | 544766208 | .2217 | .0859 | 3.9945 | 93.98 | 49.94 | 56 | 43.06 | 16.10 | 31700358/25722948 | 8704 | 97.76 | 19.79 |
+| T4 | 300000 | 79270631488 | 132947671424 | 1.6771 | .0796 | 4.8821 | 41.18 | 58.46 | 56 | 66.83 | 15.25 | 705670544/563001012 | 8704 | 97.79 | 14.44 |
+| F1 | 50000 | 2500800000 | 97200384 | .0389 | .0441 | 6.8189 | 101.69 | 39.12 | 63 | 24.75 | 9.03 | 0/0 | 2176 | 99.22 | 31.11 |
+| F1 | 300000 | 90000000000 | 3905547392 | .0434 | .0377 | 10.5505 | 98.75 | 49.06 | 63 | 32.26 | 6.77 | 0/0 | 2176 | 99.82 | 31.78 |
+| F2 | 50000 | 2500800000 | 91820032 | .0367 | .0678 | 6.8161 | 98.45 | 50.15 | 62 | 39.65 | 9.17 | 0/0 | 4352 | 99.22 | 31.12 |
+| F2 | 300000 | 90000000000 | 8390150144 | .0932 | .0558 | 10.5490 | 94.27 | 60.16 | 62 | 63.16 | 4.76 | 0/0 | 4352 | 99.82 | 31.79 |
+| F4 | 50000 | 2500800000 | 77178496 | .0309 | .0641 | 6.8160 | 99.17 | 47.82 | 48 | 41.54 | 9.53 | 0/0 | 8704 | 99.22 | 31.18 |
+| F4 | 300000 | 90000000000 | 5368952704 | .0597 | .0457 | 10.5489 | 96.58 | 59.08 | 48 | 77.49 | 5.12 | 0/0 | 8704 | 99.82 | 31.80 |
+
+F1's reported 50k L2 hit rate **101.69%** is retained as a profiler/replay anomaly, not a physical hit probability. At **50k**, B already has **98.11% L2 hits**: gains are consistent with reduced **L1/LSU traffic**, not curing L2 misses. F2 reduces raw DRAM reads 2,406,746,240→91,820,032 bytes, L1 throughput 81.07→50.15% and long-scoreboard stalls 77.27→9.17%. At **300k**, B/F2 L2 hits are 29.64/94.27%, DRAM reads 1,933,837,973,504/8,390,150,144 bytes and stalls 94.68/4.76%. This supports improved access/reuse on this workload, not universal causation. F2 occupancy is 63.16% versus B 63.41% at 300k, so increased achieved occupancy is not the explanation. F has zero measured local sectors; T retains stack traffic.
+
+Additional H3 metrics: sampled-stall share is long-scoreboard samples / all PC samples, distinct from the active-warp stall percentage above.
+
+| Arm | Rows | L1 hit % | Raw L2 read sectors | Sampled long-scoreboard share % |
+| --- | ---: | ---: | ---: | ---: |
+| B | 50000 | 52.06 | 3644256214 | 76.14 |
+| B | 300000 | 48.27 | 83051656826 | 95.13 |
+| T1 | 50000 | 29.67 | 191783768 | 14.74 |
+| T1 | 300000 | 17.29 | 5977954147 | 18.03 |
+| T2 | 50000 | 19.06 | 207776570 | 16.04 |
+| T2 | 300000 | 11.73 | 6199803424 | 16.82 |
+| T4 | 50000 | 19.51 | 211092322 | 16.87 |
+| T4 | 300000 | 11.62 | 6310018125 | 16.28 |
+| F1 | 50000 | 49.51 | 110253381 | 9.88 |
+| F1 | 300000 | 47.34 | 3394683171 | 7.65 |
+| F2 | 50000 | 23.12 | 169638777 | 10.02 |
+| F2 | 300000 | 23.28 | 5024922622 | 6.24 |
+| F4 | 50000 | 26.54 | 160392434 | 10.23 |
+| F4 | 300000 | 35.92 | 4115254260 | 6.38 |
+
+### Reporting-only first fit and CPU crossover
+
+Cold reporting is **50k×16 only**; CPU C16 versus F2 is **300k×16 only**. Each uses three processes per arm. On-disk caches were **not cleared**. Fresh-process first fits include initialization/JIT/cache effects, but are neither guaranteed cache-cold compilations nor clean JIT isolation. Summary medians: 50k B/F2 first fit .511248672/.453236648 s, warm core .081349122/.019258328, warm fit .352412340/.283256005; 300k CPU/F2 first fit 9.861194983/3.333289634, warm core 4.568857219/.471445421, warm fit 8.856450496/3.170908501 s. Ranges are tabulated below. F2 beats CPU in both core and full fit in this repeat; it does not locate a universal new crossover.
+
+| Reporting cell | Arm | Processes | First-fit seconds | Warm core seconds | Warm full-fit seconds |
+| --- | --- | ---: | --- | --- | --- |
+| 50000×16 | B | 3 | .511248672 [.509199486,.542216513] | .081349122 [.080881877,.082980450] | .352412340 [.345315310,.353396557] |
+| 50000×16 | F2 | 3 | .453236648 [.438009840,.453861062] | .019258328 [.019119082,.019780093] | .283256005 [.274036447,.289352386] |
+| 300000×16 | CPU | 3 | 9.861194983 [9.381330220,10.188934254] | 4.568857219 [4.529079635,4.762274275] | 8.856450496 [8.740564941,8.934927530] |
+| 300000×16 | F2 | 3 | 3.333289634 [3.304519547,3.334004207] | .471445421 [.467081494,.481710093] | 3.170908501 [3.136429184,3.191483266] |
+
+Exact labels digests agree across arms within each S planes, S gate, acceptance, cold and crossover cell; this is stage-output evidence for these inputs, not a universal clustering claim.
+
+### Scope and final verification
+
+Fixed synthetic Gaussian k5/min-cluster-size5 measurements on this **RTX 3080 / Ryzen 9800X3D** host/software stack only. Experimental performance covers **50k×16, 300k×16**, plus T gate tests at **300k×2/8**. Step 0's 20k–300k 16D/30D baseline is not new-arm evidence. New-arm **20k/100k/200k/30D acceptance timing is unmeasured**; final integration checks correctness, not additional acceptance timing. Generalization between dimensions and above 16 is an assumption, not timing evidence.
+
+**Final-source verification passed.** Under `artifacts/cubecl_kernels_perf/phase7/`, `final_gates/results.json` records exit0 for core tests, required-CUDA release and default debug suites, workspace/all-target clippy, formatting checks and Python analysis/campaign tests (145 passed). `final_gates/ir.json` records 44 tile variants with warp synchronization present throughout and no CTA barrier. `summary.json` records final verification passed. These receipts cover retained-source gates rather than reusing experimental-arm results.
+
+`final_integration.json` records both required commands, `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000`, exiting **0** with real CPU/CUDA execution and exact `labels_equal=true`: `artifacts/hdbscan_stages/run-20000-bgHeQylR` and `artifacts/hdbscan_stages/run-100000-xQPWOUox`. Both counter-family receipts identify **`kd_neighbors_tile_kernel`**. These integration runs establish correctness/tool integration, not new acceptance timing cells. Independent review status/receipts are tracked separately in the Ultragoal ledger.

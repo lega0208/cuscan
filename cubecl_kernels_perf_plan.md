@@ -4,7 +4,7 @@
 
 Reduce the time spent in the KD-tree exact neighbor search behind HDBSCAN `core_distances` on CPU (CubeCL LLVM) and CUDA. Neighbor IDs and squared distances must stay bit-identical to the current kernel. This is the only part of the stage that matters: it accounts for more than 99% of the CPU core stage and about 99% of the CUDA one.
 
-Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 was measured and accepted at width 64 by explicit user override of the default regression screen. Phase 6's historical malformed-tree attempt was rejected; the separately authorized valid-tree retry is implemented and accepted as C16. Independent review receipts are maintained separately in the ultragoal ledger. Phase 7 onward remain unimplemented and unmeasured.
+Source of the findings: [hdbscan_perf_report.md](hdbscan_perf_report.md), in particular the "Follow-ups: CubeCL kernel patterns" section. Phase 1 has been implemented and measured as recorded below. Phase 2 was measured and rejected. Phase 3 was implemented, measured and accepted; Phase 4 was implemented, measured and rejected. Phase 5 was measured and accepted at width 64 by explicit user override of the default regression screen. Phase 6's historical malformed-tree attempt was rejected; the separately authorized valid-tree retry is implemented and accepted as C16. Independent review receipts are maintained separately in the ultragoal ledger. Phase 7 is accepted as F2 with final-source verification passed. Independent review status/receipts are tracked separately in the Ultragoal ledger. Phase 8 remains planned.
 
 ## Baseline facts this plan relies on
 
@@ -123,28 +123,15 @@ The existing host tool/dependency are tracked at known HEAD `d8faeab5d0e825e4d93
 
 ### Phase 7: CUDA plane-cooperative leaf-tile kernel (F5)
 
-**Status:** Step 0 baseline evidence completed ([phase7_step0_report.md](phase7_step0_report.md)); kernel steps planned, not implemented or authorized. User decisions (2026-10-27): experimental timing only at 50k×16 and 300k×16 with no guard cells; a 300k gain of at least about 10% overrides 50k regressions; the accepted arm replaces the per-query kernel outright, with no row-count threshold. Detailed plan: [cubecl_kernels_perf_plan_phase7.md](cubecl_kernels_perf_plan_phase7.md). It supersedes points 1, 2 and 3 below: independent planes using `sync_plane`, the Phase 1 heap instead of register top-k, and leaf-ordered padded rows (AoS). It also adds a flat brute-force control arm, a dimension gate and measurements at 100k–300k rows.
+**Status:** accepted as **F2**, fixed **two planes per cube**, dimension gate **16**, **no row-count gate**. Experimental H1 and existing release/debug gates passed; final-source verification also **passed**. Independent review status is tracked separately in the Ultragoal ledger. Evidence: `artifacts/cubecl_kernels_perf/phase7/summary.json`, S/A/B observations and all-arm counters; see [Phase 7 results](hdbscan_perf_report.md#phase-7-results-cuda-flat-plane-kernel-f2-accepted). Final receipts are `final_gates/results.json`, `final_gates/ir.json` and `final_integration.json` under that Phase 7 directory. The [detailed protocol](cubecl_kernels_perf_plan_phase7.md) retains the approved experimental design and acceptance rules.
 
-**Change.** A separate CUDA kernel, gated on `features.plane` and the queried `plane_size_min`, behind the same host signature. The per-query kernel remains the non-plane path.
-1. **Tiles.** One plane owns `PLANE_DIM` consecutive leaf-ordered queries. Each lane keeps its own query in registers (Phase 3) and its own register top-k (Phase 2).
-2. **Traversal.** Use a cube-uniform traversal stack in `Shared`:
-   - each lane computes `lower(q, node) <= worst(q)`;
-   - `plane_any` decides whether the tile visits the node;
-   - children are ordered by `plane_min` of the lower bounds.
+**Retained design.** Independent planes stage leaf-ordered padded rows, synchronize with `sync_plane`, and broadcast candidates to query lanes. F scans all candidates without tree traversal, retaining the Phase 1 output-backed heap and ordered scalar feature arithmetic. Original IDs/output rows and CPU C16 are unchanged. CUDA retains the per-query path below 16 features, above 32, on non-plane devices or with insufficient launch/shared-memory resources. This is pre-launch selection, not execution fallback. Checked live-buffer accounting includes tile-rounded leaf rows instead of padded data, padded bounds and diagnostics-only staging counters. Experimental arms/measurement overrides are removed in finalization; below-gate forcing is test-only.
 
-   Control flow is uniform, so `sync_cube()` is never inside a masked branch.
-3. **Candidate staging.** Stage leaf candidates in `Shared` in chunks of `PLANE_DIM × d_chunks` vectors (≤ 4 KB at 32×8×16 B):
-   - each lane loads one contiguous padded candidate row from leaf-packed storage;
-   - `sync_cube()`, then each lane computes in-order distances against every staged candidate (broadcast reads);
-   - `sync_cube()` again before the next overwrite (write-after-read).
-4. **Output.** Each lane writes its sorted top-k to `out[original_row]` once.
-5. **Diagnostics.** Counters now mean tile visits; document this in the diagnostics output.
-6. **Resources.** Size `Shared` against `max_shared_memory_size` on the host. Try multiple planes per cube to clear the 16-blocks/SM limit.
-7. **Later.** Double-buffering via `memcpy_async` is deferred until its API is verified in CubeCL 0.11.1.
-
-**Accept when** H1 passes on CUDA, which requires a GPU run because CPU tests never execute plane logic. H2/H3 must show a CUDA gain over the best of Phases 1–5 at both 20k and 50k, and full-fit CPU/CUDA label equality must be preserved.
+**Decision.** Packing-inclusive CUDA core improves **76.44755% at 50k×16** and **91.27385% at 300k×16**, with **8/8 paired gains** each. The selected eligibility path is the **large-size override**; standard eligibility also passes. No 50k regression is ignored and no judgment departure is used. S selected T2 (gate 8) and F2 (fixed gate 16); T2 is not retained. S is never pooled with acceptance A/B. Experimental timing is scoped to this host's prescribed cells; other new-arm sizes/30D are unmeasured except final integration correctness, not acceptance timing. Final 20k/100k integration passed with real CPU/CUDA label equality and `kd_neighbors_tile_kernel` counter-family evidence; run directories are `artifacts/hdbscan_stages/run-20000-bgHeQylR` and `artifacts/hdbscan_stages/run-100000-xQPWOUox`.
 
 ### Phase 8: Cleanup and documentation
+
+**Status:** planned; no Phase 8 execution or verification is claimed here.
 
 - Remove superseded kernel variants and the `#[cfg(test)]` reference entry point once its role is covered by the host oracle tests. No dead aliases.
 - Update `AGENTS.md`/`README.md` wherever they describe KD traversal, the device-tree layout or resource sizing.

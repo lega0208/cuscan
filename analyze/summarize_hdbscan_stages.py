@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from hdbscan_stages_common import route_kernel_families, uniform_route
+from hdbscan_stages_common import observed_kernel_families, uniform_route
 
 SCHEMA_VERSION = 1
 EXPECTED_CONFIG = {
@@ -551,7 +551,9 @@ def _validate_kernels(
     return sorted(clean, key=lambda item: item["seconds"], reverse=True), native, profiled, wall
 
 
-def _validate_counters(report: dict[str, Any], route: str) -> dict[str, dict[str, float]]:
+def _validate_counters(
+    report: dict[str, Any], route: str, families: tuple[str, str]
+) -> dict[str, dict[str, float]]:
     _require(
         report.get("route") == route,
         f"cuda_counters.route must match the benchmark CUDA route {route}",
@@ -559,7 +561,7 @@ def _validate_counters(report: dict[str, Any], route: str) -> dict[str, dict[str
     by_family = _object(report.get("kernels"), "cuda_counters.kernels")
     captures = _object(report.get("captures"), "cuda_counters.captures")
     output: dict[str, dict[str, float]] = {}
-    for family in route_kernel_families(route):
+    for family in families:
         _require(family in by_family, f"cuda_counters missing {family} record")
         record = _object(by_family[family], f"cuda_counters.{family}")
         capture = _object(captures.get(family), f"cuda_counters.captures.{family}")
@@ -676,7 +678,21 @@ def summarize_reports(
         route = uniform_route(search, "profiles.cuda.resolved_search_per_fit")
     except ValueError as error:
         raise ReportError(str(error)) from error
-    counter_values = _validate_counters(counters, route)
+    binary = counters.get("binary", {})
+    if route == "KdTree":
+        binary = _object(binary, "cuda_counters.binary")
+    families, family_evidence = observed_kernel_families(
+        route,
+        kernels,
+        benchmark,
+        {key: binary.get(key) for key in ("path", "sha256")},
+    )
+    if route == "KdTree":
+        _require(
+            counters.get("family_evidence") == family_evidence,
+            "cuda_counters family evidence does not match cuda_kernels",
+        )
+    counter_values = _validate_counters(counters, route, families)
 
     lines = [
         f"HDBSCAN stage analysis — {rows:,} rows x {workload['features']} features",
@@ -783,6 +799,8 @@ def summarize_reports(
     lines.append(
         "Representative NCU counters (first matching warmup launch; not measured-fit averages):"
     )
+    if family_evidence:
+        lines.append(f"  Selected neighbor family from cuda_kernels.json: {families[0]}")
     for family, values in counter_values.items():
         lines.append(
             f"  {family}: occupancy {values['occupancy']:.1f}%, SM {values['sm']:.1f}%, "
@@ -807,7 +825,7 @@ def summarize_reports(
             f"({_share(round_parts[winner], cuda['stages']['mst']):.1f}% of MST), "
             "not candidate generation alone."
         )
-    neighbor_family = route_kernel_families(route)[0]
+    neighbor_family = families[0]
     partial = counter_values[neighbor_family]
     if partial["occupancy"] < 10 and partial["sm"] < 10:
         conclusions.append(

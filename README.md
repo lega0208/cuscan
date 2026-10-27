@@ -594,6 +594,22 @@ with the original-row mapping available through `finite_index()`. Neighbors
 exclude self, use `-1` padding, and core distances include infinite padding.
 `dbscan_clustering(epsilon)` returns a `Result` and rejects NaN.
 
+KD neighbor implementation: CPU retains C16 leaf-packed SoA and leaf-block queries.
+On eligible CUDA devices, 16–32 features use a flat plane-cooperative scan with
+two planes per cube and no row-count gate. Below 16, above 32, without the required
+plane operations/synchronization, or with insufficient launch/shared-memory
+resources, CUDA uses the per-query kernel (pre-launch selection, not error recovery).
+Leaf order preserves original IDs and output rows; feature sums remain ordered.
+The per-call CUDA pack replaces padded data with tile-rounded padded leaf rows,
+retains padded bounds, and adds per-tile staging counters only with diagnostics.
+Estimator live-buffer accounting and allocation-limit checks follow that same
+plan; the public shape-only resource advisory is not a device-specific allocation
+guarantee. Flat-kernel diagnostics count zero node pops and n scanned positions
+per query including self; staged-position totals count copied candidates once per
+query tile, not evaluated pairs. See [Phase 7 results](hdbscan_perf_report.md#phase-7-results-cuda-flat-plane-kernel-f2-accepted)
+for measured scope and final-source verification receipts (passed).
+Independent review status/receipts are tracked separately in the Ultragoal ledger.
+
 `HdbscanConfig::mst_graph` (`MstGraph::{Auto, Complete, KnnGraph}`, default `Auto`) selects
 the graph and `knn_k` sets the kNN width; both are Rust-only fields except that Python
 exposes `knn_k`. `Auto` resolves to `KnnGraph` above 30 features and to `Complete` otherwise.

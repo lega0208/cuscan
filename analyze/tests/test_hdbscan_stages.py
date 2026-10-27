@@ -203,9 +203,13 @@ def manifest() -> dict[str, object]:
 
 
 def synthetic_reports(
-    candidate_seconds: float = 0.95, route: str = "BruteForce"
+    candidate_seconds: float = 0.95,
+    route: str = "BruteForce",
+    neighbor_family: str = "kd_neighbors_kernel",
 ) -> tuple[dict[str, Any], ...]:
     families = common_tools.route_kernel_families(route)
+    if route == "KdTree":
+        families = (neighbor_family, "kd_candidates_kernel")
     identity_fields = {
         "schema_version": 1,
         "run_id": "synthetic-run",
@@ -415,6 +419,16 @@ def synthetic_reports(
             for family in families
         },
     }
+    if route == "KdTree":
+        binary = {"path": "/synthetic/profile", "sha256": "b" * 64}
+        kernels["binary"] = binary
+        counters["binary"] = {**binary, "label": "current"}
+        native["resolved_search_per_fit"] = [route]
+        item = kernels["profiled_fit"]["kernels"][0]
+        item["family"] = neighbor_family
+        item["name"] = f"{neighbor_family}_synthetic_hash"
+        _, evidence = common_tools.observed_kernel_families(route, kernels, benchmark, binary)
+        counters["family_evidence"] = evidence
     return benchmark, kernels, counters
 
 
@@ -459,8 +473,64 @@ def test_route_kernel_families_cover_both_routes_and_reject_unknown() -> None:
         common_tools.route_kernel_families("Auto")
 
 
-def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel() -> None:
-    assert common_tools.route_kernel_families("KdTree")[0] == "kd_neighbors_kernel"
+@pytest.mark.parametrize("family", ["kd_neighbors_kernel", "kd_neighbors_tile_kernel"])
+def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel(family: str) -> None:
+    benchmark, kernels, counters = synthetic_reports(route="KdTree", neighbor_family=family)
+    families, evidence = common_tools.observed_kernel_families(
+        "KdTree", kernels, benchmark, kernels["binary"]
+    )
+    assert families == (family, "kd_candidates_kernel")
+    assert evidence["neighbor_family"] == family
+    assert f"Selected neighbor family from cuda_kernels.json: {family}" in summarize_reports(
+        benchmark, kernels, counters
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing", "ambiguous", "identity", "provenance", "binary", "route", "capture", "export"],
+)
+def test_observed_kd_families_reject_invalid_evidence(failure: str) -> None:
+    benchmark, kernels, _ = synthetic_reports(route="KdTree")
+    if failure == "missing":
+        kernels["profiled_fit"]["kernels"] = []
+    elif failure == "ambiguous":
+        kernels["profiled_fit"]["kernels"].append(
+            {
+                "family": "kd_neighbors_tile_kernel",
+                "name": "kd_neighbors_tile_kernel_hash",
+                "launch_count": 1,
+            }
+        )
+    elif failure == "identity":
+        kernels["run_id"] = "wrong-run"
+    elif failure == "provenance":
+        kernels["provenance"] = {"source": "wrong-source"}
+    elif failure == "binary":
+        kernels["binary"] = {"path": "/wrong", "sha256": "c" * 64}
+    elif failure in ("capture", "export"):
+        kernels[failure]["exit_status"] = 1
+    else:
+        kernels["profiled_fit"]["native_profile"]["resolved_search_per_fit"] = ["BruteForce"]
+    with pytest.raises(ValueError, match="cuda_kernels"):
+        common_tools.observed_kernel_families(
+            "KdTree",
+            kernels,
+            benchmark,
+            {"path": "/synthetic/profile", "sha256": "b" * 64},
+        )
+
+
+def test_observed_kd_families_require_kernel_report() -> None:
+    with pytest.raises(ValueError, match="cuda_kernels must be a JSON object"):
+        common_tools.observed_kernel_families("KdTree", None, {}, {})
+
+
+def test_summary_rejects_counter_family_evidence_mismatch() -> None:
+    reports = synthetic_reports(route="KdTree")
+    reports[2]["family_evidence"]["neighbor_family"] = "kd_neighbors_tile_kernel"
+    with pytest.raises(ValueError, match="family evidence"):
+        summarize_reports(*reports)
 
 
 @pytest.mark.parametrize("mismatch_source", ["manifest", "benchmark"])
@@ -703,6 +773,23 @@ def test_sqlite_kernel_aggregation_aligns_window_excludes_warmup_and_groups_geom
     assert kernels["partial_kernel_hash"]["family"] == "partial_kernel"
     assert kernels["tile_candidates_hash"]["launch_count"] == 1
     assert "future_kernel" not in kernels
+
+
+@pytest.mark.parametrize("family", ["pack_leaf_rows_kernel", "kd_neighbors_tile_kernel"])
+def test_sqlite_kernel_aggregation_recognizes_phase7_families(
+    tmp_path: Path,
+    family: str,
+) -> None:
+    import sqlite3
+
+    path = tmp_path / "phase7.sqlite"
+    synthetic_nsys_db(path)
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE StringIds SET value = ? WHERE id = 1", (f"{family}_hash",))
+    result = kernel_tools.aggregate_kernels(path, 1100, 1200)
+    matching = [row for row in result["kernels"] if row["family"] == family]
+    assert len(matching) == 1
+    assert matching[0]["launch_count"] == 2
 
 
 @pytest.mark.parametrize(

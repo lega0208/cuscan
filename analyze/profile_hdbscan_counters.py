@@ -19,7 +19,7 @@ from hdbscan_stages_common import (
     EXTENDED_ROWS,
     atomic_json,
     identity,
-    route_kernel_families,
+    observed_kernel_families,
     run_command,
     uniform_route,
     validate_min_samples,
@@ -356,6 +356,18 @@ def main() -> int:
     except (KeyError, TypeError) as error:
         raise ValueError("benchmark report lacks the CUDA resolved search route") from error
     route = uniform_route(cuda_routes, "benchmark CUDA resolved_search_per_fit")
+    kernel_report = None
+    if route == "KdTree":
+        kernel_path = args.run_dir / "cuda_kernels.json"
+        if not kernel_path.is_file():
+            raise ValueError("cuda_kernels.json is required to select observed KD kernels")
+        kernel_report = json.loads(kernel_path.read_text(encoding="utf-8"))
+    families, family_evidence = observed_kernel_families(
+        route,
+        kernel_report,
+        ident,
+        {key: binary_provenance[key] for key in ("path", "sha256")},
+    )
     reports: dict[str, Any] = {}
     captures: dict[str, Any] = {}
     version_stdout, version_stderr = raw / "ncu_version.stdout", raw / "ncu_version.stderr"
@@ -373,7 +385,7 @@ def main() -> int:
         "stdout": version_stdout.read_text(encoding="utf-8").strip(),
         "stderr": version_stderr.read_text(encoding="utf-8").strip(),
     }
-    for family in route_kernel_families(route):
+    for family in families:
         log, stdout, stderr, trace = _require_fresh_capture_paths(raw, family)
         command = [
             "ncu",
@@ -430,6 +442,7 @@ def main() -> int:
             **ident,
             "binary": binary_provenance,
             "route": route,
+            "family_evidence": family_evidence,
             "kernels": reports,
             "captures": captures,
             "profiler_tools": {"ncu": ncu_version},

@@ -8,7 +8,8 @@ pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
 #[cfg(test)]
 pub(crate) use kdtree::kd_padded_bytes;
 pub(crate) use kdtree::{
-    KdCandidateLayout, kd_neighbor_pack_bytes, kd_neighbor_plan, kd_padded_width,
+    KdCandidateLayout, kd_neighbor_pack_allocations, kd_neighbor_pack_bytes, kd_neighbor_plan,
+    kd_padded_width,
 };
 
 use burn::backend::{

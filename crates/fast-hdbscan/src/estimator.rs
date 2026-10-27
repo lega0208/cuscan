@@ -312,7 +312,7 @@ fn core_search_memory(
             .checked_add(core)
             .and_then(|v| v.checked_add(compact))
             .and_then(|v| v.checked_add(tree_bytes))
-            // Zero-padded data/bound copies live alongside the tree during neighbor search.
+            // The selected candidate pack and padded bounds coexist with the tree.
             .and_then(|v| v.checked_add(kd_pack_bytes)),
         HdbscanSearch::BruteForce | HdbscanSearch::Auto => {
             // Input/core, bounded query view, batch ID/distance outputs, extracted core and
@@ -1099,7 +1099,7 @@ impl HDBSCAN {
                     })
                 })?;
                 let DispatchDevice::Cube(cube_device) = device.as_dispatch();
-                let kd_plan = crate::kernels::kd_neighbor_plan(&cube_device.client());
+                let kd_plan = crate::kernels::kd_neighbor_plan(&cube_device.client(), features);
                 let kd_pack_bytes = host_tree.as_ref().map_or(Ok(0usize), |tree| {
                     crate::kernels::kd_neighbor_pack_bytes(kd_plan, n, tree.starts.len(), features)
                         .ok_or(HdbscanError::Overflow("KD-tree neighbor pack live bytes"))
@@ -1151,8 +1151,26 @@ impl HDBSCAN {
                     // Neighbor search packs 1D zero-padded copies (not row-pitched).
                     let padded_width = crate::kernels::kd_padded_width(features)
                         .ok_or(HdbscanError::Overflow("KD-tree padded width"))?;
+                    let [data_elements, staged_elements] =
+                        crate::kernels::kd_neighbor_pack_allocations(kd_plan, n, features)
+                            .ok_or(HdbscanError::Overflow("KD-tree neighbor pack allocations"))?;
+                    u32::try_from(data_elements)
+                        .map_err(|_| HdbscanError::Overflow("KD-tree packed data elements"))?;
+                    check_device_allocation(
+                        data_elements,
+                        4,
+                        allocation_limit,
+                        "KD-tree packed data allocation",
+                    )?;
+                    if staged_elements != 0 {
+                        check_device_allocation(
+                            staged_elements,
+                            4,
+                            allocation_limit,
+                            "KD-tree staged diagnostics allocation",
+                        )?;
+                    }
                     for (rows, subject) in [
-                        (n, "KD-tree padded data allocation"),
                         (
                             tree.starts.len(),
                             "KD-tree padded minimum-bounds allocation",
@@ -1494,11 +1512,14 @@ mod search_tests {
         assert_eq!(packed_kd.host_bytes, kd.host_bytes);
         let (device, _) = selected_device(BackendChoice::Cpu).unwrap();
         let DispatchDevice::Cube(cube_device) = device.as_dispatch();
-        let plan = crate::kernels::kd_neighbor_plan(&cube_device.client());
+        let plan = crate::kernels::kd_neighbor_plan(&cube_device.client(), 5);
         let cpu_pack = crate::kernels::kd_neighbor_pack_bytes(plan, 1000, 63, 5).unwrap();
         let expected_pack = 36_032
             + match plan.layout {
                 crate::kernels::KdCandidateLayout::PaddedRows => 0,
+                crate::kernels::KdCandidateLayout::LeafRows { .. } => {
+                    panic!("CPU selected tile pack")
+                }
                 crate::kernels::KdCandidateLayout::LeafSoa { lanes } => {
                     1000usize.div_ceil(lanes) * lanes * 6 * 4
                 }

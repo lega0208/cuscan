@@ -133,6 +133,8 @@ def aggregate_kernels(db_path: str | Path, start_ns: int, end_ns: int) -> dict[s
             continue
         geometry = {"block": [bx, by, bz], "grid": [gx, gy, gz]}
         known_families = (
+            "kd_neighbors_tile_kernel",
+            "pack_leaf_rows_kernel",
             "partial_kernel",
             "tile_candidates",
             "kd_neighbors_kernel",
@@ -306,6 +308,10 @@ def main() -> int:
         report_path,
         {
             **ident,
+            "binary": {
+                "path": str(args.binary.resolve(strict=True)),
+                "sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+            },
             "profiled_fit": {**attribution, "native_profile": profile},
             "capture": provenance,
             "export": export_provenance,

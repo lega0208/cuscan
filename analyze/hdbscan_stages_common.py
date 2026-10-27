@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
-# Row counts accepted by the standalone benchmark and counter tools. 200k/300k are for
-# baseline-only investigations; the integrated campaign script stays at 20k/50k/100k.
+# Standalone tools include Phase 7 experiments at 50k/300k and baseline investigations
+# at 200k/300k; the integrated campaign script stays at 20k/50k/100k.
 EXTENDED_ROWS = (20_000, 50_000, 100_000, 200_000, 300_000)
 
 
@@ -61,6 +61,71 @@ def uniform_route(routes: Any, context: str) -> str:
     route = routes[0]
     route_kernel_families(route)
     return route
+
+
+def observed_kernel_families(
+    route: str, report: Any, expected_identity: dict[str, Any], binary: Any
+) -> tuple[tuple[str, str], dict[str, Any]]:
+    """Select KD counters strictly from the same binary's measured Nsight capture."""
+    if route != "KdTree":
+        return route_kernel_families(route), {}
+    require_fields(report, ["profiled_fit", "capture", "export", "binary"], "cuda_kernels")
+    for field in ("schema_version", "run_id", "workload", "input_sha256", "provenance"):
+        if report.get(field) != expected_identity.get(field):
+            raise ValueError(f"cuda_kernels identity mismatch for {field}")
+    if (
+        not isinstance(binary, dict)
+        or not isinstance(binary.get("path"), str)
+        or not binary["path"]
+        or not isinstance(binary.get("sha256"), str)
+        or len(binary["sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in binary["sha256"])
+        or report["binary"] != binary
+    ):
+        raise ValueError("cuda_kernels binary provenance mismatch")
+    capture = report["capture"]
+    if not isinstance(capture, dict) or (
+        capture.get("exit_status") != 0 or capture.get("timed_out") is not False
+    ):
+        raise ValueError("cuda_kernels capture did not complete successfully")
+    export = report["export"]
+    if not isinstance(export, dict) or (
+        export.get("exit_status") != 0 or export.get("timed_out") is not False
+    ):
+        raise ValueError("cuda_kernels export did not complete successfully")
+    profiled = report["profiled_fit"]
+    require_fields(profiled, ["native_profile", "kernels"], "cuda_kernels.profiled_fit")
+    native = profiled["native_profile"]
+    if not isinstance(native, dict) or native.get("resolved_search_per_fit") != [route]:
+        raise ValueError("cuda_kernels measured route does not match benchmark route")
+    rows = profiled["kernels"]
+    if not isinstance(rows, list):
+        raise ValueError("cuda_kernels measured kernels must be an array")
+    choices = {"kd_neighbors_kernel", "kd_neighbors_tile_kernel"}
+    observed = [row for row in rows if isinstance(row, dict) and row.get("family") in choices]
+    families = {row["family"] for row in observed}
+    if len(families) != 1:
+        raise ValueError(
+            "cuda_kernels needs exactly one observed KD neighbor family (missing or ambiguous)"
+        )
+    for row in observed:
+        count = row.get("launch_count")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count <= 0
+            or not isinstance(row.get("name"), str)
+            or row["family"] not in row["name"]
+        ):
+            raise ValueError("cuda_kernels KD family lacks valid measured launch evidence")
+    family = next(iter(families))
+    evidence = {
+        "source": "cuda_kernels.json",
+        "neighbor_family": family,
+        "kernel_names": sorted({row["name"] for row in observed}),
+        "launch_count": sum(row["launch_count"] for row in observed),
+    }
+    return (family, "kd_candidates_kernel"), evidence
 
 
 def validate_min_samples(identity_data: Any, benchmark: Any, requested: int) -> None:
