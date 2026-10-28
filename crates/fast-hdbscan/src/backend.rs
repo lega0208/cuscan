@@ -30,6 +30,30 @@ pub struct DeviceKdTree<B: Backend> {
     pub n_features: usize,
 }
 
+/// Call-local prepared KD reference reused by query/reference searches.
+///
+/// Built once by [`HdbscanOps::prepare_kd_reference`] from compact reference
+/// rows and their tree; every bounded query batch clones this value instead of
+/// repacking. `padded_data` holds `rows * 4⌈n_features/4⌉` zero-padded
+/// reference values and `padded_min`/`padded_max` hold `nodes` padded bounds.
+/// The tree preconditions of [`DeviceKdTree`] apply to the source data/tree.
+/// Drop the value at the end of the call to release its device allocations.
+#[derive(Clone, ExtensionType)]
+#[extension_type(fusion)]
+pub struct DeviceKdReference<B: Backend> {
+    pub padded_data: FloatTensor<B>,
+    pub padded_min: FloatTensor<B>,
+    pub padded_max: FloatTensor<B>,
+    pub indices: IntTensor<B>,
+    pub starts: IntTensor<B>,
+    pub ends: IntTensor<B>,
+    pub is_leaf: IntTensor<B>,
+    pub rows: usize,
+    pub nodes: usize,
+    pub n_levels: usize,
+    pub n_features: usize,
+}
+
 /// Backend operation used to find each point's exact outgoing Borůvka edge.
 #[backend_extension(Cube, Fusion)]
 pub trait HdbscanOps: Backend {
@@ -91,6 +115,61 @@ pub trait HdbscanOps: Backend {
         data: FloatTensor<Self>,
         #[extension_type] tree: DeviceKdTree<Self>,
         k: u32,
+    ) -> (IntTensor<Self>, FloatTensor<Self>);
+
+    #[fusion(meta = |data, tree| {
+        let rows = data.shape[0];
+        let features = data.shape[1];
+        let nodes = tree.starts.shape[0];
+        let width = features.div_ceil(4) * 4;
+        let float = |len: usize| {
+            burn::backend::fusion::custom::TensorSpec::new([len].into(), data.dtype)
+        };
+        DeviceKdReferenceMetadata {
+            padded_data: float(rows * width),
+            padded_min: float(nodes * width),
+            padded_max: float(nodes * width),
+            indices: tree.indices.clone(),
+            starts: tree.starts.clone(),
+            ends: tree.ends.clone(),
+            is_leaf: tree.is_leaf.clone(),
+            rows,
+            nodes,
+            n_levels: tree.n_levels,
+            n_features: features,
+        }
+    })]
+    /// Validates shapes/dtypes and packs compact reference rows and tree bounds
+    /// once for repeated [`HdbscanOps::exact_neighbors_kd_query`] batches. The
+    /// tree-content preconditions on [`DeviceKdTree`] are not checked.
+    fn prepare_kd_reference(
+        data: FloatTensor<Self>,
+        #[extension_type] tree: DeviceKdTree<Self>,
+    ) -> DeviceKdReference<Self>;
+
+    #[fusion(meta = |query, reference, k, exclude_self, query_offset| {
+        let shape = [query.shape[0], *k as usize];
+        (
+            burn::backend::fusion::custom::TensorSpec::new(
+                shape.into(),
+                burn::tensor::DType::I32,
+            ),
+            burn::backend::fusion::custom::TensorSpec::new(shape.into(), query.dtype),
+        )
+    })]
+    /// Exact squared-distance neighbors of each `query` row among the prepared
+    /// reference rows, ordered by `(distance², reference ID)` and returned in
+    /// query row order with shape `[query rows, k]`. Absent slots are padded
+    /// with `(inf, reference rows)`. With `exclude_self`, query row `r` skips
+    /// reference ID `query_offset + r`; identical coordinates are never
+    /// excluded by value. Always uses bounds-pruned per-query traversal; nodes
+    /// whose bound equals the current worst distance are still visited.
+    fn exact_neighbors_kd_query(
+        query: FloatTensor<Self>,
+        #[extension_type] reference: DeviceKdReference<Self>,
+        k: u32,
+        exclude_self: bool,
+        query_offset: u32,
     ) -> (IntTensor<Self>, FloatTensor<Self>);
 
     #[fusion(meta = |data, core_sq, point_components, tree, reproducible| {

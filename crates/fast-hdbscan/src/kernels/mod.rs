@@ -9,7 +9,7 @@ pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
 pub(crate) use kdtree::kd_padded_bytes;
 pub(crate) use kdtree::{
     KdCandidateLayout, kd_neighbor_pack_allocations, kd_neighbor_pack_bytes, kd_neighbor_plan,
-    kd_padded_width,
+    kd_padded_width, kd_query_pack_bytes, kd_reference_pack_bytes,
 };
 
 use burn::backend::{
@@ -68,6 +68,23 @@ impl crate::backend::HdbscanOps for CubeBackend {
         k: u32,
     ) -> (IntTensor<Self>, FloatTensor<Self>) {
         kdtree::exact_neighbors_kd(data, tree, k)
+    }
+
+    fn prepare_kd_reference(
+        data: FloatTensor<Self>,
+        tree: crate::backend::DeviceKdTree<Self>,
+    ) -> crate::backend::DeviceKdReference<Self> {
+        kdtree::prepare_kd_reference(data, tree)
+    }
+
+    fn exact_neighbors_kd_query(
+        query: FloatTensor<Self>,
+        reference: crate::backend::DeviceKdReference<Self>,
+        k: u32,
+        exclude_self: bool,
+        query_offset: u32,
+    ) -> (IntTensor<Self>, FloatTensor<Self>) {
+        kdtree::exact_neighbors_kd_query(query, reference, k, exclude_self, query_offset)
     }
 
     fn boruvka_candidates_kd(

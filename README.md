@@ -493,6 +493,10 @@ from fast_umap import HDBSCAN
 model = HDBSCAN(min_cluster_size=5, backend="cpu").fit(X)
 labels = model.labels_
 cut_labels = model.dbscan_clustering(0.5)
+new_labels, strengths = model.approximate_predict(X_new)
+new_labels, strengths, connecting_rows = model.approximate_predict(
+    X_new, return_connecting_points=True
+)
 ```
 
 `backend="auto"` chooses usable CUDA when available, otherwise CPU; explicit
@@ -541,6 +545,59 @@ Arrays are independent copies of the Rust-owned fitted snapshot. Probabilities
 are float32 for finite input and float64 when nonfinite rows are remapped,
 matching upstream. Trees are raw NumPy arrays, not plotting wrapper objects.
 Failed refits preserve the previous fitted snapshot and its DBSCAN cuts.
+
+#### Predicting into fitted clusters
+
+`approximate_predict` assigns each query independently to the existing fitted
+hierarchy; it never refits, discovers clusters, or uses other queries as neighbors.
+Every fit retains prediction data automatically. Labels and optional connectors
+are newly owned `np.intp` arrays; strengths are float64. Connectors identify original
+training rows selected by minimum mutual reachability, not necessarily Euclidean
+nearest neighbors. Noise after a real search still has a valid connector.
+
+Prediction supports only finite, nonempty Euclidean feature matrices with the
+fitted feature width. It uses the concrete CPU/CUDA backend chosen by fit, strictly
+without execution fallback, regardless of later constructor-attribute changes.
+All fitting routes, including ANN fitting, use exact bounds-pruned KD search for
+prediction. Prediction cores include self at rank `min_samples - 1`; query cores
+use rank `min_samples`. Consequently, predicting training coordinates need not
+reproduce `probabilities_`. Nonempty cluster trees require at least
+`2 * min_samples` finite training rows; unsupported widths raise an error rather
+than being clamped. Nonfinite training rows remain excluded and connectors are
+mapped back to original row IDs.
+
+Models retain compact float32 geometry (`4*n*d` bytes), hierarchy metadata and
+host KD trees built during fitting. Other routes build their host tree lazily.
+The first prediction additionally computes and caches `8*n` bytes of float64
+prediction cores; repeated calls reuse immutable host caches. Each call uploads
+the reference coordinates/tree and prepares reference packs once, reuses them
+across bounded core/query batches, and releases device buffers on return or error.
+There is no persistent device cache or full pairwise-distance matrix. Warm calls
+still pay upload, packing and readback costs. Cold tree construction and exact
+core searches can be expensive: worst-case all-training KD search is quadratic,
+and external queries can cost `O(m*n*d)`, especially in high dimensions or with
+duplicates. Fit-only resource estimates do not cover lazy prediction peaks.
+
+The algorithm follows original Python `hdbscan.approximate_predict`, not the
+separate `fast_hdbscan` package. Geometry/distance arithmetic is float32 here,
+versus the reference's float64; ties use deterministic distance/point-ID ordering,
+not a promise of reference connector identity at numerical boundaries. Lambda
+and strength arithmetic is float64. Upstream quirks are preserved: duplicate
+queries can have zero strength when a cluster maximum lambda is infinite;
+root-only/empty cluster-edge trees warn once and return noise, zero strengths and
+`-1` connectors; label-derived anchors can leave a sibling unmapped when a selected
+ancestor has no direct point rows.
+
+Prediction reads an authoritative immutable complete fit snapshot. Public mutable
+Rust fields and Python arrays are detached views: editing them changes neither
+prediction nor the canonical state intended for future export. Clones share
+immutable host data and synchronized caches. Persistence is not implemented by
+this feature. The private host-state boundary separates canonical results from
+runtime locks/devices; future save must prepare a valid host KD tree and required
+cores even before the first prediction, and must reject unsupported prediction
+widths. Shortcut models instead record cores as not required. Future loading must
+validate host topology/state and choose the runtime backend independently of
+training provenance; no public save/load stub is provided.
 
 Before a kNN-route fit, `fast_umap.HDBSCAN` calls the native shape-only estimator with the
 finite-row count, feature count and the same configuration, then emits one `UserWarning` when any

@@ -1,5 +1,5 @@
 //! Set `FAST_HDBSCAN_KD_DIAGNOSTICS=1` to emit counters when built with `tracing`.
-use crate::backend::DeviceKdTree;
+use crate::backend::{DeviceKdReference, DeviceKdTree};
 use burn::{
     backend::{
         TensorMetadata,
@@ -341,6 +341,7 @@ fn chunk_box_bound<F: Float>(
 #[cube]
 fn point_distance<F: Float>(
     data_v: &Tensor<KdVector<F>>,
+    query_v: &Tensor<KdVector<F>>,
     query: &Array<KdVector<F>>,
     row: usize,
     candidate: usize,
@@ -367,7 +368,7 @@ fn point_distance<F: Float>(
     } else {
         for chunk in 0..d_chunks {
             distance = chunk_distance::<F>(
-                data_v[row * d_chunks + chunk],
+                query_v[row * d_chunks + chunk],
                 data_v[candidate * d_chunks + chunk],
                 distance,
                 4usize,
@@ -381,7 +382,7 @@ fn point_distance<F: Float>(
 fn padded_box_lower_bound<F: Float>(
     bounds_min_v: &Tensor<KdVector<F>>,
     bounds_max_v: &Tensor<KdVector<F>>,
-    data_v: &Tensor<KdVector<F>>,
+    query_v: &Tensor<KdVector<F>>,
     query: &Array<KdVector<F>>,
     row: usize,
     node: usize,
@@ -411,7 +412,7 @@ fn padded_box_lower_bound<F: Float>(
     } else {
         for chunk in 0..d_chunks {
             sum = chunk_box_bound::<F>(
-                data_v[row * d_chunks + chunk],
+                query_v[row * d_chunks + chunk],
                 bounds_min_v[node * d_chunks + chunk],
                 bounds_max_v[node * d_chunks + chunk],
                 sum,
@@ -831,6 +832,7 @@ fn kd_neighbors_reference_kernel<F: Float, I: Int>(
 #[cube(launch)]
 fn kd_neighbors_kernel<F: Float, I: Int>(
     data_v: &Tensor<KdVector<F>>,
+    query_v: &Tensor<KdVector<F>>,
     indices: &Tensor<I>,
     starts: &Tensor<I>,
     ends: &Tensor<I>,
@@ -841,18 +843,23 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
     n: u32,
     k: u32,
     d_chunks: u32,
+    query_offset: u32,
     #[comptime] reg_features: usize,
     #[comptime] diagnostics_enabled: bool,
+    #[comptime] exclude_self: bool,
     out_indices: &mut Tensor<I>,
     out_distances: &mut Tensor<F>,
     diagnostics: &mut Tensor<I>,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
+    // `row_count` query rows of `query_v` search `n` reference rows of `data_v`.
+    // The excluded self ID is `query_offset + row`; value equality is never identity.
     let mut local_row = ABSOLUTE_POS_X as usize;
     let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
     while local_row < row_count as usize {
-        if local_row < n as usize {
+        {
             let row = local_row;
+            let self_id = row + query_offset as usize;
             let n = n as usize;
             let d_chunks = d_chunks as usize;
             let width = k as usize;
@@ -867,11 +874,11 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
             let mut bound_stack = Array::<F>::new(KD_STACK_LEN);
             stack[0] = 0;
             let mut query = Array::<KdVector<F>>::new(comptime![reg_features.div_ceil(4).max(1)]);
-            load_query::<F>(data_v, row, d_chunks, &mut query, reg_features);
+            load_query::<F>(query_v, row, d_chunks, &mut query, reg_features);
             bound_stack[0] = padded_box_lower_bound::<F>(
                 bounds_min_v,
                 bounds_max_v,
-                data_v,
+                query_v,
                 &query,
                 row,
                 0,
@@ -897,9 +904,10 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                                 leaf_positions_scanned += 1i32;
                             }
                             let candidate = u32::cast_from(indices[position]) as usize;
-                            if candidate != row {
+                            if !exclude_self || candidate != self_id {
                                 let distance = point_distance::<F>(
                                     data_v,
+                                    query_v,
                                     &query,
                                     row,
                                     candidate,
@@ -964,7 +972,7 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                         let left_bound = padded_box_lower_bound::<F>(
                             bounds_min_v,
                             bounds_max_v,
-                            data_v,
+                            query_v,
                             &query,
                             row,
                             left,
@@ -974,7 +982,7 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
                         let right_bound = padded_box_lower_bound::<F>(
                             bounds_min_v,
                             bounds_max_v,
-                            data_v,
+                            query_v,
                             &query,
                             row,
                             right,
@@ -1811,6 +1819,223 @@ pub(super) fn exact_neighbors_kd(
     (output_indices, output_distances)
 }
 
+/// Launch plan of every query/reference search: bounds-pruned per-query traversal
+/// over padded rows. Exhaustive F2 tiles and CPU leaf-SoA blocks stay exclusive to
+/// the fitting self-query entry point; this is a fixed choice, not a fallback.
+pub(crate) const fn kd_query_plan() -> KdNeighborPlan {
+    KdNeighborPlan {
+        layout: KdCandidateLayout::PaddedRows,
+        order: KdQueryOrder::Cyclic,
+    }
+}
+
+/// Device bytes of one prepared reference pack (padded rows and bounds).
+pub(crate) fn kd_reference_pack_bytes(rows: usize, nodes: usize, features: usize) -> Option<usize> {
+    kd_padded_bytes(rows, nodes, features)
+}
+
+/// Live device bytes of one query batch: padded query copy, `[rows, k]` outputs
+/// and the diagnostics allocation.
+pub(crate) fn kd_query_pack_bytes(query_rows: usize, features: usize, k: usize) -> Option<usize> {
+    let diagnostics = if kd_diagnostics_enabled() {
+        query_rows.checked_mul(8)?
+    } else {
+        4
+    };
+    query_rows
+        .checked_mul(kd_padded_width(features)?)?
+        .checked_mul(4)?
+        .checked_add(query_rows.checked_mul(k)?.checked_mul(8)?)?
+        .checked_add(diagnostics)
+}
+
+pub(super) fn prepare_kd_reference(
+    data: FloatTensor<CubeBackend>,
+    tree: DeviceKdTree<CubeBackend>,
+) -> DeviceKdReference<CubeBackend> {
+    let data = into_contiguous(data);
+    let tree = into_contiguous_tree(tree);
+    validate_tree(&data, &tree);
+    let [rows, features] = data.shape().dims::<2>();
+    let [nodes] = tree.starts.shape().dims::<1>();
+    u32::try_from(rows).expect("KD reference rows must fit u32");
+    DeviceKdReference {
+        padded_data: pad_rows(&data, rows, features),
+        padded_min: pad_rows(&tree.bounds_min, nodes, features),
+        padded_max: pad_rows(&tree.bounds_max, nodes, features),
+        indices: tree.indices,
+        starts: tree.starts,
+        ends: tree.ends,
+        is_leaf: tree.is_leaf,
+        rows,
+        nodes,
+        n_levels: tree.n_levels,
+        n_features: features,
+    }
+}
+
+pub(super) fn exact_neighbors_kd_query(
+    query: FloatTensor<CubeBackend>,
+    reference: DeviceKdReference<CubeBackend>,
+    k: u32,
+    exclude_self: bool,
+    query_offset: u32,
+) -> (IntTensor<CubeBackend>, FloatTensor<CubeBackend>) {
+    let diagnostics_enabled = kd_diagnostics_enabled();
+    let nodes = reference.nodes;
+    let (output_indices, output_distances, diagnostics) = launch_kd_query(
+        query,
+        reference,
+        k,
+        exclude_self,
+        query_offset,
+        diagnostics_enabled,
+        KD_NEIGHBORS_CUBE_DIM.x,
+        None,
+    );
+    if diagnostics_enabled {
+        let rows = output_indices.shape().dims::<2>()[0];
+        emit_kd_diagnostics("kd_neighbors_query", diagnostics, rows, nodes);
+    }
+    (output_indices, output_distances)
+}
+
+fn validate_reference(reference: &DeviceKdReference<CubeBackend>) {
+    let rows = reference.rows;
+    let nodes = reference.nodes;
+    let width = kd_padded_width(reference.n_features).expect("KD padded width overflow");
+    assert!(
+        rows > 0 && reference.n_features > 0,
+        "KD reference must be non-empty"
+    );
+    i32::try_from(rows).expect("KD reference rows must fit destination indices");
+    i32::try_from(nodes).expect("KD node count must fit diagnostic counters");
+    for (tensor, len, name) in [
+        (&reference.padded_data, rows * width, "padded data"),
+        (
+            &reference.padded_min,
+            nodes * width,
+            "padded minimum bounds",
+        ),
+        (
+            &reference.padded_max,
+            nodes * width,
+            "padded maximum bounds",
+        ),
+    ] {
+        assert_eq!(tensor.dtype, DType::F32, "KD reference {name} must be f32");
+        assert_eq!(
+            tensor.shape().dims::<1>(),
+            [len],
+            "KD reference {name} size"
+        );
+    }
+    for (tensor, len, name) in [
+        (&reference.indices, rows, "indices"),
+        (&reference.starts, nodes, "starts"),
+        (&reference.ends, nodes, "ends"),
+        (&reference.is_leaf, nodes, "leaf flags"),
+    ] {
+        assert_eq!(tensor.dtype, DType::I32, "KD reference {name} must be i32");
+        assert_eq!(
+            tensor.shape().dims::<1>(),
+            [len],
+            "KD reference {name} size"
+        );
+    }
+    assert!(
+        reference.n_levels < KD_STACK_LEN,
+        "KD tree exceeds fixed traversal stack"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_kd_query(
+    query: FloatTensor<CubeBackend>,
+    reference: DeviceKdReference<CubeBackend>,
+    k: u32,
+    exclude_self: bool,
+    query_offset: u32,
+    diagnostics_enabled: bool,
+    preferred_width: u32,
+    max_cubes_override: Option<u32>,
+) -> (
+    IntTensor<CubeBackend>,
+    FloatTensor<CubeBackend>,
+    IntTensor<CubeBackend>,
+) {
+    let query = into_contiguous(query);
+    let reference = DeviceKdReference {
+        padded_data: into_contiguous(reference.padded_data),
+        padded_min: into_contiguous(reference.padded_min),
+        padded_max: into_contiguous(reference.padded_max),
+        indices: into_contiguous(reference.indices),
+        starts: into_contiguous(reference.starts),
+        ends: into_contiguous(reference.ends),
+        is_leaf: into_contiguous(reference.is_leaf),
+        ..reference
+    };
+    validate_reference(&reference);
+    let [rows, features] = query.shape().dims::<2>();
+    assert_eq!(query.dtype, DType::F32, "KD queries must be f32");
+    assert_eq!(
+        features, reference.n_features,
+        "KD query feature count mismatch"
+    );
+    assert!(rows > 0, "KD query batch must be non-empty");
+    assert!(k > 0, "KD neighbor count must be positive");
+    let rows_u32 = u32::try_from(rows).expect("KD query rows must fit u32");
+    query_offset
+        .checked_add(rows_u32)
+        .expect("KD query offset range must fit u32");
+    let output_len = rows
+        .checked_mul(k as usize)
+        .expect("KD neighbor output size overflow");
+    let output_indices = allocate_int_2d(&query, rows, k as usize, output_len);
+    let output_distances = allocate_float_2d(&query, rows, k as usize, output_len);
+    let diagnostics = allocate_diagnostics(&query, rows, diagnostics_enabled);
+    let client = query.client.clone();
+    let (d_chunks, reg_features) = kd_vector_chunks(features);
+    // Fixed pruned-traversal plan: never the fitting F2 or leaf-SoA specializations.
+    assert_eq!(kd_query_plan().layout, KdCandidateLayout::PaddedRows);
+    let query_padded = pad_rows(&query, rows, features);
+    let (cube_count, dim) = kd_launch_geometry_with_width(
+        &client,
+        rows,
+        CubeDim::new_1d(preferred_width),
+        max_cubes_override,
+    );
+    kd_neighbors_kernel::launch(
+        &client,
+        cube_count,
+        dim,
+        padded_vector_view(&reference.padded_data, reference.rows, d_chunks),
+        padded_vector_view(&query_padded, rows, d_chunks),
+        reference.indices.clone().into_tensor_arg(),
+        reference.starts.clone().into_tensor_arg(),
+        reference.ends.clone().into_tensor_arg(),
+        reference.is_leaf.clone().into_tensor_arg(),
+        padded_vector_view(&reference.padded_min, reference.nodes, d_chunks),
+        padded_vector_view(&reference.padded_max, reference.nodes, d_chunks),
+        rows_u32,
+        u32::try_from(reference.rows).expect("validated KD reference rows"),
+        k,
+        u32::try_from(d_chunks).expect("KD feature chunk count must fit u32"),
+        query_offset,
+        reg_features,
+        diagnostics_enabled,
+        exclude_self,
+        output_indices.clone().into_tensor_arg(),
+        output_distances.clone().into_tensor_arg(),
+        diagnostics.clone().into_tensor_arg(),
+        [
+            dtype_to_storage_type(DType::F32),
+            dtype_to_storage_type(DType::I32),
+        ],
+    );
+    (output_indices, output_distances, diagnostics)
+}
+
 fn launch_kd_neighbors(
     data: FloatTensor<CubeBackend>,
     tree: DeviceKdTree<CubeBackend>,
@@ -2033,6 +2258,7 @@ fn launch_kd_neighbors_impl(
         cube_count,
         dim,
         padded_vector_view(&data_padded, n, d_chunks),
+        padded_vector_view(&data_padded, n, d_chunks),
         tree.indices.clone().into_tensor_arg(),
         tree.starts.clone().into_tensor_arg(),
         tree.ends.clone().into_tensor_arg(),
@@ -2043,8 +2269,10 @@ fn launch_kd_neighbors_impl(
         u32::try_from(n).expect("validated KD row count"),
         k,
         u32::try_from(d_chunks).expect("KD feature chunk count must fit u32"),
+        0,
         reg_features,
         diagnostics_enabled,
+        true,
         output_indices.clone().into_tensor_arg(),
         output_distances.clone().into_tensor_arg(),
         diagnostics.clone().into_tensor_arg(),
@@ -2907,6 +3135,170 @@ mod tests {
         (data, tree)
     }
 
+    fn brute_query(
+        query: &[f32],
+        reference: &[f32],
+        features: usize,
+        k: usize,
+        exclude_offset: Option<usize>,
+    ) -> (Vec<i32>, Vec<u32>) {
+        let rows = query.len() / features;
+        let n = reference.len() / features;
+        let mut ids = vec![n as i32; rows * k];
+        let mut distances = vec![f32::INFINITY.to_bits(); rows * k];
+        for row in 0..rows {
+            let mut candidates = (0..n)
+                .filter(|&c| exclude_offset.is_none_or(|offset| c != offset + row))
+                .map(|c| {
+                    let distance = (0..features).fold(0.0f32, |sum, f| {
+                        let delta = query[row * features + f] - reference[c * features + f];
+                        sum + delta * delta
+                    });
+                    (distance, c as i32)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (slot, (distance, id)) in candidates.into_iter().take(k).enumerate() {
+                ids[row * k + slot] = id;
+                distances[row * k + slot] = distance.to_bits();
+            }
+        }
+        (ids, distances)
+    }
+
+    fn check_query_routes(device: &CubeDevice) {
+        // The query plan never adopts the fitting F2 or leaf-SoA routes, even at
+        // widths where the fitting plan does.
+        assert_eq!(
+            kd_query_plan(),
+            KdNeighborPlan {
+                layout: KdCandidateLayout::PaddedRows,
+                order: KdQueryOrder::Cyclic,
+            }
+        );
+        for features in [2usize, 16, 30, 33] {
+            let n = 203usize;
+            // Eighth-quantized values keep every squared sum exact, so the host
+            // oracle is bit-comparable regardless of device contraction.
+            let quantize = |v: Vec<f32>| {
+                v.into_iter()
+                    .map(|x| (x * 8.0).round() / 8.0)
+                    .collect::<Vec<_>>()
+            };
+            let values = quantize(splitmix_values(n, features));
+            let (data, tree) = make_neighbor_inputs(&values, n, features, device);
+            let fitting_plan = kd_neighbor_plan(&data.client, features);
+            if data.client.properties().hardware.num_cpu_cores.is_some() {
+                assert_eq!(fitting_plan.order, KdQueryOrder::LeafBlocks);
+            }
+            let reference = prepare_kd_reference(data.clone(), tree);
+            let rows = 71usize;
+            let query_values = quantize(
+                splitmix_values(rows + 5, features)[5 * features..]
+                    .iter()
+                    .map(|x| x * 0.75 + 0.3)
+                    .collect(),
+            );
+            let query = CubeBackend::float_from_data(
+                TensorData::new(query_values.clone(), [rows, features]),
+                device,
+            );
+            let k = 9usize;
+            let expected = brute_query(&query_values, &values, features, k, None);
+            for (width, cap) in [(64u32, None), (32, Some(1u32)), (1, Some(3))] {
+                for diagnostics in [false, true] {
+                    let (ids, distances, counters) = launch_kd_query(
+                        query.clone(),
+                        reference.clone(),
+                        k as u32,
+                        false,
+                        0,
+                        diagnostics,
+                        width,
+                        cap,
+                    );
+                    let ids = into_data_sync(ids).try_to_vec::<i32>().unwrap();
+                    let distances = into_data_sync(distances)
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>();
+                    assert_eq!((ids, distances), expected, "d={features} width={width}");
+                    if diagnostics {
+                        let counters = into_data_sync(counters).try_to_vec::<i32>().unwrap();
+                        assert_eq!(counters.len(), rows * 2);
+                        // Pruning must skip leaf positions; exhaustive F2 would scan all n.
+                        let scanned = counters.chunks(2).map(|c| c[1] as usize).sum::<usize>();
+                        assert!(counters.chunks(2).all(|c| c[0] > 0));
+                        // Per-row node counters exist only on the traversal kernel (F2 writes
+                        // per-tile staging instead); low-dimensional data must also prune.
+                        assert!(scanned <= rows * n);
+                        if features == 2 {
+                            assert!(scanned < rows * n, "d={features} must prune leaves");
+                        }
+                    }
+                }
+            }
+            // Self exclusion uses explicit offsets, matching the fitting self query.
+            let offset = 40usize;
+            let batch = CubeBackend::float_from_data(
+                TensorData::new(
+                    values[offset * features..(offset + rows) * features].to_vec(),
+                    [rows, features],
+                ),
+                device,
+            );
+            let (fit_ids, fit_distances) = exact_neighbors_kd(
+                data.clone(),
+                make_neighbor_inputs(&values, n, features, device).1,
+                k as u32,
+            );
+            let fit_ids = into_data_sync(fit_ids).try_to_vec::<i32>().unwrap();
+            let fit_distances = into_data_sync(fit_distances)
+                .try_to_vec::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            let (ids, distances) =
+                exact_neighbors_kd_query(batch, reference, k as u32, true, offset as u32);
+            let ids = into_data_sync(ids).try_to_vec::<i32>().unwrap();
+            let distances = into_data_sync(distances)
+                .try_to_vec::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, fit_ids[offset * k..(offset + rows) * k]);
+            assert_eq!(distances, fit_distances[offset * k..(offset + rows) * k]);
+        }
+    }
+
+    #[test]
+    fn kd_query_pruned_routes_cpu() {
+        check_query_routes(&CubeDevice::Cpu(Default::default()));
+    }
+
+    #[test]
+    fn kd_query_pruned_routes_cuda() {
+        let Some(device) = phase7_cuda() else { return };
+        check_query_routes(&device);
+    }
+
+    #[test]
+    fn kd_query_sizing_checked() {
+        assert_eq!(kd_reference_pack_bytes(10, 3, 5), kd_padded_bytes(10, 3, 5));
+        let diagnostics = if kd_diagnostics_enabled() { 7 * 8 } else { 4 };
+        assert_eq!(
+            kd_query_pack_bytes(7, 5, 3),
+            Some(7 * 8 * 4 + 7 * 3 * 8 + diagnostics)
+        );
+        assert_eq!(kd_query_pack_bytes(usize::MAX, 5, 3), None);
+        assert_eq!(kd_query_pack_bytes(7, usize::MAX, 3), None);
+        assert_eq!(kd_query_pack_bytes(7, 5, usize::MAX), None);
+    }
+
     fn check_kd_neighbors_match_reference(device: &CubeDevice) {
         let mut cases = Vec::new();
         for features in [2, 16, 30] {
@@ -3480,6 +3872,7 @@ mod tests {
                 cube_count.clone(),
                 dim,
                 padded_vector_view(&input_padded, rows, d_chunks),
+                padded_vector_view(&input_padded, rows, d_chunks),
                 indices.clone().into_tensor_arg(),
                 starts.clone().into_tensor_arg(),
                 ends.clone().into_tensor_arg(),
@@ -3490,8 +3883,10 @@ mod tests {
                 rows as u32,
                 k as u32,
                 d_chunks as u32,
+                0,
                 reg_features,
                 diagnostics_enabled,
+                true,
                 output_indices.clone().into_tensor_arg(),
                 output_distances.clone().into_tensor_arg(),
                 diagnostics.clone().into_tensor_arg(),

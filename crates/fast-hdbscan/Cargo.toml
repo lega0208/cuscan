@@ -33,6 +33,10 @@ tempfile = { workspace = true }
 name = "profile_hdbscan_stages"
 required-features = ["tracing"]
 
+[[example]]
+name = "profile_hdbscan_prediction"
+required-features = ["tracing"]
+
 [[bench]]
 name = "hdbscan_cpu"
 harness = false

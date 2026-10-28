@@ -4,9 +4,9 @@ use fast_hdbscan::{
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
-use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyList};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyTuple};
 
 #[pyclass(frozen, unsendable)]
 pub(crate) struct FittedHDBSCAN {
@@ -138,6 +138,115 @@ impl FittedHDBSCAN {
             .map(i64::from)
             .collect::<Vec<_>>()
             .into_pyarray(py))
+    }
+
+    /// Predicts fixed fitted clusters for new float32 rows (original hdbscan `approximate_predict`).
+    ///
+    /// Returns `(labels, strengths)` or, with `return_connecting_points=True`,
+    /// `(labels, strengths, connecting_points)`. Labels and connectors are int64 (`np.intp`);
+    /// strengths are float64. A connector is the selected mutual-reachability neighbor, as an
+    /// original training-row index; it is -1 only on the no-cluster-tree shortcut, which also
+    /// emits exactly one `UserWarning` (at `stacklevel` relative to this call).
+    ///
+    /// The flag must be a Python `bool`; `None` and other truthy/falsy objects are rejected.
+    #[pyo3(
+        signature = (x, return_connecting_points = StrictBool(false), *, stacklevel = 1),
+        text_signature = "($self, x, return_connecting_points=False, *, stacklevel=1)"
+    )]
+    fn approximate_predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        return_connecting_points: StrictBool,
+        stacklevel: i32,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let StrictBool(return_connecting_points) = return_connecting_points;
+        if stacklevel < 1 {
+            return Err(PyValueError::new_err(
+                "stacklevel must be a positive integer",
+            ));
+        }
+        let view = x.as_array();
+        let (rows, features) = view.dim();
+        if rows == 0 || features == 0 {
+            return Err(PyValueError::new_err(
+                "X must contain at least one row and one feature",
+            ));
+        }
+        if features != self.inner.n_features() {
+            return Err(PyValueError::new_err(format!(
+                "X has {features} features, but the model was fitted with {}",
+                self.inner.n_features()
+            )));
+        }
+        // Native sizing limits: element count and raw row IDs must stay representable.
+        rows.checked_mul(features)
+            .ok_or_else(|| PyOverflowError::new_err("X element count overflows usize"))?;
+        if i32::try_from(rows).is_err() {
+            return Err(PyOverflowError::new_err("X row count exceeds i32::MAX"));
+        }
+        if view.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err("X must contain only finite values"));
+        }
+        // Owned rows: the borrowed NumPy view must not be touched while detached.
+        let input = view
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+        let result = py
+            .detach(|| self.inner.approximate_predict(&input))
+            .map_err(map_hdbscan_error)?;
+        let labels = result
+            .labels
+            .iter()
+            .map(|&value| i64::from(value))
+            .collect::<Vec<_>>()
+            .into_pyarray(py);
+        let probabilities = result.probabilities.into_pyarray(py);
+        let tuple = if return_connecting_points {
+            let connectors = result
+                .connecting_points
+                .iter()
+                .map(|&value| i64::from(value))
+                .collect::<Vec<_>>()
+                .into_pyarray(py);
+            PyTuple::new(
+                py,
+                [
+                    labels.into_any(),
+                    probabilities.into_any(),
+                    connectors.into_any(),
+                ],
+            )?
+        } else {
+            PyTuple::new(py, [labels.into_any(), probabilities.into_any()])?
+        };
+        // Warn from the explicit status only after every output is built; all-noise labels
+        // alone are not this condition.
+        if result.no_cluster_tree {
+            let category = py.get_type::<PyUserWarning>();
+            PyErr::warn(
+                py,
+                category.as_any(),
+                c"Clusterer does not have any defined clusters, new data will be automatically predicted as noise.",
+                stacklevel,
+            )?;
+        }
+        Ok(tuple)
+    }
+}
+
+/// Exactly a Python `bool`: rejects `None`, integers and other truthy objects with `ValueError`.
+struct StrictBool(bool);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for StrictBool {
+    type Error = PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        obj.cast::<PyBool>()
+            .map(|flag| StrictBool(flag.is_true()))
+            .map_err(|_| PyValueError::new_err("return_connecting_points must be a boolean"))
     }
 }
 

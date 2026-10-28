@@ -132,6 +132,24 @@ def test_bridge_auto_reports_conditional_cpu_and_cuda_scenarios() -> None:
     assert {scenario["backend"] for scenario in knn["scenarios"]} == {"cpu", "cuda"}
 
 
+def test_bridge_host_peak_counts_retained_geometry_and_fitted_state() -> None:
+    # Fit retains a model-owned finite geometry clone for prediction; during input the
+    # upload source and that clone coexist, and the clone persists into output beside
+    # the duplicated canonical fitted state. Lazy prediction peaks are not fit estimates.
+    finite = ROWS * KNN_FEATURES * 4
+    for backend in ("cpu", "cuda"):
+        knn = _native_knn(
+            _fast_umap.estimate_hdbscan_resources(
+                ROWS, KNN_FEATURES, backend=backend, min_samples=5, knn_k=15
+            )
+        )
+        (scenario,) = knn["scenarios"]
+        # Retained clone + output base + labels/probabilities (both copies) exceed 2x finite.
+        assert scenario["host_peak_bytes"] >= 2 * finite + 4 * ROWS * 4
+        # Retained geometry does not create a warning for this sub-GiB graph route.
+        assert knn["advisory"] is None
+
+
 def test_bridge_overflow_is_typed_and_allocates_nothing() -> None:
     # Input elements overflow usize before any allocation or graph routing.
     with pytest.raises(OverflowError):

@@ -15,6 +15,7 @@ pub mod linkage;
 pub mod mst;
 #[cfg(feature = "test-support")]
 pub mod oracle;
+pub mod prediction;
 pub mod select;
 
 pub use condense::CondensedTree;
@@ -22,6 +23,7 @@ pub use config::{ClusterSelectionMethod, HdbscanConfig, MstGraph};
 pub use error::HdbscanError;
 pub use kdtree::KdTree;
 pub use linkage::{LinkageRow, SortedMstEdge};
+pub use prediction::{PointPrediction, PredictionColumns, PredictionHierarchy};
 
 /// Finite-row-indexed host extraction results, before raw-row remapping.
 #[derive(Debug, Clone, PartialEq)]

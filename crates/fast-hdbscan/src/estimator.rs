@@ -23,7 +23,15 @@ use fast_hdbscan_core::{
     mst::{ComponentReductionPlan, finalize_mst, init_from_knn, merge_component_winners},
 };
 
+use std::sync::Arc;
+
+use fast_hdbscan_core::KdTree;
+
 use crate::backend::{DeviceKdTree, HdbscanOps};
+use crate::prediction::{
+    FittedOutputs, FittedState, PredictionCacheStatus, PredictionPlan, PredictionResult,
+    PredictionRuntime,
+};
 
 pub(crate) const NEIGHBOR_BATCH_ROWS: usize = 256;
 const KNN_GRAPH_EXACT_MAX_ROWS: usize = 4096;
@@ -133,7 +141,7 @@ impl HdbscanSearch {
     }
 }
 
-fn map_backend_error(error: fast_cubecl_common::BackendError) -> HdbscanError {
+pub(crate) fn map_backend_error(error: fast_cubecl_common::BackendError) -> HdbscanError {
     match error {
         fast_cubecl_common::BackendError::Unavailable(message) => {
             HdbscanError::BackendUnavailable(message)
@@ -142,12 +150,12 @@ fn map_backend_error(error: fast_cubecl_common::BackendError) -> HdbscanError {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DeviceAllocationLimit {
-    max_page_bytes: usize,
-    alignment: usize,
+pub(crate) struct DeviceAllocationLimit {
+    pub(crate) max_page_bytes: usize,
+    pub(crate) alignment: usize,
 }
 
-fn allocation_limit(device: &Device) -> Result<DeviceAllocationLimit> {
+pub(crate) fn allocation_limit(device: &Device) -> Result<DeviceAllocationLimit> {
     let DispatchDevice::Cube(cube_device) = device.as_dispatch();
     let client = cube_device.client();
     let memory = &client.properties().memory;
@@ -166,7 +174,7 @@ fn allocation_limit(device: &Device) -> Result<DeviceAllocationLimit> {
     })
 }
 
-fn checked_allocation_bytes(
+pub(crate) fn checked_allocation_bytes(
     elements: usize,
     element_size: usize,
     limit: Option<DeviceAllocationLimit>,
@@ -192,7 +200,7 @@ fn checked_allocation_bytes(
     Ok(padded_bytes)
 }
 
-fn check_device_allocation(
+pub(crate) fn check_device_allocation(
     elements: usize,
     element_size: usize,
     limit: DeviceAllocationLimit,
@@ -201,51 +209,93 @@ fn check_device_allocation(
     checked_allocation_bytes(elements, element_size, Some(limit), subject).map(|_| ())
 }
 
-fn check_device_tensor_allocation(
+/// Smallest CUDA row pitch CubeCL applies to rows wider than one element (`optimal_align` lower clamp).
+const ROW_PITCH_MIN_ALIGN: usize = 16;
+
+/// Pitch in bytes of one row of `width` elements of `element_size` bytes, mirroring CubeCL's CUDA
+/// `PitchedMemoryLayoutPolicy::optimal_align`: unit-width rows keep element pitch and other rows use
+/// the next power of two clamped to `[16, alignment]`, then round up to that pitch. A device alignment
+/// below 16 cannot express that rule, so it is a typed backend error. Shared by device sizing
+/// (`tensor_raw_bytes`) and the pure fit estimate, which passes its fixed CUDA alignment explicitly.
+pub(crate) fn pitched_row_bytes(
+    width: usize,
+    element_size: usize,
+    alignment: usize,
+    subject: &'static str,
+) -> Result<usize> {
+    let row_bytes = width
+        .checked_mul(element_size)
+        .ok_or(HdbscanError::Overflow(subject))?;
+    if width == 1 {
+        return Ok(row_bytes);
+    }
+    if alignment < ROW_PITCH_MIN_ALIGN {
+        return Err(HdbscanError::BackendUnavailable(format!(
+            "{subject}: device allocation alignment {alignment} is below the 16-byte row pitch minimum"
+        )));
+    }
+    let pitch_alignment = row_bytes
+        .checked_next_power_of_two()
+        .ok_or(HdbscanError::Overflow(subject))?
+        .clamp(ROW_PITCH_MIN_ALIGN, alignment);
+    row_bytes
+        .checked_next_multiple_of(pitch_alignment)
+        .ok_or(HdbscanError::Overflow(subject))
+}
+
+/// Raw device bytes of one row-major tensor, before padding to the device alignment.
+///
+/// Row-pitched tensors of rank above one pitch each row like CubeCL's CUDA
+/// `PitchedMemoryLayoutPolicy::optimal_align`: unit-width rows keep element pitch and other rows
+/// use the next power of two clamped to `[16, alignment]`. A device alignment below 16 cannot
+/// express that rule, so it is a typed backend error on the pitched path only.
+pub(crate) fn tensor_raw_bytes(
+    shape: &[usize],
+    element_size: usize,
+    limit: DeviceAllocationLimit,
+    row_pitched: bool,
+    subject: &'static str,
+) -> Result<usize> {
+    if !row_pitched || shape.len() < 2 {
+        return shape
+            .iter()
+            .try_fold(element_size, |bytes, &dimension| {
+                bytes.checked_mul(dimension)
+            })
+            .ok_or(HdbscanError::Overflow(subject));
+    }
+    let (width, leading) = shape.split_last().expect("rank is at least two");
+    let height = leading
+        .iter()
+        .try_fold(1usize, |rows, &dimension| rows.checked_mul(dimension))
+        .ok_or(HdbscanError::Overflow(subject))?;
+    let pitch = pitched_row_bytes(*width, element_size, limit.alignment, subject)?;
+    height
+        .checked_mul(pitch)
+        .ok_or(HdbscanError::Overflow(subject))
+}
+
+/// Device allocation bytes of one row-major tensor: raw bytes padded to the device alignment and
+/// checked against the page limit. Planning and upload both size tensors through this function.
+pub(crate) fn tensor_allocation_bytes(
+    shape: &[usize],
+    element_size: usize,
+    limit: DeviceAllocationLimit,
+    row_pitched: bool,
+    subject: &'static str,
+) -> Result<usize> {
+    let raw = tensor_raw_bytes(shape, element_size, limit, row_pitched, subject)?;
+    checked_allocation_bytes(raw, 1, Some(limit), subject)
+}
+
+pub(crate) fn check_device_tensor_allocation(
     shape: &[usize],
     element_size: usize,
     limit: DeviceAllocationLimit,
     row_pitched: bool,
     subject: &'static str,
 ) -> Result<()> {
-    let mut elements = 1usize;
-    for dimension in shape {
-        elements = elements
-            .checked_mul(*dimension)
-            .ok_or(HdbscanError::Overflow(subject))?;
-    }
-    let bytes = if row_pitched && shape.len() > 1 {
-        let width = *shape.last().expect("rank is greater than one");
-        let height = shape[..shape.len() - 1]
-            .iter()
-            .try_fold(1usize, |rows, dimension| rows.checked_mul(*dimension))
-            .ok_or(HdbscanError::Overflow(subject))?;
-        let row_bytes = width
-            .checked_mul(element_size)
-            .ok_or(HdbscanError::Overflow(subject))?;
-        // Matches CubeCL's CUDA PitchedMemoryLayoutPolicy::optimal_align heuristic.
-        let pitch_alignment = if width == 1 {
-            element_size
-        } else {
-            row_bytes
-                .checked_next_power_of_two()
-                .ok_or(HdbscanError::Overflow(subject))?
-                .clamp(16, limit.alignment)
-        };
-        let pitch = row_bytes
-            .checked_add(pitch_alignment - 1)
-            .ok_or(HdbscanError::Overflow(subject))?
-            / pitch_alignment
-            * pitch_alignment;
-        height
-            .checked_mul(pitch)
-            .ok_or(HdbscanError::Overflow(subject))?
-    } else {
-        elements
-            .checked_mul(element_size)
-            .ok_or(HdbscanError::Overflow(subject))?
-    };
-    checked_allocation_bytes(1, bytes, Some(limit), subject).map(|_| ())
+    tensor_allocation_bytes(shape, element_size, limit, row_pitched, subject).map(|_| ())
 }
 
 fn checked_brute_force_scratch(
@@ -344,7 +394,10 @@ fn tensor_i32(values: Vec<i32>, shape: [usize; 1], device: &Device) -> Tensor<1,
     Tensor::from_data(TensorData::new(values, shape), device)
 }
 
-fn upload_kd_tree(tree: &fast_hdbscan_core::KdTree, device: &Device) -> DeviceKdTree<Dispatch> {
+pub(crate) fn upload_kd_tree(
+    tree: &fast_hdbscan_core::KdTree,
+    device: &Device,
+) -> DeviceKdTree<Dispatch> {
     let nodes = tree.starts.len();
     let n_features = tree.n_features;
     DeviceKdTree {
@@ -961,6 +1014,8 @@ impl HDBSCAN {
         let mut labels = vec![-1; raw_n];
         let mut probabilities = vec![0.0; raw_n];
         let mut knn_diagnostics = None;
+        let geometry;
+        let mut retained_tree = None;
         #[cfg(feature = "tracing")]
         let result_finalization_span;
 
@@ -970,6 +1025,8 @@ impl HDBSCAN {
             } else {
                 compact_rows(&raw, features, &split.finite_index)?
             };
+            // Prediction state owns one permanent host copy; uploads consume the original.
+            geometry = finite_values.clone();
             check_device_tensor_allocation(
                 &[n, features],
                 4,
@@ -1255,6 +1312,7 @@ impl HDBSCAN {
                     }
                     neighbors = public;
                 }
+                retained_tree = host_tree;
                 #[cfg(feature = "tracing")]
                 profile_sync(&device)?;
                 #[cfg(feature = "tracing")]
@@ -1293,13 +1351,14 @@ impl HDBSCAN {
                     tracing::info_span!("result_finalization", rows = n).entered();
             }
             let host = HostClustering::one_finite();
+            geometry = compact_rows(&raw, features, &split.finite_index)?;
             labels = scatter_labels(&host.labels, &split.finite_index, raw_n)?;
             probabilities = scatter_probabilities(&host.probabilities, &split.finite_index, raw_n)?;
         }
 
-        let fitted = FittedHDBSCAN {
+        let state = FittedState::new(FittedOutputs {
             config: self.config.clone(),
-            backend: actual_backend,
+            training_backend: actual_backend,
             labels,
             probabilities,
             linkage,
@@ -1313,7 +1372,9 @@ impl HDBSCAN {
             search: resolved_search,
             resolved_graph,
             knn_diagnostics,
-        };
+            geometry,
+        })?;
+        let fitted = FittedHDBSCAN::from_state(state, actual_backend, retained_tree);
         #[cfg(feature = "tracing")]
         drop(result_finalization_span);
         Ok(fitted)
@@ -1322,6 +1383,10 @@ impl HDBSCAN {
 
 /// Fitted estimator results. Neighbor and core-distance rows use finite-row indexing;
 /// labels, probabilities, linkage and condensed-tree node ids are in raw-row space.
+///
+/// Public fields are detached mutable output views copied from an immutable canonical
+/// fitted snapshot. Mutating them changes neither [`Self::approximate_predict`] nor the
+/// canonical state. Clones share that snapshot and its lazy prediction caches.
 #[derive(Debug, Clone)]
 pub struct FittedHDBSCAN {
     pub config: HdbscanConfig,
@@ -1336,42 +1401,84 @@ pub struct FittedHDBSCAN {
     /// Euclidean core distances in finite-row order.
     pub core_distances: Vec<f32>,
     pub finite_index: Vec<u32>,
-    n_features: usize,
-    raw_n: usize,
-    search: HdbscanSearch,
-    resolved_graph: MstGraph,
-    knn_diagnostics: Option<KnnDiagnostics>,
+    pub(crate) state: Arc<FittedState>,
+    pub(crate) runtime: Arc<PredictionRuntime>,
 }
 
 impl FittedHDBSCAN {
+    fn from_state(
+        state: FittedState,
+        runtime_backend: BackendChoice,
+        tree: Option<KdTree>,
+    ) -> Self {
+        let runtime = PredictionRuntime::new(&state, runtime_backend, tree);
+        Self {
+            config: state.config.clone(),
+            backend: state.training_backend,
+            labels: state.labels.clone(),
+            probabilities: state.probabilities.clone(),
+            linkage: state.linkage.clone(),
+            condensed: state.condensed.clone(),
+            mst: state.mst.clone(),
+            neighbors: state.neighbors.clone(),
+            core_distances: state.core_distances.clone(),
+            finite_index: state.finite_index.clone(),
+            state: Arc::new(state),
+            runtime: Arc::new(runtime),
+        }
+    }
+
+    /// Assign queries to the existing fitted clustering, matching original
+    /// `hdbscan.approximate_predict` semantics with exact KD neighbor search.
+    ///
+    /// Uses the immutable fitted snapshot, the concrete backend selected at fit, and
+    /// lazily built host KD tree/prediction cores. Rows must be finite with exactly
+    /// [`Self::n_features`] features. Connectors are original training-row IDs.
+    pub fn approximate_predict(&self, input: &[Vec<f32>]) -> Result<PredictionResult> {
+        crate::prediction::approximate_predict(&self.state, &self.runtime, input)
+    }
+
+    /// Lazy prediction cache readiness, for diagnostics and tests.
+    #[doc(hidden)]
+    pub fn prediction_cache_status(&self) -> Result<PredictionCacheStatus> {
+        self.runtime.status(&self.state)
+    }
+
+    /// Checked batch plan and planned peak bytes that [`Self::approximate_predict`] would use for
+    /// `input`; `None` for the no-cluster-tree shortcut, which plans no device work.
+    #[doc(hidden)]
+    pub fn prediction_plan(&self, input: &[Vec<f32>]) -> Result<Option<PredictionPlan>> {
+        crate::prediction::prediction_plan(&self.state, &self.runtime, input)
+    }
+
     /// The requested graph policy, including `Auto` when that was requested.
     pub fn mst_graph(&self) -> MstGraph {
         self.config.mst_graph
     }
 
     pub fn resolved_mst_graph(&self) -> MstGraph {
-        self.resolved_graph
+        self.state.resolved_graph
     }
 
     #[doc(hidden)]
     pub fn knn_diagnostics(&self) -> Option<&KnnDiagnostics> {
-        self.knn_diagnostics.as_ref()
+        self.state.knn_diagnostics.as_ref()
     }
 
     pub fn dbscan_clustering(&self, epsilon: f64) -> Result<Vec<i32>> {
         let labels = dbscan_cut(&self.linkage, epsilon, self.config.resolved_min_samples())?;
-        if self.finite_index.len() == self.raw_n {
+        if self.finite_index.len() == self.state.raw_n {
             return Ok(labels);
         }
         if self.finite_index.len() <= 1 {
-            return Ok(vec![-1; self.raw_n]);
+            return Ok(vec![-1; self.state.raw_n]);
         }
         // `remap_linkage` has already expanded the tree with an infinite-distance outlier chain.
         Ok(labels)
     }
 
     pub fn n_features(&self) -> usize {
-        self.n_features
+        self.state.n_features
     }
 
     pub fn config(&self) -> &HdbscanConfig {
@@ -1405,7 +1512,7 @@ impl FittedHDBSCAN {
         &self.finite_index
     }
     pub fn search(&self) -> HdbscanSearch {
-        self.search
+        self.state.search
     }
 }
 
@@ -1492,6 +1599,46 @@ mod search_tests {
         assert!(
             check_device_tensor_allocation(&[2, 5], 4, too_small_pitched_limit, true, "test")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn small_alignment_pitch_is_a_typed_error_not_a_panic() {
+        let limit = |alignment| DeviceAllocationLimit {
+            max_page_bytes: usize::MAX,
+            alignment,
+        };
+        for alignment in 1..16 {
+            // Unit-width rows keep element pitch and never consult the alignment.
+            assert_eq!(
+                tensor_raw_bytes(&[5, 1], 4, limit(alignment), true, "test").unwrap(),
+                5 * 4,
+                "alignment={alignment}"
+            );
+            assert!(
+                matches!(
+                    tensor_raw_bytes(&[5, 3], 4, limit(alignment), true, "test"),
+                    Err(HdbscanError::BackendUnavailable(_))
+                ),
+                "alignment={alignment}"
+            );
+            assert!(
+                matches!(
+                    check_device_tensor_allocation(&[2, 5], 4, limit(alignment), true, "test"),
+                    Err(HdbscanError::BackendUnavailable(_))
+                ),
+                "alignment={alignment}"
+            );
+            // Flat tensors never pitch, so the alignment cannot make them fail on pitch.
+            assert_eq!(
+                tensor_raw_bytes(&[5, 3], 4, limit(alignment), false, "test").unwrap(),
+                5 * 3 * 4
+            );
+        }
+        // Alignment 16 is the smallest the pitch rule can express: 12-byte rows pitch to 16.
+        assert_eq!(
+            tensor_raw_bytes(&[5, 3], 4, limit(16), true, "test").unwrap(),
+            5 * 16
         );
     }
 

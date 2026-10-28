@@ -5,6 +5,16 @@
 //! host and device peaks separately. Exact and ANN graph routes are modeled as they
 //! execute, not as a flat `n * width` allocation.
 //!
+//! Retained fitted state is modeled: the model-owned compact finite geometry clone
+//! (`n * features * 4`, taken before upload and live for the whole fit, so the Input
+//! phase holds two finite copies) and, in `Output`, the public tree views plus the
+//! canonical immutable fitted snapshot, three finite-index mappings, the core-bounded
+//! approximate-prediction hierarchy and a conservative bound on its build transients
+//! (`fitted_state_bytes`). The kNN route builds no host KD tree during fit, so none is
+//! counted. Lazy first-prediction peaks (host KD tree build, `f64` prediction cores,
+//! call-local reference/query uploads and KD packs) occur after fit and are not part of
+//! this fit-only estimate.
+//!
 //! Excluded: the caller-owned raw input buffer (`raw_n * features * 4`) and the
 //! outlier-compaction copy taken when non-finite rows are dropped. The estimate receives
 //! only the finite-row count, which cannot tell whether `raw_n` exceeds it, so neither
@@ -16,12 +26,13 @@ use fast_cubecl_common::{
     neighbors::{AnnEstimate, AnnPhase, ann_host_estimate, bounded_neighbor_scratch},
 };
 use fast_hdbscan_core::{
-    HdbscanConfig, HdbscanError, MstGraph, error::Result, finite::validate_dims,
-    linkage::SortedMstEdge,
+    HdbscanConfig, HdbscanError, MstGraph, PredictionHierarchy, error::Result,
+    finite::validate_dims, linkage::SortedMstEdge,
 };
 
 use crate::estimator::{
-    KnnSource, NEIGHBOR_BATCH_ROWS, graph_width, knn_uses_ann, map_ann_error, resolve_graph,
+    KnnSource, NEIGHBOR_BATCH_ROWS, graph_width, knn_uses_ann, map_ann_error, pitched_row_bytes,
+    resolve_graph,
 };
 
 /// Documented UX advisory threshold (1 GiB, binary). Not a safety or support boundary.
@@ -37,10 +48,16 @@ const KNN_TUPLE_BYTES: usize = std::mem::size_of::<(f64, usize, usize, usize)>()
 /// Host DSU row: one `usize` parent word plus one `u32` rank word.
 const DSU_ROW_BYTES: usize = std::mem::size_of::<usize>() + std::mem::size_of::<u32>();
 const EDGE_BYTES: usize = std::mem::size_of::<SortedMstEdge>();
-/// CubeCL CUDA allocation alignment for pitched 2-D tensors (`mem_alignment`).
+const USIZE_BYTES: usize = std::mem::size_of::<usize>();
+/// Condensed-tree row: `parent: usize, child: usize, lambda: f32, child_size: f32`.
+const CONDENSED_ROW_BYTES: usize = 2 * USIZE_BYTES + 2 * F32_BYTES;
+const LINKAGE_ROW_BYTES: usize = std::mem::size_of::<fast_hdbscan_core::linkage::LinkageRow>();
+/// hashbrown SSE2 group width: trailing control bytes per table.
+const HASH_GROUP_BYTES: usize = 16;
+/// Explicit CUDA pitch alignment cap (CubeCL `mem_alignment` on the CUDA runtime). The pure
+/// estimate has no device to query, so it models this fixed value; the fit path sizes from the
+/// live `DeviceAllocationLimit` instead.
 const CUDA_PITCH_MAX_ALIGN: usize = 512;
-/// Smallest pitch alignment CubeCL applies to pitched rows (`optimal_align` lower clamp).
-const CUDA_PITCH_MIN_ALIGN: usize = 16;
 
 /// Backend side of a scenario.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +251,17 @@ fn knn_estimate(
     };
     let scenarios = backends
         .iter()
-        .map(|&backend| scenario(backend, n, features, min_samples, width, ann))
+        .map(|&backend| {
+            scenario(
+                backend,
+                n,
+                features,
+                min_samples,
+                config.min_cluster_size,
+                width,
+                ann,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let triggers: Vec<ResourceBackend> = scenarios
         .iter()
@@ -264,25 +291,22 @@ fn knn_estimate(
     })
 }
 
-/// CUDA pitch of one row-major `[n, features]` f32 tensor, mirroring CubeCL's pitched
-/// layout: the row width rounded up to `optimal_align(features, 4, 512)`. Returns the
-/// pitch in bytes. Single-feature tensors use element-size pitch.
+/// CUDA pitch in bytes of one row-major `[n, features]` f32 row at the fixed
+/// `CUDA_PITCH_MAX_ALIGN`, using the same rule as device sizing (`tensor_raw_bytes`).
 fn cuda_pitch_bytes(features: usize) -> Result<usize> {
-    let row = checked_mul(features, F32_BYTES)?;
-    let align = if features == 1 {
-        F32_BYTES
-    } else {
-        row.next_power_of_two()
-            .clamp(CUDA_PITCH_MIN_ALIGN, CUDA_PITCH_MAX_ALIGN)
-    };
-    row.checked_next_multiple_of(align)
-        .ok_or(HdbscanError::Overflow("CUDA pitched row"))
+    pitched_row_bytes(
+        features,
+        F32_BYTES,
+        CUDA_PITCH_MAX_ALIGN,
+        "CUDA pitched row",
+    )
 }
 
 /// Build one backend scenario. Phases are disjoint lifetimes; peaks are per-phase maxima.
 ///
 /// Input accounting:
 /// - Host: the finite copy used to build the upload, counted once in `Input`.
+/// - Host: the retained model-owned geometry clone (`finite`) is live in every phase.
 /// - CPU runtime: a single contiguous tensor (`finite`), which is also the ANN input.
 /// - CUDA runtime: the pitched upload tensor (`n * pitch`), live through the whole fit.
 ///   The ANN and exact paths also allocate contiguous copies of that tensor; ANN's own
@@ -292,10 +316,13 @@ fn scenario(
     n: usize,
     features: usize,
     min_samples: usize,
+    min_cluster_size: usize,
     width: usize,
     ann: Option<AnnEstimate>,
 ) -> Result<ResourceScenario> {
     let finite = checked_mul(checked_mul(n, features)?, F32_BYTES)?;
+    // Model-owned compact geometry, cloned before the upload consumes the fit buffer.
+    let retained_geometry = finite;
     let (input_device, pitched_is_padded) = match backend {
         ResourceBackend::Cpu => (finite, false),
         ResourceBackend::Cuda => {
@@ -348,7 +375,15 @@ fn scenario(
         )?),
     }
     phases.push(kruskal_phase(n, width, input_device)?);
-    phases.push(output_phase(n, width, min_samples)?);
+    let output = output_phase(n, width, min_samples)?;
+    let fitted = fitted_state_bytes(n, min_cluster_size, output.host_bytes)?;
+    phases.push(ResourcePhaseBytes {
+        host_bytes: checked_add(output.host_bytes, fitted)?,
+        ..output
+    });
+    for phase in &mut phases {
+        phase.host_bytes = checked_add(phase.host_bytes, retained_geometry)?;
+    }
 
     let (host_peak_bytes, device_peak_bytes) = match backend {
         ResourceBackend::Cpu => {
@@ -476,6 +511,79 @@ fn output_phase(n: usize, width: usize, min_samples: usize) -> Result<ResourcePh
     })
 }
 
+/// Upper bound on condensed clusters (root included): every non-root cluster holds at
+/// least `min_cluster_size` points and clusters are born in sibling pairs.
+fn cluster_bound(n: usize, min_cluster_size: usize) -> Result<usize> {
+    checked_add(checked_mul(n / min_cluster_size.max(1), 2)?, 1)
+}
+
+/// Fitted state added at `Output` on top of `output_phase`:
+/// - public tree views: labels `i32 n`, probabilities `f32 n`, condensed rows
+///   (`n` point rows plus `clusters` cluster rows) and `n - 1` linkage rows;
+/// - canonical immutable snapshot duplicating every public output (`output_host` plus
+///   the tree views) and the compact `finite_index: u32 n`;
+/// - public `finite_index: u32 n` view (`output_host` excludes every mapping);
+/// - `PredictionHierarchy` retained bytes from the core checked bound (its own
+///   `finite_index` clone, point attachments and cluster nodes), so three mappings total;
+/// - hierarchy build transients (`hierarchy_build_transient_bytes`), conservatively all
+///   live at once beside the finished state.
+///
+/// Labels and probabilities use finite rows; caller raw rows beyond them stay excluded.
+fn fitted_state_bytes(n: usize, min_cluster_size: usize, output_host: usize) -> Result<usize> {
+    let clusters = cluster_bound(n, min_cluster_size)?;
+    let tree_views = checked_sum(&[
+        checked_mul(n, I32_BYTES)?,
+        checked_mul(n, F32_BYTES)?,
+        checked_mul(checked_add(n, clusters)?, CONDENSED_ROW_BYTES)?,
+        checked_mul(n.saturating_sub(1), LINKAGE_ROW_BYTES)?,
+    ])?;
+    checked_sum(&[
+        tree_views,
+        output_host,
+        tree_views,
+        checked_mul(n, std::mem::size_of::<u32>())?,
+        checked_mul(n, std::mem::size_of::<u32>())?,
+        PredictionHierarchy::allocation_bytes_bound(n, clusters)
+            .ok_or(HdbscanError::Overflow("prediction hierarchy bound"))?,
+        hierarchy_build_transient_bytes(n, clusters)?,
+    ])
+}
+
+/// Upper bound of a hashbrown table holding `capacity` entries of `entry` bytes:
+/// `buckets = next_pow2(capacity * 8 / 7 + 1)`, at least 4, plus one control byte per
+/// bucket and one trailing group. Never smaller than the real allocation.
+fn hash_table_bytes(capacity: usize, entry: usize) -> Result<usize> {
+    let buckets = (checked_mul(capacity, 8)? / 7)
+        .checked_add(1)
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or(HdbscanError::Overflow("fit resource estimate"))?
+        .max(4);
+    checked_sum(&[checked_mul(buckets, entry)?, buckets, HASH_GROUP_BYTES])
+}
+
+/// `PredictionHierarchy::new` transients over `c` cluster nodes and `n` finite points, all
+/// counted as simultaneously live: `cluster_rows: usize c`, `node_of` map `c`,
+/// `max_lambda: f64 c`, `seen: bool c`, `attachment` map `n` (finite rows only), `anchors`
+/// map `c`, `is_anchor: Option<i32> c`, `child_start`+`fill: usize 2(c+1)`, `children:
+/// usize c` and `stack: usize c`. The constructor preallocates `cluster_rows`, `node_of`,
+/// `nodes`, `anchors` and `stack` to their exact counts (validated edges, nodes, anchors,
+/// and at most one push per node), so no doubling charge is needed on the success path.
+fn hierarchy_build_transient_bytes(n: usize, c: usize) -> Result<usize> {
+    let usize_c = checked_mul(c, USIZE_BYTES)?;
+    checked_sum(&[
+        usize_c,
+        hash_table_bytes(c, 2 * USIZE_BYTES)?,
+        checked_mul(c, F64_BYTES)?,
+        c,
+        hash_table_bytes(n, USIZE_BYTES + std::mem::size_of::<(usize, f64)>())?,
+        hash_table_bytes(c, std::mem::size_of::<(i32, usize)>())?,
+        checked_mul(c, std::mem::size_of::<Option<i32>>())?,
+        checked_mul(checked_add(c, 1)?, 2 * USIZE_BYTES)?,
+        usize_c,
+        usize_c,
+    ])
+}
+
 fn scenario_triggers(scenario: &ResourceScenario, threshold: usize) -> bool {
     scenario.host_peak_bytes >= threshold || scenario.device_peak_bytes >= threshold
 }
@@ -563,46 +671,91 @@ mod tests {
         )
         .unwrap();
         let cpu = scenario_of(knn_of(&plan), ResourceBackend::Cpu);
-        // Input: host 120 (finite), runtime 120 (contiguous tensor).
+        // Retained geometry clone (120) is added to every phase's host bytes.
+        // Input: host 120 finite + 120 retained clone, runtime 120 (contiguous tensor).
         assert_eq!(
             phase_of(cpu, ResourcePhase::Input),
             ResourcePhaseBytes {
                 phase: ResourcePhase::Input,
-                host_bytes: 120,
+                host_bytes: 240,
                 runtime_bytes: 120,
             }
         );
-        // Exact: host 10*4*8=320 full vectors + 9*4*8=288 readback = 608.
+        // Exact: host 10*4*8=320 full vectors + 9*4*8=288 readback + 120 retained = 728.
         // Runtime: input 120 + core 40 + cat 40 + block outputs 288 + query 108 = 596.
         assert_eq!(
             phase_of(cpu, ResourcePhase::ExactGraph),
             ResourcePhaseBytes {
                 phase: ResourcePhase::ExactGraph,
-                host_bytes: 608,
+                host_bytes: 728,
                 runtime_bytes: 596,
             }
         );
-        // Kruskal host: 320 slots + 2*40*32 tuples + 10*8 f64 core + 10*12 DSU + 9*16 edges = 3224.
+        // Kruskal host: 320 slots + 2*40*32 tuples + 10*8 f64 core + 10*12 DSU + 9*16 edges
+        // + 120 retained = 3344.
         assert_eq!(
             phase_of(cpu, ResourcePhase::Kruskal),
             ResourcePhaseBytes {
                 phase: ResourcePhase::Kruskal,
-                host_bytes: 3224,
+                host_bytes: 3344,
                 runtime_bytes: 120,
             }
         );
-        // Output host: 320 slots + 10*8 f64 + 10*4 f32 + 10*2*4 labels + 9*16 edges = 664.
+        // Output base: 320 slots + 10*8 f64 + 10*4 f32 + 10*2*4 neighbors + 9*16 edges = 664.
+        // Clusters bound 2*(10/2)+1 = 11. Tree views: labels 40 + probabilities 40
+        // + condensed (10+11)*24=504 + linkage 9*32=288 = 872.
+        // Fitted: views 872 + canonical 664+872 + public finite_index 40 + canonical
+        // finite_index 40 + hierarchy bound (40 + 10*16 + 11*48 = 728) + build transients
+        // 1635 = 4851. Transients: cluster_rows 88 + node_of (16 buckets*16+16+16=288)
+        // + max_lambda 88 + seen 11 + attachment (16*24+16+16=416) + anchors 288
+        // + is_anchor 88 + child_start/fill 192 + children 88 + stack 88.
+        // Output host: 664 + 4851 + 120 retained = 5635.
         assert_eq!(
             phase_of(cpu, ResourcePhase::Output),
             ResourcePhaseBytes {
                 phase: ResourcePhase::Output,
-                host_bytes: 664,
+                host_bytes: 5635,
                 runtime_bytes: 0,
             }
         );
-        // CPU peak is the largest overlapped phase: Kruskal 3224 + 120.
-        assert_eq!(cpu.host_peak_bytes, 3344);
+        // CPU peak is the largest overlapped phase: Output 5635 (Kruskal is 3344 + 120).
+        assert_eq!(cpu.host_peak_bytes, 5635);
         assert_eq!(cpu.device_peak_bytes, 0);
+    }
+
+    /// The fixed-alignment pure pitch must equal the device tensor sizing rule at the same
+    /// alignment, for every width class: element pitch, sub-16-byte rows, power-of-two rows,
+    /// the 512-byte clamp and multi-chunk rounding. Expected pitches are hand-computed.
+    #[test]
+    fn cuda_pitch_matches_device_tensor_rule_at_fixed_alignment() {
+        use crate::estimator::{DeviceAllocationLimit, tensor_raw_bytes};
+        let limit = DeviceAllocationLimit {
+            max_page_bytes: usize::MAX,
+            alignment: CUDA_PITCH_MAX_ALIGN,
+        };
+        // (width, pitch bytes): 1 -> 4; 2 -> 16; 3 -> 16; 9 -> 64; 33 -> 256; 128 -> 512;
+        // 129 -> 1024 (516 rounds to 2 chunks); 300 -> 1536; 1000 -> 4096.
+        let cases = [
+            (1usize, 4usize),
+            (2, 16),
+            (3, 16),
+            (9, 64),
+            (33, 256),
+            (128, 512),
+            (129, 1024),
+            (300, 1536),
+            (1000, 4096),
+        ];
+        for (width, expected) in cases {
+            assert_eq!(cuda_pitch_bytes(width).unwrap(), expected, "width={width}");
+            for rows in [1usize, 5] {
+                assert_eq!(
+                    tensor_raw_bytes(&[rows, width], F32_BYTES, limit, true, "test").unwrap(),
+                    rows * expected,
+                    "width={width} rows={rows}"
+                );
+            }
+        }
     }
 
     /// Same shape on CUDA. Pitch for 3 f32 features is next_multiple(12, 16) = 16, so the
@@ -626,11 +779,11 @@ mod tests {
             phase_of(cuda, ResourcePhase::ExactGraph),
             ResourcePhaseBytes {
                 phase: ResourcePhase::ExactGraph,
-                host_bytes: 608,
+                host_bytes: 728,
                 runtime_bytes: 1620,
             }
         );
-        assert_eq!(cuda.host_peak_bytes, 3224);
+        assert_eq!(cuda.host_peak_bytes, 5635);
         assert_eq!(cuda.device_peak_bytes, 1620);
     }
 
@@ -690,7 +843,8 @@ mod tests {
         ];
         for (phase, host, runtime) in expected {
             let got = phase_of(cpu, phase);
-            assert_eq!(got.host_bytes, host);
+            // Plus the retained 1000*3*4 geometry clone.
+            assert_eq!(got.host_bytes, host + 12_000);
             assert_eq!(got.runtime_bytes, runtime);
         }
         assert!(
@@ -863,6 +1017,76 @@ mod tests {
 
         let no_finite = estimate_fit_resources(0, 3, &config(5, None), BackendChoice::Cpu).unwrap();
         assert!(no_finite.knn.is_none());
+    }
+
+    #[test]
+    fn fitted_state_matches_retained_lifetimes_and_drops_nothing_for_ann() {
+        // ANN output host = ANN-independent output base + fitted state + retained geometry.
+        let (n, f) = (1000usize, 3usize);
+        let plan = plan_fit(
+            n,
+            f,
+            &config(5, Some(75)),
+            BackendChoice::Cpu,
+            KnnSource::Ann,
+        )
+        .unwrap();
+        let cpu = scenario_of(knn_of(&plan), ResourceBackend::Cpu);
+        let base = output_phase(n, 75, 5).unwrap().host_bytes;
+        let fitted = fitted_state_bytes(n, 5, base).unwrap();
+        assert_eq!(
+            phase_of(cpu, ResourcePhase::Output).host_bytes,
+            base + fitted + n * f * 4
+        );
+        // Input holds the finite upload source and the retained clone simultaneously.
+        assert_eq!(
+            phase_of(cpu, ResourcePhase::Input).host_bytes,
+            2 * n * f * 4
+        );
+    }
+
+    #[test]
+    fn constructed_hierarchy_retained_capacity_is_bounded_by_fitted_state() {
+        // Root 6; cluster 7 = finite points 0..3; cluster 8 = finite points 3..6.
+        let condensed = fast_hdbscan_core::CondensedTree {
+            parent: vec![6, 6, 7, 7, 7, 8, 8, 8],
+            child: vec![7, 8, 0, 1, 2, 3, 4, 5],
+            lambda: vec![0.5, 0.5, 2.0, 2.0, 4.0, 1.0, 1.0, 1.0],
+            child_size: vec![3.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        };
+        let labels = [0, 0, 0, 1, 1, 1];
+        let finite: Vec<u32> = (0..6).collect();
+        let hierarchy = PredictionHierarchy::new(&condensed, &labels, &finite).unwrap();
+        let (n, clusters) = (hierarchy.n_finite(), hierarchy.cluster_nodes());
+        assert_eq!((n, clusters), (6, 3));
+        // Real capacity: every retained vector is exact-length, so retained == bound.
+        let bound = PredictionHierarchy::allocation_bytes_bound(n, clusters).unwrap();
+        assert_eq!(hierarchy.retained_bytes(), bound);
+        // The estimate charges the model's cluster bound, which must cover the real node count.
+        assert!(clusters <= cluster_bound(n, 2).unwrap());
+        let modeled =
+            PredictionHierarchy::allocation_bytes_bound(n, cluster_bound(n, 2).unwrap()).unwrap();
+        assert!(hierarchy.retained_bytes() <= modeled);
+        assert!(modeled <= fitted_state_bytes(n, 2, 0).unwrap());
+        assert_eq!(hash_table_bytes(0, 16).unwrap(), 4 * 16 + 4 + 16);
+        assert!(PredictionHierarchy::allocation_bytes_bound(usize::MAX, 0).is_none());
+        assert!(hierarchy_build_transient_bytes(usize::MAX / 2, 1).is_err());
+    }
+
+    #[test]
+    fn fitted_state_sizing_is_checked_for_huge_ranks_and_pitch() {
+        // No allocation: pure checked arithmetic overflows into typed errors.
+        assert!(fitted_state_bytes(usize::MAX, 2, 0).is_err());
+        assert!(fitted_state_bytes(usize::MAX / 8, 2, 0).is_err());
+        assert!(fitted_state_bytes(10, 2, usize::MAX).is_err());
+        assert!(cluster_bound(usize::MAX, 1).is_err());
+        assert!(output_phase(usize::MAX / 4, usize::MAX / 4, 1).is_err());
+        // Very large rank `s` (min_samples) on the public neighbor term.
+        assert!(output_phase(1 << 20, 4, usize::MAX >> 4).is_err());
+        assert!(cuda_pitch_bytes(usize::MAX / 2).is_err());
+        // Row-pitch overflow: 2^22 features pitch to 2^24 bytes, times 2^40 rows.
+        assert!(scenario(ResourceBackend::Cuda, 1 << 40, 1 << 22, 2, 2, 1, None).is_err());
+        assert!(scenario(ResourceBackend::Cpu, 1 << 40, 1 << 22, 2, 2, 1, None).is_err());
     }
 
     #[test]

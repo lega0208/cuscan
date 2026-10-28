@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -29,6 +29,36 @@ class FittedHDBSCAN:
     @property
     def finite_index(self) -> NDArray[np.intp]: ...
     def dbscan_clustering(self, eps: float) -> NDArray[np.intp]: ...
+    # Labels/connectors are int64 (np.intp), strengths float64. Connectors are original
+    # training-row indices of the selected mutual-reachability neighbor; -1 only on the
+    # no-cluster-tree shortcut, which emits one UserWarning at `stacklevel`.
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: Literal[False] = ...,
+        *,
+        stacklevel: int = ...,
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]: ...
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: Literal[True],
+        *,
+        stacklevel: int = ...,
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]: ...
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: bool = ...,
+        *,
+        stacklevel: int = ...,
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ): ...
 
 def fit_hdbscan(
     x: NDArray[np.float32],

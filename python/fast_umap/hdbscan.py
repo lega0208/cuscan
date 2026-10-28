@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -395,3 +395,70 @@ class HDBSCAN:
         if np.isnan(eps):
             raise ValueError("eps must not be NaN")
         return np.array(self._native.dbscan_clustering(float(eps)), dtype=np.intp, copy=True)
+
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: Literal[False] = ...
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]: ...
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: Literal[True]
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]: ...
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: bool | np.bool_ = ...
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ): ...
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: bool | np.bool_ = False
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ):
+        """Predict fitted cluster labels for new points (original hdbscan ``approximate_predict``).
+
+        Clusters are fixed: labels are existing fitted label IDs (``-1`` is noise) and are never
+        renumbered. Uses the options and backend chosen at fit time; constructor attributes
+        changed after fitting have no effect. ``X`` must be a finite 2-D numeric array with
+        ``n_features_in_`` columns whose values fit in float32; rows are never dropped.
+
+        Returns ``(labels, strengths)`` or, with ``return_connecting_points=True``,
+        ``(labels, strengths, connecting_points)`` as new arrays in query order. Labels and
+        connectors are ``np.intp``; strengths are ``np.float64`` and need not equal
+        ``probabilities_`` even for training coordinates. A connector is the selected
+        mutual-reachability neighbor (not necessarily the Euclidean nearest point) as an
+        original training-row index; noise keeps its valid connector. Only when the fitted
+        cluster tree has no clusters are all outputs noise/``0``/``-1``, with one
+        ``UserWarning``.
+        """
+        native = self._native
+        if not isinstance(return_connecting_points, (bool, np.bool_)):
+            raise ValueError("return_connecting_points must be a boolean")
+        x, finite_rows = self._input_array(X)
+        if x.shape[0] == 0 or x.shape[1] == 0:
+            raise ValueError("X must contain at least one row and one feature")
+        if not finite_rows.all():
+            raise ValueError("X must contain only finite values")
+        n_features = self._fitted_state["n_features_in"]
+        if x.shape[1] != n_features:
+            raise ValueError(
+                f"X has {x.shape[1]} features, but the model was fitted with {n_features}"
+            )
+        # stacklevel=2: native call -> this method -> caller. The native bridge warns once.
+        # Literal flags select each native overload, so every tuple shape is type-narrowed.
+        if bool(return_connecting_points):
+            raw_labels, raw_strengths, raw_connectors = native.approximate_predict(
+                x, True, stacklevel=2
+            )
+            return (
+                np.array(raw_labels, dtype=np.intp, copy=True),
+                np.array(raw_strengths, dtype=np.float64, copy=True),
+                np.array(raw_connectors, dtype=np.intp, copy=True),
+            )
+        raw_labels, raw_strengths = native.approximate_predict(x, False, stacklevel=2)
+        return (
+            np.array(raw_labels, dtype=np.intp, copy=True),
+            np.array(raw_strengths, dtype=np.float64, copy=True),
+        )

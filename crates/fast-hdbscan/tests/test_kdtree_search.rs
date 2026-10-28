@@ -633,3 +633,274 @@ fn cuda_device() -> Option<Device> {
         }
     }
 }
+
+// ---- Query/reference KD search (prediction traversal) ----
+
+fn brute_query(
+    query: &[f32],
+    reference: &[f32],
+    d: usize,
+    k: usize,
+    exclude_offset: Option<usize>,
+) -> (Vec<i32>, Vec<u32>) {
+    let rows = query.len() / d;
+    let n = reference.len() / d;
+    let mut ids = vec![n as i32; rows * k];
+    let mut distances = vec![f32::INFINITY.to_bits(); rows * k];
+    for row in 0..rows {
+        let mut candidates = (0..n)
+            .filter(|&c| exclude_offset.is_none_or(|offset| c != offset + row))
+            .map(|c| {
+                let distance = (0..d).fold(0.0f32, |sum, f| {
+                    let delta = query[row * d + f] - reference[c * d + f];
+                    sum + delta * delta
+                });
+                (distance, c as i32)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (slot, (distance, id)) in candidates.into_iter().take(k).enumerate() {
+            ids[row * k + slot] = id;
+            distances[row * k + slot] = distance.to_bits();
+        }
+    }
+    (ids, distances)
+}
+
+fn host_tree_to_device(tree: &KdTree, device: &Device) -> DeviceKdTree<Dispatch> {
+    let n = tree.indices.len();
+    make_device_tree(tree, &vec![0; n], device)
+}
+
+/// Prepares `values` once and returns a batch query closure that reuses the
+/// same prepared reference (cloned handles, no repacking) for every call.
+fn prepared_query(
+    values: &[f32],
+    tree: &KdTree,
+    d: usize,
+    device: &Device,
+) -> impl Fn(&[f32], usize, bool, usize) -> (Vec<i32>, Vec<u32>) {
+    let n = values.len() / d;
+    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n, d]), device);
+    let reference = <Dispatch as HdbscanOps>::prepare_kd_reference(
+        data.into_dispatch(),
+        host_tree_to_device(tree, device),
+    );
+    let device = device.clone();
+    move |query: &[f32], k: usize, exclude_self: bool, offset: usize| {
+        let rows = query.len() / d;
+        let tensor = Tensor::<2>::from_data(TensorData::new(query.to_vec(), [rows, d]), &device);
+        let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd_query(
+            tensor.into_dispatch(),
+            reference.clone(),
+            k as u32,
+            exclude_self,
+            offset as u32,
+        );
+        let ids = Tensor::<2, Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap();
+        assert_eq!(ids.len(), rows * k, "output is query rows by k");
+        let distances = Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        (ids, distances)
+    }
+}
+
+fn lattice_values(n: usize, d: usize) -> Vec<f32> {
+    (0..n)
+        .flat_map(|row| {
+            (0..d).map(move |f| (((row * (f + 3) + row / (f + 2)) % (5 + f)) as f32) * 0.5)
+        })
+        .collect()
+}
+
+fn fitting_rows(
+    values: &[f32],
+    tree: &KdTree,
+    d: usize,
+    k: usize,
+    device: &Device,
+) -> (Vec<i32>, Vec<u32>) {
+    let n = values.len() / d;
+    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n, d]), device);
+    let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd(
+        data.into_dispatch(),
+        host_tree_to_device(tree, device),
+        k as u32,
+    );
+    (
+        Tensor::<2, Int>::from_dispatch(ids)
+            .to_data()
+            .try_to_vec::<i32>()
+            .unwrap(),
+        Tensor::<2>::from_dispatch(distances)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect(),
+    )
+}
+
+fn check_query_external_and_offsets(device: &Device) {
+    for d in [3usize, 16, 30] {
+        let n = 163usize;
+        let mut values = lattice_values(n, d);
+        // Identical coordinates at distinct IDs.
+        let duplicate = values[0..d].to_vec();
+        values[3 * d..4 * d].copy_from_slice(&duplicate);
+        values[90 * d..91 * d].copy_from_slice(&duplicate);
+        let tree = KdTree::build(&values, n, d).unwrap();
+        let query = prepared_query(&values, &tree, d, device);
+
+        // External queries: unequal row count, arbitrary order, exact copies of
+        // reference rows (kept: no value-based exclusion), and off-lattice rows.
+        let mut external = Vec::new();
+        for row in [90usize, 0, 162, 3, 77, 41] {
+            external.extend_from_slice(&values[row * d..(row + 1) * d]);
+        }
+        for row in 0..31usize {
+            external.extend((0..d).map(|f| ((row * 7 + f * 3) % 11) as f32 * 0.375 - 0.25));
+        }
+        for k in [1usize, 2, 5, 33, n, n + 2] {
+            assert_eq!(
+                query(&external, k, false, 0),
+                brute_query(&external, &values, d, k, None),
+                "external d={d} k={k}"
+            );
+        }
+
+        // Batched self queries with explicit offsets and a tail batch; both modes.
+        let k = 6usize;
+        let (fit_ids, fit_distances) = fitting_rows(&values, &tree, d, k, device);
+        let mut self_ids = Vec::new();
+        let mut self_distances = Vec::new();
+        for start in (0..n).step_by(64) {
+            let end = (start + 64).min(n);
+            let batch = &values[start * d..end * d];
+            let excluded = query(batch, k, true, start);
+            assert_eq!(
+                excluded,
+                brute_query(batch, &values, d, k, Some(start)),
+                "d={d} start={start}"
+            );
+            self_ids.extend(excluded.0);
+            self_distances.extend(excluded.1);
+            let included = query(batch, k, false, start);
+            let expected = brute_query(batch, &values, d, k, None);
+            assert_eq!(included, expected, "inclusive d={d} start={start}");
+            for row in 0..end - start {
+                assert_eq!(included.1[row * k], 0f32.to_bits(), "self distance is zero");
+            }
+        }
+        // The fitting wrapper and the shared exclusion path agree bit for bit.
+        assert_eq!(self_ids, fit_ids, "fitting ids d={d}");
+        assert_eq!(self_distances, fit_distances, "fitting distances d={d}");
+    }
+}
+
+fn check_query_ties_and_irregular_leaves(device: &Device) {
+    // Equal-distance ring: lower IDs must win and equal node bounds must not
+    // hide them. Points 0..8 sit at distance 1 from the origin.
+    let d = 2usize;
+    // Many repeated unit-ring points split across leaves whose node bounds
+    // tie the current worst distance, plus far points.
+    let unit = [[1.0f32, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+    let mut values = Vec::new();
+    for row in 0..1000usize {
+        if row % 5 == 4 {
+            values.extend_from_slice(&[3.0 + row as f32 * 0.01, -3.0]);
+        } else {
+            values.extend_from_slice(&unit[row % 4]);
+        }
+    }
+    let n = values.len() / d;
+    let tree = KdTree::build(&values, n, d).unwrap();
+    assert!(tree.is_leaf.iter().filter(|&&leaf| leaf != 0).count() > 2);
+    let query = prepared_query(&values, &tree, d, device);
+    let origin = [0.0f32, 0.0, 2.0, 0.0, 0.0, 1.0];
+    for k in [1usize, 3, 7, 40, 799, 800, 801, n] {
+        assert_eq!(
+            query(&origin, k, false, 0),
+            brute_query(&origin, &values, d, k, None),
+            "ties k={k}"
+        );
+    }
+    assert_eq!(query(&origin, 3, false, 0).0[..3], [0, 1, 2]);
+
+    // Hand-built valid tree with irregular leaves: [0,2) and [2,7), permuted.
+    let values = vec![
+        5.0f32, 5.0, 0.0, 0.0, 6.0, 5.0, 0.5, 0.0, 5.0, 6.0, 7.0, 7.0, 0.0, 0.5,
+    ];
+    let indices = vec![1i32, 3, 0, 2, 4, 5, 6];
+    let bounds = |rows: &[i32]| {
+        let mut minimum = vec![f32::INFINITY; d];
+        let mut maximum = vec![f32::NEG_INFINITY; d];
+        for &row in rows {
+            for f in 0..d {
+                minimum[f] = minimum[f].min(values[row as usize * d + f]);
+                maximum[f] = maximum[f].max(values[row as usize * d + f]);
+            }
+        }
+        (minimum, maximum)
+    };
+    let (root_min, root_max) = bounds(&indices);
+    let (left_min, left_max) = bounds(&indices[0..2]);
+    let (right_min, right_max) = bounds(&indices[2..7]);
+    let tree = KdTree {
+        indices: indices.clone(),
+        starts: vec![0, 0, 2],
+        ends: vec![7, 2, 7],
+        is_leaf: vec![0, 1, 1],
+        bounds_min: [root_min, left_min, right_min].concat(),
+        bounds_max: [root_max, left_max, right_max].concat(),
+        n_levels: 1,
+        n_features: d,
+    };
+    let query = prepared_query(&values, &tree, d, device);
+    let external = vec![0.125f32, 0.125, 5.5, 5.5, 6.875, 7.125, 2.5, 2.5, 0.0, 0.0];
+    for k in [1usize, 2, 3, 6, 7, 9] {
+        assert_eq!(
+            query(&external, k, false, 0),
+            brute_query(&external, &values, d, k, None),
+            "irregular k={k}"
+        );
+        assert_eq!(
+            query(&values[2 * d..], k, true, 2),
+            brute_query(&values[2 * d..], &values, d, k, Some(2)),
+            "irregular offset k={k}"
+        );
+    }
+}
+
+#[test]
+fn kd_query_external_rows_offsets_and_fitting_parity_cpu() {
+    check_query_external_and_offsets(&Device::cpu());
+}
+
+#[test]
+fn kd_query_ties_and_irregular_leaves_cpu() {
+    check_query_ties_and_irregular_leaves(&Device::cpu());
+}
+
+#[test]
+fn kd_query_external_rows_offsets_and_fitting_parity_cuda() {
+    if let Some(device) = cuda_device() {
+        check_query_external_and_offsets(&device);
+    }
+}
+
+#[test]
+fn kd_query_ties_and_irregular_leaves_cuda() {
+    if let Some(device) = cuda_device() {
+        check_query_ties_and_irregular_leaves(&device);
+    }
+}
