@@ -88,8 +88,6 @@ The fitted model has labels, probabilities, hierarchy, neighbors, fitting core d
 - `python/fast_umap/hdbscan.py::_input_array` provides the current real-numeric/float32 representability policy.
 - `python/fast_umap/_fast_umap.pyi` must describe the new native method.
 
-The working tree already contains unrelated/user changes, including `estimator.rs`, resource-analysis files, dependency files, and README changes. Implementation must integrate with that current state without reverting or overwriting it.
-
 ## 4. Explicit public contract
 
 ### Python method
