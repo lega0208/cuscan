@@ -16,7 +16,7 @@ SAMPLE_SEED = 42
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare reference fast_hdbscan and fast_umap on one data sample."
+        description="Compare reference fast_hdbscan and cuscan on one data sample."
     )
     parser.add_argument("--cluster-on", choices=("2d", "16d"), default="16d")
     parser.add_argument("--sample-size", type=int, default=1_000_000)
@@ -91,7 +91,7 @@ def build_figure(
     figure = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("fast_hdbscan (reference)", "fast_umap (local)"),
+        subplot_titles=("fast_hdbscan (reference)", "cuscan (local)"),
     )
     palette = plotly.colors.qualitative.Plotly
     for column, (estimator, labels) in enumerate(
@@ -140,7 +140,7 @@ def main() -> None:
     X, visualization = load_sample(args.input, args.sample_size, args.cluster_on)
     from fast_hdbscan import HDBSCAN as ReferenceHDBSCAN
 
-    from fast_umap import HDBSCAN as LocalHDBSCAN
+    from cuscan import HDBSCAN as LocalHDBSCAN
 
     parameters = {
         "min_cluster_size": args.min_cluster_size,
@@ -153,7 +153,7 @@ def main() -> None:
     reference_labels = ReferenceHDBSCAN(**parameters).fit(X).labels_
     reference_seconds = perf_counter() - started
 
-    print("starting fast_umap (local)")
+    print("starting cuscan (local)")
     started = perf_counter()
     local_labels = LocalHDBSCAN(**parameters, backend=args.device).fit(X).labels_
     local_seconds = perf_counter() - started
@@ -163,7 +163,7 @@ def main() -> None:
     figure.write_html(args.output, include_plotlyjs=True, full_html=True)
     for name, seconds, labels in (
         ("fast_hdbscan (reference)", reference_seconds, reference_labels),
-        ("fast_umap (local)", local_seconds, local_labels),
+        ("cuscan (local)", local_seconds, local_labels),
     ):
         clusters = set(labels.tolist()) - {-1}
         noise_count = int(np.count_nonzero(labels == -1))

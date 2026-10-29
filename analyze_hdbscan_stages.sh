@@ -56,7 +56,7 @@ run() {
     fi
 }
 # Build logs stay visible; compilation has no fit-execution deadline.
-run cargo build --manifest-path "$root/Cargo.toml" -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
+run cargo build --manifest-path "$root/Cargo.toml" -p hdbscan --release --features tracing --example profile_hdbscan_stages
 binary="$root/target/release/examples/profile_hdbscan_stages"
 # Resolve imports/environment independently of the caller working directory.
 export UV_PROJECT="$root"

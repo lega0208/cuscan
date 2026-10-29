@@ -1,0 +1,21 @@
+[package]
+name = "cuscan-python"
+description = "Python bindings for cuscan UMAP and HDBSCAN"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_cuscan"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+numpy = { workspace = true }
+umap = { workspace = true }
+hdbscan = { workspace = true }
+
+[features]
+tracing = ["umap/tracing", "hdbscan/tracing"]

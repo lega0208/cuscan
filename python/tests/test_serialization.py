@@ -8,12 +8,12 @@ from typing import Any, Literal
 import numpy as np
 import pytest
 
-import fast_umap
+import cuscan
 
 h5py = pytest.importorskip("h5py")
 hdf5plugin = pytest.importorskip("hdf5plugin")
 
-UMAP = fast_umap.UMAP
+UMAP = cuscan.UMAP
 
 
 def fitted(**kwargs: Any) -> UMAP:
@@ -41,6 +41,7 @@ def test_round_trip_keeps_native_state_and_fit_time_precision(tmp_path: Path) ->
     np.testing.assert_array_equal(loaded.transform(np.ones((3, 4), dtype=np.float32)), transformed)
     arrays, metadata = model._model.export_state()
     with h5py.File(path) as file:
+        assert file.attrs["format"] == "cuscan_fitted_model"
         np.testing.assert_array_equal(
             file["state/training_features"][...], arrays["training_features"]
         )
@@ -134,14 +135,14 @@ def test_device_index_forwarded_and_bool_rejected(
 
     path = tmp_path / "device.h5"
     fitted().save(path)
-    real_import = fast_umap._fast_umap.load
+    real_import = cuscan._cuscan.load
     received: list[tuple[str, int]] = []
 
     def capture(arrays: Any, metadata: Any, backend: str, device_index: int) -> Any:
         received.append((backend, device_index))
         return real_import(arrays, metadata, backend="cpu", device_index=0)
 
-    monkeypatch.setattr(fast_umap._fast_umap, "load", capture)
+    monkeypatch.setattr(cuscan._cuscan, "load", capture)
     UMAP.load(path, backend="cuda", device_index=7)
     assert received == [("cuda", 7)]
     with pytest.raises(ValueError, match="device_index"):
@@ -190,6 +191,16 @@ def test_rejects_bad_version_and_external_links(tmp_path: Path) -> None:
         file["external"] = h5py.ExternalLink("other.h5", "/target")
     with pytest.raises(ValueError, match="links"):
         UMAP.load(str(path))
+
+
+@pytest.mark.parametrize("format_value", ["fast_umap_fitted_model", "invalid_format", 123])
+def test_rejects_old_and_malformed_format(tmp_path: Path, format_value: Any) -> None:
+    path = tmp_path / "model.h5"
+    fitted().save(path)
+    with h5py.File(path, "r+") as file:
+        file.attrs["format"] = format_value
+    with pytest.raises(ValueError, match="format"):
+        UMAP.load(path, backend="cpu")
 
 
 def test_rejects_corrupt_dataset_before_native_import(tmp_path: Path) -> None:
@@ -273,11 +284,11 @@ def blocked(name, *args, **kwargs):
         raise ImportError()
     return old(name, *args, **kwargs)
 builtins.__import__ = blocked
-from fast_umap._serialization_v1 import _deps
+from cuscan._serialization_v1 import _deps
 try:
     _deps()
 except ImportError as error:
-    assert 'serialization' in str(error)
+    assert 'cuscan[serialization]' in str(error)
 """
     result = subprocess.run(
         [sys.executable, "-c", code], check=False, capture_output=True, text=True
@@ -297,7 +308,7 @@ def test_save_temp_cleanup_after_existing_destination(tmp_path: Path) -> None:
 def test_no_clobber_race_preserves_concurrent_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from fast_umap import _serialization_v1
+    from cuscan import _serialization_v1
 
     path = tmp_path / "raced.h5"
     actual_link = _serialization_v1.os.link
@@ -317,7 +328,7 @@ def test_no_clobber_race_preserves_concurrent_destination(
 def test_precommit_failures_clean_temporary_and_preserve_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    from fast_umap import _serialization_v1
+    from cuscan import _serialization_v1
 
     model = fitted()
     destination = tmp_path / "target.h5"
@@ -366,7 +377,7 @@ def test_postcommit_directory_fsync_failure_identifies_committed_file(
 ) -> None:
     import os
 
-    from fast_umap import _serialization_v1
+    from cuscan import _serialization_v1
 
     path = tmp_path / "committed.h5"
     real_fsync = os.fsync

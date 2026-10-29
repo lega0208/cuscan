@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from fast_umap import HDBSCAN, _fast_umap
+from cuscan import HDBSCAN, _cuscan
 
 GIB = 2**30
 ROWS = 20_000
@@ -58,9 +58,7 @@ def _blobs(rows: int = 60, features: int = 3) -> np.ndarray:
 
 
 def _patch_estimate(monkeypatch: pytest.MonkeyPatch, estimate: dict[str, Any]) -> None:
-    monkeypatch.setattr(
-        _fast_umap, "estimate_hdbscan_resources", lambda *_args, **_kwargs: estimate
-    )
+    monkeypatch.setattr(_cuscan, "estimate_hdbscan_resources", lambda *_args, **_kwargs: estimate)
 
 
 def _advisories(record: Any) -> list[Any]:
@@ -78,7 +76,7 @@ def _native_knn(estimate: dict[str, object]) -> dict[str, Any]:
 
 
 def test_bridge_complete_route_has_no_knn_estimate() -> None:
-    result = _fast_umap.estimate_hdbscan_resources(10**9, 3, backend="cpu", min_samples=5)
+    result = _cuscan.estimate_hdbscan_resources(10**9, 3, backend="cpu", min_samples=5)
     assert result["resolved_graph"] == "complete"
     assert result["knn"] is None
 
@@ -86,7 +84,7 @@ def test_bridge_complete_route_has_no_knn_estimate() -> None:
 def test_bridge_default_width_is_floored_by_min_samples() -> None:
     # Default request max(3 * min_samples, 15) = 75 for min_samples=25.
     knn = _native_knn(
-        _fast_umap.estimate_hdbscan_resources(ROWS, KNN_FEATURES, backend="cpu", min_samples=25)
+        _cuscan.estimate_hdbscan_resources(ROWS, KNN_FEATURES, backend="cpu", min_samples=25)
     )
     assert knn["effective_width"] == 75
     assert knn["min_samples"] == 25
@@ -96,7 +94,7 @@ def test_bridge_default_width_is_floored_by_min_samples() -> None:
 
 def test_bridge_explicit_wide_knn_k_is_reported_as_effective_width() -> None:
     knn = _native_knn(
-        _fast_umap.estimate_hdbscan_resources(
+        _cuscan.estimate_hdbscan_resources(
             ROWS, KNN_FEATURES, backend="cpu", min_samples=5, knn_k=512
         )
     )
@@ -106,7 +104,7 @@ def test_bridge_explicit_wide_knn_k_is_reported_as_effective_width() -> None:
 
 def test_bridge_knn_k_below_min_samples_is_raised_to_min_samples() -> None:
     knn = _native_knn(
-        _fast_umap.estimate_hdbscan_resources(
+        _cuscan.estimate_hdbscan_resources(
             ROWS, KNN_FEATURES, backend="cpu", min_samples=25, knn_k=3
         )
     )
@@ -115,7 +113,7 @@ def test_bridge_knn_k_below_min_samples_is_raised_to_min_samples() -> None:
 
 def test_bridge_width_is_capped_by_finite_row_count() -> None:
     knn = _native_knn(
-        _fast_umap.estimate_hdbscan_resources(
+        _cuscan.estimate_hdbscan_resources(
             40, KNN_FEATURES, backend="cpu", min_samples=5, knn_k=512
         )
     )
@@ -125,7 +123,7 @@ def test_bridge_width_is_capped_by_finite_row_count() -> None:
 
 def test_bridge_auto_reports_conditional_cpu_and_cuda_scenarios() -> None:
     knn = _native_knn(
-        _fast_umap.estimate_hdbscan_resources(
+        _cuscan.estimate_hdbscan_resources(
             ROWS, KNN_FEATURES, backend="auto", min_samples=5, knn_k=512
         )
     )
@@ -139,7 +137,7 @@ def test_bridge_host_peak_counts_retained_geometry_and_fitted_state() -> None:
     finite = ROWS * KNN_FEATURES * 4
     for backend in ("cpu", "cuda"):
         knn = _native_knn(
-            _fast_umap.estimate_hdbscan_resources(
+            _cuscan.estimate_hdbscan_resources(
                 ROWS, KNN_FEATURES, backend=backend, min_samples=5, knn_k=15
             )
         )
@@ -153,21 +151,21 @@ def test_bridge_host_peak_counts_retained_geometry_and_fitted_state() -> None:
 def test_bridge_overflow_is_typed_and_allocates_nothing() -> None:
     # Input elements overflow usize before any allocation or graph routing.
     with pytest.raises(OverflowError):
-        _fast_umap.estimate_hdbscan_resources(100, 2**63, backend="cpu", min_samples=5)
+        _cuscan.estimate_hdbscan_resources(100, 2**63, backend="cpu", min_samples=5)
 
 
 def test_bridge_rejects_rows_outside_device_index_range() -> None:
     with pytest.raises(ValueError, match=r"row count.*supported maximum"):
-        _fast_umap.estimate_hdbscan_resources(2**40, KNN_FEATURES, backend="cpu", min_samples=5)
+        _cuscan.estimate_hdbscan_resources(2**40, KNN_FEATURES, backend="cpu", min_samples=5)
 
 
 def test_bridge_rejects_invalid_kwargs_like_fit() -> None:
     with pytest.raises(TypeError):
-        _fast_umap.estimate_hdbscan_resources(100, 3, not_a_parameter=1)
+        _cuscan.estimate_hdbscan_resources(100, 3, not_a_parameter=1)
     with pytest.raises(ValueError):
-        _fast_umap.estimate_hdbscan_resources(100, 3, knn_k=True)
+        _cuscan.estimate_hdbscan_resources(100, 3, knn_k=True)
     with pytest.raises(ValueError):
-        _fast_umap.estimate_hdbscan_resources(100, 3, backend="gpu")
+        _cuscan.estimate_hdbscan_resources(100, 3, backend="gpu")
 
 
 # Finite-row forwarding: the warning path sends the finite-row count, not the raw row count.
@@ -180,7 +178,7 @@ def test_finite_row_count_is_forwarded_to_the_estimate(monkeypatch: pytest.Monke
         calls.append((args, kwargs))
         return {"resolved_graph": "complete", "knn": None}
 
-    monkeypatch.setattr(_fast_umap, "estimate_hdbscan_resources", record)
+    monkeypatch.setattr(_cuscan, "estimate_hdbscan_resources", record)
     data = _blobs(60, 3)
     data[0, 0] = np.nan
     data[1, 2] = np.inf

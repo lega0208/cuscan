@@ -6,8 +6,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-import fast_umap
-from fast_umap import _hdbscan_predictor_serialization_v1 as serialization
+import cuscan
+from cuscan import _hdbscan_predictor_serialization_v1 as serialization
 
 h5py = pytest.importorskip("h5py")
 pytest.importorskip("hdf5plugin")
@@ -88,7 +88,7 @@ def test_no_tree_load_passes_native_minimal_state(
         received.append((a, m, backend, device_index))
         return Native()
 
-    monkeypatch.setattr(fast_umap._fast_umap, "load_hdbscan_predictor", capture)
+    monkeypatch.setattr(cuscan._cuscan, "load_hdbscan_predictor", capture)
     restored = serialization.load_model(Predictor, path, backend="cpu", device_index=3)
     assert isinstance(restored, Native)
     loaded_arrays, loaded_metadata, backend, device_index = received[0]
@@ -117,7 +117,7 @@ def test_rejects_presence_mismatch_and_link_alias_before_native_load(
     with h5py.File(path, "r+") as file:
         file["state"].attrs["geometry_present"] = np.bool_(True)
     monkeypatch.setattr(
-        fast_umap._fast_umap,
+        cuscan._cuscan,
         "load_hdbscan_predictor",
         lambda *args, **kwargs: pytest.fail("native loader must not be called"),
     )
@@ -136,7 +136,7 @@ def _clustered_state() -> tuple[Any, dict[str, Any], dict[str, Any]]:
         [[0.0, 0.0], [0.1, 0.0], [0.0, 0.1], [3.0, 3.0], [3.1, 3.0], [3.0, 3.1]],
         dtype=np.float32,
     )
-    fitted = fast_umap._fast_umap.fit_hdbscan(x, backend="cpu", min_samples=1, min_cluster_size=2)
+    fitted = cuscan._cuscan.fit_hdbscan(x, backend="cpu", min_samples=1, min_cluster_size=2)
     predictor = fitted.to_predictor()
     arrays, metadata = predictor.export_state()
     return predictor, arrays, metadata
@@ -156,7 +156,7 @@ def test_rejects_scalar_limits_and_candidate_width_before_dataset_reads(
     with h5py.File(path, "r+") as file:
         file["state"].attrs["n_features"] = np.uint64(int(np.iinfo(np.intp).max) + 1)
     monkeypatch.setattr(
-        fast_umap._fast_umap,
+        cuscan._cuscan,
         "load_hdbscan_predictor",
         lambda *args, **kwargs: pytest.fail("native loader must not be called"),
     )
@@ -187,7 +187,7 @@ def test_rejects_predictor_dataset_attributes_and_wrong_state_object(
     with h5py.File(path, "r+") as file:
         file["state/geometry"].attrs["unexpected"] = 1
     monkeypatch.setattr(
-        fast_umap._fast_umap,
+        cuscan._cuscan,
         "load_hdbscan_predictor",
         lambda *args, **kwargs: pytest.fail("native loader must not be called"),
     )
@@ -317,7 +317,7 @@ def test_rejects_malformed_predictor_dataset_without_reading_payload(
     def unexpected_payload_read(*args: Any, **kwargs: Any) -> None:
         pytest.fail("malformed HDF5 payload was decoded before schema rejection")
 
-    monkeypatch.setattr(fast_umap._fast_umap, "load_hdbscan_predictor", unexpected_native_load)
+    monkeypatch.setattr(cuscan._cuscan, "load_hdbscan_predictor", unexpected_native_load)
     monkeypatch.setattr(h5py.Dataset, "__getitem__", unexpected_payload_read)
     with pytest.raises(ValueError, match=message):
         serialization.load_model(object, path)

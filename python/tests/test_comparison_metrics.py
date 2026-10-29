@@ -132,7 +132,7 @@ def test_native_stderr_spectral_fallback_is_failed_and_persisted(
             command,
             0,
             json.dumps({"fit_seconds": [0.01], "warnings": []}),
-            "[fast-umap] WARNING: spectral initialization did not converge; "
+            "[cuscan] WARNING: spectral initialization did not converge; "
             "using seeded uniform initialization",
         )
 

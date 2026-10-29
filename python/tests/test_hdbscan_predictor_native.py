@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from fast_umap import _fast_umap
+from cuscan import _cuscan
 
 ARRAY_KEYS = {
     "geometry",
@@ -46,14 +46,14 @@ def clustered_native() -> Any:
         ],
         dtype=np.float32,
     )
-    return _fast_umap.fit_hdbscan(
+    return _cuscan.fit_hdbscan(
         train, min_cluster_size=3, min_samples=2, backend="cpu"
     ).to_predictor()
 
 
 def shortcut_native() -> Any:
     train = np.array([[0.0], [10.0], [20.0], [30.0]], dtype=np.float32)
-    return _fast_umap.fit_hdbscan(
+    return _cuscan.fit_hdbscan(
         train, min_cluster_size=3, min_samples=2, backend="cpu"
     ).to_predictor()
 
@@ -98,7 +98,7 @@ def test_export_uses_exact_keys_shapes_dtypes_and_independent_snapshots() -> Non
 def test_native_loader_default_device_index_and_prediction_parity() -> None:
     predictor = clustered_native()
     arrays, metadata = predictor.export_state()
-    restored = _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+    restored = _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
     query = np.array([[0.05, 0.03], [8.04, 8.02]], dtype=np.float32)
     expected = predictor.approximate_predict(query, True)
     actual = restored.approximate_predict(query, True)
@@ -124,7 +124,7 @@ def test_no_cluster_loader_rejects_non_none_arrays() -> None:
     arrays, metadata = shortcut_native().export_state()
     arrays["geometry"] = np.zeros(0, dtype=np.float32)
     with pytest.raises(ValueError, match="all arrays to be None"):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
 
 
 @pytest.mark.parametrize("side", ["arrays", "metadata"])
@@ -133,12 +133,12 @@ def test_loader_rejects_missing_and_extra_keys(side: str) -> None:
     target = arrays if side == "arrays" else metadata
     target.pop(next(iter(target)))
     with pytest.raises(ValueError, match="exactly"):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
     arrays, metadata = clustered_native().export_state()
     target = arrays if side == "arrays" else metadata
     target["unexpected"] = None
     with pytest.raises(ValueError, match="exactly"):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
 
 
 @pytest.mark.parametrize(
@@ -168,7 +168,7 @@ def test_loader_rejects_noncanonical_metadata_scalars(key: str, bad: object) -> 
     arrays, metadata = clustered_native().export_state()
     metadata[key] = bad
     with pytest.raises((TypeError, ValueError, OverflowError)):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
 
 
 @pytest.mark.parametrize(
@@ -194,23 +194,21 @@ def test_loader_rejects_array_dtype_rank_and_shape(key: str, replacement: np.nda
     arrays, metadata = clustered_native().export_state()
     arrays[key] = replacement
     with pytest.raises((TypeError, ValueError, OverflowError)):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend="cpu")
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu")
 
 
 @pytest.mark.parametrize("backend", ["invalid", "CPU", "", 1])
 def test_loader_rejects_unsupported_backend(backend: Any) -> None:
     arrays, metadata = clustered_native().export_state()
     with pytest.raises((TypeError, ValueError)):
-        _fast_umap.load_hdbscan_predictor(arrays, metadata, backend=backend)
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend=backend)
 
 
 @pytest.mark.parametrize("device_index", [True, False, -1, 1.0, "0"])
 def test_loader_requires_nonnegative_builtin_integer_device_index(device_index: Any) -> None:
     arrays, metadata = clustered_native().export_state()
     with pytest.raises((TypeError, ValueError, OverflowError)):
-        _fast_umap.load_hdbscan_predictor(
-            arrays, metadata, backend="cpu", device_index=device_index
-        )
+        _cuscan.load_hdbscan_predictor(arrays, metadata, backend="cpu", device_index=device_index)
 
 
 def test_native_prediction_feature_width_and_bool_are_strict() -> None:
@@ -256,7 +254,7 @@ def test_predictor_outlives_native_fitted_estimator() -> None:
         ],
         dtype=np.float32,
     )
-    fitted = _fast_umap.fit_hdbscan(train, min_cluster_size=3, min_samples=2, backend="cpu")
+    fitted = _cuscan.fit_hdbscan(train, min_cluster_size=3, min_samples=2, backend="cpu")
     predictor = fitted.to_predictor()
     del fitted
     gc.collect()

@@ -1,6 +1,6 @@
 use std::{error::Error, fs::File, io::Write, path::Path};
 
-// Exact f32 arithmetic copied from crates/fast-hdbscan/benches/support/mod.rs.
+// Exact f32 arithmetic copied from crates/hdbscan/benches/support/mod.rs.
 fn synthetic(rows: usize, dimensions: usize) -> Vec<Vec<f32>> {
     (0..rows)
         .map(|row| {

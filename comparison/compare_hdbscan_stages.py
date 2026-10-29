@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare native fast-hdbscan and fast_hdbscan 0.3.2 stage timings.
+"""Compare native cuscan and fast_hdbscan 0.3.2 stage timings.
 
 Build the native companion before running (the backend must match --backend):
 
-    cargo build -p fast-hdbscan --release --features tracing \\
+    cargo build -p hdbscan --release --features tracing \\
         --example profile_hdbscan_stages
 
 Then run, for example:
@@ -613,7 +613,7 @@ def main() -> int:
         parser.error("--min-cluster-size must be at least 2")
     if not args.binary.is_file():
         parser.error(
-            f"{args.binary} missing; build with: cargo build -p fast-hdbscan --release "
+            f"{args.binary} missing; build with: cargo build -p hdbscan --release "
             "--features tracing "
             "--example profile_hdbscan_stages"
         )
@@ -707,13 +707,13 @@ def main() -> int:
     )
     search_ref = "pynndescent" if features > 30 else "kd-tree-boruvka"
     title = (
-        f"fast-hdbscan {args.backend} vs fast_hdbscan 0.3.2: {rows:,}x{features}, "
+        f"cuscan {args.backend} vs fast_hdbscan 0.3.2: {rows:,}x{features}, "
         f"{args.cluster_selection_method}, native {args.search}, reference {search_ref}"
     )
     if args.skip_python:
         search_ref = None
         title = (
-            f"fast-hdbscan {args.backend}: {rows:,}x{features}, "
+            f"cuscan {args.backend}: {rows:,}x{features}, "
             f"{args.cluster_selection_method}, native {args.search} (Python skipped)"
         )
     print(title)

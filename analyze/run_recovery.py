@@ -63,7 +63,7 @@ for name, n, d, ms in profile_cases:
                 for flag in (
                     "CUBECL_DEBUG_LOG",
                     "CUBECL_DEBUG_OPTION",
-                    "FAST_HDBSCAN_KD_DIAGNOSTICS",
+                    "CUSCAN_KD_DIAGNOSTICS",
                 ):
                     if flag in os.environ:
                         raise RuntimeError(f"unexpected inherited instrumentation setting: {flag}")

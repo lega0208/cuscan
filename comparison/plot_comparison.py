@@ -17,7 +17,7 @@ N_NEIGHBORS = 30
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare umap-learn and fast_umap on one reproducible data sample."
+        description="Compare umap-learn and cuscan on one reproducible data sample."
     )
     parser.add_argument("--sample-size", type=int, default=1_000_000)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -86,7 +86,7 @@ def main() -> None:
 
     import umap
 
-    from fast_umap import UMAP
+    from cuscan import UMAP
 
     umap_config = {**config}
     # fast_config = {**config, "device": args.device, "n_epochs": 2500}
@@ -101,11 +101,11 @@ def main() -> None:
     umap_seconds = perf_counter() - started
     validate_embedding(umap_embedding, X.shape[0], "umap-learn")
 
-    print("starting fast_umap")
+    print("starting cuscan")
     started = perf_counter()
     fast_embedding = UMAP(**fast_config).fit_transform(X)
     fast_seconds = perf_counter() - started
-    validate_embedding(fast_embedding, X.shape[0], "fast_umap")
+    validate_embedding(fast_embedding, X.shape[0], "cuscan")
 
     categories = sorted(set(labels), key=lambda label: (label is not None, label or ""))
     palette = plotly.colors.qualitative.Plotly
@@ -115,7 +115,7 @@ def main() -> None:
     figure = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("umap-learn", "fast_umap"),
+        subplot_titles=("umap-learn", "cuscan"),
     )
     for index, label in enumerate(categories):
         display_name = "(null)" if label is None else label
@@ -147,7 +147,7 @@ def main() -> None:
     figure.write_html(args.output, include_plotlyjs=True, full_html=True)
 
     print(f"umap-learn fit: {umap_seconds:.2f}s")
-    print(f"fast_umap fit: {fast_seconds:.2f}s")
+    print(f"cuscan fit: {fast_seconds:.2f}s")
     print(f"Saved standalone HTML to {args.output.resolve()}")
 
 

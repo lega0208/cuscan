@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --no-sync
-"""Per-stage fit timing: fast-umap Standard UMAP (CPU by default) vs umap-learn 0.5.12.
+"""Per-stage fit timing: cuscan Standard UMAP (CPU by default) vs umap-learn 0.5.12.
 
 Build the Rust companion first (build time is not measured):
 
-    cargo build --release --features tracing \
+    cargo build -p umap --release --features tracing \
         --example profile_standard_stages
 
 Then run from the repository root:
@@ -18,7 +18,7 @@ compilation. With --rust-runs N for N >= 2, Rust performs N fits in one process:
 cold and later runs are warmed; the comparison uses the per-stage median of runs 1 through
 N-1. Python still performs one fit. The defaults overlap the clusters so the k-NN graph is
 connected: with the original well-separated clusters (--center-scale 5 --noise 0.35)
-fast-umap spectral init currently fails with "component-centroid affinities underflowed";
+cuscan spectral init currently fails with "component-centroid affinities underflowed";
 use --init random for those.
 
 Rust stages come from the library's `tracing` spans (with device barriers). Python
@@ -62,7 +62,7 @@ PYTHON_STAGE_FUNCTIONS = {
     "spectral_layout": "initialization",
     "optimize_layout_euclidean": "optimization",
 }
-SPEEDUP_TITLE = "Rust faster by (%)"
+SPEEDUP_TITLE = "cuscan faster by (%)"
 
 
 def _load_spans_helpers() -> Any:
@@ -211,7 +211,7 @@ def _fmt(value: float | None, suffix: str = "") -> str:
 
 
 def _print_table(title: str, rows: list[dict[str, Any]]) -> None:
-    headers = ("Stage", "Time (ms)", "% of total", "Python time (ms)", SPEEDUP_TITLE)
+    headers = ("Stage", "cuscan time (ms)", "% of total", "umap-learn time (ms)", SPEEDUP_TITLE)
     body = [
         (
             row["stage"],
@@ -253,8 +253,8 @@ def _write_html(path: Path, rows: list[dict[str, Any]], title: str) -> None:
         rows=3,
         cols=1,
         subplot_titles=(
-            "Rust: % of total fit time",
-            f"{SPEEDUP_TITLE} (positive = Rust faster)",
+            "cuscan: % of total fit time",
+            f"{SPEEDUP_TITLE} (positive = cuscan faster)",
             "Raw stage timings (ms)",
         ),
         vertical_spacing=0.1,
@@ -278,7 +278,7 @@ def _write_html(path: Path, rows: list[dict[str, Any]], title: str) -> None:
         row=2,
         col=1,
     )
-    for implementation, key in (("Rust", "rust_ms"), ("Python", "python_ms")):
+    for implementation, key in (("cuscan", "rust_ms"), ("umap-learn", "python_ms")):
         figure.add_trace(
             go.Bar(name=implementation, x=[r["stage"] for r in rows], y=[r[key] for r in rows]),
             row=3,
@@ -330,7 +330,7 @@ def main() -> int:
         return 0
     if not args.binary.exists():
         parser.error(
-            f"{args.binary} missing; build with: cargo build --release --features tracing "
+            f"{args.binary} missing; build with: cargo build -p umap --release --features tracing "
             "--example profile_standard_stages"
         )
 
@@ -357,7 +357,7 @@ def main() -> int:
                 "--init",
                 args.init,
             ],
-            "rust",
+            "cuscan",
         )
         python_command = [sys.executable, str(Path(__file__).resolve())]
         python_command += ["--_python-worker", str(input_path), "--rows", str(args.rows)]
@@ -365,12 +365,12 @@ def main() -> int:
         python_command += ["--search", args.search, "--init", args.init, *shared]
         if args.seeded_python:
             python_command.append("--seeded-python")
-        python = _run(python_command, "python")
+        python = _run(python_command, "umap-learn")
 
     comparison_runs = range(1, args.rust_runs) if args.rust_runs >= 2 else range(1)
     rows = _rows(_summarize(rust, comparison_runs), _summarize(python))
     title = (
-        f"fast-umap {args.backend} vs umap-learn 0.5.12: {args.rows:,}x{args.features}, "
+        f"cuscan {args.backend} vs umap-learn 0.5.12: {args.rows:,}x{args.features}, "
         f"{args.epochs} epochs, k={args.neighbors}, {args.search} search, {args.init} init, "
         f"{os.cpu_count()} CPUs"
     )
@@ -381,10 +381,10 @@ def main() -> int:
         for index in range(args.rust_runs):
             label = "cold" if index == 0 else "warmed"
             _print_table(
-                f"Rust run {index} ({label})",
+                f"cuscan run {index} ({label})",
                 _rows(_summarize(rust, range(index, index + 1)), _summarize(python)),
             )
-        _print_table(f"Comparison (median of Rust warmed runs 1-{args.rust_runs - 1})", rows)
+        _print_table(f"Comparison (median of cuscan warmed runs 1-{args.rust_runs - 1})", rows)
     if args.json:
         metadata = {
             "input_sha256": input_sha256,

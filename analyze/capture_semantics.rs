@@ -1,4 +1,4 @@
-use fast_hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};
+use hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};
 use std::{error::Error, fs};
 
 fn main() -> Result<(), Box<dyn Error>> {

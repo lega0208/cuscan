@@ -958,13 +958,13 @@ def test_reference_rejects_incomplete_or_missing_metadata(tmp_path: Path, refere
 
 
 # Run when upgrading umap-learn/pynndescent or changing reference-index construction:
-# FAST_UMAP_TEST_REFERENCE_COMPAT=1 uv run --no-sync pytest \
+# CUSCAN_TEST_REFERENCE_COMPAT=1 uv run --no-sync pytest \
 #     python/tests/test_compare_umap_spans.py \
 #     -k test_umap_exact_reference_index_transforms_and_missing_index_fails
 # This checks upstream assumptions used by our reference helper, not native UMAP correctness.
 @pytest.mark.skipif(
-    os.environ.get("FAST_UMAP_TEST_REFERENCE_COMPAT") != "1",
-    reason="upstream reference compatibility check; set FAST_UMAP_TEST_REFERENCE_COMPAT=1 to run",
+    os.environ.get("CUSCAN_TEST_REFERENCE_COMPAT") != "1",
+    reason="upstream reference compatibility check; set CUSCAN_TEST_REFERENCE_COMPAT=1 to run",
 )
 def test_umap_exact_reference_index_transforms_and_missing_index_fails() -> None:
     import umap

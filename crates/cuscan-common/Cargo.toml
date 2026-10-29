@@ -1,0 +1,20 @@
+[package]
+name = "cuscan-common"
+description = "Backend-neutral CubeCL device and neighbor operations"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+burn = { workspace = true }
+burn-cubecl = { workspace = true }
+cubecl = { workspace = true }
+cubecl-cpu = { workspace = true }
+cudarc = { workspace = true }
+rayon = { workspace = true }
+
+[features]
+default = []
+tracing = ["burn/tracing", "burn-cubecl/tracing", "cubecl/tracing"]

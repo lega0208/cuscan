@@ -1,31 +1,29 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/fast-umap-core",
-  "crates/fast-umap",
-  "crates/fast-umap-python",
-  "crates/fast-cubecl-common",
-  "crates/fast-hdbscan-core",
-  "crates/fast-hdbscan",
+  "crates/umap-core",
+  "crates/umap",
+  "crates/cuscan-python",
+  "crates/cuscan-common",
+  "crates/hdbscan-core",
+  "crates/hdbscan",
 ]
-default-members = ["crates/fast-umap"]
+default-members = ["crates/umap"]
 exclude = ["references"]
 
 [workspace.package]
-version = "1.6.0"
+version = "0.1.0"
 publish = false
 edition = "2024"
 license = "MIT"
-authors = ["Eugene Hauptmann"]
-repository = "https://github.com/eugenehp/fast-map"
-homepage = "https://github.com/eugenehp/fast-map"
+repository = "https://github.com/lega0208/cuscan"
 
 [workspace.dependencies]
-fast-umap-core = { path = "crates/fast-umap-core", default-features = false }
-fast-cubecl-common = { path = "crates/fast-cubecl-common", default-features = false }
-fast-hdbscan-core = { path = "crates/fast-hdbscan-core", default-features = false }
-fast-hdbscan = { path = "crates/fast-hdbscan", default-features = false }
-fast-umap = { path = "crates/fast-umap", default-features = false }
+umap-core = { path = "crates/umap-core", default-features = false }
+cuscan-common = { path = "crates/cuscan-common", default-features = false }
+hdbscan-core = { path = "crates/hdbscan-core", default-features = false }
+hdbscan = { path = "crates/hdbscan", default-features = false }
+umap = { path = "crates/umap", default-features = false }
 burn = { version = "0.22.1", default-features = false, features = [
   "std",
   "autotune",

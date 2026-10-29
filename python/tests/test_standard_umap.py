@@ -7,8 +7,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-import fast_umap
-from fast_umap import UMAP
+import cuscan
+from cuscan import UMAP
 
 
 def blobs(n_per_cluster: int = 24) -> tuple[np.ndarray, np.ndarray]:
@@ -26,7 +26,7 @@ def estimator(**kwargs: object) -> UMAP:
 
 
 def test_exports_and_shape_dtype() -> None:
-    assert "UMAP" in fast_umap.__all__
+    assert "UMAP" in cuscan.__all__
     x, _ = blobs()
     model = estimator()
     result = model.fit_transform(x)
@@ -249,7 +249,7 @@ def test_invalid_parameters_raise_value_error(kwargs: dict[str, object], message
 
 
 @pytest.mark.skipif(
-    os.environ.get("FAST_UMAP_REQUIRE_CUDA") != "1",
+    os.environ.get("CUSCAN_REQUIRE_CUDA") != "1",
     reason="CUDA required only in CUDA validation runs",
 )
 def test_cuda_backend() -> None:
@@ -260,7 +260,7 @@ def test_cuda_backend() -> None:
 
 
 @pytest.mark.skipif(
-    os.environ.get("FAST_UMAP_REQUIRE_CUDA") != "1",
+    os.environ.get("CUSCAN_REQUIRE_CUDA") != "1",
     reason="CUDA required only in CUDA validation runs",
 )
 def test_cuda_transform_releases_gil_for_at_least_half_second() -> None:

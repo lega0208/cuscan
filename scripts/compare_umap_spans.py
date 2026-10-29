@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
-"""Stage-1 benchmark suite: umap-learn 0.5.12 (parallel) vs fast-umap CUDA standard UMAP.
+"""Stage-1 benchmark suite: umap-learn 0.5.12 (parallel) vs cuscan CUDA standard UMAP.
 
 Run from the repository root with ``uv run --no-sync python scripts/compare_umap_spans.py``.
 Build the companion first (build time is excluded from the runtime budget):
-``cargo build --release --features tracing
+``cargo build -p umap --release --features tracing
 --example profile_standard_cuda``.
 
 Primary workload: identical clustered float32 5000x32 input, 20 epochs, Euclidean,
@@ -1310,10 +1310,10 @@ def _stage2_cli(argv: list[str]) -> int:
                 },
             }
             harness_paths = [
-                Path("crates/fast-umap/examples/profile_standard_cuda.rs"),
-                Path("crates/fast-umap/tests/test_standard_ann.rs"),
-                Path("crates/fast-umap/tests/test_standard_graph.rs"),
-                Path("crates/fast-umap/tests/test_standard_quality.rs"),
+                Path("crates/umap/examples/profile_standard_cuda.rs"),
+                Path("crates/umap/tests/test_standard_ann.rs"),
+                Path("crates/umap/tests/test_standard_graph.rs"),
+                Path("crates/umap/tests/test_standard_quality.rs"),
                 Path("python/tests/test_compare_umap_spans.py"),
             ]
             manifest_payload = {
@@ -2301,7 +2301,7 @@ def _ann_construction_cli(argv: list[str]) -> int:
         "order": "ten trials; baseline/candidate/PyNNDescent rotated one-at-a-time; no overlap",
     }
     output: dict[str, Any] = {
-        "schema": "fast-umap.ann-construction-campaign.v1",
+        "schema": "cuscan.ann-construction-campaign.v1",
         "complete": False,
         "protocol_admissible": False,
         "configuration": configuration,
@@ -2643,7 +2643,7 @@ def _cli() -> int:
     if not binary.is_file():
         print(
             f"CUDA profiler executable not found: {binary}\nBuild it first:\n"
-            "  cargo build --release --features tracing "
+            "  cargo build -p umap --release --features tracing "
             "--example profile_standard_cuda",
             file=sys.stderr,
         )

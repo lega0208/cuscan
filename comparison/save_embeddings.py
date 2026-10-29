@@ -2,7 +2,7 @@ from pathlib import Path
 
 import polars as pl
 
-from fast_umap import UMAP
+from cuscan import UMAP
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "feedback_clustered.parquet"
@@ -19,8 +19,8 @@ config = {
 }
 
 config_16d = {
-  **config,
-  "n_components": 16,
+    **config,
+    "n_components": 16,
 }
 
 df = pl.read_parquet(DEFAULT_INPUT)
@@ -32,7 +32,6 @@ embeddings_16d = UMAP(**config_16d).fit_transform(df["embedding"].to_numpy())
 
 print("Saving embeddings...")
 df.with_columns(
-    embedding_2d=pl.Series(embeddings_2d),
-    embedding_16d=pl.Series(embeddings_16d)
+    embedding_2d=pl.Series(embeddings_2d), embedding_16d=pl.Series(embeddings_16d)
 ).write_parquet(DEFAULT_OUTPUT)
 print("Embeddings saved.")

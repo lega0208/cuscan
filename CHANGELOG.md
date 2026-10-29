@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.1.0] — cuscan
+
+### Added
+
+- Unified Python `cuscan` package with non-parametric UMAP and HDBSCAN, including transform, clustering and approximate prediction, and optional HDF5 fitted-model serialization.
+- Rust `umap` and `hdbscan` facades with CPU (CubeCL LLVM) and CUDA backends, selected at runtime.
+
+### Breaking
+
+- New project, package, native module, Rust crate and environment variable identities; no compatibility aliases are provided.
+- Fitted files use the `cuscan_fitted_model` identity. Older model files are rejected rather than migrated; retrain and save in the new format.
+
+## Historical predecessor changes
+
+The following inherited entries describe the predecessor at the time of each entry, not current cuscan capabilities or authorship. They are retained as historical records.
+
+## [Unreleased] — historical predecessor
 
 ### Breaking
 

@@ -8,12 +8,10 @@ from typing import Any
 import numpy as np
 import pytest
 
-import fast_umap
-from fast_umap import HDBSCAN, HDBSCANPredictor
+import cuscan
+from cuscan import HDBSCAN, HDBSCANPredictor
 
-_FIXTURE_PATH = (
-    Path(__file__).parents[2] / "crates/fast-hdbscan/tests/fixtures/hdbscan_prediction.json"
-)
+_FIXTURE_PATH = Path(__file__).parents[2] / "crates/hdbscan/tests/fixtures/hdbscan_prediction.json"
 _FIXTURE = json.loads(_FIXTURE_PATH.read_text())
 
 
@@ -25,7 +23,7 @@ def train_data() -> np.ndarray:
 
 
 def test_public_type_is_lightweight_and_has_no_arbitrary_constructor() -> None:
-    assert "HDBSCANPredictor" in fast_umap.__all__
+    assert "HDBSCANPredictor" in cuscan.__all__
     with pytest.raises(TypeError, match="created by"):
         HDBSCANPredictor()
     assert not hasattr(HDBSCANPredictor, "labels_")
@@ -33,18 +31,18 @@ def test_public_type_is_lightweight_and_has_no_arbitrary_constructor() -> None:
 
 
 def test_serialization_dependency_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
-    module = importlib.import_module("fast_umap._hdbscan_predictor_serialization_v1")
+    module = importlib.import_module("cuscan._hdbscan_predictor_serialization_v1")
 
     def missing(_model: str) -> Any:
-        raise ImportError("requires fast-umap[serialization]")
+        raise ImportError("requires cuscan[serialization]")
 
     monkeypatch.setattr(module._common, "_deps", missing)
     predictor = (
         HDBSCAN(backend="cpu", min_cluster_size=2, min_samples=1).fit(train_data()).to_predictor()
     )
-    with pytest.raises(ImportError, match=r"fast-umap\[serialization\]"):
+    with pytest.raises(ImportError, match=r"cuscan\[serialization\]"):
         predictor.save("not-written.h5")
-    assert fast_umap.HDBSCANPredictor is HDBSCANPredictor
+    assert cuscan.HDBSCANPredictor is HDBSCANPredictor
 
 
 def test_predictor_save_exports_before_file_layer(
@@ -55,7 +53,7 @@ def test_predictor_save_exports_before_file_layer(
     )
     arrays, metadata = predictor._native_predictor.export_state()
     seen: list[tuple[dict[str, Any], dict[str, Any], bool]] = []
-    module = importlib.import_module("fast_umap._hdbscan_predictor_serialization_v1")
+    module = importlib.import_module("cuscan._hdbscan_predictor_serialization_v1")
 
     def save(path: Any, actual_arrays: Any, actual_metadata: Any, *, overwrite: bool) -> None:
         assert path == tmp_path / "state.h5"
@@ -80,6 +78,7 @@ def test_cpu_round_trip_is_exact_and_predictor_only(tmp_path: Path) -> None:
     file_path = tmp_path / "prediction-only.h5"
     predictor.save(file_path)
     with h5py.File(file_path, "r") as file:
+        assert file.attrs["format"] == "cuscan_fitted_model"
         assert set(file) == {"state"}
         assert file.attrs["model_kind"] == "hdbscan_predictor"
         state = file["state"]
@@ -112,6 +111,21 @@ def test_cpu_round_trip_is_exact_and_predictor_only(tmp_path: Path) -> None:
     assert not hasattr(restored, "probabilities_")
     assert not hasattr(restored, "_fitted_state")
     assert not hasattr(restored, "__dict__")
+
+
+@pytest.mark.parametrize("format_value", ["fast_umap_fitted_model", "invalid_format", 123])
+def test_predictor_rejects_old_and_malformed_format(tmp_path: Path, format_value: Any) -> None:
+    h5py = pytest.importorskip("h5py")
+    pytest.importorskip("hdf5plugin")
+    predictor = (
+        HDBSCAN(backend="cpu", min_cluster_size=2, min_samples=1).fit(train_data()).to_predictor()
+    )
+    path = tmp_path / "predictor.h5"
+    predictor.save(path)
+    with h5py.File(path, "r+") as file:
+        file.attrs["format"] = format_value
+    with pytest.raises(ValueError, match="format"):
+        HDBSCANPredictor.load(path, backend="cpu")
 
 
 def test_shortcut_and_root_only_state_round_trip(tmp_path: Path) -> None:

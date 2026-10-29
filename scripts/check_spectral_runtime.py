@@ -151,7 +151,7 @@ def _invoke_runtime(graph, dimensions, test_runner):
     except (TypeError, ValueError) as exc:
         raise HarnessError(f"cannot encode native request: {exc}") from exc
 
-    with tempfile.TemporaryDirectory(prefix="fast-umap-spectral-runtime-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuscan-spectral-runtime-") as directory:
         request_path = pathlib.Path(directory) / "graph.json"
         response_path = pathlib.Path(directory) / "result.json"
         request_path.write_bytes(request_bytes)
@@ -163,8 +163,8 @@ def _invoke_runtime(graph, dimensions, test_runner):
             "--nocapture",
         ]
         env = dict(os.environ)
-        env["FAST_UMAP_SPECTRAL_REQUEST"] = str(request_path)
-        env["FAST_UMAP_SPECTRAL_RESPONSE"] = str(response_path)
+        env["CUSCAN_SPECTRAL_REQUEST"] = str(request_path)
+        env["CUSCAN_SPECTRAL_RESPONSE"] = str(response_path)
         try:
             child = subprocess.run(
                 command,
@@ -376,7 +376,7 @@ def _scipy_worker(request_path, response_path):
 
 
 def _run_scipy_worker(graph, dimensions):
-    with tempfile.TemporaryDirectory(prefix="fast-umap-scipy-runtime-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuscan-scipy-runtime-") as directory:
         request_path = pathlib.Path(directory) / "request.npz"
         response_path = pathlib.Path(directory) / "response.json"
         np.savez(
@@ -536,9 +536,9 @@ def _run_harness(args):
     source_paths = (
         "Cargo.toml",
         "Cargo.lock",
-        "crates/fast-umap-core/Cargo.toml",
-        "crates/fast-umap-core/src/init.rs",
-        "crates/fast-umap-core/src/block_spectral.rs",
+        "crates/umap-core/Cargo.toml",
+        "crates/umap-core/src/init.rs",
+        "crates/umap-core/src/block_spectral.rs",
         "scripts/check_spectral.py",
     )
     report = {

@@ -372,6 +372,7 @@ def source_model(capture):
         "d": d,
         "k": k,
         "boruvka_rounds_R": rounds,
+        # These paths identify captured historical snapshots, not the live source tree.
         "source_anchors": {
             "estimator": (
                 f"target/core-distance-recovery-{variant}/crates/fast-hdbscan/src/estimator.rs"

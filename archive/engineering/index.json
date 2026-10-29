@@ -1,0 +1,167 @@
+{
+  "note": "Historical records moved without content changes. Resolve original relative links from the original repository-root context; use original_path mapping for sibling reports and archived_path for their current location. Historical crate/source paths identify past revisions, not current checkout paths. Artifact paths refer to repository-root artifacts/; most performance artifacts are ignored and local, and only tracked receipts are distributed.",
+  "records": [
+    {
+      "original_path": "approx_predict_plan.md",
+      "archived_path": "archive/engineering/approx_predict_plan.md",
+      "sha256": "12bedf4691a24931e88bc3b38504e5275167a32e3a04e9d6fb3db9fc1870ed81",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "approx_query_cpu_plan.md",
+      "archived_path": "archive/engineering/approx_query_cpu_plan.md",
+      "sha256": "ca0e3a14e4d19655be884a163980ced5d8a6bd80b71d954aa817b9b714d40c5d",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "core_dist_perf.md",
+      "archived_path": "archive/engineering/core_dist_perf.md",
+      "sha256": "5864c075c65d705cc8883f513c7ea75377657174cd9fc0cf8ba2246207b5cc73",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "core_dist_refactor_plan.md",
+      "archived_path": "archive/engineering/core_dist_refactor_plan.md",
+      "sha256": "27e685049fd71b9fd22147f1ec279bbc2f10eaa7a9ea3a62fd5704e8bd9a3c5b",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan.md",
+      "sha256": "e287f2c8d57170e1c97a03ccc325ee8d0ceb35d30912ec8301199fe277fc922b",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase1.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase1.md",
+      "sha256": "eb1b2d73ce21ec6c00b0fb0828a252db9ba0bc892eec50abd37dc54d4283aa6b",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase2.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase2.md",
+      "sha256": "c19f1d7f22274ec8fcfaf711e54ac0dd3adf3b93b096b99f53dd34c260db1a0c",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase3.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase3.md",
+      "sha256": "acb0f5470d2a0c912f9dfbf55a5fb3033a1e6d1b7927637fb135e3a9b5fd830d",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase4.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase4.md",
+      "sha256": "9cdbf6219a869b28d3f7eca9525e0ceee6cc3661e653ebb379d5b91f985f0a03",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase5.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase5.md",
+      "sha256": "805daf1b15d16096616570b4d9a5766c2652dc16c824f65fbad04a49138c7559",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase6.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase6.md",
+      "sha256": "700c277f30a0fe1365e93ef977858556e5614c7c5cb648e83b15242e15d90502",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "cubecl_kernels_perf_plan_phase7.md",
+      "archived_path": "archive/engineering/cubecl_kernels_perf_plan_phase7.md",
+      "sha256": "12afa0c9afc825e51838e5d4e2069ff34c22a80e0908cd1e8afa857d74208187",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_algo_impl.md",
+      "archived_path": "archive/engineering/hdbscan_algo_impl.md",
+      "sha256": "f4888b07d64100e1daf8301677845d3e8b6529a85fd12b9bdcb917181217eab9",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_impl.md",
+      "archived_path": "archive/engineering/hdbscan_impl.md",
+      "sha256": "a80b950398df8a0b9c37ef8df055b3fe32ffcff074e39e93fe4afac81f326150",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_perf_investigation.md",
+      "archived_path": "archive/engineering/hdbscan_perf_investigation.md",
+      "sha256": "37a8c56ecc9c88b74d71d7919647ffffefb7a7db93b7aa8eb8a2d50b419d7856",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_perf_report.md",
+      "archived_path": "archive/engineering/hdbscan_perf_report.md",
+      "sha256": "52c23a2f312216ca97ef81705773998e755fca2869254fbe464060f908afd572",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_perf_report_old.md",
+      "archived_path": "archive/engineering/hdbscan_perf_report_old.md",
+      "sha256": "18918a1f87c0c1842d03826ddd1943c691c205663955d4ef3af022e4fdeb9dfd",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_phase6_plan.md",
+      "archived_path": "archive/engineering/hdbscan_phase6_plan.md",
+      "sha256": "73762766646dbc2fe309bb9d8ed1bcea160c97059867d835a0c97c5fb71b8599",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_plan_phases.md",
+      "archived_path": "archive/engineering/hdbscan_plan_phases.md",
+      "sha256": "c52d62900cd0ee3d8c03aa74c3cf0fc32c3113da2889d956b1214e14e92f53a9",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_plan_phases_completed.md",
+      "archived_path": "archive/engineering/hdbscan_plan_phases_completed.md",
+      "sha256": "34719b3265ad6a284c91731f6266fefc3cbf713c5d6dde770d68927452a345a5",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_serialization_plan.md",
+      "archived_path": "archive/engineering/hdbscan_serialization_plan.md",
+      "sha256": "8ba1e31e594db69282d97860b7bdaa79fcab7b91be3890f3cabb5b725392e34c",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_timing_findings.md",
+      "archived_path": "archive/engineering/hdbscan_timing_findings.md",
+      "sha256": "2ce8594e383681b420cf0c6c513976c9f45bc62d89a705b91f6f19857bd2db49",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "hdbscan_upstream_parity.md",
+      "archived_path": "archive/engineering/hdbscan_upstream_parity.md",
+      "sha256": "7dcbab628ef17db608e7d7e1406ef9424d3a1a07400f8f4a60cde87fcb2c7494",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "kernel_perf_lessons_learned.md",
+      "archived_path": "archive/engineering/kernel_perf_lessons_learned.md",
+      "sha256": "050632fba3fd7a41ded651035ce57c0adb5cce8c76b8fc3b5eea20cb5610861b",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "parallel_boruvka_implementation_notes.md",
+      "archived_path": "archive/engineering/parallel_boruvka_implementation_notes.md",
+      "sha256": "5a014d26cbf18f9c888fba1d6f071fa29c96bca5a213fdc1a2e43d65064f06e2",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "parallel_boruvka_plan.md",
+      "archived_path": "archive/engineering/parallel_boruvka_plan.md",
+      "sha256": "d8528bf356f5d1b446f0def4eeb79371227805e2b7bac5be1707905e88230c58",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    },
+    {
+      "original_path": "phase7_step0_report.md",
+      "archived_path": "archive/engineering/phase7_step0_report.md",
+      "sha256": "8acc5579600ef45d1d3a72ec9108047b8dad9a759a69711f58a31f6a79d56ffc",
+      "relative_link_base": "repository root at original revision; paths and identifiers are historical"
+    }
+  ]
+}

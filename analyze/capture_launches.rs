@@ -1,5 +1,5 @@
 use cubecl_runtime::logging::{LaunchObservation, LaunchObserver};
-use fast_hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};
+use hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, HdbscanSearch};
 use std::{
     collections::BTreeMap,
     error::Error,

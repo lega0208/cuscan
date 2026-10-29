@@ -235,16 +235,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "platform": platform.platform(),
         "versions": {
             name: _package_version(name)
-            for name in ("numpy", "scipy", "scikit-learn", "umap-learn", "fast-umap", "plotly")
+            for name in ("numpy", "scipy", "scikit-learn", "umap-learn", "cuscan", "plotly")
         },
     }
     report = {
         "provenance": provenance,
         "configuration": {
             "device": args.device,
-            "device_routing": (
-                "fast_umap uses the selected device; umap-learn reference runs on CPU"
-            ),
+            "device_routing": ("cuscan uses the selected device; umap-learn reference runs on CPU"),
             "seeds": [int(seed) for seed in args.seeds],
             "evaluation_seed": EVALUATION_SEED,
             "neighbors": N_NEIGHBORS,
@@ -313,7 +311,7 @@ if epochs != "none": settings["n_epochs"] = int(epochs)
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
     if is_rust:
-        from fast_umap import UMAP
+        from cuscan import UMAP
         model = UMAP(
             **settings,
             backend=backend,

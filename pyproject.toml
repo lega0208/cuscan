@@ -3,10 +3,19 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "fast-umap"
+name = "cuscan"
+description = "UMAP dimensionality reduction and HDBSCAN clustering on CPU and CUDA"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
+maintainers = [{ name = "M L" }]
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
+
+[project.urls]
+Repository = "https://github.com/lega0208/cuscan"
+Issues = "https://github.com/lega0208/cuscan/issues"
 
 [project.optional-dependencies]
 serialization = ["h5py>=3.11", "hdf5plugin>=5.0"]
@@ -25,10 +34,14 @@ dev = [
 ]
 
 [tool.maturin]
-manifest-path = "crates/fast-umap-python/Cargo.toml"
+manifest-path = "crates/cuscan-python/Cargo.toml"
 python-source = "python"
-module-name = "fast_umap._fast_umap"
+module-name = "cuscan._cuscan"
 features = ["pyo3/extension-module"]
+include = [
+    { path = "docs/development.md", format = "sdist" },
+    { path = "migration_provenance.json", format = "sdist" },
+]
 
 [tool.uv]
 cache-keys = [

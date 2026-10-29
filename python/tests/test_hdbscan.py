@@ -10,10 +10,10 @@ import pytest
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import adjusted_rand_score
 
-import fast_umap
-from fast_umap import HDBSCAN, UMAP, _fast_umap
+import cuscan
+from cuscan import HDBSCAN, UMAP, _cuscan
 
-FIXTURE_DIR = Path(__file__).parents[2] / "crates/fast-hdbscan/tests/fixtures"
+FIXTURE_DIR = Path(__file__).parents[2] / "crates/hdbscan/tests/fixtures"
 MANIFEST = json.loads((FIXTURE_DIR / "manifest.json").read_text())
 PARITY_CASES = [
     case["id"]
@@ -142,7 +142,7 @@ def test_output_dtype_and_shape_contract(
     min_samples: int,
     hdbscan_backend: Literal["cpu", "cuda"],
 ) -> None:
-    assert "HDBSCAN" in fast_umap.__all__
+    assert "HDBSCAN" in cuscan.__all__
     x, _, _ = fixture_data(case_id)
     model = estimator(hdbscan_backend, min_cluster_size=min_samples, min_samples=min_samples).fit(x)
     finite_count = int(np.isfinite(x).all(axis=1).sum())
@@ -473,13 +473,13 @@ def test_dbscan_cut_edges_and_unfitted_state(
 def test_wrapper_native_failure_is_injected_on_called_module(
     monkeypatch: pytest.MonkeyPatch, hdbscan_backend: Literal["cpu", "cuda"]
 ) -> None:
-    import fast_umap.hdbscan as hdbscan_module
+    import cuscan.hdbscan as hdbscan_module
 
     x, _, _ = fixture_data("blobs_d2")
     model = estimator(hdbscan_backend).fit(x)
     old_native = model._native
     monkeypatch.setattr(
-        hdbscan_module._fast_umap,
+        hdbscan_module._cuscan,
         "fit_hdbscan",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
     )
@@ -548,7 +548,7 @@ def test_failed_refit_preserves_fitted_state(
         refit_input = np.array([[1e100, 0.0], [0.0, 0.0]])
         error = ValueError
     else:
-        from fast_umap.hdbscan import _fast_umap as native_module
+        from cuscan.hdbscan import _cuscan as native_module
 
         monkeypatch.setattr(
             native_module,
@@ -641,19 +641,19 @@ def test_knn_k_rejects_non_positive_integers(
     with pytest.raises(ValueError):
         estimator(hdbscan_backend, knn_k=knn_k).fit(x)
     with pytest.raises(ValueError):
-        _fast_umap.fit_hdbscan(x, knn_k=knn_k)
+        _cuscan.fit_hdbscan(x, knn_k=knn_k)
 
 
 def test_native_knn_k_accepts_none_and_positive_integers() -> None:
     x, _, _ = fixture_data("blobs_d2")
-    assert _fast_umap.fit_hdbscan(x, knn_k=None).labels.shape == (len(x),)
-    assert _fast_umap.fit_hdbscan(x, knn_k=3).labels.shape == (len(x),)
+    assert _cuscan.fit_hdbscan(x, knn_k=None).labels.shape == (len(x),)
+    assert _cuscan.fit_hdbscan(x, knn_k=3).labels.shape == (len(x),)
 
 
 def test_explicit_cuda_does_not_fall_back(
     hdbscan_backend: Literal["cpu", "cuda"],
 ) -> None:
-    if _fast_umap.hdbscan_cuda_available():
+    if _cuscan.hdbscan_cuda_available():
         pytest.skip("requires a build or host without CUDA support")
     x, _, _ = fixture_data("blobs_d2")
     with pytest.raises(RuntimeError):

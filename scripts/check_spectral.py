@@ -158,7 +158,7 @@ def _reference_worker(graph, dimensions, count, dense=False):
 
 
 def scipy_reference(graph, dimensions, timeout):
-    with tempfile.TemporaryDirectory(prefix="fast-umap-scipy-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuscan-scipy-") as directory:
         request = pathlib.Path(directory) / "request.npz"
         response = pathlib.Path(directory) / "response.npz"
         np.savez(
@@ -198,14 +198,14 @@ def invoke_probe(graph, dims, seed, test_runner, timeout):
         "dimensions": dims,
         "seed": seed,
     }
-    with tempfile.TemporaryDirectory(prefix="fast-umap-spectral-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuscan-spectral-") as directory:
         path = pathlib.Path(directory) / "graph.json"
         response_path = pathlib.Path(directory) / "result.json"
         path.write_text(json.dumps(request), encoding="utf-8")
         started = time.monotonic()
         env = dict(os.environ)
-        env["FAST_UMAP_SPECTRAL_REQUEST"] = str(path)
-        env["FAST_UMAP_SPECTRAL_RESPONSE"] = str(response_path)
+        env["CUSCAN_SPECTRAL_REQUEST"] = str(path)
+        env["CUSCAN_SPECTRAL_RESPONSE"] = str(response_path)
         try:
             child = subprocess.run(
                 [

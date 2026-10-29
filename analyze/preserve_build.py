@@ -15,7 +15,7 @@ rows = [
     json.loads(line) for line in (root / f"{args.variant}-build.jsonl").read_text().splitlines()
 ]
 packages = {}
-for name in ("fast_cubecl_common", "fast_hdbscan", "profile_hdbscan_stages"):
+for name in ("cuscan_common", "hdbscan", "profile_hdbscan_stages"):
     row = next(
         r for r in rows if r.get("reason") == "compiler-artifact" and r["target"]["name"] == name
     )
@@ -40,7 +40,7 @@ if not args.preserve_only:
     library = next(
         r
         for r in rows
-        if r.get("reason") == "compiler-artifact" and r["target"]["name"] == "fast_hdbscan"
+        if r.get("reason") == "compiler-artifact" and r["target"]["name"] == "hdbscan"
     )
     rlib = next(p for p in library["filenames"] if p.endswith(".rlib"))
     dependency_dirs = sorted(
@@ -60,7 +60,7 @@ if not args.preserve_only:
         "-O",
         str(root / "capture_semantics.rs"),
         "--extern",
-        f"fast_hdbscan={rlib}",
+        f"hdbscan={rlib}",
     ]
     for directory in dependency_dirs:
         command.extend(["-L", f"dependency={directory}"])
@@ -71,18 +71,18 @@ if not args.preserve_only:
         json.dumps(command, indent=2) + "\n"
     )
     subprocess.run(command, check=True)
-worktree = Path(packages["fast_hdbscan"]["source"]).parents[3]
+worktree = Path(packages["hdbscan"]["source"]).parents[3]
 patch = subprocess.check_output(["git", "-C", str(worktree), "diff", "--binary"])
 (root / f"{args.variant}-source.patch").write_bytes(patch)
 paths = [
     "Cargo.toml",
     "Cargo.lock",
-    "crates/fast-cubecl-common/src/kernels/neighbors.rs",
-    "crates/fast-cubecl-common/src/neighbors.rs",
-    "crates/fast-hdbscan/src/estimator.rs",
-    "crates/fast-hdbscan/tests/test_estimator.rs",
-    "crates/fast-hdbscan/tests/test_kdtree_search.rs",
-    "crates/fast-hdbscan/examples/profile_hdbscan_stages.rs",
+    "crates/cuscan-common/src/kernels/neighbors.rs",
+    "crates/cuscan-common/src/neighbors.rs",
+    "crates/hdbscan/src/estimator.rs",
+    "crates/hdbscan/tests/test_estimator.rs",
+    "crates/hdbscan/tests/test_kdtree_search.rs",
+    "crates/hdbscan/examples/profile_hdbscan_stages.rs",
 ]
 
 

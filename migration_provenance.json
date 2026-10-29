@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "status": "incomplete; unresolved provenance and artifact-specific obligations block affected distribution",
+  "scope_note": "This is an attribution inventory, not a legal completeness or release certification. Historical names and paths identify evidence at the local baseline; current migration may rename first-party paths without changing upstream identities.",
+  "inherited_project": {
+    "local_upstream_ref": "origin/master",
+    "local_upstream_commit": "d414a77a2dd181d8352266aeaaf0e6fe41681346",
+    "evidence": "Local Git ancestry and git diff origin/master HEAD -- LICENSE; the latter was empty in Phase 0. This is a local ancestry boundary, not independent proof of the fork creation event.",
+    "license_path": "LICENSE",
+    "license": "MIT, Copyright 2024 Eugene Hauptmann",
+    "qualification": "The inherited notice remains unchanged. Subsequent reorganization does not establish a clean rewrite. Maintainer M L is not asserted to own copyright."
+  },
+  "inventory": [
+    {
+      "paths": ["references/burn-book/", "references/burn-examples/"],
+      "source": "Burn documentation and examples; exact upstream snapshots and nested content scope unknown",
+      "local_introduction": "f8b9decd85e71de011cebac620d39531c79a2f96",
+      "license_evidence": ["references/burn-examples/import-model-weights/Cargo.toml declares MIT OR Apache-2.0", "https://raw.githubusercontent.com/tracel-ai/burn/v0.22.1/LICENSE-MIT", "Cargo.lock locks burn 0.22.1"],
+      "notice": "Burn 0.22.1 MIT reproduced in THIRD_PARTY_NOTICES as a scoped reference, not proof that all copied content comes from that version.",
+      "action": "Match each copied tree, book, image and example to its original upstream revision; inspect then-current licenses and nested notices and supplement notices as needed."
+    },
+    {
+      "paths": ["references/cubecl-book/", "references/cubecl-examples/", "analyze/runtime-observer-source/client.rs", "analyze/runtime-observer-source/dry_run.rs", "analyze/runtime-observer-source/observer.rs"],
+      "source": "CubeCL-associated documentation, examples and runtime snapshots; exact origins, revisions, modifications and patch authorship unresolved",
+      "local_introduction": "References f8b9decd85e71de011cebac620d39531c79a2f96; runtime snapshots 3bae879b48e8761778325454d992630f05c2e11d",
+      "license_evidence": ["https://raw.githubusercontent.com/tracel-ai/cubecl/v0.11.1/LICENSE-MIT", "Cargo.lock locks cubecl 0.11.1", "client.rs uses CubeCL runtime internals; observer.rs and dry_run.rs describe runtime hooks"],
+      "notice": "CubeCL 0.11.1 MIT reproduced in THIRD_PARTY_NOTICES; this is not proof that any snapshot or patch derives from that version or has no additional applicable rights.",
+      "action": "Compare all three snapshots against versioned upstream history and any local/private patches, identify source revision and contributors, and verify corresponding licenses and notices; investigate book and example assets separately."
+    },
+    {
+      "paths": ["references/burn-examples/import-model-weights/weights/mnist_train_export.py", "references/burn-examples/import-model-weights/weights/mnist.pt", "references/burn-examples/import-model-weights/weights/mnist.safetensors"],
+      "source": "Script explicitly says copied and modified from pytorch/examples mnist/main.py under BSD-3-Clause; exact copied revision unknown. Weights and training data origins not established.",
+      "license_evidence": ["https://raw.githubusercontent.com/pytorch/examples/a38cbfc6f817d9015fc67a6309d3a0be9ff94ab6/LICENSE", "https://api.github.com/repos/pytorch/examples/commits?path=LICENSE&until=2026-10-08T15:49:00Z&per_page=1"],
+      "notice": "The upstream BSD-3 license in the last license change found before the local introduction is reproduced; its date does not identify the actual copied source revision.",
+      "action": "Establish the example source revision and license at copying; trace each weight file, training dataset and redistribution rights independently."
+    },
+    {
+      "paths": ["crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py", "associated fixture data"],
+      "source": "fast_hdbscan 0.3.2 reference; generator pins release wheel and sdist hashes, source blobs and comparison commit 43c573b",
+      "license_evidence": ["https://files.pythonhosted.org/packages/d0/92/34dac2dff0877d637535bd8852bc68323f155799521c9ee94c27c548426f/fast_hdbscan-0.3.2-py3-none-any.whl", "wheel SHA-256 619b42963935e6c3ab1e51de7895dd35260f3ef9ebe4627ff4317073fe51a667; dist-info/licenses/LICENSE BSD-2-Clause", "https://raw.githubusercontent.com/TutteInstitute/fast_hdbscan/43c573b/LICENSE"],
+      "notice": "Release license reproduced in THIRD_PARTY_NOTICES; neither generated outputs nor reference imports alone prove copying or the absence of copying.",
+      "action": "Audit generator and implementations for copied or adapted upstream code and map any obligations to distributed files."
+    },
+    {
+      "paths": ["crates/fast-hdbscan/tests/fixtures/generate_hdbscan_prediction.py", "associated fixture data"],
+      "source": "Original hdbscan.prediction, distinct from fast_hdbscan; generator records installed version and prediction source digest; lock file version 0.8.44",
+      "license_evidence": ["https://files.pythonhosted.org/packages/b0/51/b476849d27980d1ce5ba0a172891d37441b0112047894350951f6b169266/hdbscan-0.8.44.tar.gz", "sdist SHA-256 1ac6196fabdd42072284b60c9be7b9b504b5f4f25cf7a551a8af29a3c7963a4d; LICENSE BSD-3-Clause"],
+      "notice": "Locked-release license reproduced in THIRD_PARTY_NOTICES; actual fixture-generation versions and adaptation scope require confirmation.",
+      "action": "Inspect recorded fixture identities and audit copied or adapted code against corresponding source releases."
+    },
+    {
+      "paths": ["crates/fast-umap/tests/fixtures/generate_standard_umap.py", "crates/fast-umap/tests/fixtures/generate_umap_fuzzy_graph.py", "associated fixture data"],
+      "source": "umap-learn APIs and generated reference values; fuzzy-graph generator pins 0.5.12",
+      "license_evidence": ["https://files.pythonhosted.org/packages/1b/98/f63318ccbe75c810011fe9233884c5d348d94d90005de1b79e5f93bef9c0/umap_learn-0.5.12-py3-none-any.whl", "wheel SHA-256 f2a85d2a2adcb52b541bed9b27a23ca169b56bb1b23283abeebfb8dfb8a42fe5; dist-info/licenses/LICENSE.txt BSD-3-Clause"],
+      "notice": "Release license reproduced in THIRD_PARTY_NOTICES; extent of adapted source remains undetermined.",
+      "action": "Inspect generators and implementations for copied or adapted source and verify source version for each fixture."
+    },
+    {
+      "paths": ["comparison/hdbscan_stages.html"],
+      "source": "Embedded plotly.js header identifies v4.1.1, Copyright 2012-2026 Plotly, Inc., MIT",
+      "license_evidence": ["https://raw.githubusercontent.com/plotly/plotly.js/v4.1.1/LICENSE", "https://api.github.com/repos/plotly/plotly.js/git/ref/tags/v4.1.1"],
+      "notice": "Upstream tagged MIT text reproduced; its 2016-2024 Plotly Technologies Inc. copyright differs from the embedded header and both are preserved.",
+      "action": "Verify bundled bytes against the stated release, identify bundled third-party components and notices, and retain the embedded notice."
+    },
+    {
+      "paths": ["Cargo.lock", "uv.lock", "built native extensions and any packaged native libraries"],
+      "source": "Candidate wheel native extension includes statically linked LLVM per tracel-llvm-bundler 23.1.0-4 build evidence; other exact linked and bundled components remain unresolved.",
+      "license_evidence": ["Candidate wheel SBOM cuscan-0.1.0.dist-info/sboms/cuscan-python.cyclonedx.json lists 726 components with license expressions, including tracel-llvm-bundler 23.1.0-4, llvm-sys 231.0.0 and cubecl-llvm 0.11.1; inventory is not proof each component is linked", "Cargo registry tracel-llvm-bundler-23.1.0-4/README.md describes prebuilt self-contained LLVM and static link configuration", "/tmp/cuscan-manylinux-work/share/tracel/tracel-llvm-23.1.0-4/include/llvm/Support/LICENSE.TXT identifies Apache-2.0 WITH LLVM-exception", "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.0/LICENSE.TXT", "Cargo.lock: burn 0.22.1 and cubecl 0.11.1"],
+      "notice": "LLVM 23.1.0 upstream complete license file, including LLVM exceptions, third-party warning and legacy license, is reproduced in THIRD_PARTY_NOTICES; Burn and CubeCL MIT texts also appear. These do not constitute complete native dependency notices. The SBOM lists expressions, not full required attribution texts.",
+      "action": "Map actually linked transitive crates and vendored native libraries to version-specific copyright notices, license texts, NOTICE files and any modified-source requirements. Investigate LLVM bundle's exact source and patches, third-party code and build configuration, plus CUDA and CPU components and any distributed Python extras."
+    },
+    {
+      "paths": ["analyze/ excluding runtime-observer-source"],
+      "source": "Project analysis drivers, tests, generated-input tooling and external API consumers; some source describes local benchmark arithmetic and retrospective reconstruction",
+      "license_evidence": ["Local history 3bae879b48e8761778325454d992630f05c2e11d", "analyze/generate_inputs.rs", "analyze/preserve_build.py"],
+      "notice": "No blanket conclusion that every file is first-party or carries only the root license.",
+      "action": "Review copied or adapted content and embedded data or dependencies against their source and include notices where applicable."
+    }
+  ],
+  "distribution_scope": {
+    "repository_and_source_archive": "Tracked reference material, runtime snapshots, fixtures and HTML are distributed as part of the repository irrespective of Cargo workspace exclusion. Outward distribution of affected material is blocked until its provenance and required notices are determined.",
+    "wheel": "Current candidate /tmp/cuscan-release-dist/cuscan-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl has 15 members. The parent verified its LICENSE and THIRD_PARTY_NOTICES bytes match the repository, and reports independent host CUDA Python 3.14 and container CPU Python 3.10 install checks passed, as did auditwheel manylinux_2_34. Previous manylinux_2_28 failed due to LLVM glibc 2.34 requirements. Checks were not rerun for this update. Historical superseded candidate /tmp/cuscan-manylinux-dist/cuscan-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl SHA-256 621c10a3f11db291f8e32b175fdc3eaf58542152ee38cc4841194e77e0ea91fc included an SBOM with 726 components; superseded host wheel /tmp/cuscan-final-dist/cuscan-0.1.0-cp310-abi3-linux_x86_64.whl SHA-256 7908fb9a11c8acbbc9bb551938b5ef43560c3314ee4d17c4bb14c8503bd5145a also had 15 members. Their notice predates the LLVM addition; neither is the current candidate.",
+    "sdist": "Current candidate /tmp/cuscan-release-dist/cuscan-0.1.0.tar.gz has 175 entries and includes docs/development.md and migration_provenance.json; parent reports research and private paths excluded, both license-file bytes matching the repository, and an independent build from the sdist passing CPU Python 3.14. Checks were not rerun for this update. Historical superseded /tmp/cuscan-final-dist/cuscan-0.1.0.tar.gz SHA-256 927615046dccd401644ab9493e06c61bb753e83591dd4fd3799f20b2de4686a1 had 173 entries and its notice predated the LLVM addition. Because this provenance file is included in the sdist, record final candidate hashes in an external execution receipt after the last rebuild, not here.",
+    "native_dependencies": "Candidate SBOM is useful for identifying license expressions but includes dependency graph entries and does not establish linkage, complete copyright notices, native bundled third-party code, or artifact-specific compliance."
+  },
+  "release_blockers": [
+    "Resolve the exact upstream revisions and file-level licenses for Burn/CubeCL books, examples, images and runtime snapshots, including local patch authorship.",
+    "Verify the PyTorch example's copied revision and independently trace model weights and dataset rights.",
+    "Audit reference-derived fixture generators and implementations for copied or adapted upstream source and confirm the actual reference version for each fixture.",
+    "Verify the Plotly bundle bytes and identify embedded dependency notices; reconcile differing copyright headers without discarding either.",
+    "Identify all actually linked Rust and native components, especially LLVM bundle third-party code, zstd/zlib/lzma where present, and CUDA/runtime libraries; collect version-specific copyright, license and NOTICE texts, assess modifications, and reconcile them against SBOM expressions and each artifact.",
+    "Establish complete artifact-specific dependency notice coverage and verify all applicable license and NOTICE texts are included in the final artifacts before release; the existing LLVM, Burn and CubeCL notices and SBOM alone do not establish completeness."
+  ]
+}

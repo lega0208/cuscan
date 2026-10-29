@@ -2340,6 +2340,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuscan-common"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "cubecl",
+ "cubecl-cpu",
+ "cudarc",
+ "rayon",
+]
+
+[[package]]
+name = "cuscan-python"
+version = "0.1.0"
+dependencies = [
+ "hdbscan",
+ "numpy",
+ "pyo3",
+ "umap",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2902,95 +2924,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
-name = "fast-cubecl-common"
-version = "1.6.0"
-dependencies = [
- "burn",
- "burn-cubecl",
- "cubecl",
- "cubecl-cpu",
- "cudarc",
- "rayon",
-]
-
-[[package]]
-name = "fast-hdbscan"
-version = "1.6.0"
-dependencies = [
- "burn",
- "burn-cubecl",
- "criterion",
- "cubecl",
- "fast-cubecl-common",
- "fast-hdbscan-core",
- "rayon",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-chrome",
- "tracing-subscriber",
- "zip",
-]
-
-[[package]]
-name = "fast-hdbscan-core"
-version = "1.6.0"
-dependencies = [
- "serde_json",
- "tempfile",
- "tracing",
- "zip",
-]
-
-[[package]]
-name = "fast-umap"
-version = "1.6.0"
-dependencies = [
- "burn",
- "burn-cubecl",
- "ciborium",
- "criterion",
- "cubecl",
- "cubecl-cpu",
- "cubecl-environment",
- "cubecl-server",
- "fast-cubecl-common",
- "fast-umap-core",
- "log",
- "rand 0.10.3",
- "rayon",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-chrome",
- "tracing-subscriber",
- "zip",
-]
-
-[[package]]
-name = "fast-umap-core"
-version = "1.6.0"
-dependencies = [
- "faer",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "fast-umap-python"
-version = "1.6.0"
-dependencies = [
- "fast-hdbscan",
- "fast-umap",
- "numpy",
- "pyo3",
-]
-
-[[package]]
 name = "fastbloom"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3527,6 +3460,35 @@ dependencies = [
  "foldhash 0.2.0",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "hdbscan"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "criterion",
+ "cubecl",
+ "cuscan-common",
+ "hdbscan-core",
+ "rayon",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-chrome",
+ "tracing-subscriber",
+ "zip",
+]
+
+[[package]]
+name = "hdbscan-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -7459,6 +7421,44 @@ name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+
+[[package]]
+name = "umap"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "ciborium",
+ "criterion",
+ "cubecl",
+ "cubecl-cpu",
+ "cubecl-environment",
+ "cubecl-server",
+ "cuscan-common",
+ "log",
+ "rand 0.10.3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-chrome",
+ "tracing-subscriber",
+ "umap-core",
+ "zip",
+]
+
+[[package]]
+name = "umap-core"
+version = "0.1.0"
+dependencies = [
+ "faer",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "uncased"

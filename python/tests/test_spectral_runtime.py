@@ -57,8 +57,8 @@ def _mock_native_child(
 
     def completed(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         env = kwargs["env"]
-        request_path = Path(env["FAST_UMAP_SPECTRAL_REQUEST"])
-        response_path = Path(env["FAST_UMAP_SPECTRAL_RESPONSE"])
+        request_path = Path(env["CUSCAN_SPECTRAL_REQUEST"])
+        response_path = Path(env["CUSCAN_SPECTRAL_RESPONSE"])
         request = json.loads(request_path.read_text(encoding="utf-8"))
         response_path.write_text(json.dumps(response), encoding="utf-8")
         calls.append(
