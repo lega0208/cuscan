@@ -6,7 +6,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 
 [features]
 tracing = ["dep:tracing", "fast-cubecl-common/tracing", "fast-hdbscan-core/tracing"]
