@@ -550,10 +550,32 @@ Failed refits preserve the previous fitted snapshot and its DBSCAN cuts.
 
 `approximate_predict` assigns each query independently to the existing fitted
 hierarchy; it never refits, discovers clusters, or uses other queries as neighbors.
-Every fit retains prediction data automatically. Labels and optional connectors
-are newly owned `np.intp` arrays; strengths are float64. Connectors identify original
-training rows selected by minimum mutual reachability, not necessarily Euclidean
-nearest neighbors. Noise after a real search still has a valid connector.
+Labels and optional connectors are newly owned `np.intp` arrays; strengths are
+float64. Connectors identify original training rows selected by minimum
+mutual reachability, not necessarily Euclidean nearest neighbors. Noise after a
+real search still has a valid connector.
+
+For a prediction-only object that can outlive the estimator, convert explicitly:
+
+```python
+predictor = model.to_predictor()
+del model
+new_labels, strengths, connecting_rows = predictor.approximate_predict(
+    X_new, return_connecting_points=True
+)
+```
+
+The predictor retains only finite float32 geometry and validated prediction
+hierarchy/runtime state, including its prediction KD-tree cache when built; it
+does not retain labels, probabilities, fit-output trees, fit neighbors, fit core
+distances or a reference to the estimator. Conversion may synchronously
+perform cold prediction-core preparation on the concrete backend selected at fit
+time; conversion has no backend override and uses that backend strictly. It can
+fail before returning. Core preparation can be expensive; it is performed once
+during conversion so later standalone use does
+not depend on the estimator or an uninitialized core cache. Rank-one and
+no-cluster-tree shortcuts avoid that search. Predictions still use call-local
+uploads and bounded batches; converting is not a backend-portable artifact.
 
 Prediction supports only finite, nonempty Euclidean feature matrices with the
 fitted feature width. It uses the concrete CPU/CUDA backend chosen by fit, strictly
@@ -591,13 +613,28 @@ ancestor has no direct point rows.
 Prediction reads an authoritative immutable complete fit snapshot. Public mutable
 Rust fields and Python arrays are detached views: editing them changes neither
 prediction nor the canonical state intended for future export. Clones share
-immutable host data and synchronized caches. Persistence is not implemented by
-this feature. The private host-state boundary separates canonical results from
-runtime locks/devices; future save must prepare a valid host KD tree and required
-cores even before the first prediction, and must reject unsupported prediction
-widths. Shortcut models instead record cores as not required. Future loading must
-validate host topology/state and choose the runtime backend independently of
-training provenance; no public save/load stub is provided.
+immutable host data and synchronized caches.
+
+`HDBSCANPredictor` alone supports HDF5 save/load; this is not persistence for the
+fitted `HDBSCAN` estimator and does not preserve fit outputs. Install the optional
+dependencies with `uv sync --extra serialization` or
+`pip install 'fast-umap[serialization]'`. Saving exports the already-ready
+prediction state before filesystem publication and performs no prediction or
+core preparation. Files use the shared strict schema-v1 HDF5 publisher with
+atomic no-clobber publication by default; `overwrite=True` explicitly replaces
+an existing file. Publication uses a same-directory temporary file and syncs the
+directory on the documented Linux target; a post-commit sync failure reports
+uncertain durability without rolling back the published file. Loading validates
+the predictor schema and rebuilds the host KD tree, then chooses a runtime
+backend independently of fit provenance:
+`HDBSCANPredictor.load(path, backend="auto", device_index=0)` uses the normal
+auto-selection policy, while explicit `cpu` or `cuda` is strict. The load-time
+backend is validated and selected even for no-cluster-tree shortcut predictors;
+those predictors still perform no device work when queried. No fallback or
+backend migration occurs. Predictor files contain sensitive training geometry
+and derived prediction state; protect them like the source data. HDF5 compression
+and schema validation do not authenticate files, and Rust does not provide this
+HDF5 persistence API.
 
 Before a kNN-route fit, `fast_umap.HDBSCAN` calls the native shape-only estimator with the
 finite-row count, feature count and the same configuration, then emits one `UserWarning` when any

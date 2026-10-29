@@ -1,12 +1,15 @@
 use fast_hdbscan::{
     BackendChoice, ClusterSelectionMethod, FittedHDBSCAN as RustFittedHDBSCAN, HDBSCAN,
-    HdbscanConfig, HdbscanError, MstGraph, estimate_fit_resources,
+    HDBSCANPredictor as RustHDBSCANPredictor, HdbscanConfig, HdbscanError, HdbscanPredictorState,
+    MstGraph, PredictionCoresState, PredictionHierarchyState, estimate_fit_resources,
 };
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
+};
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyTuple};
 
 #[pyclass(frozen, unsendable)]
 pub(crate) struct FittedHDBSCAN {
@@ -15,6 +18,12 @@ pub(crate) struct FittedHDBSCAN {
 
 #[pymethods]
 impl FittedHDBSCAN {
+    fn to_predictor(&self, py: Python<'_>) -> PyResult<HDBSCANPredictor> {
+        py.detach(|| self.inner.to_predictor())
+            .map(|inner| HDBSCANPredictor { inner })
+            .map_err(map_hdbscan_error)
+    }
+
     #[getter]
     fn labels<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
         self.inner
@@ -197,48 +206,506 @@ impl FittedHDBSCAN {
         let result = py
             .detach(|| self.inner.approximate_predict(&input))
             .map_err(map_hdbscan_error)?;
-        let labels = result
-            .labels
+        prediction_output(py, result, return_connecting_points, stacklevel)
+    }
+}
+
+#[pyclass(frozen, unsendable)]
+pub(crate) struct HDBSCANPredictor {
+    inner: RustHDBSCANPredictor,
+}
+
+#[pymethods]
+impl HDBSCANPredictor {
+    #[getter]
+    fn n_features(&self) -> usize {
+        self.inner.n_features()
+    }
+
+    #[pyo3(
+        signature = (x, return_connecting_points = StrictBool(false), *, stacklevel = 1),
+        text_signature = "($self, x, return_connecting_points=False, *, stacklevel=1)"
+    )]
+    fn approximate_predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        return_connecting_points: StrictBool,
+        stacklevel: i32,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let StrictBool(return_connecting_points) = return_connecting_points;
+        if stacklevel < 1 {
+            return Err(PyValueError::new_err(
+                "stacklevel must be a positive integer",
+            ));
+        }
+        let view = x.as_array();
+        let (rows, features) = view.dim();
+        if rows == 0 || features == 0 {
+            return Err(PyValueError::new_err(
+                "X must contain at least one row and one feature",
+            ));
+        }
+        if features != self.inner.n_features() {
+            return Err(PyValueError::new_err(format!(
+                "X has {features} features, but the model was fitted with {}",
+                self.inner.n_features()
+            )));
+        }
+        rows.checked_mul(features)
+            .ok_or_else(|| PyOverflowError::new_err("X element count overflows usize"))?;
+        if i32::try_from(rows).is_err() {
+            return Err(PyOverflowError::new_err("X row count exceeds i32::MAX"));
+        }
+        if view.iter().any(|value| !value.is_finite()) {
+            return Err(PyValueError::new_err("X must contain only finite values"));
+        }
+        let input = view
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+        let result = py
+            .detach(|| self.inner.approximate_predict(&input))
+            .map_err(map_hdbscan_error)?;
+        prediction_output(py, result, return_connecting_points, stacklevel)
+    }
+
+    fn export_state<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+        let state = py
+            .detach(|| self.inner.export_state())
+            .map_err(map_hdbscan_error)?;
+        let arrays = PyDict::new(py);
+        let n_finite = state.hierarchy.finite_index.len();
+        let cluster_nodes = state.hierarchy.node_ids.len();
+        let (cores_status, cores_rank) = match &state.prediction_cores {
+            PredictionCoresState::NotRequiredNoClusterTree => ("not_required_no_cluster_tree", 0),
+            PredictionCoresState::Ready { rank, .. } => ("ready", *rank),
+        };
+        let hierarchy = state.hierarchy;
+        let (
+            geometry,
+            finite_index,
+            node_ids,
+            node_parent_indices,
+            node_birth_lambdas,
+            node_labels,
+            node_max_lambdas,
+            point_node_indices,
+            point_departure_lambdas,
+            prediction_cores,
+        ) = match state.prediction_cores {
+            PredictionCoresState::NotRequiredNoClusterTree => {
+                (None, None, None, None, None, None, None, None, None, None)
+            }
+            PredictionCoresState::Ready { values, .. } => (
+                Some(state.geometry),
+                Some(hierarchy.finite_index),
+                Some(hierarchy.node_ids),
+                Some(hierarchy.node_parent_indices),
+                Some(hierarchy.node_birth_lambdas),
+                Some(hierarchy.node_labels),
+                Some(hierarchy.node_max_lambdas),
+                Some(hierarchy.point_node_indices),
+                Some(hierarchy.point_departure_lambdas),
+                Some(values),
+            ),
+        };
+        arrays.set_item("geometry", geometry.map(|v| v.into_pyarray(py)))?;
+        arrays.set_item("finite_index", finite_index.map(|v| v.into_pyarray(py)))?;
+        arrays.set_item("node_ids", node_ids.map(|v| v.into_pyarray(py)))?;
+        arrays.set_item(
+            "node_parent_indices",
+            node_parent_indices.map(|v| v.into_pyarray(py)),
+        )?;
+        arrays.set_item(
+            "node_birth_lambdas",
+            node_birth_lambdas.map(|v| v.into_pyarray(py)),
+        )?;
+        arrays.set_item("node_labels", node_labels.map(|v| v.into_pyarray(py)))?;
+        arrays.set_item(
+            "node_max_lambdas",
+            node_max_lambdas.map(|v| v.into_pyarray(py)),
+        )?;
+        arrays.set_item(
+            "point_node_indices",
+            point_node_indices.map(|v| v.into_pyarray(py)),
+        )?;
+        arrays.set_item(
+            "point_departure_lambdas",
+            point_departure_lambdas.map(|v| v.into_pyarray(py)),
+        )?;
+        arrays.set_item(
+            "prediction_cores",
+            prediction_cores.map(|v| v.into_pyarray(py)),
+        )?;
+        let metadata = PyDict::new(py);
+        metadata.set_item("n_features", state.n_features)?;
+        metadata.set_item("n_finite", n_finite)?;
+        metadata.set_item("min_samples", state.min_samples)?;
+        metadata.set_item("cluster_nodes", cluster_nodes)?;
+        metadata.set_item("cores_status", cores_status)?;
+        metadata.set_item("cores_rank", cores_rank)?;
+        Ok((arrays, metadata))
+    }
+}
+
+const PREDICTOR_ARRAY_KEYS: &[&str] = &[
+    "geometry",
+    "finite_index",
+    "node_ids",
+    "node_parent_indices",
+    "node_birth_lambdas",
+    "node_labels",
+    "node_max_lambdas",
+    "point_node_indices",
+    "point_departure_lambdas",
+    "prediction_cores",
+];
+const PREDICTOR_METADATA_KEYS: &[&str] = &[
+    "n_features",
+    "n_finite",
+    "min_samples",
+    "cluster_nodes",
+    "cores_status",
+    "cores_rank",
+];
+
+#[pyfunction(signature = (arrays, metadata, backend="auto", device_index=StrictDeviceIndex(0)))]
+pub(crate) fn load_hdbscan_predictor(
+    py: Python<'_>,
+    arrays: &Bound<'_, PyDict>,
+    metadata: &Bound<'_, PyDict>,
+    backend: &str,
+    device_index: StrictDeviceIndex,
+) -> PyResult<HDBSCANPredictor> {
+    let StrictDeviceIndex(device_index) = device_index;
+    if device_index > isize::MAX as usize {
+        return Err(PyOverflowError::new_err(
+            "device_index exceeds addressable range",
+        ));
+    }
+    let backend = match backend {
+        "auto" => BackendChoice::Auto,
+        "cpu" => BackendChoice::Cpu,
+        "cuda" => BackendChoice::Cuda { device_index },
+        _ => {
+            return Err(PyValueError::new_err(
+                "backend must be 'auto', 'cpu' or 'cuda'",
+            ));
+        }
+    };
+    require_exact_keys(arrays, PREDICTOR_ARRAY_KEYS, "arrays")?;
+    require_exact_keys(metadata, PREDICTOR_METADATA_KEYS, "metadata")?;
+    let scalar = |key: &str| -> PyResult<usize> {
+        let value = metadata.get_item(key)?.expect("exact keys validated");
+        if !value.get_type().is(py.get_type::<PyInt>()) {
+            return Err(PyValueError::new_err(format!(
+                "metadata '{key}' must be a nonnegative integer"
+            )));
+        }
+        value
+            .extract::<usize>()
+            .map_err(|_| PyValueError::new_err(format!("metadata '{key}' is out of range")))
+    };
+    let n_features = scalar("n_features")?;
+    let n_finite = scalar("n_finite")?;
+    let min_samples = scalar("min_samples")?;
+    let cluster_nodes = scalar("cluster_nodes")?;
+    let cores_rank = scalar("cores_rank")?;
+    for (key, value) in [
+        ("n_features", n_features),
+        ("n_finite", n_finite),
+        ("min_samples", min_samples),
+        ("cluster_nodes", cluster_nodes),
+        ("cores_rank", cores_rank),
+    ] {
+        if value > isize::MAX as usize {
+            return Err(PyOverflowError::new_err(format!(
+                "metadata '{key}' exceeds addressable dimensions"
+            )));
+        }
+    }
+    let status = metadata
+        .get_item("cores_status")?
+        .expect("exact keys validated");
+    if !status.get_type().is(py.get_type::<pyo3::types::PyString>()) {
+        return Err(PyValueError::new_err(
+            "metadata 'cores_status' must be a string",
+        ));
+    }
+    let status = status
+        .extract::<String>()
+        .map_err(|_| PyValueError::new_err("metadata 'cores_status' must be a string"))?;
+    if n_features == 0 || min_samples == 0 {
+        return Err(PyValueError::new_err(
+            "predictor feature count and min_samples must be positive",
+        ));
+    }
+    let geometry_len = n_finite.checked_mul(n_features).ok_or_else(|| {
+        PyOverflowError::new_err("predictor geometry element count overflows usize")
+    })?;
+    let mut total_bytes =
+        checked_array_bytes(geometry_len, std::mem::size_of::<f32>(), "geometry")?;
+    let clustered = match status.as_str() {
+        "ready" => {
+            if n_finite == 0 || cluster_nodes == 0 || cores_rank != min_samples {
+                return Err(PyValueError::new_err(
+                    "ready prediction cores have inconsistent dimensions or rank",
+                ));
+            }
+            true
+        }
+        "not_required_no_cluster_tree" => {
+            if n_finite != 0 || cluster_nodes != 0 || cores_rank != 0 {
+                return Err(PyValueError::new_err(
+                    "no-cluster-tree metadata is not canonical",
+                ));
+            }
+            false
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "metadata 'cores_status' has an unsupported value",
+            ));
+        }
+    };
+    if !clustered {
+        for key in PREDICTOR_ARRAY_KEYS {
+            if !dict_value(arrays, key)?.is_none() {
+                return Err(PyValueError::new_err(
+                    "no-cluster-tree state requires all arrays to be None",
+                ));
+            }
+        }
+        let state = HdbscanPredictorState {
+            n_features,
+            min_samples,
+            geometry: Vec::new(),
+            hierarchy: PredictionHierarchyState {
+                finite_index: Vec::new(),
+                node_ids: Vec::new(),
+                node_parent_indices: Vec::new(),
+                node_birth_lambdas: Vec::new(),
+                node_labels: Vec::new(),
+                node_max_lambdas: Vec::new(),
+                point_node_indices: Vec::new(),
+                point_departure_lambdas: Vec::new(),
+            },
+            prediction_cores: PredictionCoresState::NotRequiredNoClusterTree,
+        };
+        return import_predictor_state(py, state, backend);
+    }
+    if i32::try_from(n_finite).is_err() {
+        return Err(PyOverflowError::new_err("n_finite exceeds i32::MAX"));
+    }
+    for (key, count, width) in [
+        ("finite_index", n_finite, std::mem::size_of::<u32>()),
+        ("node_ids", cluster_nodes, std::mem::size_of::<u64>()),
+        (
+            "node_parent_indices",
+            cluster_nodes,
+            std::mem::size_of::<u64>(),
+        ),
+        (
+            "node_birth_lambdas",
+            cluster_nodes,
+            std::mem::size_of::<f64>(),
+        ),
+        ("node_labels", cluster_nodes, std::mem::size_of::<i32>()),
+        (
+            "node_max_lambdas",
+            cluster_nodes,
+            std::mem::size_of::<f64>(),
+        ),
+        ("point_node_indices", n_finite, std::mem::size_of::<u64>()),
+        (
+            "point_departure_lambdas",
+            n_finite,
+            std::mem::size_of::<f64>(),
+        ),
+        ("prediction_cores", n_finite, std::mem::size_of::<f64>()),
+    ] {
+        total_bytes = total_bytes
+            .checked_add(checked_array_bytes(count, width, key)?)
+            .ok_or_else(|| {
+                PyOverflowError::new_err("predictor arrays total byte count overflows usize")
+            })?;
+    }
+    if total_bytes > isize::MAX as usize {
+        return Err(PyOverflowError::new_err(
+            "predictor arrays exceed addressable size",
+        ));
+    }
+    let array_len = |key: &str| -> PyResult<()> {
+        let value = dict_value(arrays, key)?;
+        if value.is_none() {
+            return Err(PyValueError::new_err(format!(
+                "clustered predictor requires array '{key}'"
+            )));
+        }
+        Ok(())
+    };
+    for key in PREDICTOR_ARRAY_KEYS {
+        array_len(key)?;
+    }
+    macro_rules! copy_array {
+        ($key:literal, $ty:ty, $expected:expr) => {{
+            let value = dict_value(arrays, $key)?;
+            let array = value.extract::<PyReadonlyArray1<'_, $ty>>().map_err(|_| {
+                PyValueError::new_err(concat!(
+                    "array '",
+                    $key,
+                    "' must be one-dimensional with the exact dtype"
+                ))
+            })?;
+            if array.shape()[0] != $expected {
+                return Err(PyValueError::new_err(format!(
+                    "array '{}' has an inconsistent length",
+                    $key
+                )));
+            }
+            array.as_array().iter().copied().collect::<Vec<$ty>>()
+        }};
+    }
+    let geometry = copy_array!("geometry", f32, geometry_len);
+    let finite_index = copy_array!("finite_index", u32, n_finite);
+    let node_ids = copy_array!("node_ids", u64, cluster_nodes);
+    let node_parent_indices = copy_array!("node_parent_indices", u64, cluster_nodes);
+    let node_birth_lambdas = copy_array!("node_birth_lambdas", f64, cluster_nodes);
+    let node_labels = copy_array!("node_labels", i32, cluster_nodes);
+    let node_max_lambdas = copy_array!("node_max_lambdas", f64, cluster_nodes);
+    let point_node_indices = copy_array!("point_node_indices", u64, n_finite);
+    let point_departure_lambdas = copy_array!("point_departure_lambdas", f64, n_finite);
+    let prediction_cores = copy_array!("prediction_cores", f64, n_finite);
+    let state = HdbscanPredictorState {
+        n_features,
+        min_samples,
+        geometry,
+        hierarchy: PredictionHierarchyState {
+            finite_index,
+            node_ids,
+            node_parent_indices,
+            node_birth_lambdas,
+            node_labels,
+            node_max_lambdas,
+            point_node_indices,
+            point_departure_lambdas,
+        },
+        prediction_cores: PredictionCoresState::Ready {
+            rank: cores_rank,
+            values: prediction_cores,
+        },
+    };
+    import_predictor_state(py, state, backend)
+}
+
+fn dict_value<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+    dict.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("missing array '{key}'")))
+}
+
+fn checked_array_bytes(count: usize, element_size: usize, name: &str) -> PyResult<usize> {
+    let bytes = count.checked_mul(element_size).ok_or_else(|| {
+        PyOverflowError::new_err(format!("array '{name}' byte count overflows usize"))
+    })?;
+    if bytes > isize::MAX as usize {
+        return Err(PyOverflowError::new_err(format!(
+            "array '{name}' exceeds addressable size"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn require_exact_keys(dict: &Bound<'_, PyDict>, expected: &[&str], name: &str) -> PyResult<()> {
+    if dict.len() != expected.len()
+        || dict.iter().any(|(key, _)| {
+            key.extract::<String>()
+                .map_or(true, |key| !expected.contains(&key.as_str()))
+        })
+    {
+        return Err(PyValueError::new_err(format!(
+            "{name} must contain exactly the documented keys"
+        )));
+    }
+    Ok(())
+}
+
+fn import_predictor_state(
+    py: Python<'_>,
+    state: HdbscanPredictorState,
+    backend: BackendChoice,
+) -> PyResult<HDBSCANPredictor> {
+    py.detach(move || RustHDBSCANPredictor::from_state(state, backend))
+        .map(|inner| HDBSCANPredictor { inner })
+        .map_err(map_hdbscan_error)
+}
+
+fn prediction_output<'py>(
+    py: Python<'py>,
+    result: fast_hdbscan::PredictionResult,
+    return_connecting_points: bool,
+    stacklevel: i32,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let labels = result
+        .labels
+        .iter()
+        .map(|&value| i64::from(value))
+        .collect::<Vec<_>>()
+        .into_pyarray(py);
+    let probabilities = result.probabilities.into_pyarray(py);
+    let tuple = if return_connecting_points {
+        let connectors = result
+            .connecting_points
             .iter()
             .map(|&value| i64::from(value))
             .collect::<Vec<_>>()
             .into_pyarray(py);
-        let probabilities = result.probabilities.into_pyarray(py);
-        let tuple = if return_connecting_points {
-            let connectors = result
-                .connecting_points
-                .iter()
-                .map(|&value| i64::from(value))
-                .collect::<Vec<_>>()
-                .into_pyarray(py);
-            PyTuple::new(
-                py,
-                [
-                    labels.into_any(),
-                    probabilities.into_any(),
-                    connectors.into_any(),
-                ],
-            )?
-        } else {
-            PyTuple::new(py, [labels.into_any(), probabilities.into_any()])?
-        };
-        // Warn from the explicit status only after every output is built; all-noise labels
-        // alone are not this condition.
-        if result.no_cluster_tree {
-            let category = py.get_type::<PyUserWarning>();
-            PyErr::warn(
-                py,
-                category.as_any(),
-                c"Clusterer does not have any defined clusters, new data will be automatically predicted as noise.",
-                stacklevel,
-            )?;
-        }
-        Ok(tuple)
+        PyTuple::new(
+            py,
+            [
+                labels.into_any(),
+                probabilities.into_any(),
+                connectors.into_any(),
+            ],
+        )?
+    } else {
+        PyTuple::new(py, [labels.into_any(), probabilities.into_any()])?
+    };
+    if result.no_cluster_tree {
+        PyErr::warn(
+            py,
+            py.get_type::<PyUserWarning>().as_any(),
+            c"Clusterer does not have any defined clusters, new data will be automatically predicted as noise.",
+            stacklevel,
+        )?;
     }
+    Ok(tuple)
 }
 
 /// Exactly a Python `bool`: rejects `None`, integers and other truthy objects with `ValueError`.
 struct StrictBool(bool);
+
+/// Exact nonnegative Python int; rejects bool and integer-like objects.
+pub(crate) struct StrictDeviceIndex(usize);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for StrictDeviceIndex {
+    type Error = PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if !obj.get_type().is(obj.py().get_type::<PyInt>()) {
+            return Err(PyValueError::new_err(
+                "device_index must be a nonnegative integer",
+            ));
+        }
+        obj.extract::<usize>()
+            .map(StrictDeviceIndex)
+            .map_err(|_| PyValueError::new_err("device_index must be a nonnegative integer"))
+    }
+}
 
 impl<'a, 'py> FromPyObject<'a, 'py> for StrictBool {
     type Error = PyErr;

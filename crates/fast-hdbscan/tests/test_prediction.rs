@@ -641,10 +641,140 @@ fn retained_state_bytes_are_reported_from_actual_allocations() {
         &data,
     );
     let status = model.prediction_cache_status().unwrap();
-    // Canonical state includes at least the owned geometry and the duplicated outputs.
-    assert!(status.canonical_bytes >= 90 * 3 * 4 + 90 * 4 * 2);
+    // Canonical bytes cover only compact prediction geometry, excluding fit outputs.
+    assert_eq!(status.canonical_bytes, 90 * 3 * std::mem::size_of::<f32>());
     // Fit-created tree is retained: permutation plus node arrays and bounds.
     assert!(status.tree_bytes >= 90 * 4);
     // Hierarchy metadata is retained from the fitted condensed tree.
     assert!(status.hierarchy_bytes > 0);
+}
+
+#[test]
+fn standalone_predictor_matches_fit_routes_and_detaches_lifetime() {
+    let data = blobs(24, 3);
+    let query = queries(3, 29);
+    let models = [
+        (
+            "brute",
+            fit(
+                BackendChoice::Cpu,
+                config(5, 3),
+                HdbscanSearch::BruteForce,
+                &data,
+            ),
+        ),
+        (
+            "kd",
+            fit(
+                BackendChoice::Cpu,
+                config(5, 3),
+                HdbscanSearch::KdTree,
+                &data,
+            ),
+        ),
+        (
+            "knn",
+            fit_knn_graph_with_source(&data, config(5, 3), BackendChoice::Cpu, KnnSource::Exact)
+                .unwrap(),
+        ),
+    ];
+    for (route, mut model) in models {
+        let expected = model.approximate_predict(&query).unwrap();
+        let predictor = model.to_predictor().unwrap();
+        assert_eq!(predictor.n_features(), 3, "{route}");
+        let before = predictor.prediction_cache_status().unwrap();
+        assert!(before.tree_ready, "{route}");
+        assert_eq!(
+            before.cores,
+            PredictionCoreStatus::Ready { rank: 3, len: 72 },
+            "{route}"
+        );
+
+        // Public fitted views are detached from the canonical predictor payload.
+        model.labels.fill(99);
+        model.probabilities.clear();
+        model.finite_index.reverse();
+        model.condensed.parent.clear();
+        let actual = predictor.approximate_predict(&query).unwrap();
+        assert_matches(&actual, &expected, route);
+        drop(model);
+        assert_matches(
+            &predictor.approximate_predict(&query).unwrap(),
+            &expected,
+            "after fit drop",
+        );
+    }
+}
+
+#[test]
+fn standalone_predictor_cold_conversion_no_tree_and_singleton_rank() {
+    // Conversion on a cold clustered model eagerly prepares prediction cores.
+    let data = blobs(20, 2);
+    let cold = fit(
+        BackendChoice::Cpu,
+        config(5, 3),
+        HdbscanSearch::BruteForce,
+        &data,
+    );
+    assert_eq!(
+        cold.prediction_cache_status().unwrap().cores,
+        PredictionCoreStatus::Uninitialized
+    );
+    let predictor = cold.to_predictor().unwrap();
+    assert_eq!(
+        predictor.prediction_cache_status().unwrap().cores,
+        PredictionCoreStatus::Ready { rank: 3, len: 60 }
+    );
+    let query = queries(2, 11);
+    assert_matches(
+        &predictor.approximate_predict(&query).unwrap(),
+        &cold.approximate_predict(&query).unwrap(),
+        "cold conversion",
+    );
+
+    // Rank one has canonical zero cores and does not need a search tree to prepare.
+    let singleton_rank = fit(
+        BackendChoice::Cpu,
+        config(5, 1),
+        HdbscanSearch::BruteForce,
+        &data,
+    );
+    let rank_one_predictor = singleton_rank.to_predictor().unwrap();
+    assert_eq!(
+        rank_one_predictor.prediction_cache_status().unwrap().cores,
+        PredictionCoreStatus::Ready { rank: 1, len: 60 }
+    );
+    assert_matches(
+        &rank_one_predictor.approximate_predict(&query).unwrap(),
+        &singleton_rank.approximate_predict(&query).unwrap(),
+        "rank one",
+    );
+
+    // No-tree models bypass candidate-width checks and remain all-noise.
+    let shortcut = HDBSCAN::new(config(5, 50), BackendChoice::Cpu)
+        .fit(&[vec![1.0, 2.0]])
+        .unwrap();
+    let shortcut_predictor = shortcut.to_predictor().unwrap();
+    assert_eq!(shortcut_predictor.n_features(), 2);
+    assert_eq!(
+        shortcut_predictor.prediction_cache_status().unwrap().cores,
+        PredictionCoreStatus::NotRequiredNoClusterTree
+    );
+    assert_eq!(
+        shortcut_predictor
+            .approximate_predict(&[vec![1.0, 2.0], vec![9.0, 9.0]])
+            .unwrap(),
+        PredictionResult {
+            labels: vec![-1, -1],
+            probabilities: vec![0.0, 0.0],
+            connecting_points: vec![-1, -1],
+            no_cluster_tree: true,
+        }
+    );
+    assert!(
+        !shortcut_predictor
+            .prediction_cache_status()
+            .unwrap()
+            .tree_ready
+    );
 }

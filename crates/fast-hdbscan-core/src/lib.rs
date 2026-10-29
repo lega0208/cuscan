@@ -23,7 +23,9 @@ pub use config::{ClusterSelectionMethod, HdbscanConfig, MstGraph};
 pub use error::HdbscanError;
 pub use kdtree::KdTree;
 pub use linkage::{LinkageRow, SortedMstEdge};
-pub use prediction::{PointPrediction, PredictionColumns, PredictionHierarchy};
+pub use prediction::{
+    PointPrediction, PredictionColumns, PredictionHierarchy, PredictionHierarchyState,
+};
 
 /// Finite-row-indexed host extraction results, before raw-row remapping.
 #[derive(Debug, Clone, PartialEq)]

@@ -154,7 +154,311 @@ pub struct PredictionHierarchy {
     root: usize,
 }
 
+/// Portable, storage-independent columns for a validated prediction hierarchy.
+///
+/// The all-empty value represents the no-cluster-tree shortcut. Clustered values use
+/// node index 0 as the root and `u64::MAX` as its parent sentinel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictionHierarchyState {
+    /// Ascending raw training-row ids for compact finite rows.
+    pub finite_index: Vec<u32>,
+    /// Raw hierarchy ids, with the root at index 0.
+    pub node_ids: Vec<u64>,
+    /// Parent node index; `u64::MAX` marks the single root at node index 0.
+    pub node_parent_indices: Vec<u64>,
+    /// Birth lambda on the parent edge; root stores canonical +0.0.
+    pub node_birth_lambdas: Vec<f64>,
+    /// Propagated fitted label (`-1` means unmapped/no selected cluster).
+    pub node_labels: Vec<i32>,
+    /// Propagated selected-anchor maximum lambda.
+    pub node_max_lambdas: Vec<f64>,
+    /// Hierarchy node index attached to each compact finite row.
+    pub point_node_indices: Vec<u64>,
+    /// Departure lambda for each compact finite row.
+    pub point_departure_lambdas: Vec<f64>,
+}
+
 impl PredictionHierarchy {
+    /// Export the validated hierarchy into portable, owned columns.
+    pub fn export_state(&self) -> Result<PredictionHierarchyState> {
+        if self.no_cluster_tree() {
+            return Ok(PredictionHierarchyState {
+                finite_index: Vec::new(),
+                node_ids: Vec::new(),
+                node_parent_indices: Vec::new(),
+                node_birth_lambdas: Vec::new(),
+                node_labels: Vec::new(),
+                node_max_lambdas: Vec::new(),
+                point_node_indices: Vec::new(),
+                point_departure_lambdas: Vec::new(),
+            });
+        }
+        let mut finite_index = Vec::new();
+        reserve_column(
+            &mut finite_index,
+            self.finite_index.len(),
+            "portable finite index",
+        )?;
+        finite_index.extend_from_slice(&self.finite_index);
+        let mut state = PredictionHierarchyState {
+            finite_index,
+            node_ids: Vec::new(),
+            node_parent_indices: Vec::new(),
+            node_birth_lambdas: Vec::new(),
+            node_labels: Vec::new(),
+            node_max_lambdas: Vec::new(),
+            point_node_indices: Vec::new(),
+            point_departure_lambdas: Vec::new(),
+        };
+        reserve_column(
+            &mut state.node_ids,
+            self.nodes.len(),
+            "portable hierarchy nodes",
+        )?;
+        reserve_column(
+            &mut state.node_parent_indices,
+            self.nodes.len(),
+            "portable hierarchy parents",
+        )?;
+        reserve_column(
+            &mut state.node_birth_lambdas,
+            self.nodes.len(),
+            "portable hierarchy births",
+        )?;
+        reserve_column(
+            &mut state.node_labels,
+            self.nodes.len(),
+            "portable hierarchy labels",
+        )?;
+        reserve_column(
+            &mut state.node_max_lambdas,
+            self.nodes.len(),
+            "portable hierarchy maxima",
+        )?;
+        reserve_column(
+            &mut state.point_node_indices,
+            self.points.len(),
+            "portable hierarchy point nodes",
+        )?;
+        reserve_column(
+            &mut state.point_departure_lambdas,
+            self.points.len(),
+            "portable hierarchy point departures",
+        )?;
+        for node in &self.nodes {
+            state.node_ids.push(
+                u64::try_from(node.id)
+                    .map_err(|_| HdbscanError::Overflow("portable hierarchy node id"))?,
+            );
+            let (parent, birth) = match node.parent {
+                Some((parent, birth)) => (
+                    u64::try_from(parent)
+                        .map_err(|_| HdbscanError::Overflow("portable hierarchy parent index"))?,
+                    birth,
+                ),
+                None => (u64::MAX, 0.0),
+            };
+            state.node_parent_indices.push(parent);
+            state.node_birth_lambdas.push(birth);
+            state.node_labels.push(node.label);
+            state.node_max_lambdas.push(node.max_lambda);
+        }
+        for point in &self.points {
+            state.point_node_indices.push(
+                u64::try_from(point.node)
+                    .map_err(|_| HdbscanError::Overflow("portable hierarchy point node index"))?,
+            );
+            state.point_departure_lambdas.push(point.departure_lambda);
+        }
+        Ok(state)
+    }
+
+    /// Validate and import portable hierarchy columns.
+    ///
+    /// Every column is treated as untrusted and checked before private hierarchy metadata
+    /// is constructed. An all-empty state imports the no-cluster-tree shortcut.
+    pub fn from_state(state: PredictionHierarchyState) -> Result<Self> {
+        let PredictionHierarchyState {
+            finite_index,
+            node_ids,
+            node_parent_indices,
+            node_birth_lambdas,
+            node_labels,
+            node_max_lambdas,
+            point_node_indices,
+            point_departure_lambdas,
+        } = state;
+        let columns_empty = [
+            finite_index.is_empty(),
+            node_ids.is_empty(),
+            node_parent_indices.is_empty(),
+            node_birth_lambdas.is_empty(),
+            node_labels.is_empty(),
+            node_max_lambdas.is_empty(),
+            point_node_indices.is_empty(),
+            point_departure_lambdas.is_empty(),
+        ];
+        if columns_empty.iter().all(|&empty| empty) {
+            return Ok(Self {
+                finite_index,
+                nodes: Vec::new(),
+                points: Vec::new(),
+                root: 0,
+            });
+        }
+        if columns_empty.iter().any(|&empty| empty) {
+            return Err(invalid(
+                "portable prediction hierarchy has a partially empty column set",
+            ));
+        }
+
+        let n_finite = finite_index.len();
+        let n_nodes = node_ids.len();
+        if n_finite > i32::MAX as usize || n_nodes > i32::MAX as usize {
+            return Err(HdbscanError::Overflow(
+                "portable prediction hierarchy count",
+            ));
+        }
+        checked_column_bytes::<u32>(n_finite, "portable finite index")?;
+        checked_column_bytes::<u64>(n_nodes, "portable hierarchy node")?;
+        checked_column_bytes::<f64>(n_nodes, "portable hierarchy node")?;
+        checked_column_bytes::<i32>(n_nodes, "portable hierarchy node")?;
+        checked_column_bytes::<u64>(n_finite, "portable hierarchy point")?;
+        checked_column_bytes::<f64>(n_finite, "portable hierarchy point")?;
+        if node_parent_indices.len() != n_nodes
+            || node_birth_lambdas.len() != n_nodes
+            || node_labels.len() != n_nodes
+            || node_max_lambdas.len() != n_nodes
+            || point_node_indices.len() != n_finite
+            || point_departure_lambdas.len() != n_finite
+        {
+            return Err(invalid(
+                "portable prediction hierarchy columns have inconsistent lengths",
+            ));
+        }
+        if finite_index.iter().any(|&raw| raw > i32::MAX as u32)
+            || finite_index.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "portable finite index must be strictly ascending and fit i32",
+            ));
+        }
+
+        let mut ids = Vec::new();
+        reserve_column(&mut ids, n_nodes, "portable hierarchy ids")?;
+        let mut unique_ids = std::collections::HashSet::new();
+        unique_ids
+            .try_reserve(n_nodes)
+            .map_err(|_| invalid("unable to reserve portable hierarchy id validation"))?;
+        for &id in &node_ids {
+            let host_id = usize::try_from(id)
+                .map_err(|_| invalid("portable hierarchy node id does not fit usize"))?;
+            if !unique_ids.insert(host_id) {
+                return Err(invalid("portable hierarchy node ids are not unique"));
+            }
+            ids.push(host_id);
+        }
+        if ids[0] != *ids.iter().min().expect("nonempty node ids") {
+            return Err(invalid(
+                "portable hierarchy root is not the minimum node id",
+            ));
+        }
+        if node_parent_indices[0] != u64::MAX
+            || node_birth_lambdas[0].to_bits() != 0.0_f64.to_bits()
+        {
+            return Err(invalid(
+                "portable hierarchy root sentinel or birth lambda is not canonical",
+            ));
+        }
+        let mut parents = Vec::new();
+        reserve_column(&mut parents, n_nodes, "portable hierarchy parents")?;
+        parents.push(None);
+        for index in 1..n_nodes {
+            let parent = usize::try_from(node_parent_indices[index])
+                .map_err(|_| invalid("portable hierarchy parent index does not fit usize"))?;
+            if parent >= n_nodes
+                || parent == index
+                || ids[parent] >= ids[index]
+                || ids[index] <= ids[0]
+            {
+                return Err(invalid("portable hierarchy parent graph is invalid"));
+            }
+            parents.push(Some(parent));
+        }
+
+        let mut labels = std::collections::HashSet::new();
+        labels
+            .try_reserve(n_nodes)
+            .map_err(|_| invalid("unable to reserve portable hierarchy label validation"))?;
+        if node_labels[0] >= 0 {
+            labels.insert(node_labels[0]);
+        }
+        for index in 0..n_nodes {
+            let birth = node_birth_lambdas[index];
+            let maximum = node_max_lambdas[index];
+            if birth.is_nan()
+                || birth < 0.0
+                || maximum.is_nan()
+                || maximum < 0.0
+                || node_labels[index] < -1
+            {
+                return Err(invalid(
+                    "portable hierarchy contains an invalid lambda or label",
+                ));
+            }
+            if index == 0 {
+                if node_labels[index] == -1 && maximum.to_bits() != 0.0_f64.to_bits() {
+                    return Err(invalid(
+                        "unmapped portable hierarchy root must have canonical zero maximum",
+                    ));
+                }
+            } else {
+                let parent = parents[index].expect("non-root parent checked");
+                if node_labels[index] == node_labels[parent] {
+                    if maximum.to_bits() != node_max_lambdas[parent].to_bits() {
+                        return Err(invalid(
+                            "inherited portable hierarchy maximum differs from its parent",
+                        ));
+                    }
+                } else if node_labels[index] < 0 || !labels.insert(node_labels[index]) {
+                    return Err(invalid(
+                        "portable hierarchy anchor labels are invalid or duplicated",
+                    ));
+                }
+            }
+        }
+
+        let mut nodes = Vec::new();
+        reserve_column(&mut nodes, n_nodes, "validated hierarchy nodes")?;
+        for index in 0..n_nodes {
+            nodes.push(ClusterNode {
+                id: ids[index],
+                parent: parents[index].map(|parent| (parent, node_birth_lambdas[index])),
+                label: node_labels[index],
+                max_lambda: node_max_lambdas[index],
+            });
+        }
+        let mut points = Vec::new();
+        reserve_column(&mut points, n_finite, "validated hierarchy points")?;
+        for (node, &departure_lambda) in point_node_indices.iter().zip(&point_departure_lambdas) {
+            let node = usize::try_from(*node)
+                .map_err(|_| invalid("portable point node index does not fit usize"))?;
+            if node >= n_nodes || departure_lambda.is_nan() || departure_lambda < 0.0 {
+                return Err(invalid("portable point attachment is invalid"));
+            }
+            points.push(PointAttachment {
+                node,
+                departure_lambda,
+            });
+        }
+        Ok(Self {
+            finite_index,
+            nodes,
+            points,
+            root: 0,
+        })
+    }
+
     /// Build metadata from the final raw-row condensed tree, raw fitted labels
     /// (`labels.len()` is the raw row count) and the ascending finite-to-raw mapping.
     ///
@@ -622,6 +926,19 @@ impl PredictionHierarchy {
     }
 }
 
+fn checked_column_bytes<T>(count: usize, name: &'static str) -> Result<usize> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(HdbscanError::Overflow(name))
+}
+
+fn reserve_column<T>(column: &mut Vec<T>, count: usize, name: &'static str) -> Result<()> {
+    checked_column_bytes::<T>(count, name)?;
+    column
+        .try_reserve_exact(count)
+        .map_err(|_| invalid(format!("unable to reserve {name} column")))
+}
+
 fn invalid(message: impl Into<String>) -> HdbscanError {
     HdbscanError::InvalidInput(message.into())
 }
@@ -654,4 +971,236 @@ fn validate_labels(labels: &[i32], finite_index: &[u32]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod portable_state_tests {
+    use super::*;
+
+    fn clustered_state() -> PredictionHierarchyState {
+        PredictionHierarchyState {
+            finite_index: vec![3, 9],
+            node_ids: vec![10, 11],
+            node_parent_indices: vec![u64::MAX, 0],
+            node_birth_lambdas: vec![0.0, 1.0],
+            node_labels: vec![-1, 4],
+            node_max_lambdas: vec![0.0, 4.0],
+            point_node_indices: vec![1, 1],
+            point_departure_lambdas: vec![0.1, 0.2],
+        }
+    }
+
+    fn three_node_state() -> PredictionHierarchyState {
+        PredictionHierarchyState {
+            finite_index: vec![3, 9],
+            node_ids: vec![10, 11, 12],
+            node_parent_indices: vec![u64::MAX, 0, 0],
+            node_birth_lambdas: vec![0.0, 1.0, 1.5],
+            node_labels: vec![-1, 4, 5],
+            node_max_lambdas: vec![0.0, 4.0, 5.0],
+            point_node_indices: vec![1, 2],
+            point_departure_lambdas: vec![0.1, 0.2],
+        }
+    }
+
+    #[test]
+    fn portable_state_round_trip_preserves_prediction_authority() {
+        let hierarchy = PredictionHierarchy::from_state(clustered_state()).unwrap();
+        let exported = hierarchy.export_state().unwrap();
+        assert_eq!(exported, clustered_state());
+
+        let prediction = hierarchy
+            .predict_candidates(&[0, 1], &[1.0, 2.0], &[0.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(prediction.label, 4);
+        assert_eq!(prediction.probability, 0.125);
+        assert_eq!(prediction.connecting_point, 3);
+    }
+
+    #[test]
+    fn portable_state_empty_shortcut_is_canonical() {
+        let empty = PredictionHierarchyState {
+            finite_index: Vec::new(),
+            node_ids: Vec::new(),
+            node_parent_indices: Vec::new(),
+            node_birth_lambdas: Vec::new(),
+            node_labels: Vec::new(),
+            node_max_lambdas: Vec::new(),
+            point_node_indices: Vec::new(),
+            point_departure_lambdas: Vec::new(),
+        };
+        let hierarchy = PredictionHierarchy::from_state(empty.clone()).unwrap();
+        assert!(hierarchy.no_cluster_tree());
+        assert_eq!(hierarchy.export_state().unwrap(), empty);
+
+        // Root-only fitted trees retain a finite map in memory but must export canonically empty.
+        let root_only = CondensedTree {
+            parent: vec![2, 2],
+            child: vec![0, 1],
+            lambda: vec![1.0, 2.0],
+            child_size: vec![1.0, 1.0],
+        };
+        let hierarchy = PredictionHierarchy::new(&root_only, &[-1, -1], &[0, 1]).unwrap();
+        assert!(hierarchy.no_cluster_tree());
+        assert_eq!(hierarchy.export_state().unwrap(), empty);
+    }
+
+    #[test]
+    fn portable_state_rejects_malformed_columns_and_hierarchy_invariants() {
+        let mut state = clustered_state();
+        state.node_labels.pop();
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.finite_index[1] = state.finite_index[0];
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.node_parent_indices[1] = 1;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.node_birth_lambdas[1] = f64::NAN;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.node_labels[1] = -1;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.node_ids.push(12);
+        state.node_parent_indices.push(0);
+        state.node_birth_lambdas.push(1.0);
+        state.node_labels.push(4);
+        state.node_max_lambdas.push(4.0);
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.point_node_indices[0] = 2;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.node_parent_indices[0] = 0;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.point_departure_lambdas[0] = f64::NEG_INFINITY;
+        assert!(PredictionHierarchy::from_state(state).is_err());
+
+        let mut state = clustered_state();
+        state.point_departure_lambdas[0] = f64::INFINITY;
+        assert!(PredictionHierarchy::from_state(state.clone()).is_ok());
+        assert_eq!(
+            PredictionHierarchy::from_state(state.clone())
+                .unwrap()
+                .export_state()
+                .unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn portable_state_rejects_table_of_invalid_values() {
+        enum InvalidField {
+            DuplicateNodeIds,
+            ParentIdDoesNotDescend,
+            InheritedMaximumBitsDiffer,
+            DuplicateAnchors,
+            BirthLambda(f64),
+            MaximumLambda(f64),
+            DepartureLambda(f64),
+            OutOfRangeParent,
+            MultipleRootSentinels,
+            RawIdTooLarge,
+            RawIdsOutOfOrder,
+        }
+
+        let cases = [
+            ("duplicate node ids", InvalidField::DuplicateNodeIds),
+            (
+                "parent id does not descend",
+                InvalidField::ParentIdDoesNotDescend,
+            ),
+            (
+                "inherited maximum has different bits",
+                InvalidField::InheritedMaximumBitsDiffer,
+            ),
+            ("duplicate anchor labels", InvalidField::DuplicateAnchors),
+            ("NaN birth lambda", InvalidField::BirthLambda(f64::NAN)),
+            (
+                "negative-infinity birth lambda",
+                InvalidField::BirthLambda(f64::NEG_INFINITY),
+            ),
+            ("negative birth lambda", InvalidField::BirthLambda(-1.0)),
+            ("NaN maximum lambda", InvalidField::MaximumLambda(f64::NAN)),
+            (
+                "negative-infinity maximum lambda",
+                InvalidField::MaximumLambda(f64::NEG_INFINITY),
+            ),
+            ("negative maximum lambda", InvalidField::MaximumLambda(-1.0)),
+            (
+                "NaN departure lambda",
+                InvalidField::DepartureLambda(f64::NAN),
+            ),
+            (
+                "negative-infinity departure lambda",
+                InvalidField::DepartureLambda(f64::NEG_INFINITY),
+            ),
+            (
+                "negative departure lambda",
+                InvalidField::DepartureLambda(-1.0),
+            ),
+            ("out-of-range parent", InvalidField::OutOfRangeParent),
+            (
+                "multiple root sentinels",
+                InvalidField::MultipleRootSentinels,
+            ),
+            ("raw id exceeds i32", InvalidField::RawIdTooLarge),
+            ("raw ids out of order", InvalidField::RawIdsOutOfOrder),
+        ];
+
+        for (case, field) in cases {
+            let mut state = clustered_state();
+            match field {
+                InvalidField::DuplicateNodeIds => {
+                    state.node_ids[1] = state.node_ids[0];
+                }
+                InvalidField::ParentIdDoesNotDescend => {
+                    state = three_node_state();
+                    state.node_ids = vec![10, 12, 11];
+                    state.node_parent_indices[1] = 2;
+                    state.node_parent_indices[2] = 0;
+                    state.node_labels = vec![-1, 4, 5];
+                    state.node_max_lambdas = vec![0.0, 4.0, 5.0];
+                    state.node_birth_lambdas = vec![0.0, 1.0, 1.5];
+                    state.point_node_indices = vec![1, 2];
+                    state.point_departure_lambdas = vec![0.1, 0.2];
+                    // Node 2 (id 11) now has node 1 (id 12) as parent.
+                    state.node_parent_indices[2] = 1;
+                }
+                InvalidField::InheritedMaximumBitsDiffer => {
+                    state.node_labels = vec![4, 4];
+                    state.node_max_lambdas = vec![0.0, -0.0];
+                }
+                InvalidField::DuplicateAnchors => {
+                    state = three_node_state();
+                    state.node_labels = vec![-1, 4, 4];
+                    state.node_max_lambdas = vec![0.0, 4.0, 4.0];
+                }
+                InvalidField::BirthLambda(value) => state.node_birth_lambdas[1] = value,
+                InvalidField::MaximumLambda(value) => state.node_max_lambdas[1] = value,
+                InvalidField::DepartureLambda(value) => state.point_departure_lambdas[0] = value,
+                InvalidField::OutOfRangeParent => state.node_parent_indices[1] = 2,
+                InvalidField::MultipleRootSentinels => state.node_parent_indices[1] = u64::MAX,
+                InvalidField::RawIdTooLarge => {
+                    state.finite_index[1] = i32::MAX as u32 + 1;
+                }
+                InvalidField::RawIdsOutOfOrder => state.finite_index = vec![9, 3],
+            }
+            assert!(
+                PredictionHierarchy::from_state(state).is_err(),
+                "expected portable hierarchy import to reject {case}"
+            );
+        }
+    }
 }

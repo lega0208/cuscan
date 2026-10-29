@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 from hdbscan.plots import CondensedTree
 
-from fast_umap import HDBSCAN, _fast_umap
+from fast_umap import HDBSCAN, HDBSCANPredictor, _fast_umap
 
 FIXTURE_DIR = Path(__file__).parents[2] / "crates/fast-hdbscan/tests/fixtures"
 FIXTURE_PATH = FIXTURE_DIR / "hdbscan_prediction.json"
@@ -691,3 +691,80 @@ def test_original_reference_is_importable_for_parity_gate() -> None:
     # The parity gate must fail, not skip, without the original package.
     assert hasattr(hdbscan, "HDBSCAN")
     assert hasattr(hp, "approximate_predict")
+
+
+def test_standalone_predictor_matches_fitted_and_has_only_prediction_state(
+    hdbscan_backend: Backend,
+) -> None:
+    _, queries = case_arrays("blobs_2d")
+    model = fit_model(hdbscan_backend, "blobs_2d")
+    labels_view = model.labels_
+    labels_view[:] = -99
+    probabilities_view = model.probabilities_
+    probabilities_view[:] = 0
+    predictor = model.to_predictor()
+    assert isinstance(predictor, HDBSCANPredictor)
+    assert predictor.n_features_in_ == model.n_features_in_
+    assert not hasattr(predictor, "labels_")
+    assert not hasattr(predictor, "_fitted_state")
+    assert not hasattr(predictor, "__dict__")
+    for flag in (False, True):
+        for actual, expected in zip(
+            predictor.approximate_predict(queries, flag),
+            model.approximate_predict(queries, flag),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
+    expected = predictor.approximate_predict(queries, True)
+    model.fit(np.array([[0.0], [0.1], [0.2], [4.0], [4.1], [4.2]], np.float32))
+    del model
+    import gc
+
+    gc.collect()
+    for actual, before in zip(predictor.approximate_predict(queries, True), expected, strict=True):
+        np.testing.assert_array_equal(actual, before)
+
+
+def test_standalone_predictor_input_validation_and_numpy_bool(fitted: HDBSCAN) -> None:
+    _, queries = case_arrays("blobs_2d")
+    predictor = fitted.to_predictor()
+    expected = predictor.approximate_predict(queries, True)
+    for value in (queries.tolist(), queries.astype(np.float64), np.asfortranarray(queries)):
+        for actual, before in zip(
+            predictor.approximate_predict(value, np.bool_(True)), expected, strict=True
+        ):
+            np.testing.assert_array_equal(actual, before)
+    for bad in (
+        np.zeros((1, 3)),
+        np.empty((0, 2)),
+        np.empty((1, 0)),
+        np.array([[np.nan, 0.0]]),
+        np.array([[np.inf, 0.0]]),
+        np.array([[1e300, 0.0]]),
+        np.array([[1 + 2j, 0.0]]),
+        np.array([["x", "y"]]),
+    ):
+        with pytest.raises(ValueError):
+            predictor.approximate_predict(bad)
+    invalid_flags: tuple[Any, ...] = (None, 0, 1, "true")
+    for flag in invalid_flags:
+        with pytest.raises(ValueError, match="return_connecting_points"):
+            predictor.approximate_predict(queries, flag)
+
+
+def test_standalone_predictor_unfitted_and_shortcut_warning_location(
+    hdbscan_backend: Backend,
+) -> None:
+    with pytest.raises(ValueError, match="not fitted"):
+        HDBSCAN(backend=hdbscan_backend).to_predictor()
+    shortcut = fit_model(hdbscan_backend, "no_cluster_tree").to_predictor()
+    _, queries = case_arrays("no_cluster_tree")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = shortcut.approximate_predict(queries, True)
+    relevant = [warning for warning in caught if NO_CLUSTER_WARNING in str(warning.message)]
+    assert len(relevant) == 1
+    assert relevant[0].filename == __file__
+    assert result[0].dtype == result[2].dtype == np.dtype(np.intp)
+    assert result[1].dtype == np.dtype(np.float64)

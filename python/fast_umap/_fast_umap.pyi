@@ -59,6 +59,39 @@ class FittedHDBSCAN:
         tuple[NDArray[np.intp], NDArray[np.float64]]
         | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
     ): ...
+    def to_predictor(self) -> HDBSCANPredictor: ...
+
+class HDBSCANPredictor:
+    @property
+    def n_features(self) -> int: ...
+    def export_state(self) -> tuple[dict[str, NDArray[np.generic] | None], dict[str, object]]: ...
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: Literal[False] = ...,
+        *,
+        stacklevel: int = ...,
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]: ...
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: Literal[True],
+        *,
+        stacklevel: int = ...,
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]: ...
+    @overload
+    def approximate_predict(
+        self,
+        x: NDArray[np.float32],
+        return_connecting_points: bool = ...,
+        *,
+        stacklevel: int = ...,
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ): ...
 
 def fit_hdbscan(
     x: NDArray[np.float32],
@@ -98,3 +131,9 @@ def load(
     backend: Literal["auto", "cpu", "cuda"] = "auto",
     device_index: int = 0,
 ) -> FittedUMAP: ...
+def load_hdbscan_predictor(
+    arrays: dict[str, NDArray[np.generic] | None],
+    metadata: dict[str, object],
+    backend: Literal["auto", "cpu", "cuda"] = "auto",
+    device_index: int = 0,
+) -> HDBSCANPredictor: ...

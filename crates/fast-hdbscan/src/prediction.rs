@@ -2,27 +2,20 @@
 //!
 //! # Canonical state and views
 //!
-//! Every successful fit captures one immutable [`FittedState`]: the authoritative,
-//! backend-free host record of the complete fitted model (configuration, requested and
-//! resolved fitting choices, all public outputs and diagnostics, owned compact finite
-//! training geometry and raw-row mapping) plus the prediction hierarchy derived from the
-//! final labels/condensed tree. The public mutable fields of
-//! [`crate::FittedHDBSCAN`] are detached output views; mutating them affects neither
-//! prediction nor this canonical record.
+//! A successful fit captures an immutable [`FittedState`] for fit outputs and a shared
+//! [`PredictionState`] containing only compact prediction geometry and validated
+//! hierarchy metadata. The public mutable fields of [`crate::FittedHDBSCAN`] are detached
+//! output views; mutating them affects neither prediction nor canonical state.
 //!
 //! Runtime concerns (selected runtime backend, initialization locks, `Arc` sharing) live
-//! in [`PredictionRuntime`], separate from canonical data. Host KD tree and prediction-core
-//! payloads are canonical values published into the runtime cache as immutable `Arc`s.
+//! in [`PredictionRuntime`]. Host KD tree and prediction-core payloads are published into
+//! that runtime cache as immutable `Arc`s.
 //!
-//! # Future persistence boundary (not implemented)
+//! # Portable predictor state
 //!
-//! A future save prepares a complete state from [`FittedState`] plus a validated host KD
-//! tree and the prediction-core status: `Ready { rank: s, values }` for nonempty cluster
-//! trees (rejecting unsupported `2*s > n_finite` widths before cold work), or
-//! `NotRequired(NoClusterTree)` for shortcut models, always with a valid tree (singleton
-//! included). Derived hierarchy lookup tables are reconstructed on load, never persisted
-//! as a second authority. Load selects the runtime backend independently of the training
-//! backend recorded here as provenance. No file I/O or public save/load API exists yet.
+//! The portable state contains prediction geometry, validated hierarchy columns, and
+//! ready prediction cores. KD trees are rebuilt deterministically on import; fitted
+//! outputs, device tensors, and training provenance are never exported.
 //!
 //! # Lazy cache and locking contract
 //!
@@ -44,7 +37,7 @@ use fast_hdbscan_core::{
     error::Result,
     kdtree::{LEAF_SIZE, MAX_KD_LEVELS},
     linkage::{LinkageRow, SortedMstEdge},
-    prediction::{candidate_width, prediction_core_from_squared_rows},
+    prediction::{PredictionHierarchyState, candidate_width, prediction_core_from_squared_rows},
 };
 
 use crate::backend::{DeviceKdReference, HdbscanOps};
@@ -86,16 +79,19 @@ pub(crate) struct FittedState {
     pub(crate) core_distances: Vec<f32>,
     /// Ascending compact-to-raw row mapping.
     pub(crate) finite_index: Vec<u32>,
-    pub(crate) n_features: usize,
     pub(crate) raw_n: usize,
     pub(crate) search: HdbscanSearch,
     pub(crate) resolved_graph: MstGraph,
     pub(crate) knn_diagnostics: Option<KnnDiagnostics>,
-    /// Owned compact finite row-major float32 training coordinates.
+    pub(crate) prediction: Arc<PredictionState>,
+}
+
+/// Immutable prediction-only payload shared with detached predictors.
+#[derive(Debug)]
+pub(crate) struct PredictionState {
     pub(crate) geometry: Vec<f32>,
-    /// Resolved `min_samples` (`s`) used for prediction ranks.
+    pub(crate) n_features: usize,
     pub(crate) min_samples: usize,
-    /// Validated prediction metadata derived from final labels/condensed tree.
     pub(crate) hierarchy: PredictionHierarchy,
 }
 
@@ -144,8 +140,18 @@ impl FittedState {
         }
         let hierarchy =
             PredictionHierarchy::new(&outputs.condensed, &outputs.labels, &outputs.finite_index)?;
-        Ok(Self {
+        let geometry = if hierarchy.no_cluster_tree() {
+            Vec::new()
+        } else {
+            outputs.geometry
+        };
+        let prediction = Arc::new(PredictionState {
+            geometry,
+            n_features: outputs.n_features,
             min_samples: outputs.config.resolved_min_samples(),
+            hierarchy,
+        });
+        Ok(Self {
             config: outputs.config,
             training_backend: outputs.training_backend,
             labels: outputs.labels,
@@ -156,21 +162,20 @@ impl FittedState {
             neighbors: outputs.neighbors,
             core_distances: outputs.core_distances,
             finite_index: outputs.finite_index,
-            n_features: outputs.n_features,
             raw_n: outputs.raw_n,
             search: outputs.search,
             resolved_graph: outputs.resolved_graph,
             knn_diagnostics: outputs.knn_diagnostics,
-            geometry: outputs.geometry,
-            hierarchy,
+            prediction,
         })
     }
+}
 
+impl PredictionState {
     pub(crate) fn n_finite(&self) -> usize {
-        self.finite_index.len()
+        self.hierarchy.n_finite()
     }
 
-    /// Canonical status of the prediction-core cache before any initialization.
     fn initial_core_status(&self) -> CoreStatus {
         if self.hierarchy.no_cluster_tree() {
             CoreStatus::NotRequired(NotRequiredReason::NoClusterTree)
@@ -179,42 +184,8 @@ impl FittedState {
         }
     }
 
-    /// Persistent host bytes of the canonical snapshot, from actual allocations
-    /// (excluding the hierarchy, tree and cores which are reported separately).
-    pub(crate) fn canonical_host_bytes(&self) -> Option<usize> {
-        let condensed = self
-            .condensed
-            .parent
-            .len()
-            .checked_mul(2 * std::mem::size_of::<usize>() + 2 * std::mem::size_of::<f32>())?;
-        let knn = self
-            .knn_diagnostics
-            .as_ref()
-            .map_or(Some(0), |diagnostics| {
-                diagnostics
-                    .neighbors
-                    .len()
-                    .checked_mul(4)?
-                    .checked_add(diagnostics.distances_sq.len().checked_mul(4)?)
-            })?;
-        [
-            self.labels.len().checked_mul(4)?,
-            self.probabilities.len().checked_mul(4)?,
-            self.linkage
-                .len()
-                .checked_mul(std::mem::size_of::<LinkageRow>())?,
-            condensed,
-            self.mst
-                .len()
-                .checked_mul(std::mem::size_of::<SortedMstEdge>())?,
-            self.neighbors.len().checked_mul(4)?,
-            self.core_distances.len().checked_mul(4)?,
-            self.finite_index.len().checked_mul(4)?,
-            knn,
-            self.geometry.len().checked_mul(4)?,
-        ]
-        .into_iter()
-        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+    fn canonical_host_bytes(&self) -> Option<usize> {
+        self.geometry.len().checked_mul(std::mem::size_of::<f32>())
     }
 }
 
@@ -274,7 +245,7 @@ pub struct PredictionCacheStatus {
     pub tree_ready: bool,
     /// Actual host bytes of the retained/published KD tree (0 when absent).
     pub tree_bytes: usize,
-    /// Actual host bytes of the canonical snapshot excluding tree, cores and hierarchy.
+    /// Prediction geometry bytes only; excludes fit outputs, hierarchy, tree, and cores.
     pub canonical_bytes: usize,
     /// Actual retained host bytes of the prediction hierarchy metadata.
     pub hierarchy_bytes: usize,
@@ -290,19 +261,54 @@ pub enum PredictionCoreStatus {
     Ready { rank: usize, len: usize },
 }
 
+/// Storage-independent, prediction-only HDBSCAN state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HdbscanPredictorState {
+    pub n_features: usize,
+    pub min_samples: usize,
+    /// Flat row-major finite training coordinates; empty only for no-cluster-tree state.
+    pub geometry: Vec<f32>,
+    pub hierarchy: PredictionHierarchyState,
+    pub prediction_cores: PredictionCoresState,
+}
+
+/// Ready prediction cores required for clustered models, or the canonical no-tree shortcut.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredictionCoresState {
+    NotRequiredNoClusterTree,
+    Ready { rank: usize, values: Vec<f64> },
+}
+
 fn poisoned(subject: &str) -> HdbscanError {
     HdbscanError::Numerical(format!("prediction {subject} lock was poisoned"))
 }
 
 impl PredictionRuntime {
     /// `tree` is the fit-created host tree when the fitting route built one.
-    pub(crate) fn new(state: &FittedState, backend: BackendChoice, tree: Option<KdTree>) -> Self {
+    pub(crate) fn new(
+        state: &PredictionState,
+        backend: BackendChoice,
+        tree: Option<KdTree>,
+    ) -> Self {
+        Self {
+            backend,
+            init: Mutex::new(()),
+            cache: Mutex::new(CacheState {
+                tree: tree
+                    .filter(|_| !state.hierarchy.no_cluster_tree())
+                    .map(Arc::new),
+                cores: state.initial_core_status(),
+            }),
+        }
+    }
+
+    fn loaded(backend: BackendChoice, tree: Option<KdTree>, cores: CoreStatus) -> Self {
         Self {
             backend,
             init: Mutex::new(()),
             cache: Mutex::new(CacheState {
                 tree: tree.map(Arc::new),
-                cores: state.initial_core_status(),
+                cores,
             }),
         }
     }
@@ -319,7 +325,7 @@ impl PredictionRuntime {
         self.init.lock().map_err(|_| poisoned("initialization"))
     }
 
-    pub(crate) fn status(&self, state: &FittedState) -> Result<PredictionCacheStatus> {
+    pub(crate) fn status(&self, state: &PredictionState) -> Result<PredictionCacheStatus> {
         let cache = self.cache()?;
         let tree_bytes = match &cache.tree {
             Some(tree) => {
@@ -332,7 +338,7 @@ impl PredictionRuntime {
             tree_bytes,
             canonical_bytes: state
                 .canonical_host_bytes()
-                .ok_or(HdbscanError::Overflow("canonical fitted host bytes"))?,
+                .ok_or(HdbscanError::Overflow("canonical prediction host bytes"))?,
             hierarchy_bytes: state.hierarchy.retained_bytes(),
             cores: match &cache.cores {
                 CoreStatus::NotRequired(NotRequiredReason::NoClusterTree) => {
@@ -349,7 +355,7 @@ impl PredictionRuntime {
 
     /// Returns the published tree, building and publishing it under `init` when absent.
     /// The caller must not hold `init`.
-    fn tree(&self, state: &FittedState) -> Result<Arc<KdTree>> {
+    fn tree(&self, state: &PredictionState) -> Result<Arc<KdTree>> {
         if let Some(tree) = self.cache()?.tree.clone() {
             return Ok(tree);
         }
@@ -358,7 +364,7 @@ impl PredictionRuntime {
     }
 
     /// Tree initialization while the caller holds `init`.
-    fn tree_locked(&self, state: &FittedState) -> Result<Arc<KdTree>> {
+    fn tree_locked(&self, state: &PredictionState) -> Result<Arc<KdTree>> {
         if let Some(tree) = self.cache()?.tree.clone() {
             return Ok(tree);
         }
@@ -749,6 +755,60 @@ fn plan_prediction(
     })
 }
 
+/// Preflight only the cold reference/core phases used by conversion, without a fake query row.
+fn plan_core_preparation(
+    reference: usize,
+    features: usize,
+    s: usize,
+    limit: DeviceAllocationLimit,
+    row_pitched: bool,
+) -> Result<usize> {
+    candidate_width(s, reference)?;
+    let levels = planned_tree_levels(reference)?;
+    let nodes = planned_tree_nodes(levels)?;
+    let batch = plan_batch_rows(reference, s, features, limit, row_pitched)?;
+    let device_reference =
+        reference_device_bytes(reference, reference, nodes, features, limit, row_pitched)?;
+    let core_pack = crate::kernels::kd_query_pack_bytes(batch, features, s)
+        .ok_or(HdbscanError::Overflow("prediction core pack bytes"))?;
+    checked_live_sum(
+        &[device_reference, core_pack],
+        "prediction core device bytes",
+    )?;
+
+    let tree_elements = reference
+        .checked_add(
+            nodes
+                .checked_mul(3)
+                .ok_or(HdbscanError::Overflow("KD-tree host bytes"))?,
+        )
+        .and_then(|sum| {
+            let bounds = nodes.checked_mul(features)?.checked_mul(2)?;
+            sum.checked_add(bounds)
+        })
+        .ok_or(HdbscanError::Overflow("KD-tree host bytes"))?;
+    let tree_host = checked_allocation_bytes(tree_elements, 4, None, "KD-tree host bytes")?;
+    let geometry = checked_allocation_bytes(
+        reference
+            .checked_mul(features)
+            .ok_or(HdbscanError::Overflow("prediction upload geometry clone"))?,
+        4,
+        None,
+        "prediction upload geometry clone",
+    )?;
+    let cores = checked_allocation_bytes(reference, 16, None, "prediction core allocation")?;
+    let upload_tree = tree_host;
+    let readback_slots = batch
+        .checked_mul(s)
+        .ok_or(HdbscanError::Overflow("prediction core readback"))?;
+    let readback = checked_allocation_bytes(readback_slots, 16, None, "prediction core readback")?;
+    checked_live_sum(
+        &[tree_host, upload_tree, geometry, cores, readback],
+        "prediction conversion host bytes",
+    )?;
+    Ok(batch)
+}
+
 /// Strict runtime device plus its allocation limits, resolved before any cold work.
 struct Target {
     device: Device,
@@ -758,18 +818,338 @@ struct Target {
 
 impl Target {
     fn resolve(backend: BackendChoice) -> Result<Self> {
-        let (device, actual) = selected_device(backend).map_err(map_backend_error)?;
+        let (target, actual) = Self::resolve_choice(backend)?;
         if actual != backend {
             return Err(HdbscanError::BackendUnavailable(format!(
                 "prediction runtime backend {backend:?} resolved to {actual:?}"
             )));
         }
-        Ok(Self {
-            limit: allocation_limit(&device)?,
-            row_pitched: matches!(backend, BackendChoice::Cuda { .. }),
-            device,
-        })
+        Ok(target)
     }
+
+    fn resolve_choice(backend: BackendChoice) -> Result<(Self, BackendChoice)> {
+        let (device, actual) = selected_device(backend).map_err(map_backend_error)?;
+        if backend != BackendChoice::Auto && actual != backend {
+            return Err(HdbscanError::BackendUnavailable(format!(
+                "prediction runtime backend {backend:?} resolved to {actual:?}"
+            )));
+        }
+        Ok((
+            Self {
+                limit: allocation_limit(&device)?,
+                row_pitched: matches!(actual, BackendChoice::Cuda { .. }),
+                device,
+            },
+            actual,
+        ))
+    }
+}
+
+fn checked_export_bytes(state: &PredictionState, cores: usize) -> Result<usize> {
+    let hierarchy = &state.hierarchy;
+    let terms = [
+        state.geometry.len().checked_mul(std::mem::size_of::<f32>()),
+        hierarchy.n_finite().checked_mul(std::mem::size_of::<u32>()),
+        hierarchy.cluster_nodes().checked_mul(8 + 8 + 8 + 4 + 8),
+        hierarchy.n_finite().checked_mul(8 + 8),
+        cores.checked_mul(std::mem::size_of::<f64>()),
+    ];
+    let bytes = terms
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes?))
+        .ok_or(HdbscanError::Overflow("predictor state export bytes"))?;
+    if bytes > isize::MAX as usize {
+        return Err(HdbscanError::Overflow("predictor state export bytes"));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn export_predictor_state(
+    state: &PredictionState,
+    runtime: &PredictionRuntime,
+) -> Result<HdbscanPredictorState> {
+    let cores = runtime.ready_cores()?;
+    if state.hierarchy.no_cluster_tree() {
+        if cores.is_some() {
+            return Err(HdbscanError::Numerical(
+                "no-cluster predictor unexpectedly has prediction cores".into(),
+            ));
+        }
+        checked_export_bytes(state, 0)?;
+        return Ok(HdbscanPredictorState {
+            n_features: state.n_features,
+            min_samples: state.min_samples,
+            geometry: Vec::new(),
+            hierarchy: state.hierarchy.export_state()?,
+            prediction_cores: PredictionCoresState::NotRequiredNoClusterTree,
+        });
+    }
+    let cores = cores
+        .ok_or_else(|| HdbscanError::Numerical("clustered predictor cores are not ready".into()))?;
+    checked_export_bytes(state, cores.len())?;
+    let mut geometry = Vec::new();
+    geometry
+        .try_reserve_exact(state.geometry.len())
+        .map_err(|_| HdbscanError::Overflow("predictor geometry export allocation"))?;
+    geometry.extend_from_slice(&state.geometry);
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(cores.len())
+        .map_err(|_| HdbscanError::Overflow("predictor cores export allocation"))?;
+    values.extend_from_slice(&cores);
+    Ok(HdbscanPredictorState {
+        n_features: state.n_features,
+        min_samples: state.min_samples,
+        geometry,
+        hierarchy: state.hierarchy.export_state()?,
+        prediction_cores: PredictionCoresState::Ready {
+            rank: state.min_samples,
+            values,
+        },
+    })
+}
+
+fn checked_portable_state_bytes(state: &HdbscanPredictorState) -> Result<usize> {
+    let hierarchy = &state.hierarchy;
+    let core_bytes = match &state.prediction_cores {
+        PredictionCoresState::NotRequiredNoClusterTree => Some(0),
+        PredictionCoresState::Ready { values, .. } => {
+            values.len().checked_mul(std::mem::size_of::<f64>())
+        }
+    };
+    let terms = [
+        state.geometry.len().checked_mul(std::mem::size_of::<f32>()),
+        hierarchy
+            .finite_index
+            .len()
+            .checked_mul(std::mem::size_of::<u32>()),
+        hierarchy
+            .node_ids
+            .len()
+            .checked_mul(std::mem::size_of::<u64>()),
+        hierarchy
+            .node_parent_indices
+            .len()
+            .checked_mul(std::mem::size_of::<u64>()),
+        hierarchy
+            .node_birth_lambdas
+            .len()
+            .checked_mul(std::mem::size_of::<f64>()),
+        hierarchy
+            .node_labels
+            .len()
+            .checked_mul(std::mem::size_of::<i32>()),
+        hierarchy
+            .node_max_lambdas
+            .len()
+            .checked_mul(std::mem::size_of::<f64>()),
+        hierarchy
+            .point_node_indices
+            .len()
+            .checked_mul(std::mem::size_of::<u64>()),
+        hierarchy
+            .point_departure_lambdas
+            .len()
+            .checked_mul(std::mem::size_of::<f64>()),
+        core_bytes,
+    ];
+    let bytes = terms
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes?))
+        .ok_or(HdbscanError::Overflow("predictor state import bytes"))?;
+    if bytes > isize::MAX as usize {
+        return Err(HdbscanError::Overflow("predictor state import bytes"));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn import_predictor_state(
+    portable: HdbscanPredictorState,
+    backend: BackendChoice,
+) -> Result<(Arc<PredictionState>, Arc<PredictionRuntime>)> {
+    if portable.n_features == 0 || portable.min_samples == 0 {
+        return Err(HdbscanError::InvalidInput(
+            "predictor feature count and min_samples must be positive".into(),
+        ));
+    }
+    let source_hierarchy = &portable.hierarchy;
+    let n = source_hierarchy.finite_index.len();
+    let nodes = source_hierarchy.node_ids.len();
+    let no_tree = source_hierarchy.finite_index.is_empty()
+        && source_hierarchy.node_ids.is_empty()
+        && source_hierarchy.node_parent_indices.is_empty()
+        && source_hierarchy.node_birth_lambdas.is_empty()
+        && source_hierarchy.node_labels.is_empty()
+        && source_hierarchy.node_max_lambdas.is_empty()
+        && source_hierarchy.point_node_indices.is_empty()
+        && source_hierarchy.point_departure_lambdas.is_empty();
+    let tree_needed = if no_tree {
+        if !portable.geometry.is_empty()
+            || !matches!(
+                &portable.prediction_cores,
+                PredictionCoresState::NotRequiredNoClusterTree
+            )
+        {
+            return Err(HdbscanError::InvalidInput(
+                "no-cluster predictor must omit geometry and prediction cores".into(),
+            ));
+        }
+        false
+    } else {
+        if n == 0 || n > i32::MAX as usize {
+            return Err(HdbscanError::InvalidInput(
+                "clustered predictor finite row count must be in 1..=i32::MAX".into(),
+            ));
+        }
+        if source_hierarchy.node_parent_indices.len() != nodes
+            || source_hierarchy.node_birth_lambdas.len() != nodes
+            || source_hierarchy.node_labels.len() != nodes
+            || source_hierarchy.node_max_lambdas.len() != nodes
+            || source_hierarchy.point_node_indices.len() != n
+            || source_hierarchy.point_departure_lambdas.len() != n
+        {
+            return Err(HdbscanError::InvalidInput(
+                "portable hierarchy columns have inconsistent lengths".into(),
+            ));
+        }
+        let elements = n
+            .checked_mul(portable.n_features)
+            .ok_or(HdbscanError::Overflow("predictor geometry elements"))?;
+        if portable.geometry.len() != elements {
+            return Err(HdbscanError::InvalidInput(
+                "predictor geometry does not match hierarchy finite rows".into(),
+            ));
+        }
+        if portable.geometry.iter().any(|value| !value.is_finite()) {
+            return Err(HdbscanError::InvalidInput(
+                "predictor geometry must contain only finite values".into(),
+            ));
+        }
+        candidate_width(portable.min_samples, n)?;
+        let (rank, values) = match &portable.prediction_cores {
+            PredictionCoresState::Ready { rank, values } => (*rank, values),
+            PredictionCoresState::NotRequiredNoClusterTree => {
+                return Err(HdbscanError::InvalidInput(
+                    "clustered predictor requires ready prediction cores".into(),
+                ));
+            }
+        };
+        if rank != portable.min_samples {
+            return Err(HdbscanError::InvalidInput(
+                "prediction core rank must equal min_samples".into(),
+            ));
+        }
+        if values.len() != n
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(HdbscanError::InvalidInput(
+                "prediction cores must be finite, nonnegative, and match finite rows".into(),
+            ));
+        }
+        if rank == 1 && values.iter().any(|value| value.to_bits() != 0) {
+            return Err(HdbscanError::InvalidInput(
+                "rank-one prediction cores must be canonical positive zero".into(),
+            ));
+        }
+        true
+    };
+    checked_portable_state_bytes(&portable)?;
+    let hierarchy = PredictionHierarchy::from_state(portable.hierarchy)?;
+    let cores = if tree_needed {
+        match portable.prediction_cores {
+            PredictionCoresState::Ready { rank, values } => {
+                hierarchy.validate_prediction_core(&values)?;
+                CoreStatus::Ready {
+                    rank,
+                    values: Arc::from(values),
+                }
+            }
+            PredictionCoresState::NotRequiredNoClusterTree => unreachable!("prevalidated cores"),
+        }
+    } else {
+        CoreStatus::NotRequired(NotRequiredReason::NoClusterTree)
+    };
+    let state = Arc::new(PredictionState {
+        geometry: portable.geometry,
+        n_features: portable.n_features,
+        min_samples: portable.min_samples,
+        hierarchy,
+    });
+    if tree_needed {
+        let nodes = planned_tree_nodes(planned_tree_levels(n)?)?;
+        let node_arrays = nodes
+            .checked_mul(3)
+            .and_then(|count| {
+                count.checked_add(nodes.checked_mul(state.n_features)?.checked_mul(2)?)
+            })
+            .ok_or(HdbscanError::Overflow("KD-tree host bytes"))?;
+        let tree_elements = n
+            .checked_add(node_arrays)
+            .ok_or(HdbscanError::Overflow("KD-tree host bytes"))?;
+        let tree_bytes = checked_allocation_bytes(tree_elements, 4, None, "KD-tree host bytes")?;
+        let _ = tree_bytes;
+    }
+    let (_target, concrete_backend) = Target::resolve_choice(backend)?;
+    let tree = if tree_needed {
+        Some(KdTree::build(
+            &state.geometry,
+            state.n_finite(),
+            state.n_features,
+        )?)
+    } else {
+        None
+    };
+    let runtime = Arc::new(PredictionRuntime::loaded(concrete_backend, tree, cores));
+    Ok((state, runtime))
+}
+
+pub(crate) fn prepare_predictor(
+    state: &PredictionState,
+    runtime: &PredictionRuntime,
+) -> Result<()> {
+    if state.hierarchy.no_cluster_tree() {
+        return Ok(());
+    }
+    let n = state.n_finite();
+    let s = state.min_samples;
+    candidate_width(s, n)?;
+    if runtime.ready_cores()?.is_some() {
+        return Ok(());
+    }
+    if s == 1 {
+        let _init = runtime.init()?;
+        if runtime.ready_cores()?.is_some() {
+            return Ok(());
+        }
+        checked_allocation_bytes(n, 16, None, "rank-one prediction core allocation")?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(n)
+            .map_err(|_| HdbscanError::Overflow("rank-one prediction core allocation"))?;
+        values.resize(n, 0.0);
+        state.hierarchy.validate_prediction_core(&values)?;
+        runtime.cache()?.cores = CoreStatus::Ready {
+            rank: s,
+            values: Arc::from(values),
+        };
+        return Ok(());
+    }
+    let target = Target::resolve(runtime.backend())?;
+    let batch = plan_core_preparation(n, state.n_features, s, target.limit, target.row_pitched)?;
+    let tree = runtime.tree(state)?;
+    let _init = runtime.init()?;
+    if runtime.ready_cores()?.is_some() {
+        return Ok(());
+    }
+    let call = CallReference::upload(state, &tree, &target)?;
+    let values = compute_cores(state, &call, batch)?;
+    runtime.cache()?.cores = CoreStatus::Ready {
+        rank: s,
+        values: Arc::from(values),
+    };
+    Ok(())
 }
 
 /// Call-local device reference: one upload per prediction call, released on return.
@@ -780,7 +1160,7 @@ struct CallReference {
 }
 
 impl CallReference {
-    fn upload(state: &FittedState, tree: &KdTree, target: &Target) -> Result<Self> {
+    fn upload(state: &PredictionState, tree: &KdTree, target: &Target) -> Result<Self> {
         let device = target.device.clone();
         let limit = target.limit;
         let row_pitched = target.row_pitched;
@@ -882,7 +1262,7 @@ impl CallReference {
 
 /// Compute validated inclusive-self prediction cores (`k = s`) through the call reference.
 /// `batch` is the preflighted core batch row count.
-fn compute_cores(state: &FittedState, call: &CallReference, batch: usize) -> Result<Vec<f64>> {
+fn compute_cores(state: &PredictionState, call: &CallReference, batch: usize) -> Result<Vec<f64>> {
     #[cfg(test)]
     tests::maybe_fail(tests::Injection::Cores)?;
     #[cfg(feature = "tracing")]
@@ -892,6 +1272,8 @@ fn compute_cores(state: &FittedState, call: &CallReference, batch: usize) -> Res
     if s == 1 {
         return Ok(vec![0.0; n]);
     }
+    #[cfg(test)]
+    tests::count_core_search();
     let mut cores = Vec::with_capacity(n);
     for start in (0..n).step_by(batch) {
         let end = start.saturating_add(batch).min(n);
@@ -917,7 +1299,7 @@ fn compute_cores(state: &FittedState, call: &CallReference, batch: usize) -> Res
 /// Preflights every sizing decision of `m` query rows before tree construction, upload or core
 /// search: output columns, the strict runtime device and its planned batches and peaks.
 fn preflight(
-    state: &FittedState,
+    state: &PredictionState,
     runtime: &PredictionRuntime,
     m: usize,
 ) -> Result<(Target, PredictionPlan)> {
@@ -943,7 +1325,7 @@ fn preflight(
 /// Checked plan `approximate_predict` would use for `input`; `None` for the no-cluster-tree
 /// shortcut, which plans no device work.
 pub(crate) fn prediction_plan(
-    state: &FittedState,
+    state: &PredictionState,
     runtime: &PredictionRuntime,
     input: &[Vec<f32>],
 ) -> Result<Option<PredictionPlan>> {
@@ -956,7 +1338,7 @@ pub(crate) fn prediction_plan(
 
 /// Bounded strict-backend exact-KD `approximate_predict` over canonical state.
 pub(crate) fn approximate_predict(
-    state: &FittedState,
+    state: &PredictionState,
     runtime: &PredictionRuntime,
     input: &[Vec<f32>],
 ) -> Result<PredictionResult> {
@@ -1046,6 +1428,7 @@ pub(crate) mod tests {
     thread_local! {
         static FAIL: Cell<Option<Injection>> = const { Cell::new(None) };
         static UPLOADS: Cell<usize> = const { Cell::new(0) };
+        static CORE_SEARCHES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn maybe_fail(point: Injection) -> Result<()> {
@@ -1065,8 +1448,16 @@ pub(crate) mod tests {
         UPLOADS.with(Cell::get)
     }
 
+    fn core_searches() -> usize {
+        CORE_SEARCHES.with(Cell::get)
+    }
+
     fn inject(point: Option<Injection>) {
         FAIL.with(|fail| fail.set(point));
+    }
+
+    pub(crate) fn count_core_search() {
+        CORE_SEARCHES.with(|searches| searches.set(searches.get() + 1));
     }
 
     fn blobs(rows_per_group: usize) -> Vec<Vec<f32>> {
@@ -1105,10 +1496,13 @@ pub(crate) mod tests {
         assert_eq!(state.neighbors, model.neighbors);
         assert_eq!(state.core_distances, model.core_distances);
         assert_eq!(state.finite_index, model.finite_index);
-        assert_eq!(state.geometry.len(), 60 * 2);
-        assert_eq!(state.min_samples, 3);
-        assert!(!state.hierarchy.no_cluster_tree());
-        assert!(state.canonical_host_bytes().unwrap() >= state.geometry.len() * 4);
+        assert_eq!(state.prediction.geometry.len(), 60 * 2);
+        assert_eq!(state.prediction.min_samples, 3);
+        assert!(!state.prediction.hierarchy.no_cluster_tree());
+        assert_eq!(
+            state.prediction.canonical_host_bytes().unwrap(),
+            state.prediction.geometry.len() * 4
+        );
         let status = model.prediction_cache_status().unwrap();
         assert!(!status.tree_ready, "brute-force fit builds the tree lazily");
         assert_eq!(status.cores, PredictionCoreStatus::Uninitialized);
@@ -1124,9 +1518,202 @@ pub(crate) mod tests {
         assert!(host_tree_bytes(&tree).unwrap() > 0);
         assert_eq!(
             *tree,
-            KdTree::build(&model.state.geometry, 60, 2).unwrap(),
+            KdTree::build(&model.state.prediction.geometry, 60, 2).unwrap(),
             "retained tree is the fit-created builder tree"
         );
+    }
+
+    #[test]
+    fn predictor_conversion_prepares_once_and_shares_canonical_caches() {
+        let model = fit(crate::HdbscanSearch::BruteForce);
+        let searches_before = core_searches();
+        let uploads_before = uploads();
+        let predictor = model.to_predictor().unwrap();
+        assert_eq!(core_searches() - searches_before, 1);
+        assert_eq!(uploads() - uploads_before, 1);
+        assert!(Arc::ptr_eq(&predictor.state, &model.state.prediction));
+
+        let (fitted_tree, fitted_cores) = {
+            let cache = model.runtime.cache().unwrap();
+            (
+                cache.tree.as_ref().unwrap().clone(),
+                match &cache.cores {
+                    CoreStatus::Ready { values, .. } => Arc::clone(values),
+                    other => panic!("conversion did not publish ready cores: {other:?}"),
+                },
+            )
+        };
+        let searches_before_warm = core_searches();
+        let uploads_before_warm = uploads();
+        let warm_predictor = model.to_predictor().unwrap();
+        assert_eq!(core_searches(), searches_before_warm);
+        assert_eq!(uploads(), uploads_before_warm);
+        let (tree, cores) = {
+            let cache = model.runtime.cache().unwrap();
+            (
+                cache.tree.as_ref().unwrap().clone(),
+                match &cache.cores {
+                    CoreStatus::Ready { values, .. } => Arc::clone(values),
+                    other => panic!("warm conversion lost ready cores: {other:?}"),
+                },
+            )
+        };
+        assert!(Arc::ptr_eq(&fitted_tree, &tree));
+        assert!(Arc::ptr_eq(&fitted_cores, &cores));
+        assert!(Arc::ptr_eq(&warm_predictor.state, &predictor.state));
+        drop(model);
+        assert_eq!(
+            warm_predictor.prediction_cache_status().unwrap().cores,
+            PredictionCoreStatus::Ready { rank: 3, len: 60 }
+        );
+    }
+
+    #[test]
+    fn rank_one_conversion_is_ready_without_target_tree_or_upload() {
+        let config = HdbscanConfig {
+            min_cluster_size: 5,
+            min_samples: Some(1),
+            ..HdbscanConfig::default()
+        };
+        let mut model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
+            .with_search(crate::HdbscanSearch::BruteForce)
+            .fit(&blobs(30))
+            .unwrap();
+        Arc::get_mut(&mut model.runtime).unwrap().backend = BackendChoice::Cuda {
+            device_index: usize::MAX,
+        };
+        inject(Some(Injection::Tree));
+        let before_uploads = uploads();
+        let before_searches = core_searches();
+        let predictor = model.to_predictor().unwrap();
+        inject(None);
+        assert_eq!(uploads(), before_uploads);
+        assert_eq!(core_searches(), before_searches);
+        let status = predictor.prediction_cache_status().unwrap();
+        assert!(!status.tree_ready);
+        assert_eq!(
+            status.cores,
+            PredictionCoreStatus::Ready { rank: 1, len: 60 }
+        );
+        let CoreStatus::Ready { values, .. } = &model.runtime.cache().unwrap().cores else {
+            panic!("rank-one conversion did not publish cores");
+        };
+        assert!(values.iter().all(|value| value.to_bits() == 0));
+    }
+
+    #[test]
+    fn oversized_no_cluster_conversion_skips_backend_and_cold_work() {
+        let config = HdbscanConfig {
+            min_cluster_size: 5,
+            min_samples: Some(50),
+            ..HdbscanConfig::default()
+        };
+        let mut model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
+            .fit(&[vec![0.0], vec![1.0], vec![2.0]])
+            .unwrap();
+        Arc::get_mut(&mut model.runtime).unwrap().backend = BackendChoice::Cuda {
+            device_index: usize::MAX,
+        };
+        inject(Some(Injection::Tree));
+        let before_uploads = uploads();
+        let before_searches = core_searches();
+        let predictor = model.to_predictor().unwrap();
+        inject(None);
+        assert_eq!(uploads(), before_uploads);
+        assert_eq!(core_searches(), before_searches);
+        assert!(!predictor.prediction_cache_status().unwrap().tree_ready);
+        assert_eq!(
+            predictor.prediction_cache_status().unwrap().cores,
+            PredictionCoreStatus::NotRequiredNoClusterTree
+        );
+        let result = predictor.approximate_predict(&[vec![0.5]]).unwrap();
+        assert_eq!(result.labels, vec![-1]);
+        assert_eq!(result.connecting_points, vec![-1]);
+    }
+
+    #[test]
+    fn conversion_tree_and_core_failures_return_no_predictor_and_retry() {
+        let tree_model = fit(crate::HdbscanSearch::BruteForce);
+        inject(Some(Injection::Tree));
+        let before_uploads = uploads();
+        assert!(tree_model.to_predictor().is_err());
+        inject(None);
+        assert_eq!(uploads(), before_uploads);
+        assert!(!tree_model.prediction_cache_status().unwrap().tree_ready);
+        assert!(tree_model.to_predictor().is_ok());
+
+        let core_model = fit(crate::HdbscanSearch::BruteForce);
+        inject(Some(Injection::Cores));
+        assert!(core_model.to_predictor().is_err());
+        inject(None);
+        let status = core_model.prediction_cache_status().unwrap();
+        assert!(status.tree_ready);
+        assert_eq!(status.cores, PredictionCoreStatus::Uninitialized);
+        assert!(core_model.to_predictor().is_ok());
+        assert_eq!(
+            core_model.prediction_cache_status().unwrap().cores,
+            PredictionCoreStatus::Ready { rank: 3, len: 60 }
+        );
+    }
+
+    #[test]
+    fn conversion_width_error_precedes_tree_or_core_work() {
+        let mut model = fit(crate::HdbscanSearch::BruteForce);
+        let state = Arc::get_mut(&mut model.state).unwrap();
+        let n = state.prediction.n_finite();
+        Arc::get_mut(&mut state.prediction).unwrap().min_samples = n / 2 + 1;
+        let before_uploads = uploads();
+        let before_searches = core_searches();
+        assert!(matches!(
+            model.to_predictor(),
+            Err(HdbscanError::InvalidInput(_))
+        ));
+        assert_eq!(uploads(), before_uploads);
+        assert_eq!(core_searches(), before_searches);
+        assert!(!model.prediction_cache_status().unwrap().tree_ready);
+    }
+
+    #[test]
+    fn core_only_plan_has_no_query_output_rows_and_checks_limits() {
+        let n = 60;
+        let features = 2;
+        let rank = 3;
+        let limit = DeviceAllocationLimit {
+            // Reference padding for 60x2 (including the device pack) is the dominant
+            // allocation; use a page limit large enough for the real reference footprint.
+            max_page_bytes: 8192,
+            alignment: 16,
+        };
+        assert!(plan_core_preparation(n, features, rank, limit, false).is_ok());
+        assert!(matches!(
+            plan_core_preparation(
+                n,
+                usize::MAX,
+                rank,
+                DeviceAllocationLimit {
+                    max_page_bytes: usize::MAX,
+                    alignment: 256,
+                },
+                false
+            ),
+            Err(HdbscanError::Overflow(_))
+        ));
+        assert!(matches!(
+            plan_core_preparation(
+                n,
+                features,
+                rank,
+                DeviceAllocationLimit {
+                    max_page_bytes: 16,
+                    alignment: 16,
+                },
+                false
+            ),
+            Err(HdbscanError::BackendUnavailable(_)) | Err(HdbscanError::Overflow(_))
+        ));
+        // The API takes only reference/core dimensions: conversion does not manufacture query or
+        // output rows to reuse plan_prediction's combined query-plus-core accounting.
+        assert!(plan_core_preparation(n, features, rank, limit, false).is_ok());
     }
 
     #[test]
@@ -1186,7 +1773,7 @@ pub(crate) mod tests {
         let model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
             .fit(&[vec![0.0], vec![1.0], vec![2.0]])
             .unwrap();
-        assert!(model.state.hierarchy.no_cluster_tree());
+        assert!(model.state.prediction.hierarchy.no_cluster_tree());
         assert_eq!(
             model.prediction_cache_status().unwrap().cores,
             PredictionCoreStatus::NotRequiredNoClusterTree
@@ -1209,10 +1796,11 @@ pub(crate) mod tests {
     #[test]
     fn cluster_tree_width_violation_rejects_before_cold_work() {
         let mut model = fit(crate::HdbscanSearch::BruteForce);
-        assert!(!model.state.hierarchy.no_cluster_tree());
+        assert!(!model.state.prediction.hierarchy.no_cluster_tree());
         // Fitting cannot yield a nonempty tree with 2*s > n, so the state width is raised directly.
-        let n = model.state.n_finite();
-        Arc::get_mut(&mut model.state).unwrap().min_samples = n / 2 + 1;
+        let n = model.state.prediction.n_finite();
+        let fitted = Arc::get_mut(&mut model.state).unwrap();
+        Arc::get_mut(&mut fitted.prediction).unwrap().min_samples = n / 2 + 1;
         let before = uploads();
         let error = model.approximate_predict(&[vec![0.0, 0.0]]).unwrap_err();
         assert!(matches!(error, HdbscanError::InvalidInput(_)));

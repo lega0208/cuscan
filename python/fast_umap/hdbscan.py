@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 import warnings
-from typing import Literal, TypedDict, overload
+from typing import Any, Literal, TypedDict, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -24,6 +25,112 @@ class _FittedState(TypedDict):
     arrays: _FittedArrays
     n_features_in: int
     native: _fast_umap.FittedHDBSCAN
+
+
+def _approximate_predict(
+    native: Any,
+    n_features: int,
+    X: ArrayLike,
+    return_connecting_points: bool | np.bool_,
+) -> (
+    tuple[NDArray[np.intp], NDArray[np.float64]]
+    | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+):
+    if not isinstance(return_connecting_points, (bool, np.bool_)):
+        raise ValueError("return_connecting_points must be a boolean")
+    x, finite_rows = HDBSCAN._input_array(X)
+    if x.shape[0] == 0 or x.shape[1] == 0:
+        raise ValueError("X must contain at least one row and one feature")
+    if not finite_rows.all():
+        raise ValueError("X must contain only finite values")
+    if x.shape[1] != n_features:
+        raise ValueError(f"X has {x.shape[1]} features, but the model was fitted with {n_features}")
+    # This helper adds one Python frame between the native warning and the caller.
+    if bool(return_connecting_points):
+        raw_labels, raw_strengths, raw_connectors = native.approximate_predict(
+            x, True, stacklevel=3
+        )
+        return (
+            np.array(raw_labels, dtype=np.intp, copy=True),
+            np.array(raw_strengths, dtype=np.float64, copy=True),
+            np.array(raw_connectors, dtype=np.intp, copy=True),
+        )
+    raw_labels, raw_strengths = native.approximate_predict(x, False, stacklevel=3)
+    return (
+        np.array(raw_labels, dtype=np.intp, copy=True),
+        np.array(raw_strengths, dtype=np.float64, copy=True),
+    )
+
+
+class HDBSCANPredictor:
+    """Lightweight detached predictor for an already-fitted HDBSCAN hierarchy."""
+
+    __slots__ = ("_n_features_in", "_native_predictor")
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "HDBSCANPredictor instances are created by HDBSCAN.to_predictor() or load()"
+        )
+
+    @classmethod
+    def _from_native(cls, native: _fast_umap.HDBSCANPredictor) -> HDBSCANPredictor:
+        predictor = cls.__new__(cls)
+        predictor._native_predictor = native
+        predictor._n_features_in = int(native.n_features)
+        return predictor
+
+    @property
+    def n_features_in_(self) -> int:
+        return self._n_features_in
+
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: Literal[False] = ...
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]: ...
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: Literal[True]
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]: ...
+    @overload
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: bool | np.bool_ = ...
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ): ...
+    def approximate_predict(
+        self, X: ArrayLike, return_connecting_points: bool | np.bool_ = False
+    ) -> (
+        tuple[NDArray[np.intp], NDArray[np.float64]]
+        | tuple[NDArray[np.intp], NDArray[np.float64], NDArray[np.intp]]
+    ):
+        """Predict into the fixed hierarchy and return new arrays in query order."""
+        return _approximate_predict(
+            self._native_predictor,
+            self._n_features_in,
+            X,
+            return_connecting_points,
+        )
+
+    def save(self, path: str | os.PathLike[str], overwrite: bool = False) -> None:
+        """Save this ready prediction-only state to the optional HDF5 format."""
+        arrays, metadata = self._native_predictor.export_state()
+        from . import _hdbscan_predictor_serialization_v1 as serialization
+
+        serialization.save_model(path, arrays, metadata, overwrite=overwrite)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        backend: Literal["auto", "cpu", "cuda"] = "auto",
+        device_index: int = 0,
+    ) -> HDBSCANPredictor:
+        """Load a prediction-only HDF5 state with strict runtime backend selection."""
+        from . import _hdbscan_predictor_serialization_v1 as serialization
+
+        return serialization.load_model(cls, path, backend=backend, device_index=device_index)
 
 
 _ArrayName = Literal[
@@ -105,6 +212,16 @@ class HDBSCAN:
         if not hasattr(self, "_fitted_state"):
             raise ValueError("This HDBSCAN instance is not fitted yet")
         return self._fitted_state["native"]
+
+    def to_predictor(self) -> HDBSCANPredictor:
+        """Prepare and return a detached prediction-only view of this fitted model.
+
+        Conversion can synchronously prepare prediction cores on the fit-time
+        backend and can fail before returning. The predictor shares no estimator
+        wrapper or fit-output arrays and remains usable after this estimator is
+        dropped or refitted.
+        """
+        return HDBSCANPredictor._from_native(self._native.to_predictor())
 
     def __init__(
         self,
@@ -433,32 +550,9 @@ class HDBSCAN:
         cluster tree has no clusters are all outputs noise/``0``/``-1``, with one
         ``UserWarning``.
         """
-        native = self._native
-        if not isinstance(return_connecting_points, (bool, np.bool_)):
-            raise ValueError("return_connecting_points must be a boolean")
-        x, finite_rows = self._input_array(X)
-        if x.shape[0] == 0 or x.shape[1] == 0:
-            raise ValueError("X must contain at least one row and one feature")
-        if not finite_rows.all():
-            raise ValueError("X must contain only finite values")
-        n_features = self._fitted_state["n_features_in"]
-        if x.shape[1] != n_features:
-            raise ValueError(
-                f"X has {x.shape[1]} features, but the model was fitted with {n_features}"
-            )
-        # stacklevel=2: native call -> this method -> caller. The native bridge warns once.
-        # Literal flags select each native overload, so every tuple shape is type-narrowed.
-        if bool(return_connecting_points):
-            raw_labels, raw_strengths, raw_connectors = native.approximate_predict(
-                x, True, stacklevel=2
-            )
-            return (
-                np.array(raw_labels, dtype=np.intp, copy=True),
-                np.array(raw_strengths, dtype=np.float64, copy=True),
-                np.array(raw_connectors, dtype=np.intp, copy=True),
-            )
-        raw_labels, raw_strengths = native.approximate_predict(x, False, stacklevel=2)
-        return (
-            np.array(raw_labels, dtype=np.intp, copy=True),
-            np.array(raw_strengths, dtype=np.float64, copy=True),
+        return _approximate_predict(
+            self._native,
+            self._fitted_state["n_features_in"],
+            X,
+            return_connecting_points,
         )

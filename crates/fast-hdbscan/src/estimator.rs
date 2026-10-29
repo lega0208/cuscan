@@ -29,8 +29,8 @@ use fast_hdbscan_core::KdTree;
 
 use crate::backend::{DeviceKdTree, HdbscanOps};
 use crate::prediction::{
-    FittedOutputs, FittedState, PredictionCacheStatus, PredictionPlan, PredictionResult,
-    PredictionRuntime,
+    FittedOutputs, FittedState, HdbscanPredictorState, PredictionCacheStatus, PredictionPlan,
+    PredictionResult, PredictionRuntime, PredictionState,
 };
 
 pub(crate) const NEIGHBOR_BATCH_ROWS: usize = 256;
@@ -1411,7 +1411,7 @@ impl FittedHDBSCAN {
         runtime_backend: BackendChoice,
         tree: Option<KdTree>,
     ) -> Self {
-        let runtime = PredictionRuntime::new(&state, runtime_backend, tree);
+        let runtime = PredictionRuntime::new(&state.prediction, runtime_backend, tree);
         Self {
             config: state.config.clone(),
             backend: state.training_backend,
@@ -1435,20 +1435,29 @@ impl FittedHDBSCAN {
     /// lazily built host KD tree/prediction cores. Rows must be finite with exactly
     /// [`Self::n_features`] features. Connectors are original training-row IDs.
     pub fn approximate_predict(&self, input: &[Vec<f32>]) -> Result<PredictionResult> {
-        crate::prediction::approximate_predict(&self.state, &self.runtime, input)
+        crate::prediction::approximate_predict(&self.state.prediction, &self.runtime, input)
+    }
+
+    /// Create a detached predictor and synchronously prepare its prediction cores.
+    pub fn to_predictor(&self) -> Result<HDBSCANPredictor> {
+        crate::prediction::prepare_predictor(&self.state.prediction, &self.runtime)?;
+        Ok(HDBSCANPredictor {
+            state: Arc::clone(&self.state.prediction),
+            runtime: Arc::clone(&self.runtime),
+        })
     }
 
     /// Lazy prediction cache readiness, for diagnostics and tests.
     #[doc(hidden)]
     pub fn prediction_cache_status(&self) -> Result<PredictionCacheStatus> {
-        self.runtime.status(&self.state)
+        self.runtime.status(&self.state.prediction)
     }
 
     /// Checked batch plan and planned peak bytes that [`Self::approximate_predict`] would use for
     /// `input`; `None` for the no-cluster-tree shortcut, which plans no device work.
     #[doc(hidden)]
     pub fn prediction_plan(&self, input: &[Vec<f32>]) -> Result<Option<PredictionPlan>> {
-        crate::prediction::prediction_plan(&self.state, &self.runtime, input)
+        crate::prediction::prediction_plan(&self.state.prediction, &self.runtime, input)
     }
 
     /// The requested graph policy, including `Auto` when that was requested.
@@ -1478,7 +1487,7 @@ impl FittedHDBSCAN {
     }
 
     pub fn n_features(&self) -> usize {
-        self.state.n_features
+        self.state.prediction.n_features
     }
 
     pub fn config(&self) -> &HdbscanConfig {
@@ -1513,6 +1522,38 @@ impl FittedHDBSCAN {
     }
     pub fn search(&self) -> HdbscanSearch {
         self.state.search
+    }
+}
+
+/// Standalone prediction object that owns no fitted-model outputs.
+#[derive(Debug, Clone)]
+pub struct HDBSCANPredictor {
+    pub(crate) state: Arc<PredictionState>,
+    pub(crate) runtime: Arc<PredictionRuntime>,
+}
+
+impl HDBSCANPredictor {
+    /// Assign queries using the exact search and hierarchy semantics of the source model.
+    pub fn approximate_predict(&self, input: &[Vec<f32>]) -> Result<PredictionResult> {
+        crate::prediction::approximate_predict(&self.state, &self.runtime, input)
+    }
+
+    pub fn n_features(&self) -> usize {
+        self.state.n_features
+    }
+
+    #[doc(hidden)]
+    pub fn prediction_cache_status(&self) -> Result<PredictionCacheStatus> {
+        self.runtime.status(&self.state)
+    }
+
+    pub fn export_state(&self) -> Result<HdbscanPredictorState> {
+        crate::prediction::export_predictor_state(&self.state, &self.runtime)
+    }
+
+    pub fn from_state(state: HdbscanPredictorState, backend: BackendChoice) -> Result<Self> {
+        let (state, runtime) = crate::prediction::import_predictor_state(state, backend)?;
+        Ok(Self { state, runtime })
     }
 }
 

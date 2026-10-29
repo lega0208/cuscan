@@ -440,8 +440,10 @@ fn _fast_umap(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<FittedUMAP>()?;
     module.add_class::<hdbscan::FittedHDBSCAN>()?;
+    module.add_class::<hdbscan::HDBSCANPredictor>()?;
     module.add_function(wrap_pyfunction!(fit_umap, module)?)?;
     module.add_function(wrap_pyfunction!(hdbscan::fit_hdbscan, module)?)?;
+    module.add_function(wrap_pyfunction!(hdbscan::load_hdbscan_predictor, module)?)?;
     module.add_function(wrap_pyfunction!(
         hdbscan::estimate_hdbscan_resources,
         module
