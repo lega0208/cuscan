@@ -794,3 +794,66 @@ had zero differences across all 10k queries; each binary checked cold/warm
 strengths too. Planned device peak increased **42,040,964 → 62,227,968 bytes**.
 These are one process per arm, not confidence intervals. Raw outputs/traces and
 input SHA-256 are retained under `artifacts/approx_query_cpu/300k/`.
+
+## CPU prediction leaf-coherent scheduling (Phase B)
+
+**Decision: reject both production scheduling arms.** Phase A's CPU leaf-SoA
+candidate pack and input-order queries remain the production baseline. This is
+a negative experiment, not a delivered prediction speedup. CUDA and fit kernels
+are unchanged. The approved contract is [approx_query_cpu_plan_phaseB.md](approx_query_cpu_plan_phaseB.md).
+
+Evidence is under `artifacts/approx_query_cpu_phaseB/`: frozen baseline binaries,
+four experimental source diffs and binary hashes, stored float32 inputs and hashes,
+raw process outputs/traces, `summary.json`, `correctness.json`, `decisions.json`,
+and the reproducible `run_experiment.py` summarizer. The 21 cells cover the 16
+historical clustered shapes, 300k×16/10k scaling, and uniform/overlapping 100k×{2,16}
+controls. Every candidate has three initial and seven repeated processes, each
+paired with A in alternating order; each process has three warm calls. Process
+medians, not individual warm calls, are the statistical units. Shared JIT caches
+were retained; first prediction is not asserted cache-cold.
+
+All **1,260 exact comparisons** agree on labels, raw connectors, f64 probability
+bits and compact-ID core bits. In-crate device tests additionally compare ordered
+candidate IDs and squared-distance bits after inverse mapping. The frozen Phase A
+product source, rebuilt with only exact-output profiler instrumentation, also
+matches A exactly. Original frozen-binary timing and label/connector parity runs
+are retained separately; timing noise is visible rather than treated as proof of
+equal latency.
+
+### Independent decisions
+
+- **C, cold-core leaf gathering: reject.** Paired cold median improves about 9.9%
+  (238 ms) at 300k×16/10k and about 10% at clustered 100k×16/1k. However, repeated
+  overlapping 100k×2 and ×16 cold calls regress about 3.0% (9.6 ms) and 1.5%
+  (43.5 ms), and uniform 100k×16 regresses about 1.0% (31.7 ms). Unconditional
+  retention is not justified across relevant workloads. No speculative shape gate
+  is introduced.
+- **Q, external-query affinity buckets: reject.** Key construction, unstable sort,
+  gathering/upload and output scatter are included in end-to-end measurements.
+  Representative full-query warm regressions are about 9.8% at clustered
+  100k×33, 11.1% at uniform 100k×2, and 10.1% at overlapping 100k×2. Search-only
+  locality benefits do not justify these total costs.
+- **CQ: reject.** Combining the arms does not remove external scheduling costs;
+  independent core gains do not constitute combined acceptance.
+
+`summary.json` records paired ratios and absolute deltas for every cell, planned
+host/device peaks, batch sizes, and cold-core/cold-external/warm-external span
+totals. Spans are inclusive and must not be summed across nested scopes. Plans
+are logical live-buffer bounds, not RSS measurements. A corrects the shared
+transactional output-column and f64 math-scratch accounting omissions; its host
+peak increase versus frozen Phase A is accounting, not a new physical allocation.
+
+The user explicitly reduced any further performance rerun to two representative
+cases, one paired process each with three warm calls. The completed full matrix
+is preserved; final-source evidence is deliberately narrower and does not claim
+a new full-matrix replication.
+
+Final-source Rust core/facade tests, strict CUDA prediction/KD tests, Clippy,
+formatting, release Python extension build and 156 Python prediction/predictor
+tests passed. Both native stage analyses passed on CPU/CUDA at 20k and 100k:
+`run-20000-AMHHE8hJ` and `run-100000-nppzZfX2`. Existing warnings and ignored tests
+remain visible. Final/A cold smoke checks were 115.3/114.1 ms at 20k×2/1k and
+458.1/460.7 ms at 100k×16/1k, with bit-exact predictions and cores. These single
+pairs establish no statistical speedup. Details and final binary hash are in
+`final_gates/{verification,performance}.json`. Production contains no experimental
+order constants or rejected leaf routes; alternatives exist only in unit tests.

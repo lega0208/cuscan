@@ -115,6 +115,88 @@ fn export_is_identical_before_and_after_fitted_prediction() {
     assert_eq!(after, before);
 }
 
+fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
+    let mut training = data();
+    training[0] = vec![f32::NAN, 0.0];
+    training[13] = vec![f32::INFINITY, 0.0];
+    training[2] = training[3].clone();
+    let cold = HDBSCAN::new(config(3, 2), backend).fit(&training).unwrap();
+    let warm = HDBSCAN::new(config(3, 2), backend).fit(&training).unwrap();
+    let query: Vec<Vec<f32>> = (0..1029)
+        .map(|i| match i % 4 {
+            0 => training[2].clone(),
+            1 => vec![0.25, 0.125],
+            2 => vec![100.5, 0.25],
+            _ => vec![1000.0, 0.0],
+        })
+        .collect();
+    let warm_result = warm.approximate_predict(&query).unwrap();
+    assert!(!warm_result.no_cluster_tree);
+    let cold_predictor = cold.to_predictor().unwrap();
+    let warm_predictor = warm.to_predictor().unwrap();
+    let cold_state = cold_predictor.export_state().unwrap();
+    let warm_state = warm_predictor.export_state().unwrap();
+    let (
+        PredictionCoresState::Ready { rank, values },
+        PredictionCoresState::Ready {
+            rank: warm_rank,
+            values: warm_values,
+        },
+    ) = (&cold_state.prediction_cores, &warm_state.prediction_cores)
+    else {
+        panic!("conversion must export ready cores")
+    };
+    assert_eq!(*rank, 2);
+    assert_eq!(rank, warm_rank);
+    assert_eq!(values.len(), 22);
+    assert_eq!(values.len(), warm_values.len());
+    for (cold, warm) in values.iter().zip(warm_values) {
+        assert_eq!(cold.to_bits(), warm.to_bits());
+    }
+    assert_eq!(cold_state, warm_state);
+    let restored = HDBSCANPredictor::from_state(cold_state.clone(), backend).unwrap();
+    let imported_state = restored.export_state().unwrap();
+    assert_eq!(imported_state, cold_state);
+    let PredictionCoresState::Ready {
+        values: imported_values,
+        ..
+    } = &imported_state.prediction_cores
+    else {
+        panic!("import must retain ready cores")
+    };
+    assert_eq!(imported_values.len(), values.len());
+    for (imported, original) in imported_values.iter().zip(values) {
+        assert_eq!(imported.to_bits(), original.to_bits());
+    }
+    assert_eq!(
+        restored.prediction_cache_status().unwrap().cores,
+        fast_hdbscan::PredictionCoreStatus::Ready { rank: 2, len: 22 }
+    );
+    for predictor in [&cold_predictor, &warm_predictor, &restored] {
+        let actual = predictor.approximate_predict(&query).unwrap();
+        assert_eq!(actual.no_cluster_tree, warm_result.no_cluster_tree);
+        assert_eq!(actual.labels, warm_result.labels);
+        assert_eq!(actual.connecting_points, warm_result.connecting_points);
+        assert_eq!(actual.probabilities.len(), warm_result.probabilities.len());
+        for (actual, expected) in actual.probabilities.iter().zip(&warm_result.probabilities) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(predictor.export_state().unwrap(), cold_state);
+    }
+}
+
+#[test]
+fn conversion_and_import_preserve_ready_cores_cpu() {
+    conversion_and_import_preserve_ready_cores(BackendChoice::Cpu);
+}
+
+#[test]
+fn conversion_and_import_preserve_ready_cores_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        conversion_and_import_preserve_ready_cores(backend);
+    }
+}
+
 #[test]
 fn mixed_nonfinite_and_tied_geometry_roundtrips_raw_connectors() {
     let mut training = data();

@@ -51,6 +51,151 @@ use crate::kernels::{KdCandidateLayout, KdNeighborPlan};
 /// Maximum query rows per bounded prediction batch before device-limit planning.
 pub(crate) const PREDICTION_BATCH_ROWS: usize = 1024;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryOrder {
+    Input,
+    Leaf,
+}
+
+#[cfg(test)]
+fn effective_orders(
+    plan: KdNeighborPlan,
+    requested: (QueryOrder, QueryOrder),
+) -> (QueryOrder, QueryOrder) {
+    if matches!(plan.layout, KdCandidateLayout::LeafSoa { .. }) {
+        requested
+    } else {
+        (QueryOrder::Input, QueryOrder::Input)
+    }
+}
+
+/// Scheduling affinity only: the actual exact search still starts at the root.
+#[cfg(test)]
+fn leaf_affinity(tree: &KdTree, row: &[f32]) -> usize {
+    let mut node = 0;
+    for _ in 0..tree.n_levels {
+        if tree.is_leaf[node] != 0 {
+            return tree.starts[node] as usize;
+        }
+        let left = 2 * node + 1;
+        let right = left + 1;
+        debug_assert!(right < tree.starts.len());
+        debug_assert!(tree.starts[left] < tree.ends[left]);
+        debug_assert!(tree.starts[right] < tree.ends[right]);
+        let lower_bound = |child: usize| {
+            let mut sum = 0.0f64;
+            for (feature, &value) in row.iter().enumerate() {
+                let index = child * row.len() + feature;
+                let value = f64::from(value);
+                let lo = f64::from(tree.bounds_min[index]);
+                let hi = f64::from(tree.bounds_max[index]);
+                let delta = if value < lo {
+                    lo - value
+                } else if value > hi {
+                    value - hi
+                } else {
+                    0.0
+                };
+                sum += delta * delta;
+            }
+            sum
+        };
+        node = if lower_bound(left) <= lower_bound(right) {
+            left
+        } else {
+            right
+        };
+    }
+    unreachable!("validated KD tree descent exceeds its levels")
+}
+
+#[cfg(test)]
+fn gather_rows(
+    values: &[f32],
+    features: usize,
+    rows: impl Iterator<Item = usize>,
+    count: usize,
+) -> Result<Vec<f32>> {
+    let elements = count
+        .checked_mul(features)
+        .ok_or(HdbscanError::Overflow("prediction gather elements"))?;
+    checked_allocation_bytes(elements, 4, None, "prediction gather allocation")?;
+    let mut gathered = Vec::new();
+    gathered
+        .try_reserve_exact(elements)
+        .map_err(|_| HdbscanError::Overflow("prediction gather allocation"))?;
+    for row in rows {
+        let start = row
+            .checked_mul(features)
+            .ok_or(HdbscanError::Overflow("prediction gather row"))?;
+        let end = start
+            .checked_add(features)
+            .ok_or(HdbscanError::Overflow("prediction gather row"))?;
+        gathered.extend_from_slice(values.get(start..end).ok_or_else(|| {
+            HdbscanError::Numerical("prediction gather row outside input".into())
+        })?);
+    }
+    if gathered.len() != elements {
+        return Err(HdbscanError::Numerical(
+            "prediction gather returned wrong length".into(),
+        ));
+    }
+    Ok(gathered)
+}
+
+#[cfg(test)]
+fn scatter_columns(
+    destination: &mut PredictionColumns,
+    packed: &PredictionColumns,
+    order: &[(usize, usize)],
+    start: usize,
+) -> Result<()> {
+    if packed.labels.len() != order.len()
+        || packed.probabilities.len() != order.len()
+        || packed.connecting_points.len() != order.len()
+    {
+        return Err(HdbscanError::Numerical(
+            "prediction scatter returned wrong lengths".into(),
+        ));
+    }
+    for (position, &(_, original)) in order.iter().enumerate() {
+        let index = start
+            .checked_add(original)
+            .ok_or(HdbscanError::Overflow("prediction scatter index"))?;
+        if index >= destination.len() {
+            return Err(HdbscanError::Numerical(
+                "prediction scatter outside output".into(),
+            ));
+        }
+        destination.labels[index] = packed.labels[position];
+        destination.probabilities[index] = packed.probabilities[position];
+        destination.connecting_points[index] = packed.connecting_points[position];
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn unfilled_columns(rows: usize) -> Result<PredictionColumns> {
+    let mut columns = PredictionColumns::default();
+    columns
+        .labels
+        .try_reserve_exact(rows)
+        .map_err(|_| HdbscanError::Overflow("prediction label allocation"))?;
+    columns
+        .probabilities
+        .try_reserve_exact(rows)
+        .map_err(|_| HdbscanError::Overflow("prediction strength allocation"))?;
+    columns
+        .connecting_points
+        .try_reserve_exact(rows)
+        .map_err(|_| HdbscanError::Overflow("prediction connector allocation"))?;
+    columns.labels.resize(rows, -1);
+    columns.probabilities.resize(rows, f64::NAN);
+    columns.connecting_points.resize(rows, -1);
+    Ok(columns)
+}
+
 /// Result of [`crate::FittedHDBSCAN::approximate_predict`], in query order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredictionResult {
@@ -653,6 +798,7 @@ pub struct PredictionPlan {
 /// Shapes come from the same formulas `KdTree::build` and `CallReference::upload` use. Each phase's
 /// live set is summed with checked arithmetic: the cache tree is live throughout, and upload clones
 /// of geometry and tree overlap it.
+#[cfg(test)]
 fn plan_prediction(
     kd_plan: KdNeighborPlan,
     queries: usize,
@@ -662,6 +808,32 @@ fn plan_prediction(
     limit: DeviceAllocationLimit,
     row_pitched: bool,
 ) -> Result<PredictionPlan> {
+    plan_prediction_impl(
+        kd_plan,
+        queries,
+        reference,
+        features,
+        s,
+        limit,
+        row_pitched,
+        (QueryOrder::Input, QueryOrder::Input),
+        PREDICTION_BATCH_ROWS,
+    )
+}
+
+fn plan_prediction_impl(
+    kd_plan: KdNeighborPlan,
+    queries: usize,
+    reference: usize,
+    features: usize,
+    s: usize,
+    limit: DeviceAllocationLimit,
+    row_pitched: bool,
+    #[cfg(test)] orders: (QueryOrder, QueryOrder),
+    #[cfg(test)] batch_limit: usize,
+) -> Result<PredictionPlan> {
+    #[cfg(not(test))]
+    let batch_limit = PREDICTION_BATCH_ROWS;
     if queries == 0 || queries > i32::MAX as usize {
         return Err(HdbscanError::InvalidInput(
             "prediction row count must be in 1..=i32::MAX".into(),
@@ -676,8 +848,8 @@ fn plan_prediction(
     let k = candidate_width(s, reference)?;
     let levels = planned_tree_levels(reference)?;
     let nodes = planned_tree_nodes(levels)?;
-    let query_batch = plan_batch_rows(queries, k, features, limit, row_pitched)?;
-    let core_batch = plan_batch_rows(reference, s, features, limit, row_pitched)?;
+    let query_batch = plan_batch_rows(queries.min(batch_limit), k, features, limit, row_pitched)?;
+    let core_batch = plan_batch_rows(reference.min(batch_limit), s, features, limit, row_pitched)?;
 
     // Device reference: the same checked sizing `CallReference::upload` applies to the actual tree.
     let device_reference = reference_device_bytes(
@@ -693,8 +865,27 @@ fn plan_prediction(
         reference_prepare_bytes(kd_plan, device_reference, reference, nodes, features)?;
     let core_pack = crate::kernels::kd_query_pack_bytes(core_batch, features, s)
         .ok_or(HdbscanError::Overflow("prediction core pack bytes"))?;
+    #[cfg(test)]
+    let (core_order, external_order) = orders;
+    #[cfg(test)]
+    let core_source = if core_order == QueryOrder::Leaf && s != 1 {
+        tensor_allocation_bytes(
+            &[core_batch, features],
+            ELEMENT_BYTES,
+            limit,
+            row_pitched,
+            "prediction core query allocation",
+        )?
+    } else {
+        0
+    };
     let core_device = checked_live_sum(
-        &[device_reference, core_pack],
+        &[
+            device_reference,
+            #[cfg(test)]
+            core_source,
+            core_pack,
+        ],
         "prediction core device bytes",
     )?;
     let query_source = tensor_allocation_bytes(
@@ -762,8 +953,29 @@ fn plan_prediction(
         .ok_or(HdbscanError::Overflow("prediction core readback"))?;
     let core_readback =
         checked_allocation_bytes(core_readback_slots, 16, None, "prediction core readback")?;
+    #[cfg(test)]
+    let core_gather = if core_order == QueryOrder::Leaf && s != 1 {
+        checked_allocation_bytes(
+            core_batch
+                .checked_mul(features)
+                .ok_or(HdbscanError::Overflow("prediction core gather"))?,
+            4,
+            None,
+            "prediction core gather",
+        )?
+    } else {
+        0
+    };
+    let batch_cores = checked_allocation_bytes(core_batch, 8, None, "prediction batch cores")?;
     let core_host = checked_live_sum(
-        &[base_host, cores_host, core_readback],
+        &[
+            base_host,
+            cores_host,
+            core_readback,
+            #[cfg(test)]
+            core_gather,
+            batch_cores,
+        ],
         "prediction core host bytes",
     )?;
 
@@ -785,8 +997,43 @@ fn plan_prediction(
         None,
         "prediction candidate readback",
     )?;
+    let local_columns = checked_allocation_bytes(
+        query_batch,
+        OUTPUT_ROW_BYTES,
+        None,
+        "prediction batch columns",
+    )?;
+    #[cfg(test)]
+    let packed_columns = if external_order == QueryOrder::Leaf {
+        local_columns
+    } else {
+        0
+    };
+    #[cfg(test)]
+    let tuples = if external_order == QueryOrder::Leaf {
+        checked_allocation_bytes(
+            query_batch,
+            std::mem::size_of::<(usize, usize)>(),
+            None,
+            "prediction tuple allocation",
+        )?
+    } else {
+        0
+    };
+    let math_scratch = checked_allocation_bytes(k, 8, None, "prediction math scratch")?;
     let query_host_live = checked_live_sum(
-        &[base_host, cores, query_host, candidate_readback],
+        &[
+            base_host,
+            cores,
+            query_host,
+            candidate_readback,
+            local_columns,
+            #[cfg(test)]
+            packed_columns,
+            #[cfg(test)]
+            tuples,
+            math_scratch,
+        ],
         "prediction query host bytes",
     )?;
 
@@ -799,6 +1046,7 @@ fn plan_prediction(
 }
 
 /// Preflight only the cold reference/core phases used by conversion, without a fake query row.
+#[cfg(test)]
 fn plan_core_preparation(
     kd_plan: KdNeighborPlan,
     reference: usize,
@@ -806,6 +1054,26 @@ fn plan_core_preparation(
     s: usize,
     limit: DeviceAllocationLimit,
     row_pitched: bool,
+) -> Result<usize> {
+    plan_core_preparation_impl(
+        kd_plan,
+        reference,
+        features,
+        s,
+        limit,
+        row_pitched,
+        QueryOrder::Input,
+    )
+}
+
+fn plan_core_preparation_impl(
+    kd_plan: KdNeighborPlan,
+    reference: usize,
+    features: usize,
+    s: usize,
+    limit: DeviceAllocationLimit,
+    row_pitched: bool,
+    #[cfg(test)] core_order: QueryOrder,
 ) -> Result<usize> {
     candidate_width(s, reference)?;
     let levels = planned_tree_levels(reference)?;
@@ -823,8 +1091,25 @@ fn plan_core_preparation(
     reference_prepare_bytes(kd_plan, device_reference, reference, nodes, features)?;
     let core_pack = crate::kernels::kd_query_pack_bytes(batch, features, s)
         .ok_or(HdbscanError::Overflow("prediction core pack bytes"))?;
+    #[cfg(test)]
+    let core_source = if core_order == QueryOrder::Leaf && s != 1 {
+        tensor_allocation_bytes(
+            &[batch, features],
+            4,
+            limit,
+            row_pitched,
+            "prediction core query allocation",
+        )?
+    } else {
+        0
+    };
     checked_live_sum(
-        &[device_reference, core_pack],
+        &[
+            device_reference,
+            #[cfg(test)]
+            core_source,
+            core_pack,
+        ],
         "prediction core device bytes",
     )?;
 
@@ -854,8 +1139,31 @@ fn plan_core_preparation(
         .checked_mul(s)
         .ok_or(HdbscanError::Overflow("prediction core readback"))?;
     let readback = checked_allocation_bytes(readback_slots, 16, None, "prediction core readback")?;
+    #[cfg(test)]
+    let gather = if core_order == QueryOrder::Leaf && s != 1 {
+        checked_allocation_bytes(
+            batch
+                .checked_mul(features)
+                .ok_or(HdbscanError::Overflow("prediction core gather"))?,
+            4,
+            None,
+            "prediction core gather",
+        )?
+    } else {
+        0
+    };
+    let batch_cores = checked_allocation_bytes(batch, 8, None, "prediction batch cores")?;
     checked_live_sum(
-        &[tree_host, upload_tree, geometry, cores, readback],
+        &[
+            tree_host,
+            upload_tree,
+            geometry,
+            cores,
+            readback,
+            #[cfg(test)]
+            gather,
+            batch_cores,
+        ],
         "prediction conversion host bytes",
     )?;
     Ok(batch)
@@ -1194,13 +1502,15 @@ pub(crate) fn prepare_predictor(
         return Ok(());
     }
     let target = Target::resolve(runtime.backend())?;
-    let batch = plan_core_preparation(
+    let batch = plan_core_preparation_impl(
         target.query_plan(state.n_features),
         n,
         state.n_features,
         s,
         target.limit,
         target.row_pitched,
+        #[cfg(test)]
+        QueryOrder::Input,
     )?;
     let tree = runtime.tree(state)?;
     let _init = runtime.init()?;
@@ -1208,7 +1518,15 @@ pub(crate) fn prepare_predictor(
         return Ok(());
     }
     let call = CallReference::upload(state, &tree, &target)?;
-    let values = compute_cores(state, &call, batch)?;
+    let values = compute_cores(
+        state,
+        &call,
+        #[cfg(test)]
+        &tree,
+        batch,
+        #[cfg(test)]
+        QueryOrder::Input,
+    )?;
     runtime.cache()?.cores = CoreStatus::Ready {
         rank: s,
         values: Arc::from(values),
@@ -1336,7 +1654,13 @@ impl CallReference {
 
 /// Compute validated inclusive-self prediction cores (`k = s`) through the call reference.
 /// `batch` is the preflighted core batch row count.
-fn compute_cores(state: &PredictionState, call: &CallReference, batch: usize) -> Result<Vec<f64>> {
+fn compute_cores(
+    state: &PredictionState,
+    call: &CallReference,
+    #[cfg(test)] tree: &KdTree,
+    batch: usize,
+    #[cfg(test)] order: QueryOrder,
+) -> Result<Vec<f64>> {
     #[cfg(test)]
     tests::maybe_fail(tests::Injection::Cores)?;
     #[cfg(feature = "tracing")]
@@ -1348,11 +1672,36 @@ fn compute_cores(state: &PredictionState, call: &CallReference, batch: usize) ->
     }
     #[cfg(test)]
     tests::count_core_search();
-    let mut cores = Vec::with_capacity(n);
+    let mut cores = Vec::new();
+    cores
+        .try_reserve_exact(n)
+        .map_err(|_| HdbscanError::Overflow("prediction core allocation"))?;
+    #[cfg(test)]
+    if order == QueryOrder::Leaf {
+        cores.resize(n, f64::NAN);
+    }
     for start in (0..n).step_by(batch) {
         let end = start.saturating_add(batch).min(n);
+        #[cfg(test)]
+        let query = if order == QueryOrder::Leaf {
+            #[cfg(feature = "tracing")]
+            let _span = tracing::info_span!("prediction_core_gather_upload").entered();
+            let gathered = gather_rows(
+                &state.geometry,
+                state.n_features,
+                tree.indices[start..end].iter().map(|&id| id as usize),
+                end - start,
+            )?;
+            Tensor::<2>::from_data(
+                TensorData::new(gathered, [end - start, state.n_features]),
+                &call.device,
+            )
+        } else {
+            call.data.clone().slice([start..end, 0..state.n_features])
+        };
+        #[cfg(not(test))]
         let query = call.data.clone().slice([start..end, 0..state.n_features]);
-        let (ids, distances) = call.query(query, s, false, start)?;
+        let (ids, distances) = call.query(query, s, false, 0)?;
         if ids.iter().any(|&id| id < 0 || id as usize >= n) {
             return Err(HdbscanError::Numerical(
                 "prediction core search returned a missing or sentinel neighbor".into(),
@@ -1364,7 +1713,23 @@ fn compute_cores(state: &PredictionState, call: &CallReference, batch: usize) ->
                 "prediction core batch returned wrong length".into(),
             ));
         }
+        #[cfg(test)]
+        if order == QueryOrder::Leaf {
+            #[cfg(feature = "tracing")]
+            let _span = tracing::info_span!("prediction_core_scatter").entered();
+            for (j, value) in batch_cores.into_iter().enumerate() {
+                cores[tree.indices[start + j] as usize] = value;
+            }
+        } else {
+            cores.extend(batch_cores);
+        }
+        #[cfg(not(test))]
         cores.extend(batch_cores);
+    }
+    if cores.iter().any(|value| value.is_nan()) {
+        return Err(HdbscanError::Numerical(
+            "prediction core scatter left unfilled rows".into(),
+        ));
     }
     state.hierarchy.validate_prediction_core(&cores)?;
     Ok(cores)
@@ -1377,6 +1742,24 @@ fn preflight(
     runtime: &PredictionRuntime,
     m: usize,
 ) -> Result<(Target, PredictionPlan)> {
+    preflight_impl(
+        state,
+        runtime,
+        m,
+        #[cfg(test)]
+        (QueryOrder::Input, QueryOrder::Input),
+        #[cfg(test)]
+        PREDICTION_BATCH_ROWS,
+    )
+}
+
+fn preflight_impl(
+    state: &PredictionState,
+    runtime: &PredictionRuntime,
+    m: usize,
+    #[cfg(test)] requested: (QueryOrder, QueryOrder),
+    #[cfg(test)] batch_limit: usize,
+) -> Result<(Target, PredictionPlan)> {
     for (elements, size, subject) in [
         (m, 4, "prediction label allocation"),
         (m, 8, "prediction strength allocation"),
@@ -1385,14 +1768,21 @@ fn preflight(
         checked_allocation_bytes(elements, size, None, subject)?;
     }
     let target = Target::resolve(runtime.backend())?;
-    let plan = plan_prediction(
-        target.query_plan(state.n_features),
+    let kd_plan = target.query_plan(state.n_features);
+    #[cfg(test)]
+    let orders = effective_orders(kd_plan, requested);
+    let plan = plan_prediction_impl(
+        kd_plan,
         m,
         state.n_finite(),
         state.n_features,
         state.min_samples,
         target.limit,
         target.row_pitched,
+        #[cfg(test)]
+        orders,
+        #[cfg(test)]
+        batch_limit,
     )?;
     Ok((target, plan))
 }
@@ -1417,6 +1807,24 @@ pub(crate) fn approximate_predict(
     runtime: &PredictionRuntime,
     input: &[Vec<f32>],
 ) -> Result<PredictionResult> {
+    approximate_predict_impl(
+        state,
+        runtime,
+        input,
+        #[cfg(test)]
+        (QueryOrder::Input, QueryOrder::Input),
+        #[cfg(test)]
+        PREDICTION_BATCH_ROWS,
+    )
+}
+
+fn approximate_predict_impl(
+    state: &PredictionState,
+    runtime: &PredictionRuntime,
+    input: &[Vec<f32>],
+    #[cfg(test)] requested: (QueryOrder, QueryOrder),
+    #[cfg(test)] batch_limit: usize,
+) -> Result<PredictionResult> {
     let values = validate_queries(input, state.n_features)?;
     let m = input.len();
     if state.hierarchy.no_cluster_tree() {
@@ -1431,7 +1839,18 @@ pub(crate) fn approximate_predict(
     let n = state.n_finite();
     let s = state.min_samples;
     let k = candidate_width(s, n)?;
-    let (target, plan) = preflight(state, runtime, m)?;
+    let (target, plan) = preflight_impl(
+        state,
+        runtime,
+        m,
+        #[cfg(test)]
+        requested,
+        #[cfg(test)]
+        batch_limit,
+    )?;
+    #[cfg(test)]
+    let (core_order, external_order) =
+        effective_orders(target.query_plan(state.n_features), requested);
     let features = state.n_features;
     let PredictionPlan {
         query_batch: batch,
@@ -1447,7 +1866,16 @@ pub(crate) fn approximate_predict(
             match runtime.ready_cores()? {
                 Some(cores) => cores,
                 None => {
-                    let cores: Arc<[f64]> = compute_cores(state, &call, core_batch)?.into();
+                    let cores: Arc<[f64]> = compute_cores(
+                        state,
+                        &call,
+                        #[cfg(test)]
+                        &tree,
+                        core_batch,
+                        #[cfg(test)]
+                        core_order,
+                    )?
+                    .into();
                     runtime.cache()?.cores = CoreStatus::Ready {
                         rank: s,
                         values: Arc::clone(&cores),
@@ -1458,9 +1886,68 @@ pub(crate) fn approximate_predict(
         }
     };
 
+    #[cfg(test)]
+    let mut columns = if external_order == QueryOrder::Leaf {
+        unfilled_columns(m)?
+    } else {
+        PredictionColumns::default()
+    };
+    #[cfg(not(test))]
     let mut columns = PredictionColumns::default();
     for start in (0..m).step_by(batch) {
         let end = start.saturating_add(batch).min(m);
+        #[cfg(test)]
+        if external_order == QueryOrder::Leaf {
+            let mut order = Vec::new();
+            order
+                .try_reserve_exact(end - start)
+                .map_err(|_| HdbscanError::Overflow("prediction tuple allocation"))?;
+            {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("prediction_affinity_keys").entered();
+                for original in 0..end - start {
+                    let offset = (start + original) * features;
+                    order.push((
+                        leaf_affinity(&tree, &values[offset..offset + features]),
+                        original,
+                    ));
+                }
+            }
+            {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("prediction_affinity_sort").entered();
+                order.sort_unstable_by_key(|&pair| pair);
+            }
+            let query = {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("prediction_query_gather_upload").entered();
+                let gathered = gather_rows(
+                    &values,
+                    features,
+                    order.iter().map(|&(_, original)| start + original),
+                    end - start,
+                )?;
+                Tensor::<2>::from_data(
+                    TensorData::new(gathered, [end - start, features]),
+                    &call.device,
+                )
+            };
+            let (ids, distances) = call.query(query, k, false, 0)?;
+            let mut packed = PredictionColumns::default();
+            {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("prediction_candidate_math").entered();
+                state
+                    .hierarchy
+                    .predict_squared_batch(&ids, &distances, &cores, s, &mut packed)?;
+            }
+            {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("prediction_output_scatter").entered();
+                scatter_columns(&mut columns, &packed, &order, start)?;
+            }
+            continue;
+        }
         let query = Tensor::<2>::from_data(
             TensorData::new(
                 values[start * features..end * features].to_vec(),
@@ -1476,7 +1963,7 @@ pub(crate) fn approximate_predict(
             .predict_squared_batch(&ids, &distances, &cores, s, &mut columns)?;
     }
     drop(call);
-    if columns.len() != m {
+    if columns.len() != m || columns.probabilities.iter().any(|value| value.is_nan()) {
         return Err(HdbscanError::Numerical(
             "prediction returned wrong row count".into(),
         ));
@@ -1545,6 +2032,179 @@ pub(crate) mod tests {
                 ]
             })
             .collect()
+    }
+
+    #[test]
+    fn leaf_affinity_gather_and_scatter_preserve_identity() {
+        let values: Vec<f32> = (0..129).flat_map(|i| [i as f32 - 64.0, -0.0]).collect();
+        let tree = KdTree::build(&values, 129, 2).unwrap();
+        for row in [[-f32::MAX, 0.0], [f32::MAX, -0.0], [0.0, 0.0]] {
+            let key = leaf_affinity(&tree, &row);
+            assert!(
+                tree.starts
+                    .iter()
+                    .zip(&tree.is_leaf)
+                    .any(|(&start, &leaf)| leaf != 0 && start as usize == key)
+            );
+        }
+        let equal = vec![0.0; 129 * 2];
+        let tied = KdTree::build(&equal, 129, 2).unwrap();
+        assert_eq!(leaf_affinity(&tied, &[0.0, -0.0]), 0);
+        let single = KdTree::build(&[-0.0, 1.0], 1, 2).unwrap();
+        assert_eq!(leaf_affinity(&single, &[f32::MAX, -f32::MAX]), 0);
+        let pairs = [(0, 2), (0, 0), (0, 1)];
+        let gathered = gather_rows(&values, 2, pairs.iter().map(|&(_, row)| row), 3).unwrap();
+        for (position, &(_, row)) in pairs.iter().enumerate() {
+            assert_eq!(
+                gathered[position * 2..position * 2 + 2]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                values[row * 2..row * 2 + 2]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        let packed = PredictionColumns {
+            labels: vec![12, 10, 11],
+            probabilities: vec![0.2, 0.0, 0.1],
+            connecting_points: vec![92, 90, 91],
+        };
+        let mut output = unfilled_columns(3).unwrap();
+        scatter_columns(&mut output, &packed, &pairs, 0).unwrap();
+        assert_eq!(output.labels, [10, 11, 12]);
+        assert_eq!(output.connecting_points, [90, 91, 92]);
+        assert_eq!(output.probabilities, [0.0, 0.1, 0.2]);
+        assert!(scatter_columns(&mut output, &packed, &pairs[..2], 0).is_err());
+        assert!(gather_rows(&values, 2, [129].into_iter(), 1).is_err());
+        let mut sorted = pairs;
+        sorted.sort_unstable_by_key(|&pair| pair);
+        assert_eq!(sorted, [(0, 0), (0, 1), (0, 2)]);
+    }
+
+    #[test]
+    fn phase_b_all_orders_match_candidates_cores_and_predictions() {
+        for features in [2, 8, 16, 30, 33] {
+            for quantized in [false, true] {
+                let data: Vec<Vec<f32>> = (0..129)
+                    .map(|row| {
+                        (0..features)
+                            .map(|feature| {
+                                let jitter = ((row * 17 + feature * 13) % 47) as f32;
+                                (row % 3) as f32 * 30.0
+                                    + if quantized {
+                                        (jitter / 7.0).floor()
+                                    } else {
+                                        jitter * 0.0314159
+                                    }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let config = HdbscanConfig {
+                    min_cluster_size: 5,
+                    min_samples: Some(3),
+                    ..Default::default()
+                };
+                let model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
+                    .with_search(crate::HdbscanSearch::KdTree)
+                    .fit(&data)
+                    .unwrap();
+                let state = &model.state.prediction;
+                assert!(!state.hierarchy.no_cluster_tree());
+                let queries: Vec<Vec<f32>> = (0..259)
+                    .map(|row| data[(row * 37) % data.len()].clone())
+                    .collect();
+                let target = Target::resolve(BackendChoice::Cpu).unwrap();
+                let tree = model.runtime.tree(state).unwrap();
+                let call = CallReference::upload(state, &tree, &target).unwrap();
+                let cores = compute_cores(state, &call, &tree, 63, QueryOrder::Input).unwrap();
+                let leaf_cores = compute_cores(state, &call, &tree, 63, QueryOrder::Leaf).unwrap();
+                assert_eq!(
+                    cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    leaf_cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+                let flat: Vec<f32> = queries.iter().flatten().copied().collect();
+                let mut order: Vec<_> = queries
+                    .iter()
+                    .enumerate()
+                    .map(|(row, values)| (leaf_affinity(&tree, values), row))
+                    .collect();
+                order.sort_unstable_by_key(|&pair| pair);
+                let input_query = Tensor::<2>::from_data(
+                    TensorData::new(flat.clone(), [queries.len(), features]),
+                    &call.device,
+                );
+                let packed = gather_rows(
+                    &flat,
+                    features,
+                    order.iter().map(|&(_, row)| row),
+                    queries.len(),
+                )
+                .unwrap();
+                let leaf_query = Tensor::<2>::from_data(
+                    TensorData::new(packed, [queries.len(), features]),
+                    &call.device,
+                );
+                let (input_ids, input_distances) = call.query(input_query, 6, false, 0).unwrap();
+                let (leaf_ids, leaf_distances) = call.query(leaf_query, 6, false, 0).unwrap();
+                for (position, &(_, original)) in order.iter().enumerate() {
+                    assert_eq!(
+                        input_ids[original * 6..original * 6 + 6],
+                        leaf_ids[position * 6..position * 6 + 6]
+                    );
+                    for candidate in 0..6 {
+                        assert_eq!(
+                            input_distances[original * 6 + candidate].to_bits(),
+                            leaf_distances[position * 6 + candidate].to_bits()
+                        );
+                    }
+                }
+                let reference = approximate_predict_impl(
+                    state,
+                    &PredictionRuntime::new(state, BackendChoice::Cpu, None),
+                    &queries,
+                    (QueryOrder::Input, QueryOrder::Input),
+                    64,
+                )
+                .unwrap();
+                for core_order in [QueryOrder::Input, QueryOrder::Leaf] {
+                    for query_order in [QueryOrder::Input, QueryOrder::Leaf] {
+                        for batch in [1, 63, 64, 65, 1024] {
+                            let runtime = PredictionRuntime::new(state, BackendChoice::Cpu, None);
+                            let result = approximate_predict_impl(
+                                state,
+                                &runtime,
+                                &queries,
+                                (core_order, query_order),
+                                batch,
+                            )
+                            .unwrap();
+                            assert_eq!(result.labels, reference.labels);
+                            assert_eq!(result.connecting_points, reference.connecting_points);
+                            assert_eq!(
+                                result
+                                    .probabilities
+                                    .iter()
+                                    .map(|x| x.to_bits())
+                                    .collect::<Vec<_>>(),
+                                reference
+                                    .probabilities
+                                    .iter()
+                                    .map(|x| x.to_bits())
+                                    .collect::<Vec<_>>()
+                            );
+                            let published = runtime.ready_cores().unwrap().unwrap();
+                            assert_eq!(
+                                published.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn fit(search: crate::HdbscanSearch) -> crate::FittedHDBSCAN {
@@ -2168,6 +2828,90 @@ mod resource_plan_tests {
                 "prediction SoA candidate allocation"
             ))
         ));
+    }
+
+    #[test]
+    fn phase_b_plans_exact_added_buffers_and_conversion() {
+        let (n, m, d, s, cap) = (129, 2053, 33, 3, 65);
+        let kd = cpu_plan(d);
+        let nodes = planned_tree_nodes(planned_tree_levels(n).unwrap()).unwrap();
+        let tree = (n + nodes * 3 + nodes * d * 2) * 4;
+        let base = m * d * 4 + m * OUTPUT_ROW_BYTES + tree;
+        let steady = reference_device_bytes(kd, n, n, nodes, d, UNBOUNDED, false).unwrap();
+        let prepare = reference_prepare_bytes(kd, steady, n, nodes, d).unwrap();
+        for core in [QueryOrder::Input, QueryOrder::Leaf] {
+            for external in [QueryOrder::Input, QueryOrder::Leaf] {
+                let plan =
+                    plan_prediction_impl(kd, m, n, d, s, UNBOUNDED, false, (core, external), cap)
+                        .unwrap();
+                assert_eq!((plan.core_batch, plan.query_batch), (cap, cap));
+                let gather = if core == QueryOrder::Leaf {
+                    cap * d * 4
+                } else {
+                    0
+                };
+                let tuples = if external == QueryOrder::Leaf {
+                    cap * std::mem::size_of::<(usize, usize)>()
+                } else {
+                    0
+                };
+                let packed = if external == QueryOrder::Leaf {
+                    cap * OUTPUT_ROW_BYTES
+                } else {
+                    0
+                };
+                let host_core = base + n * 16 + cap * s * 16 + gather + cap * 8;
+                let host_query = base
+                    + n * 8
+                    + cap * d * 4
+                    + cap * (2 * s) * 16
+                    + cap * OUTPUT_ROW_BYTES
+                    + packed
+                    + tuples
+                    + 2 * s * 8;
+                let host_upload = base + n * d * 4 + tree;
+                assert_eq!(
+                    plan.host_peak_bytes,
+                    host_core.max(host_query).max(host_upload)
+                );
+                let source = if core == QueryOrder::Leaf {
+                    tensor_allocation_bytes(&[cap, d], 4, UNBOUNDED, false, "t").unwrap()
+                } else {
+                    0
+                };
+                let core_device =
+                    steady + source + crate::kernels::kd_query_pack_bytes(cap, d, s).unwrap();
+                let query_device = steady
+                    + tensor_allocation_bytes(&[cap, d], 4, UNBOUNDED, false, "t").unwrap()
+                    + crate::kernels::kd_query_pack_bytes(cap, d, 2 * s).unwrap();
+                assert_eq!(
+                    plan.device_peak_bytes,
+                    prepare.max(core_device).max(query_device)
+                );
+                assert_eq!(
+                    plan_core_preparation_impl(kd, n, d, s, UNBOUNDED, false, core).unwrap(),
+                    n
+                );
+            }
+        }
+        assert_eq!(
+            effective_orders(padded_plan(), (QueryOrder::Leaf, QueryOrder::Leaf)),
+            (QueryOrder::Input, QueryOrder::Input)
+        );
+        assert!(
+            plan_prediction_impl(
+                kd,
+                m,
+                n,
+                usize::MAX,
+                s,
+                UNBOUNDED,
+                false,
+                (QueryOrder::Leaf, QueryOrder::Leaf),
+                cap
+            )
+            .is_err()
+        );
     }
 
     #[test]

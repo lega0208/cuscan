@@ -507,6 +507,55 @@ fn batch_partitioning_is_invariant_cuda() {
     }
 }
 
+fn permuted_duplicate_queries_restore_raw_connectors(backend: BackendChoice) {
+    let mut data = blobs(40, 3);
+    data.insert(0, vec![f32::NAN, 0.0, 0.0]);
+    data.insert(17, vec![0.0, f32::INFINITY, 0.0]);
+    data[8] = data[9].clone();
+    let model = fit(backend, config(5, 4), HdbscanSearch::KdTree, &data);
+    let mut query = queries(3, 2053);
+    for i in (0..query.len()).step_by(7) {
+        query[i] = data[8].clone();
+    }
+    let expected = model.approximate_predict(&query).unwrap();
+    assert!(!expected.no_cluster_tree);
+    assert_matches(&expected, &oracle(&model, &data, &query), "raw mapping");
+    assert!(expected.connecting_points.iter().any(|&id| id > 17));
+    assert!(expected.connecting_points.iter().all(|&id| {
+        id == -1 || (id != 0 && id != 17 && data[id as usize].iter().all(|v| v.is_finite()))
+    }));
+
+    // Reverse and rotate so observations move across both batch boundaries and the tail.
+    let mut order: Vec<usize> = (0..query.len()).rev().collect();
+    order.rotate_left(317);
+    let shuffled: Vec<Vec<f32>> = order.iter().map(|&i| query[i].clone()).collect();
+    let actual = model.approximate_predict(&shuffled).unwrap();
+    assert_eq!(actual.no_cluster_tree, expected.no_cluster_tree);
+    for (position, &original) in order.iter().enumerate() {
+        assert_eq!(actual.labels[position], expected.labels[original]);
+        assert_eq!(
+            actual.connecting_points[position],
+            expected.connecting_points[original]
+        );
+        assert_eq!(
+            actual.probabilities[position].to_bits(),
+            expected.probabilities[original].to_bits()
+        );
+    }
+}
+
+#[test]
+fn permuted_duplicate_queries_restore_raw_connectors_cpu() {
+    permuted_duplicate_queries_restore_raw_connectors(BackendChoice::Cpu);
+}
+
+#[test]
+fn permuted_duplicate_queries_restore_raw_connectors_cuda() {
+    if let Some(backend) = cuda_backend_or_skip() {
+        permuted_duplicate_queries_restore_raw_connectors(backend);
+    }
+}
+
 #[test]
 fn cpu_and_cuda_agree() {
     let Some(cuda) = cuda_backend_or_skip() else {

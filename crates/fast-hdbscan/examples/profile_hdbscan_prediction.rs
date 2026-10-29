@@ -3,7 +3,9 @@
 //! unbuildable without it, so the reported trace file is always a real trace.
 //! Compilation is outside the per-case budget.
 
-use fast_hdbscan::{BackendChoice, HDBSCAN, HdbscanConfig, PredictionCoreStatus};
+use fast_hdbscan::{
+    BackendChoice, HDBSCAN, HdbscanConfig, PredictionCoreStatus, PredictionCoresState,
+};
 use std::{error::Error, time::Instant};
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -80,7 +82,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let warm = fitted.approximate_predict(&query)?;
         warm_seconds.push(start.elapsed().as_secs_f64());
         if cold.labels != warm.labels
-            || cold.probabilities != warm.probabilities
+            || !cold
+                .probabilities
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(warm.probabilities.iter().map(|v| v.to_bits()))
             || cold.connecting_points != warm.connecting_points
         {
             return Err("cold/warm predictions differ".into());
@@ -93,6 +99,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     drop(guard);
     let trace_bytes = std::fs::metadata(&args[7])?.len();
+    // Export only after all timed calls and trace collection. This public API copies
+    // the portable predictor state, including prediction cores in finite-row order.
+    let predictor_state = fitted.to_predictor()?.export_state()?;
+    let (prediction_core_status, prediction_core_rank, prediction_core_bits) =
+        match predictor_state.prediction_cores {
+            PredictionCoresState::NotRequiredNoClusterTree => {
+                ("not_required_no_cluster_tree", None, None)
+            }
+            PredictionCoresState::Ready { rank, values } => (
+                "ready",
+                Some(rank),
+                Some(
+                    values
+                        .iter()
+                        .map(|v| format!("{:016x}", v.to_bits()))
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        };
+    let probability_bits: Vec<_> = cold
+        .probabilities
+        .iter()
+        .map(|v| format!("{:016x}", v.to_bits()))
+        .collect();
     println!(
         "{}",
         serde_json::json!({
@@ -103,6 +133,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "noise_count": cold.labels.iter().filter(|&&v| v < 0).count(),
             "labels": cold.labels,
             "connecting_points": cold.connecting_points,
+            "probability_bits_f64_hex": probability_bits,
+            "prediction_core_status": prediction_core_status,
+            "prediction_core_rank": prediction_core_rank,
+            "prediction_core_bits_f64_hex_finite_row_order": prediction_core_bits,
             "geometry_bytes": finite_rows * features * 4,
             "prediction_core_bytes": prediction_core_bytes,
             "canonical_host_bytes": after.canonical_bytes,
