@@ -410,11 +410,12 @@ def test_parquet_selection_and_reproducible_sampling(tmp_path: Path) -> None:
     pl.DataFrame(
         {
             "embedding_2d": [[i, -i] for i in range(20)],
+            "embedding_16d": [[i, -i, i + 100] for i in range(20)],
             "embedding": [[i, -i, i + 100] for i in range(20)],
         }
     ).write_parquet(path)
     small = module.load_parquet(path, 8, "2d", 42)
-    full = module.load_parquet(path, 8, "full", 42)
+    full = module.load_parquet(path, 8, "16d", 42)
     assert small.shape == (8, 2)
     assert full.shape == (8, 3)
     np.testing.assert_array_equal(small, full[:, :2])
