@@ -11,6 +11,7 @@ __pycache__/
 
 comparison/*.parquet
 comparison/umap_comparison.html
+comparison/hdbscan_stages.html
 comparison/stages.html
 # Raw benchmark/profiling captures: regenerable and large. Reports, summaries,
 # Nsight stats CSVs and host traces next to them stay tracked.
