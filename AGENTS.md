@@ -33,19 +33,19 @@ HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses th
 
 ## Development Commands
 
-Run from the repository root. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
+Run from the repository root. Prefer `soldr cargo` whenever `soldr` is available on PATH; use plain `cargo` only when `soldr` is unavailable. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
 
 ```sh
-cargo build -p fast-umap --release
-cargo test -p fast-umap-core
-cargo test -p fast-cubecl-common
-cargo test -p fast-hdbscan-core
-cargo test -p fast-hdbscan
-cargo test -p fast-umap
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test -p fast-umap
-cargo bench -p fast-umap --bench standard_umap_cpu
+soldr cargo build -p fast-umap --release
+soldr cargo test -p fast-umap-core
+soldr cargo test -p fast-cubecl-common
+soldr cargo test -p fast-hdbscan-core
+soldr cargo test -p fast-hdbscan
+soldr cargo test -p fast-umap
+soldr cargo fmt --all -- --check
+soldr cargo clippy --workspace --all-targets
+soldr cargo test -p fast-umap
+soldr cargo bench -p fast-umap --bench standard_umap_cpu
 ```
 
 Python development and checks:
@@ -106,7 +106,7 @@ Rust uses `#[test]` integration/unit tests and Criterion benchmarks; Python uses
 For required CUDA coverage rather than silent hardware skips:
 
 ```sh
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common -- --nocapture
+FAST_UMAP_REQUIRE_CUDA=1 soldr cargo test -p fast-cubecl-common -- --nocapture
 ```
 
 Test observable shape, finite outputs, numerical tolerances, deterministic seeds, and validation failures. New backend operations should share assertions across CPU and CUDA. Use `tempfile` for new filesystem tests.

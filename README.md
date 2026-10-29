@@ -204,11 +204,13 @@ on generated data (default 5,000 rows, 16 features), or on parquet supplied with
 it does not generate point plots. Both scripts print timing tables and accept
 `--html` for stage charts and `--json` for raw measurements and metadata.
 
-Build their native companions separately so build time is not measured:
+Prefer `soldr cargo` whenever `soldr` is available on PATH; use plain `cargo` only
+when `soldr` is unavailable. Build the native companions separately so build time
+is not measured:
 
 ```sh
-cargo build -p fast-umap --release --features tracing --example profile_standard_stages
-cargo build -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
+soldr cargo build -p fast-umap --release --features tracing --example profile_standard_stages
+soldr cargo build -p fast-hdbscan --release --features tracing --example profile_hdbscan_stages
 
 uv run --no-sync python comparison/compare_stages.py --backend cpu \
   --html comparison/umap_stages.html --json comparison/umap_stages.json
@@ -379,17 +381,17 @@ Burn/CubeCL tracing. The library does not install a subscriber. Profiling benche
 install one only when `FAST_UMAP_TRACE` is set; leave it unset for timing runs.
 
 ```sh
-cargo bench -p fast-umap --bench standard_umap_cpu
-cargo bench -p fast-umap --bench standard_umap_cuda
+soldr cargo bench -p fast-umap --bench standard_umap_cpu
+soldr cargo bench -p fast-umap --bench standard_umap_cuda
 
 # Chrome/Perfetto trace (import the JSON file into ui.perfetto.dev)
-FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace cargo bench -p fast-umap \
+FAST_UMAP_TRACE=standard-cpu.json RUST_LOG=fast_umap=trace soldr cargo bench -p fast-umap \
   --features tracing --bench standard_umap_cpu -- --test
-FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace cargo bench -p fast-umap \
+FAST_UMAP_TRACE=standard-cuda.json RUST_LOG=fast_umap=trace,cubecl=trace,cubecl_cuda=trace soldr cargo bench -p fast-umap \
   --features tracing --bench standard_umap_cuda -- --test
 
 # Console span timings instead of a trace file
-FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug cargo bench -p fast-umap \
+FAST_UMAP_TRACE=console RUST_LOG=fast_umap=debug soldr cargo bench -p fast-umap \
   --features tracing --bench standard_umap_cpu -- --test
 ```
 
@@ -402,7 +404,7 @@ embedding readback, with deterministic inputs prepared outside the timed loop.
 Compare standard UMAP with **umap-learn 0.5.12**, using CUDA only:
 
 ```sh
-cargo build -p fast-umap --release --features tracing --example profile_standard_cuda
+soldr cargo build -p fast-umap --release --features tracing --example profile_standard_cuda
 uv run --no-sync python scripts/compare_umap_spans.py --output comparison.json --trace cuda-trace.json
 ```
 
@@ -444,9 +446,9 @@ the reference on its exact-search branch. Missing CUDA fails without CPU fallbac
 The Standard CPU test lane uses CubeCL LLVM and does not require a GPU.
 
 ```shell
-cargo test -p fast-umap-core
-cargo test -p fast-umap
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-cubecl-common -- --nocapture
+soldr cargo test -p fast-umap-core
+soldr cargo test -p fast-umap
+FAST_UMAP_REQUIRE_CUDA=1 soldr cargo test -p fast-cubecl-common -- --nocapture
 ```
 
 Default quality fixtures retain every dataset with three fixed seeds, 10 graph
@@ -458,8 +460,8 @@ signed gaps are diagnostics only. Recall thresholds are unchanged.
 An opt-in 200-epoch fit/transform case retains longer-optimization coverage:
 
 ```shell
-FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --test test_standard_quality long_quality
-FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_LONG_QUALITY=1 cargo test -p fast-umap --test test_standard_quality long_quality
+FAST_UMAP_RUN_LONG_QUALITY=1 soldr cargo test -p fast-umap --test test_standard_quality long_quality
+FAST_UMAP_REQUIRE_CUDA=1 FAST_UMAP_RUN_LONG_QUALITY=1 soldr cargo test -p fast-umap --test test_standard_quality long_quality
 ```
 
 Regenerate only quality fixtures (without replacing graph/layout references) with:
@@ -474,8 +476,8 @@ not a later source checkout. Verify their provenance and semantic regeneration w
 ```shell
 uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --verify-provenance
 uv run --no-sync python crates/fast-hdbscan/tests/fixtures/generate_fast_hdbscan.py --check
-cargo test -p fast-hdbscan-core --test test_fixtures
-cargo test -p fast-hdbscan-core --features test-support
+soldr cargo test -p fast-hdbscan-core --test test_fixtures
+soldr cargo test -p fast-hdbscan-core --features test-support
 ```
 
 The reference remains unpatched: upstream [PR #72](https://github.com/TutteInstitute/fast_hdbscan/pull/72)
@@ -726,10 +728,10 @@ same advisory fields; without that feature `fit` emits nothing. The same exclusi
 semantics described for Python apply.
 
 ```shell
-cargo test -p fast-hdbscan
-FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan
-cargo bench -p fast-hdbscan --bench hdbscan_cpu
-FAST_UMAP_REQUIRE_CUDA=1 cargo bench -p fast-hdbscan --bench hdbscan_cuda
+soldr cargo test -p fast-hdbscan
+FAST_UMAP_REQUIRE_CUDA=1 soldr cargo test -p fast-hdbscan
+soldr cargo bench -p fast-hdbscan --bench hdbscan_cpu
+FAST_UMAP_REQUIRE_CUDA=1 soldr cargo bench -p fast-hdbscan --bench hdbscan_cuda
 ```
 
 Criterion benchmarks compare forced routes on the same fixtures and seeded
