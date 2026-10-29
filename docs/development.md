@@ -12,12 +12,12 @@ Linux x86-64/WSL2 with Python 3.14, using synthetic 4,096-row, 32-feature data,
 gave the following results at 1,024-row chunks (latency in milliseconds, RSS
 in MiB):
 
-| Synthetic case | Blosc2 level | File bytes | Save ms | Load ms | Save RSS MiB | Load RSS MiB |
-|---|---:|---:|---:|---:|---:|---:|
-| Continuous f32 features | 1 | 474,450 | 29.25 | 5.55 | 61.1 | 55.5 |
-| Continuous f32 features | 9 | 457,808 | 94.22 | 5.91 | 62.8 | 55.8 |
-| Deduplicated model state | 1 | 305,631 | 33.88 | 8.90 | 60.3 | 55.0 |
-| Deduplicated model state | 9 | 298,053 | 113.92 | 2.16 | 62.9 | 55.2 |
+| Synthetic case           | Blosc2 level | File bytes | Save ms | Load ms | Save RSS MiB | Load RSS MiB |
+| ------------------------ | -----------: | ---------: | ------: | ------: | -----------: | -----------: |
+| Continuous f32 features  |            1 |    474,450 |   29.25 |    5.55 |         61.1 |         55.5 |
+| Continuous f32 features  |            9 |    457,808 |   94.22 |    5.91 |         62.8 |         55.8 |
+| Deduplicated model state |            1 |    305,631 |   33.88 |    8.90 |         60.3 |         55.0 |
+| Deduplicated model state |            9 |    298,053 |  113.92 |    2.16 |         62.9 |         55.2 |
 
 In these single-trial quick measurements, level 9 reduced file size by about
 2.9–3.0% versus level 1, but took about 3.3–3.4× as long to save and used up to
@@ -124,17 +124,17 @@ For native-only hotspot attribution, see [HDBSCAN stage analysis](#hdbscan-stage
 
 #### HDBSCAN stage analysis
 
-`analyze_hdbscan_stages.sh` analyzes native CPU/CUDA hotspots, not performance
+`scripts/analyze_hdbscan_stages.sh` analyzes native CPU/CUDA hotspots, not performance
 against reference `fast_hdbscan`. It requires Linux x86-64 (including WSL2), Cargo,
 a configured uv environment (`uv sync`), a working NVIDIA CUDA runtime, Nsight
 Systems (`nsys`), Nsight Compute (`ncu`), and GPU counter permissions.
 
 ```sh
-bash analyze_hdbscan_stages.sh --help
-bash analyze_hdbscan_stages.sh                     # 20,000 rows
-bash analyze_hdbscan_stages.sh --rows 50000
-bash analyze_hdbscan_stages.sh --rows 100000
-bash analyze_hdbscan_stages.sh --rows 20000 --output-dir artifacts/hdbscan_stages/my-run
+bash scripts/analyze_hdbscan_stages.sh --help
+bash scripts/analyze_hdbscan_stages.sh                     # 20,000 rows
+bash scripts/analyze_hdbscan_stages.sh --rows 50000
+bash scripts/analyze_hdbscan_stages.sh --rows 100000
+bash scripts/analyze_hdbscan_stages.sh --rows 20000 --output-dir artifacts/hdbscan_stages/my-run
 uv run --no-sync python analyze/summarize_hdbscan_stages.py \
   --benchmark artifacts/hdbscan_stages/my-run/benchmark.json \
   --kernels artifacts/hdbscan_stages/my-run/cuda_kernels.json \
@@ -178,20 +178,20 @@ UMAP reports neighbor search, fuzzy graph, schedule, spectral graph export,
 initialization, and optimization; its `other` row is fit time outside measured
 stages. HDBSCAN instead reports exclusive, non-overlapping stages:
 
-| HDBSCAN stage | Measured work |
-| --- | --- |
-| `input_validation` | Configuration/input checks, flattening and finite-row detection in native; estimator/input/parameter validation in the reference |
-| `backend_setup` | Native backend/device resolution, runtime initialization, allocation properties and search-route selection |
-| `input_preparation` | Native result-buffer allocation, finite-row compaction and device allocation-size checks |
-| `tree_build` | Host KD-tree construction and native tree allocation checks (only a branch check for native brute force) |
-| `input_upload` | Native input/tree tensor uploads, including synchronization |
-| `core_distances` | Native neighbor search, readback, core distances and retained neighbor/core output copies |
-| `mst` | Native Borůvka spanning tree construction and finalization |
-| `mst_setup` | Reference MST dispatch/validation outside the measured tree/Borůvka calls |
-| `core_distances_and_mst` | Reference fused Numba Borůvka call, which cannot expose separate core-distance and MST timings through Python wrappers |
-| `approximate_neighbors_and_mst` | Reference approximate-neighbor/MST path above 30 features, instead of its KD-tree/Borůvka stages |
-| `cluster_extraction` | Linkage, condensation, cluster selection, labels and membership strengths |
-| `result_finalization` | Native result remapping/scattering and fitted-state assembly; reference fitted-attribute/record-array conversion |
+| HDBSCAN stage                   | Measured work                                                                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `input_validation`              | Configuration/input checks, flattening and finite-row detection in native; estimator/input/parameter validation in the reference |
+| `backend_setup`                 | Native backend/device resolution, runtime initialization, allocation properties and search-route selection                       |
+| `input_preparation`             | Native result-buffer allocation, finite-row compaction and device allocation-size checks                                         |
+| `tree_build`                    | Host KD-tree construction and native tree allocation checks (only a branch check for native brute force)                         |
+| `input_upload`                  | Native input/tree tensor uploads, including synchronization                                                                      |
+| `core_distances`                | Native neighbor search, readback, core distances and retained neighbor/core output copies                                        |
+| `mst`                           | Native Borůvka spanning tree construction and finalization                                                                       |
+| `mst_setup`                     | Reference MST dispatch/validation outside the measured tree/Borůvka calls                                                        |
+| `core_distances_and_mst`        | Reference fused Numba Borůvka call, which cannot expose separate core-distance and MST timings through Python wrappers           |
+| `approximate_neighbors_and_mst` | Reference approximate-neighbor/MST path above 30 features, instead of its KD-tree/Borůvka stages                                 |
+| `cluster_extraction`            | Linkage, condensation, cluster selection, labels and membership strengths                                                        |
+| `result_finalization`           | Native result remapping/scattering and fitted-state assembly; reference fitted-attribute/record-array conversion                 |
 
 HDBSCAN estimator construction is outside fit timing. `unattributed` retains
 only the per-fit difference between total time and measured exclusive stages;
@@ -660,4 +660,3 @@ collection when necessary to retain all 100 samples. Reference tile widths
 default remains 256, without a runtime-specific tile tuning claim.
 
 ---
-

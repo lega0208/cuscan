@@ -21,16 +21,16 @@ Current evidence index: [`summary.json`](artifacts/cubecl_kernels_perf/phase6_va
 
 Use symbols rather than legacy line numbers; new retry symbols below are planned, not existing implementations.
 
-| Path | Responsibility / symbols |
-| --- | --- |
-| `crates/fast-hdbscan-core/src/kdtree.rs` | `KdTree::build`, `LEAF_SIZE`, `MAX_KD_LEVELS`: builder contract, no production algorithm change |
-| `crates/fast-hdbscan-core/tests/kdtree.rs` | Extend `assert_invariants`, `build_handles_leaf_size_boundaries_and_heap_layout`, `build_is_deterministic_with_duplicate_and_equal_feature_values`; retain `build_rejects_invalid_dimensions_and_non_finite_values` |
-| `crates/fast-hdbscan/src/backend.rs` | Document valid data/tree precondition on `DeviceKdTree` and `HdbscanOps::exact_neighbors_kd`; no runtime scan |
-| `crates/fast-hdbscan/src/kernels/kdtree.rs` | Existing `exact_neighbors_kd`, `launch_kd_neighbors`, `validate_tree`, `kd_launch_geometry`, `kd_padded_bytes`, `kd_neighbors_kernel`, frozen `kd_neighbors_reference_kernel`; planned plan/route, CPU/pack kernels, pack sizing and all-arm/all-width harness via `check_kd_neighbors_match_reference` |
-| `crates/fast-hdbscan/src/kernels/mod.rs` | Export planned `kd_neighbor_plan` / `kd_neighbor_pack_bytes` for sizing; preserve `HdbscanOps` dispatch |
-| `crates/fast-hdbscan/src/estimator.rs` | `core_search_memory`, `check_device_allocation`, `core_search_memory_accounts_for_bounded_and_full_routes`: account for actual packs; `upload_kd_tree` stays unchanged |
-| `crates/fast-hdbscan/tests/test_kdtree_search.rs` | Preserve `check_kd_oracle`, `check_kd_oracle_high_dim`, `check_small_neighbor_boundaries`, `check_permuted_tree_row_oracles`, overflow cases and CPU/required-CUDA wrappers |
-| `crates/fast-hdbscan/examples/kd_host_baseline.rs`, `crates/fast-hdbscan/Cargo.toml` | Retain tracked reporting tool and Rayon dev-dependency |
+| Path                                                                                 | Responsibility / symbols                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/fast-hdbscan-core/src/kdtree.rs`                                             | `KdTree::build`, `LEAF_SIZE`, `MAX_KD_LEVELS`: builder contract, no production algorithm change                                                                                                                                                                                                         |
+| `crates/fast-hdbscan-core/tests/kdtree.rs`                                           | Extend `assert_invariants`, `build_handles_leaf_size_boundaries_and_heap_layout`, `build_is_deterministic_with_duplicate_and_equal_feature_values`; retain `build_rejects_invalid_dimensions_and_non_finite_values`                                                                                     |
+| `crates/fast-hdbscan/src/backend.rs`                                                 | Document valid data/tree precondition on `DeviceKdTree` and `HdbscanOps::exact_neighbors_kd`; no runtime scan                                                                                                                                                                                           |
+| `crates/fast-hdbscan/src/kernels/kdtree.rs`                                          | Existing `exact_neighbors_kd`, `launch_kd_neighbors`, `validate_tree`, `kd_launch_geometry`, `kd_padded_bytes`, `kd_neighbors_kernel`, frozen `kd_neighbors_reference_kernel`; planned plan/route, CPU/pack kernels, pack sizing and all-arm/all-width harness via `check_kd_neighbors_match_reference` |
+| `crates/fast-hdbscan/src/kernels/mod.rs`                                             | Export planned `kd_neighbor_plan` / `kd_neighbor_pack_bytes` for sizing; preserve `HdbscanOps` dispatch                                                                                                                                                                                                 |
+| `crates/fast-hdbscan/src/estimator.rs`                                               | `core_search_memory`, `check_device_allocation`, `core_search_memory_accounts_for_bounded_and_full_routes`: account for actual packs; `upload_kd_tree` stays unchanged                                                                                                                                  |
+| `crates/fast-hdbscan/tests/test_kdtree_search.rs`                                    | Preserve `check_kd_oracle`, `check_kd_oracle_high_dim`, `check_small_neighbor_boundaries`, `check_permuted_tree_row_oracles`, overflow cases and CPU/required-CUDA wrappers                                                                                                                             |
+| `crates/fast-hdbscan/examples/kd_host_baseline.rs`, `crates/fast-hdbscan/Cargo.toml` | Retain tracked reporting tool and Rayon dev-dependency                                                                                                                                                                                                                                                  |
 
 ## Objective
 
@@ -173,6 +173,7 @@ fn kd_neighbors_cpu_kernel<F: Float, I: Int, N: Size>(
 For `PaddedRows`, launch with `N = 1` (unused). Dummy buffers are small allocations; they are not counted as pack memory beyond their constant size.
 
 **Work loop (one call site for the per-row body).**
+
 - `Cyclic`: work items `w = ABSOLUTE_POS_X, w += units` over `0..n`; `row = w`.
 - `LeafBlocks`: work items over `0..n` in blocks of `KD_QUERY_BLOCK` assigned block-cyclically by unit; process `row = indices[w]` exactly once per position.
 
@@ -253,6 +254,7 @@ uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py
 **Gate.** This is the experimental matrix (all arms); after Step 6 the final-gate matrix applies. Require all gates to pass without hardware skips and every valid-tree case to match IDs, distance bits and diagnostics for every plan and host `w`. Run the plan-parameterized harness on measurement source; each arm binary additionally passes the tracing example test built with its `KD_CPU_ARM`. Archive fresh logs under `retry/logs/`, never historical `phase6/`.
 
 **Mismatch triage.** Never change the reference kernel or tests to match.
+
 - Distances differ, IDs/diagnostics follow: FMA contraction or operation-order difference between the vector and scalar sums. Inspect the generated IR (Step 0.3). Fix by expressing the vector accumulation so it matches the scalar kernel's contraction (e.g. the same `delta * delta` then `+=` shape the scalar code uses), never by changing the scalar kernel. **Width policy:** every width in the host list must pass; there is no width-exclusion mechanism. If any width stays unfixed, P and C are rejected (O is unaffected).
 - Distances equal, diagnostics differ: tile range or lane mask error, or the screen skipped an admissible lane.
 - Some rows uninitialized or differing only under `LeafBlocks`: block assignment or permutation-position scheduling error.
@@ -263,14 +265,14 @@ uv run --no-sync pytest analyze/tests/test_hdbscan_stages.py
 
 All CPU. Verify these exact historical input paths and SHA-256 values from `phase6/provenance.json` before reuse; they do not all reside in `inputs/`:
 
-| Cell | Input path | SHA-256 |
-| --- | --- | --- |
+| Cell   | Input path                                                            | SHA-256                                                            |
+| ------ | --------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | 20k×16 | `artifacts/hdbscan_core_investigation/baseline_20000/raw/input.f32le` | `b2df07faa30a6814fffb398b140b2a8edcc8ab88fbde802cc85dcce3b659925e` |
 | 50k×16 | `artifacts/hdbscan_core_investigation/baseline_50000/raw/input.f32le` | `99e4275cee1a443d0ac2b2e3434e1b81a86b5726d596f13e1455a1d9f1722a81` |
-| 20k×30 | `artifacts/hdbscan_core_investigation/dim30.f32le` | `a7f6fa44daa73c5c75e55a56f57c383db64043a2409180a3c4d12af1848d935e` |
-| 50k×30 | `artifacts/cubecl_kernels_perf/inputs/input_50000_30.f32le` | `7e17b48290ed5ea9335caf4602f35d8526cd3c24d9336c5e493d549bba498e2e` |
-| 20k×8 | `artifacts/hdbscan_core_investigation/dim8.f32le` | `6dc2e889f243d4d075b1f6a75e8d18d7cabb02c1466998e385b70c7a8e2be1f5` |
-| 20k×2 | `artifacts/hdbscan_core_investigation/dim2.f32le` | `66235e50a1f68995e1fe39f8914f1551bafaa6a2ebb34c0b0ea9c8b7ef173239` |
+| 20k×30 | `artifacts/hdbscan_core_investigation/dim30.f32le`                    | `a7f6fa44daa73c5c75e55a56f57c383db64043a2409180a3c4d12af1848d935e` |
+| 50k×30 | `artifacts/cubecl_kernels_perf/inputs/input_50000_30.f32le`           | `7e17b48290ed5ea9335caf4602f35d8526cd3c24d9336c5e493d549bba498e2e` |
+| 20k×8  | `artifacts/hdbscan_core_investigation/dim8.f32le`                     | `6dc2e889f243d4d075b1f6a75e8d18d7cabb02c1466998e385b70c7a8e2be1f5` |
+| 20k×2  | `artifacts/hdbscan_core_investigation/dim2.f32le`                     | `66235e50a1f68995e1fe39f8914f1551bafaa6a2ebb34c0b0ea9c8b7ef173239` |
 
 Command: `<binary> <input.f32le> <rows> <features> --backend cpu --runs 3 --min-samples 5`. Each process reports core-stage and `core_neighbor_kernel` medians (including all packing), full-fit median and labels. Missing/mismatched files require fresh recorded input provenance, not an unsupported claim of historical comparability.
 
@@ -302,7 +304,7 @@ Copy `phase4/cold_start.py` unchanged except paths and backend restricted to CPU
 
 ### 4f. Final pipeline validation
 
-With final production code after Step 6, run `bash analyze_hdbscan_stages.sh --rows 20000` and `bash analyze_hdbscan_stages.sh --rows 100000`; archive `retry/logs/analyze_*.log`. Require actual CPU/CUDA execution and exact label equality. Existing CUDA kernel filters need no change because kernel names are unchanged; CPU timing is span-based. These are single runs, not interleaved comparisons.
+With final production code after Step 6, run `bash scripts/analyze_hdbscan_stages.sh --rows 20000` and `bash scripts/analyze_hdbscan_stages.sh --rows 100000`; archive `retry/logs/analyze_*.log`. Require actual CPU/CUDA execution and exact label equality. Existing CUDA kernel filters need no change because kernel names are unchanged; CPU timing is span-based. These are single runs, not interleaved comparisons.
 
 ## Step 5: Decision rule
 
@@ -317,6 +319,7 @@ An arm `X ∈ {P, O, C}` **passes** by default when:
 **Selection.** If no arm passes, reject Phase 6. Otherwise let `G` be the passing arm with the lowest geometric mean of pooled primary core medians. Among passing arms within +2% of `G` in every primary cell (including `G`), select the simplest (simplicity `O < P < C`). This is one comparison against `G`, not iterated. Correctness criterion (1) is mandatory. Criteria (2)–(3) and the selection rule are the default guide, not absolute vetoes: make an evidence-backed judgement call when timings are noisy or the trade-off is reasonable, weighing both batches, paired ratios, absolute and relative effects, guard-cell variability, memory (`kd_neighbor_pack_bytes` increase) and JIT cost. A threshold crossing alone does not establish benefit or harm, and "no effect" does not establish equivalence. This discretion does not authorize extra batches or selecting samples.
 
 **Failure handling.**
+
 - Fail of (1): a correctness defect; fix it, never relax tests. If unfixable for an arm, that arm cannot be selected.
 - A guard regression only at 20k×2 with sub-millisecond absolute cost (Phase 3 precedent of non-replicating 2D noise) may be accepted only with a documented judgement; it is not silently ignored.
 - **Document the judgement** in `summary.json` and the Phase 6 results in `hdbscan_perf_report.md`: decision, selected arm and `W`, each unmet criterion, supporting and contrary measurements (variability, absolute and relative costs), and the trade-off and why it is reasonable. Distinguish measured gains from hypotheses.
@@ -338,15 +341,15 @@ An arm `X ∈ {P, O, C}` **passes** by default when:
 
 ## Risks and mitigations
 
-| Risk | Mitigation |
-| --- | --- |
-| Vector vs scalar FMA contraction changes distance bits | Bit-equality at every host `w` on CPU; Step 4d IR inspection; triage procedure; any unfixed `w` rejects P/C |
-| Lane waste at misaligned leaf starts (est. +17% at W = 16) | Quantified up front; Step 4a selects `W` empirically; per-leaf layout recorded as a later experiment |
-| Load imbalance from leaf order | Block-cyclic `KD_QUERY_BLOCK = 64`; isolation arm O measures order alone |
-| Caller violates valid-tree precondition | Document precondition; test builder invariants and rejection of invalid builder inputs, not runtime scans |
-| JIT cost of `(d, W, order)` variants on CPU LLVM | Only the selected `W`/order compiles in production; cold start reported (4e) |
-| Extra memory (SoA plus slot IDs) | Checked sizing and allocation limits; reported in results; O has no added proportional storage |
-| Small cells dominated by packing | 20k×2 and 20k×8 guards; regression screen |
-| Units of one CPU cube not concurrent as assumed | Step 0.4 establishes the facts; design inherits the existing geometry either way |
-| Duplicate heap code in two kernels | Copied verbatim to keep CUDA untouched; O folds into the CUDA kernel source only with CUDA verification; Phase 8 removes duplication |
-| Gains specific to Gaussian 16D/30D inputs | Scope stated in results; no generality claim |
+| Risk                                                       | Mitigation                                                                                                                           |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Vector vs scalar FMA contraction changes distance bits     | Bit-equality at every host `w` on CPU; Step 4d IR inspection; triage procedure; any unfixed `w` rejects P/C                          |
+| Lane waste at misaligned leaf starts (est. +17% at W = 16) | Quantified up front; Step 4a selects `W` empirically; per-leaf layout recorded as a later experiment                                 |
+| Load imbalance from leaf order                             | Block-cyclic `KD_QUERY_BLOCK = 64`; isolation arm O measures order alone                                                             |
+| Caller violates valid-tree precondition                    | Document precondition; test builder invariants and rejection of invalid builder inputs, not runtime scans                            |
+| JIT cost of `(d, W, order)` variants on CPU LLVM           | Only the selected `W`/order compiles in production; cold start reported (4e)                                                         |
+| Extra memory (SoA plus slot IDs)                           | Checked sizing and allocation limits; reported in results; O has no added proportional storage                                       |
+| Small cells dominated by packing                           | 20k×2 and 20k×8 guards; regression screen                                                                                            |
+| Units of one CPU cube not concurrent as assumed            | Step 0.4 establishes the facts; design inherits the existing geometry either way                                                     |
+| Duplicate heap code in two kernels                         | Copied verbatim to keep CUDA untouched; O folds into the CUDA kernel source only with CUDA verification; Phase 8 removes duplication |
+| Gains specific to Gaussian 16D/30D inputs                  | Scope stated in results; no generality claim                                                                                         |

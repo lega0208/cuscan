@@ -22,6 +22,7 @@ hidden. Fit's CPU core distances already use C16 arithmetic, so CPU prediction's
 matches fit's arithmetic.
 
 Non-goals:
+
 - CUDA query routing. F2 is exhaustive over the training set, which is the wrong trade for external
   query batches. CUDA stays on `kd_neighbors_kernel`.
 - Changing fit's KNN path or the Borůvka paths.
@@ -69,6 +70,7 @@ Non-goals:
 ### 3.1 Query plan becomes per client
 
 Replace `const fn kd_query_plan()` with `kd_query_plan(client, features) -> KdNeighborPlan`:
+
 - CPU client (`num_cpu_cores.is_some()`): `LeafSoa { lanes: kd_cpu_soa_lanes(client) }`,
   `order: Cyclic`. Queries run in input order; see Phase B for leaf order.
 - Otherwise: `PaddedRows / Cyclic`, unchanged.
@@ -81,13 +83,14 @@ predict share the same lane selection. `features` is accepted so this has the sa
 
 Change `DeviceKdReference`:
 
-| field | `lanes == 0` (PaddedRows) | `lanes > 0` (LeafSoa) |
-|---|---|---|
-| `candidates: FloatTensor` (replaces `padded_data`) | padded rows, `rows × 4⌈d/4⌉` | SoA, `kd_soa_slots(rows, lanes) × d` |
-| `slot_ids: IntTensor` (new) | `indices` (same handle, no allocation) | `kd_soa_slots(rows, lanes)` packed IDs, pad = `rows` |
-| `lanes: usize` (new) | 0 | lanes |
+| field                                              | `lanes == 0` (PaddedRows)              | `lanes > 0` (LeafSoa)                                |
+| -------------------------------------------------- | -------------------------------------- | ---------------------------------------------------- |
+| `candidates: FloatTensor` (replaces `padded_data`) | padded rows, `rows × 4⌈d/4⌉`           | SoA, `kd_soa_slots(rows, lanes) × d`                 |
+| `slot_ids: IntTensor` (new)                        | `indices` (same handle, no allocation) | `kd_soa_slots(rows, lanes)` packed IDs, pad = `rows` |
+| `lanes: usize` (new)                               | 0                                      | lanes                                                |
 
 Rationale:
+
 - The SoA kernel never reads padded reference rows: it reads queries from the query buffer and
   candidates from the SoA. Keeping both would add `rows × 4⌈d/4⌉ × 4` bytes that are never read. With
   the replacement, the CPU candidate pack costs `slots × (d+1) × 4` instead of `rows × 4⌈d/4⌉ × 4`.
@@ -100,6 +103,7 @@ Rationale:
 - `padded_min` / `padded_max` stay. Both kernels use them.
 
 `prepare_kd_reference(data, tree, lanes: u32)`:
+
 - Gains an explicit `lanes` argument. The fusion `meta` closure has no client, so the caller chooses
   the layout and `meta` computes shapes from `lanes`:
   - `candidates`: `rows·width` if `lanes == 0`, else `slots·d`;
@@ -118,6 +122,7 @@ and passes `lanes`. The same plan is threaded into sizing (3.5).
 ### 3.3 One CPU kernel for fit and query
 
 Make `kd_neighbors_cpu_kernel` cover both cases instead of duplicating it:
+
 - `data_v` → `query_v` (padded queries) and `data` → `query` (compact queries, used above 32
   features).
 - New runtime `query_offset: u32`, comptime `leaf_order: bool` and comptime `exclude_self: bool`.
@@ -129,6 +134,7 @@ Make `kd_neighbors_cpu_kernel` cover both cases instead of duplicating it:
 - The sentinel stays `n` (reference rows). Outputs and diagnostics are indexed by query `row`.
 
 Callers:
+
 - Fit (`launch_kd_neighbors_impl`, kdtree.rs:2213-2248) passes `query_v = data_v = padded data`,
   `query = data`, `leaf_order = true`, `exclude_self = true`, `query_offset = 0`. This is the same
   computation as before.
@@ -218,6 +224,7 @@ Decision: Phase B isn't planned work. It is written down here so Phase A's inter
 ## 5. Tests (focused, CPU and CUDA where applicable)
 
 kdtree.rs unit tests:
+
 - `check_query_routes`, extended: on CPU, for `features ∈ {2, 16, 30, 33}` (covering register and
   runtime paths and `d % 4 ∈ {0, 1, 2}`), quantized inputs, `k = 9`:
   - the SoA query route matches `brute_query` bitwise;
@@ -251,6 +258,7 @@ kdtree.rs unit tests:
   `FAST_UMAP_REQUIRE_CUDA=1`.
 
 Integration (`tests/test_kdtree_search.rs`, `tests/test_prediction.rs`):
+
 - The public `prepare_kd_reference` call site (test_kdtree_search.rs:685) is updated to pass `lanes`.
   Test both `0` and the CPU lane width on CPU.
 - The existing prediction oracle, batching (`1024 + 1024 + 5` split), mixed-nonfinite and
@@ -264,6 +272,7 @@ after `maturin develop --release`. No API change is expected.
 ## 6. Verification and performance gate
 
 Correctness (must pass):
+
 ```sh
 cargo test -p fast-hdbscan
 FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan kd_query -- --nocapture
@@ -271,10 +280,12 @@ FAST_UMAP_REQUIRE_CUDA=1 cargo test -p fast-hdbscan --test test_prediction -- --
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
+
 Known failures that already exist (a parquet fixture, a flaky CUDA timing test, Ruff formatting) are
 reported, not hidden.
 
 Performance (judgment-based, following earlier phases):
+
 - **Tool.** `examples/profile_hdbscan_prediction.rs` (requires `tracing`), on CPU, comparing the
   route before and after on the same binary inputs. The baseline is the current source built with
   the same profile.
@@ -310,8 +321,8 @@ Performance (judgment-based, following earlier phases):
   Packing straight from compact data would remove them; this is deferred because
   `pack_leaf_soa_kernel` reads `KdVector` chunks.
 - **Fit regression from generalizing the kernel.** This is covered by the existing fit tests, the
-  diagnostics-equality test and the HDBSCAN stage analysis: `bash analyze_hdbscan_stages.sh --rows 20000`
-  for feedback, then the required final `bash analyze_hdbscan_stages.sh --rows 100000`. CPU must show
+  diagnostics-equality test and the HDBSCAN stage analysis: `bash scripts/analyze_hdbscan_stages.sh --rows 20000`
+  for feedback, then the required final `bash scripts/analyze_hdbscan_stages.sh --rows 100000`. CPU must show
   no regression against the Phase 7 artifacts. CUDA is expected to be unchanged because its branch
   isn't touched. The comptime flags compile to the same code for
   fit.

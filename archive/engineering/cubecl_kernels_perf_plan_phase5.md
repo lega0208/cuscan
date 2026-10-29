@@ -118,8 +118,8 @@ Performance thresholds are default decision aids, not permission to hide trade-o
 After removing experiment-only production hooks and selecting the winning width (or restoring 32), run final integration validation on that exact cleaned source:
 
 ```sh
-bash analyze_hdbscan_stages.sh --rows 20000
-bash analyze_hdbscan_stages.sh --rows 100000
+bash scripts/analyze_hdbscan_stages.sh --rows 20000
+bash scripts/analyze_hdbscan_stages.sh --rows 100000
 ```
 
 Both campaigns must complete strict CPU and real CUDA execution, exact CPU/CUDA label checks, route-aware kernel/counter captures and successful summaries. Preserve run directories, raw logs, source/binary/input hashes and exact commands. Compilation alone, skipped CUDA or incomplete profiler outputs do not satisfy this gate. Resolve failures before declaring implementation complete. These are integration gates, not additional selection samples; do not use them to retune the width. Follow the script's scale-specific limits, including runtime JIT. Repeat source-sensitive correctness gates on the cleaned implementation.

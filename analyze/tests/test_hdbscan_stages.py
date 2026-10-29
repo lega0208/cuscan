@@ -34,7 +34,7 @@ summarize_paths = summary_tools.summarize_paths
 summarize_reports = summary_tools.summarize_reports
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "analyze_hdbscan_stages.sh"
+SCRIPT = ROOT / "scripts" / "analyze_hdbscan_stages.sh"
 SUMMARY_SCRIPT = ROOT / "analyze" / "summarize_hdbscan_stages.py"
 BASH = shutil.which("bash") or "/bin/bash"
 

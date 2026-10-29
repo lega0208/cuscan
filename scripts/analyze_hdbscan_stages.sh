@@ -3,7 +3,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 usage() {
-    printf '%s\n' 'Usage: bash analyze_hdbscan_stages.sh [--rows 20000|50000|100000] [--output-dir NEW_DIRECTORY]' \
+    printf '%s\n' 'Usage: bash scripts/analyze_hdbscan_stages.sh [--rows 20000|50000|100000] [--output-dir NEW_DIRECTORY]' \
         'Requires cargo, uv, nsys, ncu and working CPU/CUDA runtimes and counter permissions.' \
         'Default: 20000 rows; fresh directory under artifacts/hdbscan_stages.'
 }

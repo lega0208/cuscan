@@ -46,21 +46,21 @@ This report covers Step 0 of [cubecl_kernels_perf_plan_phase7.md](cubecl_kernels
 - **Inputs:** `make_inputs.py` generated 20k/50k/100k/200k/300k × 16/30 with `make_input(rows, d, 1.0, 1.0, 42)`. Hashes are in `inputs.json`; the four 20k/50k cells match the Phase 6 hashes.
 - **Tool changes:** `analyze/hdbscan_stages_common.py` gained `EXTENDED_ROWS`. `benchmark_hdbscan_stages.py` (`benchmark()` validation and argparse) and `profile_hdbscan_counters.py` (argparse) accept 200k/300k.
 - **Tests:** the benchmark parametrization was extended, and rejection and acceptance tests were added. `pytest analyze/tests/test_hdbscan_stages.py` passes (100), and `ruff check`/`ruff format --check` on `analyze/` are clean.
-- **Unchanged tools:** `profile_hdbscan_kernels.py`, `summarize_hdbscan_stages.py` and `analyze_hdbscan_stages.sh` still accept only up to 100k. The plan did not require changing them.
+- **Unchanged tools:** `profile_hdbscan_kernels.py`, `summarize_hdbscan_stages.py` and `scripts/analyze_hdbscan_stages.sh` still accept only up to 100k. The plan did not require changing them.
 - **Separate Step 0 scripts:** the benchmark tool hardcodes 16 features, and the counter tool's fixed metric set lacks the L2/DRAM metrics. Steps 0.3–0.5 therefore use separate runners (`run_crossover.py`, `run_scan_fraction.py`, `run_l2_counters.py`) instead of modifying production analysis tools.
 
 ## 0.3 CPU/CUDA crossover (B)
 
 Each cell ran six processes alternating CPU/CUDA (three per backend), with the starting backend alternating between cells. Each process ran `--runs 3 --min-cluster-size 5 --min-samples 5 --search auto`, and `CUBECL_*` variables were stripped. CPU runs used the CubeCL LLVM runtime with 15 units. Values are medians of three process medians, in seconds.
 
-| Cell | Core CPU / CUDA | CPU/CUDA core | MST CPU / CUDA | Full fit CPU / CUDA | CPU/CUDA fit | Labels |
-| --- | --- | ---: | --- | --- | ---: | --- |
-| 100k×16 | 0.767 / 0.302 | 2.54 | 0.510 / 0.423 | 1.357 / 0.821 | 1.65 | equal |
-| 200k×16 | 2.336 / 1.762 | 1.33 | 1.542 / 1.041 | 4.082 / 3.027 | 1.35 | equal |
-| 300k×16 | 4.199 / 4.689 | **0.90** | 3.452 / 1.967 | 8.018 / 6.997 | 1.15 | equal |
-| 100k×30 | 2.187 / 1.511 | 1.45 | 2.341 / 1.345 | 4.709 / 3.045 | 1.55 | equal |
-| 200k×30 | 8.173 / 10.532 | **0.78** | 7.105 / 4.308 | 15.686 / 15.200 | 1.03 | equal |
-| 300k×30 | 16.300 / 25.861 | **0.63** | 16.765 / 8.810 | 33.717 / 35.401 | **0.95** | equal |
+| Cell    | Core CPU / CUDA | CPU/CUDA core | MST CPU / CUDA | Full fit CPU / CUDA | CPU/CUDA fit | Labels |
+| ------- | --------------- | ------------: | -------------- | ------------------- | -----------: | ------ |
+| 100k×16 | 0.767 / 0.302   |          2.54 | 0.510 / 0.423  | 1.357 / 0.821       |         1.65 | equal  |
+| 200k×16 | 2.336 / 1.762   |          1.33 | 1.542 / 1.041  | 4.082 / 3.027       |         1.35 | equal  |
+| 300k×16 | 4.199 / 4.689   |      **0.90** | 3.452 / 1.967  | 8.018 / 6.997       |         1.15 | equal  |
+| 100k×30 | 2.187 / 1.511   |          1.45 | 2.341 / 1.345  | 4.709 / 3.045       |         1.55 | equal  |
+| 200k×30 | 8.173 / 10.532  |      **0.78** | 7.105 / 4.308  | 15.686 / 15.200     |         1.03 | equal  |
+| 300k×30 | 16.300 / 25.861 |      **0.63** | 16.765 / 8.810 | 33.717 / 35.401     |     **0.95** | equal  |
 
 - **Spread:** process medians spread ≤ 2% except for one 100k×16 CPU process at 0.90 s (others 0.73–0.77 s). Tree build is identical across backends (host).
 - **Core crossover:** between 200k and 300k at 16D and between 100k and 200k at 30D.
@@ -69,12 +69,12 @@ Each cell ran six processes alternating CPU/CUDA (three per backend), with the s
 
 Warm CUDA ns per scanned pair (core seconds / diagnostic leaf positions scanned):
 
-| | 20k | 50k | 100k | 200k | 300k |
-| --- | ---: | ---: | ---: | ---: | ---: |
+|          |    20k |    50k |  100k |  200k |  300k |
+| -------- | -----: | -----: | ----: | ----: | ----: |
 | CUDA 16D | 0.072ᵃ | 0.067ᵃ | 0.068 | 0.130 | 0.160 |
 | CUDA 30D | 0.107ᵃ | 0.109ᵃ | 0.180 | 0.337 | 0.369 |
-| CPU 16D | — | — | 0.174 | 0.172 | 0.143 |
-| CPU 30D | — | — | 0.260 | 0.261 | 0.232 |
+| CPU 16D  |      — |      — | 0.174 | 0.172 | 0.143 |
+| CPU 30D  |      — |      — | 0.260 | 0.261 | 0.232 |
 
 ᵃ These come from Phase 5 width-64 CUDA core medians, which use the same CUDA kernel but a different measurement campaign. Use them as trend context only.
 
@@ -85,18 +85,18 @@ Warm CUDA ns per scanned pair (core seconds / diagnostic leaf positions scanned)
 - **Cross-check:** the 20k cells reproduce the historical totals exactly (8,089,849 pops / 296,417,695 positions at 16D).
 - **Raw data:** per-row arrays are kept gzipped in `scan_fraction_cuda/`.
 
-| Cell | Mean nodes popped | Scanned / n² | Per-query scanned min / median / max | Queries scanning all |
-| --- | ---: | ---: | --- | ---: |
-| 20k×16 | 404.5 | 0.741 | 4,453 / 15,237 / 20,000 | 0.11% |
-| 50k×16 | 1,257.1 | 0.546 | 7,270 / 26,692 / 49,462 | 0 |
-| 100k×16 | 2,090.3 | 0.442 | 10,443 / 42,599 / 96,140 | 0 |
-| 200k×16 | 3,316.3 | 0.339 | 14,413 / 64,415 / 189,856 | 0 |
-| 300k×16 | 3,172.9 | 0.326 | 20,484 / 93,053 / 288,860 | 0 |
-| 20k×30 | 498.5 | 0.965 | 7,734 / 19,688 / 20,000 | 23.9% |
-| 50k×30 | 1,896.6 | 0.898 | 14,596 / 46,535 / 50,000 | 1.3% |
-| 100k×30 | 3,603.5 | 0.841 | 24,117 / 87,256 / 100,000 | 0.08% |
-| 200k×30 | 6,814.3 | 0.782 | 41,880 / 162,093 / 200,000 | 0.003% |
-| 300k×30 | 6,752.9 | 0.779 | 70,235 / 241,768 / 300,000 | 0.002% |
+| Cell    | Mean nodes popped | Scanned / n² | Per-query scanned min / median / max | Queries scanning all |
+| ------- | ----------------: | -----------: | ------------------------------------ | -------------------: |
+| 20k×16  |             404.5 |        0.741 | 4,453 / 15,237 / 20,000              |                0.11% |
+| 50k×16  |           1,257.1 |        0.546 | 7,270 / 26,692 / 49,462              |                    0 |
+| 100k×16 |           2,090.3 |        0.442 | 10,443 / 42,599 / 96,140             |                    0 |
+| 200k×16 |           3,316.3 |        0.339 | 14,413 / 64,415 / 189,856            |                    0 |
+| 300k×16 |           3,172.9 |        0.326 | 20,484 / 93,053 / 288,860            |                    0 |
+| 20k×30  |             498.5 |        0.965 | 7,734 / 19,688 / 20,000              |                23.9% |
+| 50k×30  |           1,896.6 |        0.898 | 14,596 / 46,535 / 50,000             |                 1.3% |
+| 100k×30 |           3,603.5 |        0.841 | 24,117 / 87,256 / 100,000            |                0.08% |
+| 200k×30 |           6,814.3 |        0.782 | 41,880 / 162,093 / 200,000           |               0.003% |
+| 300k×30 |           6,752.9 |        0.779 | 70,235 / 241,768 / 300,000           |               0.002% |
 
 - **Trend:** pruning improves with n, strongly at 16D and weakly at 30D.
 - **200k → 300k:** pops/query drop at both dimensions, because both sizes have 13 levels and 300k leaves are 73–74 points instead of 48–49.
@@ -110,16 +110,16 @@ Warm CUDA ns per scanned pair (core seconds / diagnostic leaf positions scanned)
 
 **Normalization.** "Per pair" divides by the diagnostic leaf positions scanned for the same cell.
 
-| Cell | Padded rows | L2 hit | L1 hit | DRAM B/pair | L2 rd sectors/pair | L1 sectors/request | Long-scoreboard | Achieved occ. | Threads/inst | ns/pair (base clk) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 20k×16 | 1.28 MB | 99.8% | 60.4% | 0.09 | 2.05 | 11.8 | 67% | 18.8% | 12.4 | 0.061 |
-| 50k×16 | 3.2 MB | 98.2% | 52.1% | 1.60 | 2.66 | 10.1 | 76% | 46.1% | 10.3 | 0.051 |
-| 100k×16 | 6.4 MB | 75.7% | 50.2% | 22.3 | 2.79 | 9.4 | 81% | 50.9% | 9.6 | 0.069 |
-| 200k×16 | 12.8 MB | 38.2% | 47.7% | 60.2 | 2.95 | 8.6 | 94% | 61.9% | 8.7 | 0.134 |
-| 300k×16 | 19.2 MB | 29.2% | 48.3% | 65.4 | 2.81 | 8.5 | 95% | 63.5% | 8.6 | 0.164 |
-| 20k×30 | 2.56 MB | 99.6% | 55.8% | 0.26 | 3.86 | 15.0 | 75% | 18.9% | 16.5 | 0.092 |
-| 50k×30 | 6.4 MB | 82.2% | 50.2% | 28.1 | 4.86 | 14.3 | 88% | 46.9% | 14.7 | 0.088 |
-| 100k×30 | 12.8 MB | 49.3% | 48.0% | 85.4 | 5.14 | 13.6 | 95% | 51.2% | 13.8 | 0.193 |
+| Cell    | Padded rows | L2 hit | L1 hit | DRAM B/pair | L2 rd sectors/pair | L1 sectors/request | Long-scoreboard | Achieved occ. | Threads/inst | ns/pair (base clk) |
+| ------- | ----------: | -----: | -----: | ----------: | -----------------: | -----------------: | --------------: | ------------: | -----------: | -----------------: |
+| 20k×16  |     1.28 MB |  99.8% |  60.4% |        0.09 |               2.05 |               11.8 |             67% |         18.8% |         12.4 |              0.061 |
+| 50k×16  |      3.2 MB |  98.2% |  52.1% |        1.60 |               2.66 |               10.1 |             76% |         46.1% |         10.3 |              0.051 |
+| 100k×16 |      6.4 MB |  75.7% |  50.2% |        22.3 |               2.79 |                9.4 |             81% |         50.9% |          9.6 |              0.069 |
+| 200k×16 |     12.8 MB |  38.2% |  47.7% |        60.2 |               2.95 |                8.6 |             94% |         61.9% |          8.7 |              0.134 |
+| 300k×16 |     19.2 MB |  29.2% |  48.3% |        65.4 |               2.81 |                8.5 |             95% |         63.5% |          8.6 |              0.164 |
+| 20k×30  |     2.56 MB |  99.6% |  55.8% |        0.26 |               3.86 |               15.0 |             75% |         18.9% |         16.5 |              0.092 |
+| 50k×30  |      6.4 MB |  82.2% |  50.2% |        28.1 |               4.86 |               14.3 |             88% |         46.9% |         14.7 |              0.088 |
+| 100k×30 |     12.8 MB |  49.3% |  48.0% |        85.4 |               5.14 |               13.6 |             95% |         51.2% |         13.8 |              0.193 |
 
 **Resources.**
 
@@ -162,19 +162,19 @@ All probes passed on CUDA. Details are in `logs/api_probe.log`; the archived tes
 - Baseline totals equal the device diagnostics exactly at 20k and to within ≤ 12 pops / ≤ 439 positions elsewhere. The residual is FMA in device bounds/distances versus unfused host arithmetic.
 - 64–625 tiles per cell were checked lane-by-lane against per-query results (IDs and distance bits): zero mismatches. This supports Invariant 2 (visit order is free) on these data.
 
-| Cell | Leaf size | Baseline scan/n | Warp-max/n | Tile staged/n | Lane util. | Staged ÷ warp-max | Staged ÷ mean | Tile pops (vs query pops) | Chunks/tile |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
-| 20k×2 | 78–79 | 0.006 | 0.014 | 0.023 | 32% | 1.62 | 3.59 | 28 (18) | 17 |
-| 20k×8 | 78–79 | 0.175 | 0.411 | 0.716 | 25% | 1.74 | 4.10 | 402 (125) | 550 |
-| 20k×16 | 78–79 | 0.741 | 0.973 | 0.999 | 74% | 1.03 | 1.35 | 511 (404) | 767 |
-| 50k×16 | 48–49 | 0.546 | 0.859 | 0.982 | 56% | 1.14 | 1.80 | 2,025 (1,257) | 2,012 |
-| 100k×16 | 48–49 | 0.442 | 0.749 | 0.944 | 47% | 1.26 | 2.14 | 3,935 (2,090) | 3,866 |
-| 200k×16 | 48–49 | 0.339 | 0.628 | 0.892 | 38% | 1.42 | 2.63 | 7,564 (3,316) | 7,309 |
-| 300k×16 | 73–74 | 0.326 | 0.606 | 0.881 | 37% | 1.45 | 2.70 | 7,474 (3,173) | 10,823 |
-| 20k×30 | 78–79 | 0.965 | 1.000 | 1.000 | 97% | 1.00 | 1.04 | 511 (499) | 768 |
-| 50k×30 | 48–49 | 0.898 | 0.998 | 1.000 | 90% | 1.00 | 1.11 | 2,047 (1,897) | 2,048 |
-| 100k×30 | 48–49 | 0.841 | 0.990 | 0.999 | 84% | 1.01 | 1.19 | 4,092 (3,604) | 4,090 |
-| 200k×30 | 48–49 | 0.782 | 0.979 | 0.996 | 79% | 1.02 | 1.27 | 8,173 (6,814) | 8,162 |
+| Cell    | Leaf size | Baseline scan/n | Warp-max/n | Tile staged/n | Lane util. | Staged ÷ warp-max | Staged ÷ mean | Tile pops (vs query pops) | Chunks/tile |
+| ------- | --------- | --------------: | ---------: | ------------: | ---------: | ----------------: | ------------: | ------------------------- | ----------: |
+| 20k×2   | 78–79     |           0.006 |      0.014 |         0.023 |        32% |              1.62 |          3.59 | 28 (18)                   |          17 |
+| 20k×8   | 78–79     |           0.175 |      0.411 |         0.716 |        25% |              1.74 |          4.10 | 402 (125)                 |         550 |
+| 20k×16  | 78–79     |           0.741 |      0.973 |         0.999 |        74% |              1.03 |          1.35 | 511 (404)                 |         767 |
+| 50k×16  | 48–49     |           0.546 |      0.859 |         0.982 |        56% |              1.14 |          1.80 | 2,025 (1,257)             |       2,012 |
+| 100k×16 | 48–49     |           0.442 |      0.749 |         0.944 |        47% |              1.26 |          2.14 | 3,935 (2,090)             |       3,866 |
+| 200k×16 | 48–49     |           0.339 |      0.628 |         0.892 |        38% |              1.42 |          2.63 | 7,564 (3,316)             |       7,309 |
+| 300k×16 | 73–74     |           0.326 |      0.606 |         0.881 |        37% |              1.45 |          2.70 | 7,474 (3,173)             |      10,823 |
+| 20k×30  | 78–79     |           0.965 |      1.000 |         1.000 |        97% |              1.00 |          1.04 | 511 (499)                 |         768 |
+| 50k×30  | 48–49     |           0.898 |      0.998 |         1.000 |        90% |              1.00 |          1.11 | 2,047 (1,897)             |       2,048 |
+| 100k×30 | 48–49     |           0.841 |      0.990 |         0.999 |        84% |              1.01 |          1.19 | 4,092 (3,604)             |       4,090 |
+| 200k×30 | 48–49     |           0.782 |      0.979 |         0.996 |        79% |              1.02 |          1.27 | 8,173 (6,814)             |       8,162 |
 
 How to read the columns:
 
@@ -191,19 +191,19 @@ How to read the columns:
 
 ## Impact on the plan's assumptions
 
-| Plan assumption | Step 0 finding | Effect |
-| --- | --- | --- |
-| Crossover near 300k (user observation) | Confirmed: 16D core between 200k and 300k; 30D between 100k and 200k; full fit only at 300k×30 | Motivation holds, and is stronger at 30D |
-| "Near O(n²) with traversal overhead" (20k numbers) | 16D scan falls to 0.33 at 300k; 30D stays ≥ 0.78 | Holds for 30D. At 16D the per-query kernel's useful work shrinks, but the tile union does not (0.88) |
-| L2 holds padded rows to about 80k (16D) / 40k (30D) | 98% hit at 50k×16, 76% at 100k×16; 82% at 50k×30, 49% at 100k×30 | Thresholds confirmed within the resolution of the grid |
-| L2 hypothesis "unverified" | Supported (correlational): hit-rate cliff, DRAM/pair ×40–700, ns/pair ×2.4 | Gains at ≥ 100k may be attributed to reduced DRAM traffic only together with post-change H3 counters |
-| Global candidate traffic falls about 32× | Real factor ≈ 32 × lane utilization: about 15–24× at 16D (≤ 100k), about 27–31× at 30D | Lower expected traffic reduction at 16D. The direction is unchanged |
-| "Prefer T because its cost does not grow as n²" | T stages 88–100% of n through 300k at 16/30D | Rationale not supported in the measured range |
-| Union visits many more leaves at low d | 2D/8D: staged ÷ warp-max 1.6–1.7, lane util 25–32% | Confirmed. The gate will very likely be 16 for both arms |
-| Leaves longer than T are an edge case to test | Every production leaf is 40–79 points (2–3 chunks) | Multi-chunk is the main path. Chunk slot utilization is about 76–82% |
-| `sync_plane` → `__syncwarp()` via `cubecl-cpp/src/cuda/dialect.rs:69` | Lowers via cubecl-llvm NVPTX to `llvm.nvvm.bar.warp.sync(-1)`; no cpp dialect in this build | Citation and the Step 0.6 check criterion are wrong; the design is unaffected |
-| Per-lane local stacks are acceptable first | Baseline local traffic ≈ 2% of global sectors | Supported |
-| Experimental arms capped at 100k | The crossover regime is at 200k–300k; the 100k cells sit at the start of the cache cliff | Acceptance can show gains, but cannot show whether the crossover moves |
+| Plan assumption                                                       | Step 0 finding                                                                                 | Effect                                                                                               |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Crossover near 300k (user observation)                                | Confirmed: 16D core between 200k and 300k; 30D between 100k and 200k; full fit only at 300k×30 | Motivation holds, and is stronger at 30D                                                             |
+| "Near O(n²) with traversal overhead" (20k numbers)                    | 16D scan falls to 0.33 at 300k; 30D stays ≥ 0.78                                               | Holds for 30D. At 16D the per-query kernel's useful work shrinks, but the tile union does not (0.88) |
+| L2 holds padded rows to about 80k (16D) / 40k (30D)                   | 98% hit at 50k×16, 76% at 100k×16; 82% at 50k×30, 49% at 100k×30                               | Thresholds confirmed within the resolution of the grid                                               |
+| L2 hypothesis "unverified"                                            | Supported (correlational): hit-rate cliff, DRAM/pair ×40–700, ns/pair ×2.4                     | Gains at ≥ 100k may be attributed to reduced DRAM traffic only together with post-change H3 counters |
+| Global candidate traffic falls about 32×                              | Real factor ≈ 32 × lane utilization: about 15–24× at 16D (≤ 100k), about 27–31× at 30D         | Lower expected traffic reduction at 16D. The direction is unchanged                                  |
+| "Prefer T because its cost does not grow as n²"                       | T stages 88–100% of n through 300k at 16/30D                                                   | Rationale not supported in the measured range                                                        |
+| Union visits many more leaves at low d                                | 2D/8D: staged ÷ warp-max 1.6–1.7, lane util 25–32%                                             | Confirmed. The gate will very likely be 16 for both arms                                             |
+| Leaves longer than T are an edge case to test                         | Every production leaf is 40–79 points (2–3 chunks)                                             | Multi-chunk is the main path. Chunk slot utilization is about 76–82%                                 |
+| `sync_plane` → `__syncwarp()` via `cubecl-cpp/src/cuda/dialect.rs:69` | Lowers via cubecl-llvm NVPTX to `llvm.nvvm.bar.warp.sync(-1)`; no cpp dialect in this build    | Citation and the Step 0.6 check criterion are wrong; the design is unaffected                        |
+| Per-lane local stacks are acceptable first                            | Baseline local traffic ≈ 2% of global sectors                                                  | Supported                                                                                            |
+| Experimental arms capped at 100k                                      | The crossover regime is at 200k–300k; the 100k cells sit at the start of the cache cliff       | Acceptance can show gains, but cannot show whether the crossover moves                               |
 
 ## Recommended plan changes
 
@@ -226,7 +226,7 @@ How to read the columns:
    - At 50k×16, attribute any gain to L1/LSU traffic (L2 hit 98%), not to L2.
 6. **Resolved (2026-10-27):** the user re-added 300k as an experimental cell with size-priority acceptance. The plan now measures every arm at 300k. Original recommendation, kept for the record: **Reporting-only large-n check (Step 4, needs user approval).** The motivating crossover lies at 200k–300k, outside the 100k experimental cap. Consider one reporting-only, non-acceptance measurement: selected arm vs B vs CPU C16 at 200k/300k × 16/30, three processes each. Otherwise the phase cannot say whether the crossover moved. This contradicts Changes §6 as written, so it requires an explicit user decision; without it, the report must state that the crossover question remains open.
 7. **Guard expectations (Step 4).** At 20k neither the DRAM regime nor launch-size headroom applies: about 19% achieved occupancy from only 313 cubes, and the tile kernel keeps the same warp count. Expect "no effect" or a small regression there. The existing guard thresholds stand.
-8. **Analysis tooling.** The Phase 7 runners kept 200k/300k out of `profile_hdbscan_kernels.py`, `summarize_hdbscan_stages.py` and `analyze_hdbscan_stages.sh`. If item 6 is approved, extend those choices with tests as well. Otherwise no change is needed.
+8. **Analysis tooling.** The Phase 7 runners kept 200k/300k out of `profile_hdbscan_kernels.py`, `summarize_hdbscan_stages.py` and `scripts/analyze_hdbscan_stages.sh`. If item 6 is approved, extend those choices with tests as well. Otherwise no change is needed.
 
 ## Reproduction
 

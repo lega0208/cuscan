@@ -10,7 +10,6 @@
 - `crates/umap/src/standard_umap/` owns the `UMAP`/`FittedUMAP` estimator. Query, fuzzy graph and layout remain in UMAP's forward-only `StandardUmapOps`; common owns approximate neighbors (including candidate-width sizing), exact neighbors and squared distance blocks through `NeighborOps`. ANN callers validate launches with common's typed preflight before dispatch. Each extension trait and its `CubeBackend` implementation stay in the same crate (orphan rule). UMAP neighbor search explicitly uses unsquared mode; common exact squared mode has different infinity/padding semantics. Kernels import host helpers from cores, never estimator modules. Spectral initialization remains host-side. The CUDA layout kernel updates embedding/clock/RNG operands in place, so callers must pass unaliased buffers. Feature values are used as-is, without scaling.
 - `cuscan-common` owns backend choice/errors, CUDA discovery and device resolution. CPU and CUDA implementations are always compiled; UMAP maps common errors locally to preserve its error contract.
 
-
 Trace actual consumers before documenting or changing configuration behavior.
 
 HDBSCAN `approximate_predict` CPU KD queries use the C16 leaf-SoA candidate scan in
@@ -68,6 +67,7 @@ uv run maturin develop --release && uv run --no-sync myscript.py
 ```
 
 ## References
+
 - [Burn Tensor ops](references/burn_tensor_ops.md): A list of available tensor ops and utilities for Burn Tensors, along with their pytorch equivalents.
 
 ## Code Conventions & Common Patterns
@@ -95,8 +95,8 @@ Burn/CubeCL requirements are declared once in `[workspace.dependencies]`; keep t
 ## Testing & QA
 
 Native HDBSCAN hotspot reproduction (strict CPU/CUDA, Nsight and counter access):
-`bash analyze_hdbscan_stages.sh --rows 20000`. After relevant changes, require
-`bash analyze_hdbscan_stages.sh --rows 100000` final validation. The fixed synthetic
+`bash scripts/analyze_hdbscan_stages.sh --rows 20000`. After relevant changes, require
+`bash scripts/analyze_hdbscan_stages.sh --rows 100000` final validation. The fixed synthetic
 workload and per-child 10s feedback cap include runtime JIT, not Cargo compilation;
 compilation-only or skipped CUDA execution is not validation. See
 [HDBSCAN stage analysis](docs/development.md#hdbscan-stage-analysis) for final-scale limits.

@@ -42,14 +42,14 @@ e43d6e95dfd42e825c66272467094fb4dcf403a904da9861e51892387c0f867c
 
 Record the installed package version and source hash in generated prediction fixture provenance. The development dependency currently permits `hdbscan>=0.8.44`; a future environment can differ from this inspected source.
 
-| Reference | Relevant behavior |
-| --- | --- |
-| `prediction.py:166–218`, `PredictionData.__init__` | Converts training coordinates to float64; builds a spatial tree; computes inclusive-self prediction core distances; builds selected-cluster maps and parent maxima. |
-| `prediction.py:221–268`, `_find_neighbor_and_lambda` | Query core rank, mutual-reachability minimum, first-minimum tie policy, finite maximum-double lambda for zero distance. |
-| `prediction.py:330–413`, `_find_cluster_and_probability` | Connect point to hierarchy, walk ancestors, map to a fitted label, and compute strength. |
-| `prediction.py:416–520`, `approximate_predict` | `2 * min_samples` query width, optional connectors, empty-cluster-tree noise shortcut. |
-| `plots.py:235–245`, `CondensedTree._select_clusters` | Reconstructs selected segments from actual fitted labels and point-parent rows; it does not simply rerun EOM selection. |
-| `hdbscan_.py:1303–1327`, `generate_prediction_data` | Resolves `min_samples or min_cluster_size` and creates `PredictionData`. |
+| Reference                                                | Relevant behavior                                                                                                                                                   |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prediction.py:166–218`, `PredictionData.__init__`       | Converts training coordinates to float64; builds a spatial tree; computes inclusive-self prediction core distances; builds selected-cluster maps and parent maxima. |
+| `prediction.py:221–268`, `_find_neighbor_and_lambda`     | Query core rank, mutual-reachability minimum, first-minimum tie policy, finite maximum-double lambda for zero distance.                                             |
+| `prediction.py:330–413`, `_find_cluster_and_probability` | Connect point to hierarchy, walk ancestors, map to a fitted label, and compute strength.                                                                            |
+| `prediction.py:416–520`, `approximate_predict`           | `2 * min_samples` query width, optional connectors, empty-cluster-tree noise shortcut.                                                                              |
+| `plots.py:235–245`, `CondensedTree._select_clusters`     | Reconstructs selected segments from actual fitted labels and point-parent rows; it does not simply rerun EOM selection.                                             |
+| `hdbscan_.py:1303–1327`, `generate_prediction_data`      | Resolves `min_samples or min_cluster_size` and creates `PredictionData`.                                                                                            |
 
 ### Read-only probes already executed
 
@@ -323,7 +323,7 @@ For training count `n`, query count `m`, dimensions `d`, width `s`, and batch ro
 
 - Retained geometry: `4*n*d` bytes, host KD permutation/ranges/flags/bounds, O(n + cluster_count) metadata, and eventual `8*n` cores. Count actual host tree allocations and canonical fitted outputs, not assumed packed struct sizes; fit-created trees are retained rather than rebuilt/copied needlessly.
 - Cold initialization: host tree construction only where absent, plus n exact KD queries for cores (unless `s=1` or not required). Tree build/packing and search are separate measured phases. Typical KD pruning reduces work; worst-case KD search remains quadratic for all-training queries, especially high dimensions/duplicates. No unconditional quadratic startup claim or universal subquadratic guarantee.
-- Warm search: m exact KD queries plus candidate selection and ancestry walks; worst case O(m*n*d). Candidate outputs are O(b*s), not a retained full pairwise matrix or n-by-s graph.
+- Warm search: m exact KD queries plus candidate selection and ancestry walks; worst case O(m*n*d). Candidate outputs are O(b\*s), not a retained full pairwise matrix or n-by-s graph.
 - Each call uploads coordinates and KD buffers once and constructs/reuses the route's call-local reference packs. Include query packs, padded/tile-rounded rows, stack/candidate scratch, readbacks, initialization overlap and error cleanup in checked peak accounting. No device cache is retained.
 
 Report cold and warm KD cost separately, including host build, uploads and packing. A 100k-row cold initialization may still be expensive; disclose it rather than hiding it in fit or substituting ANN fitting cores. Upstream KD speed parity is not promised.
@@ -594,8 +594,8 @@ Do not run independent racing formatters or project-wide gates in delegated subt
 Because shared KD fitting traversal, packing and fitted ownership/resource lifetimes change, run the native HDBSCAN stage analysis with real strict CPU/CUDA execution. Compare current baseline fitting IDs, distance bits, outputs/diagnostics and packing-inclusive timings; do not compare against an obsolete route or remove concurrent performance work:
 
 ```sh
-bash analyze_hdbscan_stages.sh --rows 20000
-bash analyze_hdbscan_stages.sh --rows 100000
+bash scripts/analyze_hdbscan_stages.sh --rows 20000
+bash scripts/analyze_hdbscan_stages.sh --rows 100000
 ```
 
 The final 100k run remains required. Compilation-only, skipped CUDA, or benchmark-only evidence does not replace correctness. Preserve unrelated performance work already in the tree.

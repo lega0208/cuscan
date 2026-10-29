@@ -28,15 +28,15 @@ Evidence root: [`artifacts/hdbscan_core_investigation/`](artifacts/hdbscan_core_
 
 Relevant implementation:
 
-| Source | Responsibility |
-| --- | --- |
-| `crates/fast-hdbscan/src/estimator.rs:124–133` | Resolve complete-graph neighbor search: KD for >=256 finite rows and <=30 features |
-| `estimator.rs:384–547` | Exact neighbor search, device core extraction, host neighbor/distance transfer and seed-core assembly |
-| `estimator.rs:549–572` | Consume compact neighbor IDs/distances for MST seeding |
-| `crates/fast-hdbscan/src/kernels/kdtree.rs:221–422` | Single-unit-per-query near-first traversal, output-backed max-heap and final heapsort |
-| `kdtree.rs:429–447,586–635` | CPU/CUDA launch geometry and allocations |
-| `crates/fast-hdbscan-core/src/kdtree.rs:52–125` | Balanced implicit tree, widest-axis partitions and deterministic original-ID tie keys |
-| `crates/fast-cubecl-common/src/kernels/neighbors.rs` | Exact brute-force CPU path and squared CUDA partial-list/merge path |
+| Source                                               | Responsibility                                                                                        |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `crates/fast-hdbscan/src/estimator.rs:124–133`       | Resolve complete-graph neighbor search: KD for >=256 finite rows and <=30 features                    |
+| `estimator.rs:384–547`                               | Exact neighbor search, device core extraction, host neighbor/distance transfer and seed-core assembly |
+| `estimator.rs:549–572`                               | Consume compact neighbor IDs/distances for MST seeding                                                |
+| `crates/fast-hdbscan/src/kernels/kdtree.rs:221–422`  | Single-unit-per-query near-first traversal, output-backed max-heap and final heapsort                 |
+| `kdtree.rs:429–447,586–635`                          | CPU/CUDA launch geometry and allocations                                                              |
+| `crates/fast-hdbscan-core/src/kdtree.rs:52–125`      | Balanced implicit tree, widest-axis partitions and deterministic original-ID tie keys                 |
+| `crates/fast-cubecl-common/src/kernels/neighbors.rs` | Exact brute-force CPU path and squared CUDA partial-list/merge path                                   |
 
 The KD kernel reads contiguous row-major feature vectors through `tree.indices`; points belonging to a leaf are not packed into a contiguous data region. Query threads follow input order. Every thread maintains private 33-entry node/bound stacks, computes scalar feature distances and child-box bounds, and updates a heap in its global output row. CPU uses one cube with reported CPU-core-count units and cyclic query assignment. CUDA uses 32-thread blocks, one query per thread.
 
@@ -50,22 +50,22 @@ Tree construction and upload are outside `core_distances`. Extraction is an asyn
 
 Median seconds, three measured fits after warmup:
 
-| Rows | CPU fit | CPU core [min–max] | CUDA fit | CUDA core [min–max] |
-| ---: | ---: | ---: | ---: | ---: |
-| 20,000 | 0.3430 | 0.2724 [0.2624–0.2943] | 0.1625 | 0.07421 [0.07402–0.07521] |
-| 50,000 | 1.5949 | 1.3936 [1.2900–1.3983] | 0.6626 | 0.38625 [0.38427–0.38705] |
-| 100,000 | 5.2866 | 4.6565 [4.3844–4.7280] | 1.8090 | 1.17654 [1.17548–1.19866] |
+|    Rows | CPU fit |     CPU core [min–max] | CUDA fit |       CUDA core [min–max] |
+| ------: | ------: | ---------------------: | -------: | ------------------------: |
+|  20,000 |  0.3430 | 0.2724 [0.2624–0.2943] |   0.1625 | 0.07421 [0.07402–0.07521] |
+|  50,000 |  1.5949 | 1.3936 [1.2900–1.3983] |   0.6626 | 0.38625 [0.38427–0.38705] |
+| 100,000 |  5.2866 | 4.6565 [4.3844–4.7280] |   1.8090 | 1.17654 [1.17548–1.19866] |
 
 Increasing rows fivefold increases core time approximately 17.1x CPU / 15.9x CUDA. This is poor scaling consistent with substantial scan work; three sizes on one distribution do not establish an asymptotic complexity law.
 
 Fine-stage medians in milliseconds:
 
 | Rows/backend | Neighbor operation + sync | Extraction enqueue | Neighbor readback/conversion | Final host assembly |
-| --- | ---: | ---: | ---: | ---: |
-| 20k CPU | 271.344 | 0.024 | 0.556 | 0.020 |
-| 20k CUDA | 73.318 | 0.012 | 0.477 | 0.018 |
-| 100k CPU | 4654.905 | 0.026 | 0.878 | 0.082 |
-| 100k CUDA | 1169.090 | 0.026 | 6.653 | 0.082 |
+| ------------ | ------------------------: | -----------------: | ---------------------------: | ------------------: |
+| 20k CPU      |                   271.344 |              0.024 |                        0.556 |               0.020 |
+| 20k CUDA     |                    73.318 |              0.012 |                        0.477 |               0.018 |
+| 100k CPU     |                  4654.905 |              0.026 |                        0.878 |               0.082 |
+| 100k CUDA    |                  1169.090 |              0.026 |                        6.653 |               0.082 |
 
 Independent medians need not sum exactly to the inclusive median; span-boundary overhead also remains. At 100k/k5, compact readback is only 4 MB of IDs plus distances. Transfer/extraction optimization cannot materially address multi-second traversal time on this workload.
 
@@ -78,11 +78,11 @@ The benchmark runner verified **exact CPU/CUDA final-label equality at all three
 20k, same generator/configuration, median core and full-fit seconds:
 
 | Features/backend | KD core | Brute core | KD fit | Brute fit |
-| --- | ---: | ---: | ---: | ---: |
-| 16 CPU | 0.2724 | 0.3140 | 0.3430 | 1.3818 |
-| 16 CUDA | 0.07421 | 0.54023 | 0.1625 | 0.7557 |
-| 30 CPU | 0.6425 | 0.6112 | — | 2.9368 |
-| 30 CUDA | 0.10605 | 0.76074 | — | 1.2456 |
+| ---------------- | ------: | ---------: | -----: | --------: |
+| 16 CPU           |  0.2724 |     0.3140 | 0.3430 |    1.3818 |
+| 16 CUDA          | 0.07421 |    0.54023 | 0.1625 |    0.7557 |
+| 30 CPU           |  0.6425 |     0.6112 |      — |    2.9368 |
+| 30 CUDA          | 0.10605 |    0.76074 |      — |    1.2456 |
 
 CPU repeat baseline at 16D was 0.2898 s core; its advantage over brute force is modest and variable. At 30D the brute-force core is only about 5% faster in this single comparison, not sufficient evidence to change routing. Forced search also changes **MST search**, making full-fit ratios unsuitable as isolated core-distance speedups. KD/brute final labels agree for both feature counts and both backends.
 
@@ -93,11 +93,11 @@ CUDA's approximately 7x KD advantage over the current brute comparator does **no
 20k, Auto/KD, k5; diagnostic work counts collected separately from timing:
 
 | Features | CPU core (s) | CUDA core (s) | Mean nodes popped / 511 | Mean leaf positions | Leaf positions / n² |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 0.00239 | 0.00182 | 18.3 | 126 | 0.63% |
-| 8 | 0.03710 | 0.01746 | 124.6 | 3,490 | 17.45% |
-| 16 | 0.27241 | 0.07421 | 404.5 | 14,821 | 74.10% |
-| 30 | 0.64249 | 0.10605 | 498.5 | 19,301 | 96.50% |
+| -------: | -----------: | ------------: | ----------------------: | ------------------: | ------------------: |
+|        2 |      0.00239 |       0.00182 |                    18.3 |                 126 |               0.63% |
+|        8 |      0.03710 |       0.01746 |                   124.6 |               3,490 |              17.45% |
+|       16 |      0.27241 |       0.07421 |                   404.5 |              14,821 |              74.10% |
+|       30 |      0.64249 |       0.10605 |                   498.5 |              19,301 |              96.50% |
 
 These use the same generator parameters/seed at different feature counts, not nested feature subsets. Low-dimensional pruning works extremely well; the 16D result is not universal. CPU/CUDA labels match exactly for each dimensional workload.
 
@@ -115,12 +115,12 @@ A follow-up alternated original/spatial processes in `O,S,S,O,O,S` order. Each p
 
 Core-stage medians and ranges in milliseconds:
 
-| Rows/backend | Original | Spatial | Median reduction |
-| --- | ---: | ---: | ---: |
-| 20k CPU | 266.47 [256.50–285.61] | 221.53 [216.70–228.83] | 16.9% |
-| 50k CPU | 1356.07 [1244.84–1444.37] | 1054.72 [1031.02–1169.99] | 22.2% |
-| 20k CUDA | 61.72 [61.06–63.56] | 56.22 [55.65–57.47] | 8.9% |
-| 50k CUDA | 319.73 [313.65–331.33] | 312.24 [297.59–329.89] | 2.3%, overlapping ranges |
+| Rows/backend |                  Original |                   Spatial |         Median reduction |
+| ------------ | ------------------------: | ------------------------: | -----------------------: |
+| 20k CPU      |    266.47 [256.50–285.61] |    221.53 [216.70–228.83] |                    16.9% |
+| 50k CPU      | 1356.07 [1244.84–1444.37] | 1054.72 [1031.02–1169.99] |                    22.2% |
+| 20k CUDA     |       61.72 [61.06–63.56] |       56.22 [55.65–57.47] |                     8.9% |
+| 50k CUDA     |    319.73 [313.65–331.33] |    312.24 [297.59–329.89] | 2.3%, overlapping ranges |
 
 The initial unpaired 50k CUDA ordering comparison was actually slower (0.3999 vs 0.3862 s). The paired confirmation shows only a small, noisy difference. **A robust CUDA ordering win at 50k is not established.** Later baseline timings also differ from the initial scaling campaign; compare candidates within their interleaved batch, not against whichever historical baseline gives the largest ratio.
 
@@ -137,18 +137,18 @@ Nevertheless final partitions have ARI **0.99997165 at 20k** and **0.75024177 at
 Nsight Systems sees **one** KD-neighbor launch per measured fit:
 
 | Rows | Grid x block | Neighbor device time |
-| ---: | --- | ---: |
-| 20k | 625 x 32 | 74.07 ms |
-| 50k | 1563 x 32 | 387.57 ms |
-| 100k | 3125 x 32 | 1184.95 ms |
+| ---: | ------------ | -------------------: |
+|  20k | 625 x 32     |             74.07 ms |
+|  50k | 1563 x 32    |            387.57 ms |
+| 100k | 3125 x 32    |           1184.95 ms |
 
 Representative Nsight Compute percentages:
 
 | Rows | Active warps | SM throughput | DRAM throughput | L1/TEX throughput | Long-scoreboard stalls |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 20k | 18.53 | 22.30 | 1.36 | 83.68 | 69.77 |
-| 50k | 27.89 | 24.37 | 4.84 | 80.82 | 74.27 |
-| 100k | 31.68 | 27.22 | 32.73 | 86.52 | 79.07 |
+| ---: | -----------: | ------------: | --------------: | ----------------: | ---------------------: |
+|  20k |        18.53 |         22.30 |            1.36 |             83.68 |                  69.77 |
+|  50k |        27.89 |         24.37 |            4.84 |             80.82 |                  74.27 |
+| 100k |        31.68 |         27.22 |           32.73 |             86.52 |                  79.07 |
 
 At 20k, additional LaunchStats/Occupancy capture reports **71 registers/thread**, a **16-block/SM limit**, **33.33% theoretical occupancy**, **18.53% achieved occupancy**, and **0.57 waves/SM**. One-warp blocks encounter the block residency limit well before the warp limit. At 20k, the total of only 625 warps also limits device-wide parallelism; increasing block size alone does not create more query work or warps. At larger sizes, grouping multiple planes per block could raise the block-limit occupancy ceiling, subject to register allocation and scheduling.
 
@@ -223,12 +223,12 @@ Prototype comptime small-k local arrays and a cached heap root, writing sorted I
 
 The counts below are global/L1 loads per scanned leaf position at 16D, read from the source. They are not measured:
 
-| Load | Count | Needed? |
-| --- | ---: | --- |
-| `indices[position]` | 1 | yes; it is the gather that the packed layout removes |
-| query features `data[row*d + f]` | 16 | **no**: the values are the same for the whole query |
-| candidate features | 16 | yes |
-| heap root `out_distances[root]`, `out_indices[root]` | 2 (+1 on equality) | **no**: the value changes only on admission |
+| Load                                                 |              Count | Needed?                                              |
+| ---------------------------------------------------- | -----------------: | ---------------------------------------------------- |
+| `indices[position]`                                  |                  1 | yes; it is the gather that the packed layout removes |
+| query features `data[row*d + f]`                     |                 16 | **no**: the values are the same for the whole query  |
+| candidate features                                   |                 16 | yes                                                  |
+| heap root `out_distances[root]`, `out_indices[root]` | 2 (+1 on equality) | **no**: the value changes only on admission          |
 
 About half of the loads in the leaf loop are therefore redundant. Each internal-node pop adds `is_leaf[node]`, two child lower bounds of `16 query + 32 bound` loads each, and up to three more reads of the global heap root (`kdtree.rs:339–359`). The feature loop bound is the runtime `data.shape(1)`, so the loop cannot be unrolled or kept in registers. The generated code was not inspected. Unless it marks the buffers no-alias, stores into `out_distances`/`out_indices` can prevent the compiler from hoisting `data` reads across heap updates. On CUDA, all of these loads are L1TEX dependencies, and that is consistent with the measured 70–79% long-scoreboard stalls. Dynamically indexed `stack`/`bound_stack` arrays normally live in local memory, which is also L1TEX. Treat this as a hypothesis until `local_load`/spill and sectors-per-request counters are collected.
 
@@ -323,16 +323,16 @@ Register-cached KD heap root implemented against `2c3fc35fa2b2492f519c0adcb54477
 
 Each cell ran serial B,V,V,B,B,V processes, three measured fits after warmup per process. Values below are **core-stage seconds**, median [min–max] of three process medians per binary, not nine independent fits. `summary.json` retains all fit samples, process grouping, neighbor-operation-plus-sync and full-fit distributions. Every one of the 48 processes' final-fit label vectors matches its cell's baseline exactly.
 
-| Rows / dimensions / backend | Baseline | Variant |
-| --- | --- | --- |
-| 20k / 16 / CPU | 0.274719 [0.273299–0.283516] | 0.276343 [0.274420–0.278630] |
-| 20k / 16 / CUDA | 0.062015 [0.061393–0.063803] | 0.060967 [0.059383–0.062536] |
-| 20k / 30 / CPU | 0.642068 [0.613602–0.669521] | 0.641285 [0.638788–0.674744] |
-| 20k / 30 / CUDA | 0.086227 [0.085676–0.086515] | 0.082826 [0.082734–0.083026] |
-| 50k / 16 / CPU | 1.302675 [1.270986–1.318149] | 1.336367 [1.325411–1.339078] |
-| 50k / 16 / CUDA | 0.317111 [0.314820–0.317113] | 0.267245 [0.267160–0.270133] |
-| 50k / 30 / CPU | 3.641410 [3.586260–3.656764] | 3.618289 [3.597900–3.664402] |
-| 50k / 30 / CUDA | 0.803226 [0.784221–0.807848] | 0.592493 [0.590486–0.594431] |
+| Rows / dimensions / backend | Baseline                     | Variant                      |
+| --------------------------- | ---------------------------- | ---------------------------- |
+| 20k / 16 / CPU              | 0.274719 [0.273299–0.283516] | 0.276343 [0.274420–0.278630] |
+| 20k / 16 / CUDA             | 0.062015 [0.061393–0.063803] | 0.060967 [0.059383–0.062536] |
+| 20k / 30 / CPU              | 0.642068 [0.613602–0.669521] | 0.641285 [0.638788–0.674744] |
+| 20k / 30 / CUDA             | 0.086227 [0.085676–0.086515] | 0.082826 [0.082734–0.083026] |
+| 50k / 16 / CPU              | 1.302675 [1.270986–1.318149] | 1.336367 [1.325411–1.339078] |
+| 50k / 16 / CUDA             | 0.317111 [0.314820–0.317113] | 0.267245 [0.267160–0.270133] |
+| 50k / 30 / CPU              | 3.641410 [3.586260–3.656764] | 3.618289 [3.597900–3.664402] |
+| 50k / 30 / CUDA             | 0.803226 [0.784221–0.807848] | 0.592493 [0.590486–0.594431] |
 
 **Decision:** retain the root cache. CUDA core medians improve at both required 16D scales, with the 50k variant maximum below the baseline median. All eight median regressions are bounded by their baseline process-median range. CPU is not a demonstrated speedup; its 50k×16 median increases about 2.6%, within the plan's noise bound. No generalization beyond these cells is warranted.
 
@@ -352,24 +352,24 @@ The Phase 2 exact-comptime-`k` register-list implementation was measured against
 
 For each cell the runner alternated baseline and variant processes (B,V,V,B,B,V); each process supplied three fits, and the table reports the median and range of **the three process medians**, not nine independent fits. Core values are milliseconds; full-fit column gives baseline/variant process medians (ms). All 16 cells had exact final-label equality.
 
-| Rows × dimensions | k | Backend | Core baseline median [min–max] | Core variant median [min–max] | Full-fit medians B/V |
-| --- | ---: | --- | ---: | ---: | ---: |
-| 20k × 16 | 5 | CPU | 270.705 [267.604–271.666] | 268.543 [268.180–274.717] | 325.331 / 324.036 |
-| 20k × 16 | 5 | CUDA | 58.789 [58.515–59.043] | 58.650 [58.355–58.660] | 127.110 / 126.770 |
-| 20k × 16 | 16 | CPU | 306.414 [296.754–311.963] | 299.044 [280.161–303.360] | 334.985 / 327.136 |
-| 20k × 16 | 16 | CUDA | 64.646 [64.492–64.772] | 64.390 [63.753–68.834] | 112.466 / 111.557 |
-| 20k × 16 | 17 | CPU | 311.776 [307.957–312.357] | 298.248 [297.433–334.982] | 339.594 / 325.678 |
-| 20k × 16 | 17 | CUDA | 70.907 [70.840–70.974] | 71.144 [70.843–71.196] | 121.175 / 121.095 |
-| 20k × 30 | 5 | CPU | 610.241 [602.808–626.535] | 625.997 [612.916–638.545] | 798.420 / 812.246 |
-| 20k × 30 | 5 | CUDA | 82.653 [82.345–82.679] | 82.619 [82.046–83.069] | 230.645 / 231.120 |
-| 50k × 16 | 5 | CPU | 1,346.111 [1,335.766–1,354.702] | 1,366.055 [1,317.155–1,366.723] | 1,546.423 / 1,550.468 |
-| 50k × 16 | 5 | CUDA | 267.796 [265.624–269.913] | 266.673 [265.045–269.068] | 497.184 / 492.086 |
-| 50k × 16 | 16 | CPU | 1,563.672 [1,534.052–1,588.237] | 1,629.554 [1,540.535–1,766.095] | 1,641.018 / 1,706.054 |
-| 50k × 16 | 16 | CUDA | 332.303 [330.151–333.515] | 330.854 [328.737–333.103] | 464.235 / 459.508 |
-| 50k × 16 | 17 | CPU | 1,560.856 [1,536.756–1,575.685] | 1,569.391 [1,555.950–1,600.088] | 1,635.497 / 1,641.426 |
-| 50k × 16 | 17 | CUDA | 313.971 [312.612–314.763] | 312.544 [311.042–313.776] | 440.588 / 438.318 |
-| 50k × 30 | 5 | CPU | 3,565.519 [3,505.034–3,712.549] | 3,621.818 [3,616.564–3,624.905] | 4,363.573 / 4,427.335 |
-| 50k × 30 | 5 | CUDA | 565.500 [564.302–566.026] | 566.232 [563.122–567.094] | 1,157.294 / 1,172.186 |
+| Rows × dimensions |   k | Backend |  Core baseline median [min–max] |   Core variant median [min–max] |  Full-fit medians B/V |
+| ----------------- | --: | ------- | ------------------------------: | ------------------------------: | --------------------: |
+| 20k × 16          |   5 | CPU     |       270.705 [267.604–271.666] |       268.543 [268.180–274.717] |     325.331 / 324.036 |
+| 20k × 16          |   5 | CUDA    |          58.789 [58.515–59.043] |          58.650 [58.355–58.660] |     127.110 / 126.770 |
+| 20k × 16          |  16 | CPU     |       306.414 [296.754–311.963] |       299.044 [280.161–303.360] |     334.985 / 327.136 |
+| 20k × 16          |  16 | CUDA    |          64.646 [64.492–64.772] |          64.390 [63.753–68.834] |     112.466 / 111.557 |
+| 20k × 16          |  17 | CPU     |       311.776 [307.957–312.357] |       298.248 [297.433–334.982] |     339.594 / 325.678 |
+| 20k × 16          |  17 | CUDA    |          70.907 [70.840–70.974] |          71.144 [70.843–71.196] |     121.175 / 121.095 |
+| 20k × 30          |   5 | CPU     |       610.241 [602.808–626.535] |       625.997 [612.916–638.545] |     798.420 / 812.246 |
+| 20k × 30          |   5 | CUDA    |          82.653 [82.345–82.679] |          82.619 [82.046–83.069] |     230.645 / 231.120 |
+| 50k × 16          |   5 | CPU     | 1,346.111 [1,335.766–1,354.702] | 1,366.055 [1,317.155–1,366.723] | 1,546.423 / 1,550.468 |
+| 50k × 16          |   5 | CUDA    |       267.796 [265.624–269.913] |       266.673 [265.045–269.068] |     497.184 / 492.086 |
+| 50k × 16          |  16 | CPU     | 1,563.672 [1,534.052–1,588.237] | 1,629.554 [1,540.535–1,766.095] | 1,641.018 / 1,706.054 |
+| 50k × 16          |  16 | CUDA    |       332.303 [330.151–333.515] |       330.854 [328.737–333.103] |     464.235 / 459.508 |
+| 50k × 16          |  17 | CPU     | 1,560.856 [1,536.756–1,575.685] | 1,569.391 [1,555.950–1,600.088] | 1,635.497 / 1,641.426 |
+| 50k × 16          |  17 | CUDA    |       313.971 [312.612–314.763] |       312.544 [311.042–313.776] |     440.588 / 438.318 |
+| 50k × 30          |   5 | CPU     | 3,565.519 [3,505.034–3,712.549] | 3,621.818 [3,616.564–3,624.905] | 4,363.573 / 4,427.335 |
+| 50k × 30          |   5 | CUDA    |       565.500 [564.302–566.026] |       566.232 [563.122–567.094] | 1,157.294 / 1,172.186 |
 
 **Decision: reject the register-top-k kernel; retain no threshold.** Rule 2's winning-backend test passed on CUDA for k5, but the mandatory gates still failed: rule 3 (k16 non-regression/local memory), rule 4 (k17 heap-path non-regression), and rule 6 (every-cell non-regression). In particular, k5 CPU 50k×16 increased **19.944 ms**, exceeding the baseline process-median spread of **18.936 ms**; k16 CPU 50k×16 increased **65.882 ms**, exceeding its **54.185 ms** spread; and unchanged-heap k17 CUDA 20k×16 increased **0.237 ms**, beyond its **0.134 ms** spread. The candidate also had slightly more local-load sectors in every captured CUDA counter pair, although local stores were unchanged. Thus the counter non-increase requirement failed; “no ptxas spills” does not waive it. CUDA k5 gains do not compensate for independent mandatory failures.
 
@@ -381,7 +381,6 @@ Fresh-process first-fit evidence, in seconds, includes JIT and is reported as `w
 
 Boundary review also closed a configuration-identity gap: the fixed-k5 Nsight Systems consumer now rejects non-k5 provisioned manifests before profiler execution instead of recording a k5 capture under a k16 identity. Counter provisioning remains parameterized for k16. A regression test covers rejection before launch/report creation; inherited ordinary KD feature dimensions 1, 3, 4, 5 and 29 remain covered alongside the new exhaustive width sweep.
 
-
 ## Phase 3 results: padded vector data and register-resident query
 
 **Decision: accepted**, with two recorded deviations from the literal Step 5 rule (below). Plan: [cubecl_kernels_perf_plan_phase3.md](cubecl_kernels_perf_plan_phase3.md). Evidence: [`artifacts/cubecl_kernels_perf/phase3/`](artifacts/cubecl_kernels_perf/phase3/) (`summary.json`, `provenance.json`, `alternation_records.json`, `cuda_counters.json`, `cold_start.json`, `logs/`, `generated/`). Scope: the measured cells and backends below on this host (RTX 3080, Ryzen 7 9800X3D), k = 5.
@@ -392,20 +391,20 @@ Boundary review also closed a configuration-identity gap: the fixed-k5 Nsight Sy
 
 **Timing** (process medians of 3 measured fits; order B,V,V,B,B,V; `alternation_records.json`):
 
-| Cell | Backend | Core baseline, ms [min–max] | Core variant, ms [min–max] | Change | Full fit B → V, ms | Labels equal |
-| --- | --- | --- | --- | --- | --- | --- |
-| 20k×16 | CPU | 292.5 [290.7–295.2] | 206.7 [203.1–211.5] | -29.3% | 351.6 → 264.7 | yes |
-| 20k×16 | CUDA | 66.2 [65.8–66.4] | 19.7 [19.5–20.0] | -70.3% | 142.3 → 95.9 | yes |
-| 50k×16 | CPU | 1431.9 [1420.5–1443.7] | 1048.3 [1045.3–1083.6] | -26.8% | 1634.5 → 1260.1 | yes |
-| 50k×16 | CUDA | 304.7 [300.6–306.7] | 99.5 [97.2–100.2] | -67.3% | 564.4 → 356.1 | yes |
-| 50k×30 | CPU | 3964.0 [3911.3–4019.8] | 2999.7 [2990.5–3000.1] | -24.3% | 4889.2 → 3854.7 | yes |
-| 50k×30 | CUDA | 639.9 [634.5–640.1] | 241.3 [240.3–242.1] | -62.3% | 1312.7 → 900.2 | yes |
-| 20k×30 | CPU | 652.6 [646.3–681.4] | 489.8 [488.3–516.7] | -25.0% | 847.6 → 682.6 | yes |
-| 20k×30 | CUDA | 93.2 [91.5–94.0] | 34.3 [34.3–35.6] | -63.2% | 259.2 → 199.2 | yes |
-| 20k×8 | CPU | 38.7 [35.1–39.9] | 29.5 [27.2–35.1] | -23.8% | 64.7 → 55.0 | yes |
-| 20k×8 | CUDA | 13.3 [11.7–14.6] | 10.3 [8.8–10.7] | -22.3% | 57.1 → 54.0 | yes |
-| 20k×2 | CPU | 3.9 [3.2–4.0] | 3.4 [3.3–3.8] | -10.7% | 21.7 → 21.5 | yes |
-| 20k×2 | CUDA | 1.6 [1.4–1.8] | 1.9 [1.7–1.9] | +17.0% | 17.1 → 16.8 | yes |
+| Cell   | Backend | Core baseline, ms [min–max] | Core variant, ms [min–max] | Change | Full fit B → V, ms | Labels equal |
+| ------ | ------- | --------------------------- | -------------------------- | ------ | ------------------ | ------------ |
+| 20k×16 | CPU     | 292.5 [290.7–295.2]         | 206.7 [203.1–211.5]        | -29.3% | 351.6 → 264.7      | yes          |
+| 20k×16 | CUDA    | 66.2 [65.8–66.4]            | 19.7 [19.5–20.0]           | -70.3% | 142.3 → 95.9       | yes          |
+| 50k×16 | CPU     | 1431.9 [1420.5–1443.7]      | 1048.3 [1045.3–1083.6]     | -26.8% | 1634.5 → 1260.1    | yes          |
+| 50k×16 | CUDA    | 304.7 [300.6–306.7]         | 99.5 [97.2–100.2]          | -67.3% | 564.4 → 356.1      | yes          |
+| 50k×30 | CPU     | 3964.0 [3911.3–4019.8]      | 2999.7 [2990.5–3000.1]     | -24.3% | 4889.2 → 3854.7    | yes          |
+| 50k×30 | CUDA    | 639.9 [634.5–640.1]         | 241.3 [240.3–242.1]        | -62.3% | 1312.7 → 900.2     | yes          |
+| 20k×30 | CPU     | 652.6 [646.3–681.4]         | 489.8 [488.3–516.7]        | -25.0% | 847.6 → 682.6      | yes          |
+| 20k×30 | CUDA    | 93.2 [91.5–94.0]            | 34.3 [34.3–35.6]           | -63.2% | 259.2 → 199.2      | yes          |
+| 20k×8  | CPU     | 38.7 [35.1–39.9]            | 29.5 [27.2–35.1]           | -23.8% | 64.7 → 55.0        | yes          |
+| 20k×8  | CUDA    | 13.3 [11.7–14.6]            | 10.3 [8.8–10.7]            | -22.3% | 57.1 → 54.0        | yes          |
+| 20k×2  | CPU     | 3.9 [3.2–4.0]               | 3.4 [3.3–3.8]              | -10.7% | 21.7 → 21.5        | yes          |
+| 20k×2  | CUDA    | 1.6 [1.4–1.8]               | 1.9 [1.7–1.9]              | +17.0% | 17.1 → 16.8        | yes          |
 
 All four primary cells improve on both backends, and the variant maximum is below the baseline median in 4/4 cells on each backend. 50k×30 does not regress.
 
@@ -413,17 +412,17 @@ All four primary cells improve on both backends, and the variant maximum is belo
 
 **CUDA counters** (ncu, first `kd_neighbors_kernel` launch = warmup fit, 20k rows):
 
-| d | Registers B → V | Global load requests B → V | Local load sectors B → V | Local store sectors B → V | Kernel time B → V |
-| --- | --- | --- | --- | --- | --- |
-| 16 | 75 → 106 | 8.20e8 → 1.28e8 | 7,798,943 → 7,785,545 | 11,047,614 → 11,045,114 | 82.0 → 24.0 ms |
-| 30 | 75 → 128 | 1.48e9 → 2.24e8 | 6,307,809 → 6,302,296 | 9,255,624 → 9,253,124 | 113.8 → 36.1 ms |
-| 2 | 75 → 34 | 3.49e6 → 2.04e6 | 136,300 → 136,520 | 332,412 → 329,912 | 0.455 → 0.400 ms |
+| d   | Registers B → V | Global load requests B → V | Local load sectors B → V | Local store sectors B → V | Kernel time B → V |
+| --- | --------------- | -------------------------- | ------------------------ | ------------------------- | ----------------- |
+| 16  | 75 → 106        | 8.20e8 → 1.28e8            | 7,798,943 → 7,785,545    | 11,047,614 → 11,045,114   | 82.0 → 24.0 ms    |
+| 30  | 75 → 128        | 1.48e9 → 2.24e8            | 6,307,809 → 6,302,296    | 9,255,624 → 9,253,124     | 113.8 → 36.1 ms   |
+| 2   | 75 → 34         | 3.49e6 → 2.04e6            | 136,300 → 136,520        | 332,412 → 329,912         | 0.455 → 0.400 ms  |
 
 Global load requests fall about 6.4× (16D) and 6.6× (30D), in line with the source-level count. Deviation 2: 2D local-load sectors rise by 220 (+0.16%), while local stores fall in every cell. The generated kernel (`generated/kd_neighbors_kernel_cuda_d2.ll`) has only the two 33-entry traversal-stack allocas. Query and candidate arrays are scalarized into `align 16` `<4 x float>` global loads, so the rise is stack traffic, not a scalarization failure. Long-scoreboard stall share rises (61 → 67% at 16D, 61 → 74% at 30D) because fewer, wider loads remain on the critical path. Achieved occupancy is unchanged (about 18–19%). The data `pad_rows_kernel` launch takes 9 µs (16D) and 16 µs (30D), under 0.1% of the CUDA core stage. On CPU, packing is inside the measured neighbor scope, so the gains above are net of it.
 
 **Cold start** (`cold_start.json`, first fit including runtime JIT, median of 3 fresh processes): the variant is not slower in any of d ∈ 2, 16, 30 on CPU or CUDA (−0.001 to −0.075 s). The extra JIT for the pack kernel and the specialization is smaller than the faster first fit.
 
-**Final pipeline validation.** `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000` both passed with the variant (logs in `artifacts/cubecl_kernels_perf/phase3/logs/analyze_*.log`). At 100k×16 the CUDA `core_neighbor_kernel` median is 381.7 ms (1.18 s in the baseline facts), and the CPU median is 3.34 s (4.66 s). The three `pad_rows_kernel` launches total 43.8 µs. CPU/CUDA labels agree exactly. These are single runs, not interleaved comparisons.
+**Final pipeline validation.** `bash scripts/analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000` both passed with the variant (logs in `artifacts/cubecl_kernels_perf/phase3/logs/analyze_*.log`). At 100k×16 the CUDA `core_neighbor_kernel` median is 381.7 ms (1.18 s in the baseline facts), and the CPU median is 3.34 s (4.66 s). The three `pad_rows_kernel` launches total 43.8 µs. CPU/CUDA labels agree exactly. These are single runs, not interleaved comparisons.
 
 ## Phase 4 results: compact node layout rejected
 
@@ -431,20 +430,20 @@ Global load requests fall about 6.4× (16D) and 6.6× (30D), in line with the so
 
 **Provenance/method.** Clean HEAD `f407b4b` differs from `3e885a7` only in planning documents. Fresh baseline SHA-256 `14ca624faa0fb72074d582c5cf16bdeeb2ea4ee61a9b8e51f1f2d47608906c62` matches the Phase 3 variant. Inputs retain Phase 3 hashes. Two predeclared serial matrices (A then B), each B,V,V,B,B,V per cell, give six process medians per arm; each process measures three fits. No further timing batches were run. All 144 process labels agree within their benchmark cells. Full per-arm ranges, both batches, six adjacent-pair ratios, core/neighbor/full-fit samples and medians are retained in `summary.json` and `batch_{A,B}/`. The following core-stage timings include packing, not isolated kernel speedups.
 
-| Cell | Backend | Pooled core B → V ms | Pooled Δ | Six paired V/B range | Screen |
-| --- | --- | --- | --- | --- | --- |
-| 20k×16 | CPU | 212.374 → 219.583 | +3.40% | 1.0175–1.0403 | regression |
-| 20k×16 | CUDA | 20.854 → 20.140 | −3.42% | 0.9567–1.1322 | no effect |
-| 50k×16 | CPU | 1095.460 → 1126.597 | +2.84% | 0.9872–1.0497 | no effect |
-| 50k×16 | CUDA | 101.519 → 99.902 | −1.59% | 0.9757–0.9991 | no effect |
-| 20k×30 | CPU | 517.719 → 522.466 | +0.92% | 0.9953–1.0545 | no effect |
-| 20k×30 | CUDA | 36.551 → 36.127 | −1.16% | 0.9434–1.0367 | no effect |
-| 50k×30 | CPU | 3103.270 → 3095.563 | −0.25% | 0.9774–1.0233 | no effect |
-| 50k×30 | CUDA | 247.964 → 246.917 | −0.42% | 0.9907–1.0541 | no effect |
-| 20k×8 | CPU | 29.544 → 28.834 | −2.41% | 0.8247–1.2323 | no effect |
-| 20k×8 | CUDA | 9.134 → 9.155 | +0.23% | 0.9665–1.0399 | no effect |
-| 20k×2 | CPU | 3.261 → 3.402 | +4.31% | 0.8499–1.7660 | no effect |
-| 20k×2 | CUDA | 2.064 → 2.036 | −1.36% | 0.6833–1.2596 | no effect |
+| Cell   | Backend | Pooled core B → V ms | Pooled Δ | Six paired V/B range | Screen     |
+| ------ | ------- | -------------------- | -------- | -------------------- | ---------- |
+| 20k×16 | CPU     | 212.374 → 219.583    | +3.40%   | 1.0175–1.0403        | regression |
+| 20k×16 | CUDA    | 20.854 → 20.140      | −3.42%   | 0.9567–1.1322        | no effect  |
+| 50k×16 | CPU     | 1095.460 → 1126.597  | +2.84%   | 0.9872–1.0497        | no effect  |
+| 50k×16 | CUDA    | 101.519 → 99.902     | −1.59%   | 0.9757–0.9991        | no effect  |
+| 20k×30 | CPU     | 517.719 → 522.466    | +0.92%   | 0.9953–1.0545        | no effect  |
+| 20k×30 | CUDA    | 36.551 → 36.127      | −1.16%   | 0.9434–1.0367        | no effect  |
+| 50k×30 | CPU     | 3103.270 → 3095.563  | −0.25%   | 0.9774–1.0233        | no effect  |
+| 50k×30 | CUDA    | 247.964 → 246.917    | −0.42%   | 0.9907–1.0541        | no effect  |
+| 20k×8  | CPU     | 29.544 → 28.834      | −2.41%   | 0.8247–1.2323        | no effect  |
+| 20k×8  | CUDA    | 9.134 → 9.155        | +0.23%   | 0.9665–1.0399        | no effect  |
+| 20k×2  | CPU     | 3.261 → 3.402        | +4.31%   | 0.8499–1.7660        | no effect  |
+| 20k×2  | CUDA    | 2.064 → 2.036        | −1.36%   | 0.6833–1.2596        | no effect  |
 
 **Acceptance criteria and judgement.** (1) Correctness passed on CPU and required CUDA, including exact-bit pack tests, early-leaf traversal and diagnostics; benchmark labels agree. (2) Failed: zero primary cells on either backend meet the −2% plus 5-of-6 gain screen. (3) Failed: 20k×16 CPU regresses +3.395% (+7.209 ms), with all six pairs above 1; neighbor scope also regresses +3.371%. (4) Global requests decrease in all profiled cells and registers remain within 128, but 16D local-load sectors increase by 279 (+0.00358%). No exception is taken.
 
@@ -452,11 +451,11 @@ CUDA point estimates favor the variant, but 20k×16 has only four favorable pair
 
 **Conditional CUDA counters.** NCU first matching warmup launches, not whole-fit averages; raw CSVs and all metrics, including sectors/request, long-scoreboard stall share and achieved/theoretical occupancy, are in `cuda_counters.json` and `counters/`.
 
-| d | Registers B → V | Global requests B → V | Local load sectors B → V | Local store sectors B → V |
-| --- | --- | --- | --- | --- |
-| 16 | 106 → 114 | 128,376,127 → 127,771,285 | 7,785,712 → 7,785,991 | 11,045,114 → 11,045,114 |
-| 30 | 128 → 128 | 223,896,822 → 223,305,948 | 6,302,618 → 6,302,366 | 9,253,124 → 9,253,124 |
-| 2 | 34 → 42 | 2,042,570 → 2,031,136 | 136,560 → 136,558 | 329,912 → 329,912 |
+| d   | Registers B → V | Global requests B → V     | Local load sectors B → V | Local store sectors B → V |
+| --- | --------------- | ------------------------- | ------------------------ | ------------------------- |
+| 16  | 106 → 114       | 128,376,127 → 127,771,285 | 7,785,712 → 7,785,991    | 11,045,114 → 11,045,114   |
+| 30  | 128 → 128       | 223,896,822 → 223,305,948 | 6,302,618 → 6,302,366    | 9,253,124 → 9,253,124     |
+| 2   | 34 → 42         | 2,042,570 → 2,031,136     | 136,560 → 136,558        | 329,912 → 329,912         |
 
 The tiny 16D local-load increase, unchanged stores and registers below budget do not establish a new major spill regime; nevertheless the strict default fails. No demonstrated benefit warrants retaining or further tuning the resource cost.
 
@@ -464,14 +463,14 @@ The tiny 16D local-load increase, unchanged stores and registers below budget do
 
 **Cold first fits**, median of three fresh-process whole warmup fits, caches not cleared. These include runtime JIT and cannot isolate per-kernel compilation cost. First-minus-warm uses the same binary's pooled H2 full-fit medians, with sources in `summary.json`.
 
-| d | Backend | First fit B → V ms | First-minus-warm B → V ms |
-| --- | --- | --- | --- |
-| 2 | CPU | 187.342 → 211.863 | 164.536 → 190.191 |
-| 2 | CUDA | 294.668 → 295.050 | 276.903 → 277.305 |
-| 16 | CPU | 500.900 → 484.319 | 226.034 → 206.237 |
-| 16 | CUDA | 374.310 → 385.136 | 276.651 → 287.589 |
-| 30 | CPU | 934.917 → 929.152 | 217.641 → 193.953 |
-| 30 | CUDA | 495.150 → 511.054 | 290.279 → 306.280 |
+| d   | Backend | First fit B → V ms | First-minus-warm B → V ms |
+| --- | ------- | ------------------ | ------------------------- |
+| 2   | CPU     | 187.342 → 211.863  | 164.536 → 190.191         |
+| 2   | CUDA    | 294.668 → 295.050  | 276.903 → 277.305         |
+| 16  | CPU     | 500.900 → 484.319  | 226.034 → 206.237         |
+| 16  | CUDA    | 374.310 → 385.136  | 276.651 → 287.589         |
+| 30  | CPU     | 934.917 → 929.152  | 217.641 → 193.953         |
+| 30  | CUDA    | 495.150 → 511.054  | 290.279 → 306.280         |
 
 **Verification/rollback.** Variant Step 3 logs are in `variant_logs/` and `variant_verification.json`: formatting, workspace clippy, core tests, required-CUDA KD/estimator/integration/full HDBSCAN suites, tracing example and 91 Python profiling tests passed. Existing manual ignored tests remain ignored; hardware skips are not counted as validation. An initial test-only nonexistent `DeviceKdTree::clone` compile error was corrected before the successful campaign. Only the three owned implementation/test source files were restored byte-for-byte to Phase 3, preserving unrelated work. Final restored-source gates passed again (`logs/`, `verification.json`), as did strict 20k and 100k analysis pipelines with CPU/CUDA label equality and real Nsight captures. Existing Burn future-incompatibility notices and clippy warnings were not suppressed. README/AGENTS are unchanged because public API/semantics are unchanged and neither enumerates these internal buffers.
 
@@ -483,16 +482,16 @@ Evidence root: `artifacts/cubecl_kernels_perf/phase4/`. `summary.json` records e
 
 **Method/provenance.** Fresh baseline from committed `0fd27dfdddfe96e4be1e9b00bcb2b31e5e21a85e` has SHA-256 `14ca624faa0fb72074d582c5cf16bdeeb2ea4ee61a9b8e51f1f2d47608906c62`, identical to the accepted Phase 3 binary. Fixed release/tracing 32/64/128 binaries, source snapshots/diffs, versions, device identity, commands and unchanged deterministic input hashes are preserved in `artifacts/cubecl_kernels_perf/phase5/`. CUDA requests legalize to actual widths 32/64/128 on the RTX 3080; all execute successfully. Timing diagnostics are disabled uniformly. Matrix A runs 64 then 128; matrix B reverses that order. Each cell uses B,V,V,B,B,V, three measured fits per process: six independent process medians per arm pooled across batches. All 192 timing processes complete with equal labels within each comparison cell. `batch_{A,B}_width_{64,128}/` retains raw samples, process medians, labels, traces and separate batch summaries; `pooled_summary.json` retains ranges, absolute milliseconds, neighbor-scope series and all six adjacent-pair ratios.
 
-| Cell | Backend | Core B → 64 ms | Core Δ64 | Core B → 128 ms | Core Δ128 | Full-fit Δ64 / Δ128 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 20k×16 | CPU | 220.794 → 217.966 | −1.28% | 218.264 → 218.019 | −0.11% | −0.36% / +0.21% |
-| 20k×16 | CUDA | 22.419 → 21.339 | −4.82% | 23.591 → 24.220 | +2.67% | −0.71% / +2.35% |
-| 50k×16 | CPU | 1102.689 → 1125.238 | +2.04% | 1115.099 → 1103.159 | −1.07% | +1.73% / −0.56% |
-| 50k×16 | CUDA | 112.822 → 90.996 | −19.35% | 113.507 → 91.474 | −19.41% | −5.77% / −5.36% |
-| 50k×30 | CPU | 3107.531 → 3139.487 | +1.03% | 3100.292 → 3125.252 | +0.81% | +0.23% / −0.83% |
-| 50k×30 | CUDA | 271.985 → 244.910 | −9.95% | 271.411 → 246.698 | −9.10% | −2.72% / −1.88% |
-| 20k×30 | CPU | 526.542 → 529.314 | +0.53% | 524.932 → 547.259 | +4.25% | −0.58% / +2.23% |
-| 20k×30 | CUDA | 39.811 → 41.254 | +3.62% | 39.805 → 46.470 | +16.74% | +1.37% / +3.66% |
+| Cell   | Backend | Core B → 64 ms      | Core Δ64 | Core B → 128 ms     | Core Δ128 | Full-fit Δ64 / Δ128 |
+| ------ | ------- | ------------------- | -------- | ------------------- | --------- | ------------------- |
+| 20k×16 | CPU     | 220.794 → 217.966   | −1.28%   | 218.264 → 218.019   | −0.11%    | −0.36% / +0.21%     |
+| 20k×16 | CUDA    | 22.419 → 21.339     | −4.82%   | 23.591 → 24.220     | +2.67%    | −0.71% / +2.35%     |
+| 50k×16 | CPU     | 1102.689 → 1125.238 | +2.04%   | 1115.099 → 1103.159 | −1.07%    | +1.73% / −0.56%     |
+| 50k×16 | CUDA    | 112.822 → 90.996    | −19.35%  | 113.507 → 91.474    | −19.41%   | −5.77% / −5.36%     |
+| 50k×30 | CPU     | 3107.531 → 3139.487 | +1.03%   | 3100.292 → 3125.252 | +0.81%    | +0.23% / −0.83%     |
+| 50k×30 | CUDA    | 271.985 → 244.910   | −9.95%   | 271.411 → 246.698   | −9.10%    | −2.72% / −1.88%     |
+| 20k×30 | CPU     | 526.542 → 529.314   | +0.53%   | 524.932 → 547.259   | +4.25%    | −0.58% / +2.23%     |
+| 20k×30 | CUDA    | 39.811 → 41.254     | +3.62%   | 39.805 → 46.470     | +16.74%   | +1.37% / +3.66%     |
 
 **Default-screen result and override rationale.** Width 64 meets both 50k CUDA gain screens (six favorable pairs each): core savings are 21.826 ms (16D, −19.35%) and 27.075 ms (30D, −9.95%), with full-fit deltas −5.77% and −2.72%. Its sole failed default acceptance criterion is the 20k×30 CUDA core regression: +1.443 ms / +3.62%, five unfavorable pairs; full fit increases +1.37% but does not meet the full-fit regression screen. Its 20k×16 CUDA core improves −4.82%, and no CPU control or full-fit cell meets the regression screen. The user explicitly accepts this trade-off because larger workloads dominate practical use and small workloads already finish quickly. This does not extrapolate measured gains beyond the matrix. Both batches, all paired ratios, ranges and absolute full-fit/neighbor timings remain available in the original pooled and per-batch summaries; no unfavorable cells are dropped.
 
@@ -524,18 +523,18 @@ Both original 32-thread cleaned-source integration campaigns pass with real CPU/
 - With a reachable leaf ending at `n+5` (`n=300, d=3`), the frozen reference faults before variant comparison: CPU SIGSEGV (`logs/triage_cpu.log`) and CUDA event status 700 (`logs/triage_cuda.log`). The isolated required-CUDA reproduction fails identically. The fault is not a hardware skip.
 - All earlier CPU cases in those runs complete their all-arm/all-width ID, distance-bit, per-row diagnostic and diagnostics-disabled comparisons, including NaNs, non-permutation ownership, early and empty leaves. Pack, ownership and checked-sizing tests also pass in the experimental log. These partial successes do **not** make the complete experimental gate pass.
 
-The plan assumes out-of-range tensor accesses deterministically clamp to the last *logical* element. Dependency source instead derives checked buffer lengths from physical handles, which may contain upload padding. Furthermore, scalar `data[candidate*d+f]` and four-lane padded-vector gathers have different out-of-range address domains even with exact-sized buffers. Diagnostic `cubecl/pliron-dump` builds preserve generated IR under `generated/triage/`; the inspected frozen-reference NVPTX IR has direct indices/candidate GEP/load sequences without an intervening bounds clamp. These facts invalidate the assumed safe oracle; the precise compiler/runtime fault mechanism is not established here. Neither the reference, fixtures nor dependency implementation was modified to manufacture a passing result. Resuming optimization requires an explicit correction of malformed-input semantics/oracle scope, and potentially a separate bounds-safety change.
+The plan assumes out-of-range tensor accesses deterministically clamp to the last _logical_ element. Dependency source instead derives checked buffer lengths from physical handles, which may contain upload padding. Furthermore, scalar `data[candidate*d+f]` and four-lane padded-vector gathers have different out-of-range address domains even with exact-sized buffers. Diagnostic `cubecl/pliron-dump` builds preserve generated IR under `generated/triage/`; the inspected frozen-reference NVPTX IR has direct indices/candidate GEP/load sequences without an intervening bounds clamp. These facts invalidate the assumed safe oracle; the precise compiler/runtime fault mechanism is not established here. Neither the reference, fixtures nor dependency implementation was modified to manufacture a passing result. Resuming optimization requires an explicit correction of malformed-input semantics/oracle scope, and potentially a separate bounds-safety change.
 
 **Unperformed acceptance work.** Width batch S, isolation batches A/B, their paired/pooled statistics, per-arm accepted binaries, selected-arm codegen/cold-start comparison and selection/fold protocols were not run because Step 3 failed. There are no measured P/O/C gains, guard regressions, accepted width, or implied zero costs. Prepared runners and `summary.json` mark these as not run, rather than fabricating acceptance data.
 
 **Retained host measurement tool.** `kd_host_baseline` implements scalar ordered-f32 traversal with Rayon, validated input/CLI, JSON run medians and `--verify` against the public CPU operation. Three independent processes per primary cell, five timed traversals each, 15 threads, were run after rejection as reporting-only measurements (not acceptance samples). Tree construction, allocation, pool creation, one warmup and verification are excluded; output initialization and scheduling are included. `rayon_baseline.json` retains every result:
 
-| Cell | Median of process medians, ms | ID mismatches | Distance-bit mismatches / outputs |
-|---|---:|---:|---:|
-| 20k×16 | 279.967 | 0 | 31,111 / 100,000 |
-| 50k×16 | 1478.868 | 0 | 79,019 / 250,000 |
-| 20k×30 | 662.593 | 0 | 33,674 / 100,000 |
-| 50k×30 | 4312.856 | 0 | 81,495 / 250,000 |
+| Cell   | Median of process medians, ms | ID mismatches | Distance-bit mismatches / outputs |
+| ------ | ----------------------------: | ------------: | --------------------------------: |
+| 20k×16 |                       279.967 |             0 |                  31,111 / 100,000 |
+| 50k×16 |                      1478.868 |             0 |                  79,019 / 250,000 |
+| 20k×30 |                       662.593 |             0 |                  33,674 / 100,000 |
+| 50k×30 |                      4312.856 |             0 |                  81,495 / 250,000 |
 
 The host verification honestly reports non-equal distance bits; this is **not** an exact replacement oracle. Rust uses separate multiplication/addition, while the unchanged CPU kernel's optimized diagnostic LLVM IR contains `llvm.fmuladd` in the ordered sums (`generated/baseline_cpu16/`). That supports contraction as an explanation, not a proof of every mismatch. No FMA change was made to hide the comparison. Fifteen additional black-box boundary/CLI cases pass, including ties, overflow distances, `k > n`, dimensions above 32, invalid options, nonfinite and truncated input (`host_baseline_boundary_report.json`). Timings conflate runtime, scheduling, codegen and buffer handling; they do not isolate CubeCL overhead or establish a Phase 6 speedup.
 
@@ -567,23 +566,23 @@ This amendment authorizes documents only, not execution. Original G001 is comple
 
 Seconds; B baseline, P packed/cyclic, O padded/leaf-block, C packed/leaf-block. Δ compares pooled medians to B; paired ratios are median [min,max]. All-arm ranges and per-batch effects for every metric remain in `acceptance_summary.json`.
 
-| Cell | Core B / P / O / C (s) | C pooled Δ; batch A / B Δ | C paired core ratio [range] |
-| --- | --- | --- | --- |
-| 20k×16 | .203527 / .039348 / .201191 / .038213 | −81.22%; −81.35% / −80.48% | .1881 [.1799,.2132] |
-| 50k×16 | 1.044663 / .245888 / 1.022576 / .246394 | −76.41%; −76.41% / −76.72% | .2345 [.2192,.2554] |
-| 20k×30 | .488497 / .092948 / .488041 / .093392 | −80.88%; −80.77% / −80.94% | .1916 [.1765,.2314] |
-| 50k×30 | 2.879559 / .615681 / 2.855542 / .619836 | −78.47%; −78.74% / −78.04% | .2135 [.2059,.2270] |
-| 20k×8 | .028158 / .011078 / .026245 / .010659 | −62.14%; −63.76% / −60.35% | .3822 [.2850,.4317] |
-| 20k×2 | .003473 / .003375 / .003228 / .003459 | −.41%; −.58% / −6.56% | .9557 [.6136,1.2507] |
+| Cell   | Core B / P / O / C (s)                  | C pooled Δ; batch A / B Δ  | C paired core ratio [range] |
+| ------ | --------------------------------------- | -------------------------- | --------------------------- |
+| 20k×16 | .203527 / .039348 / .201191 / .038213   | −81.22%; −81.35% / −80.48% | .1881 [.1799,.2132]         |
+| 50k×16 | 1.044663 / .245888 / 1.022576 / .246394 | −76.41%; −76.41% / −76.72% | .2345 [.2192,.2554]         |
+| 20k×30 | .488497 / .092948 / .488041 / .093392   | −80.88%; −80.77% / −80.94% | .1916 [.1765,.2314]         |
+| 50k×30 | 2.879559 / .615681 / 2.855542 / .619836 | −78.47%; −78.74% / −78.04% | .2135 [.2059,.2270]         |
+| 20k×8  | .028158 / .011078 / .026245 / .010659   | −62.14%; −63.76% / −60.35% | .3822 [.2850,.4317]         |
+| 20k×2  | .003473 / .003375 / .003228 / .003459   | −.41%; −.58% / −6.56%      | .9557 [.6136,1.2507]        |
 
-| Cell | Synchronized neighbor B → C | Full fit B → C; pooled Δ | Full-fit batch A / B Δ; paired median [range] |
-| --- | --- | --- | --- |
-| 20k×16 | .202454 → .037243 | .260531 → .097523; −62.57% | −63.01% / −62.15%; .3744 [.3574,.3995] |
-| 50k×16 | 1.043565 → .245341 | 1.241712 → .448006; −63.92% | −63.81% / −64.44%; .3588 [.3245,.3854] |
-| 20k×30 | .487422 → .092482 | .677496 → .282036; −58.37% | −58.93% / −57.36%; .4140 [.4003,.4787] |
-| 50k×30 | 2.878350 → .616742 | 3.711688 → 1.420763; −61.72% | −61.89% / −61.68%; .3800 [.3722,.4137] |
-| 20k×8 | .027032 → .009656 | .053880 → .034656; −35.68% | −33.89% / −37.12%; .6423 [.5672,.7384] |
-| 20k×2 | .002605 → .001986 | .022062 → .021778; −1.29% | +1.62% / −4.00%; .9716 [.8642,1.0885] |
+| Cell   | Synchronized neighbor B → C | Full fit B → C; pooled Δ     | Full-fit batch A / B Δ; paired median [range] |
+| ------ | --------------------------- | ---------------------------- | --------------------------------------------- |
+| 20k×16 | .202454 → .037243           | .260531 → .097523; −62.57%   | −63.01% / −62.15%; .3744 [.3574,.3995]        |
+| 50k×16 | 1.043565 → .245341          | 1.241712 → .448006; −63.92%  | −63.81% / −64.44%; .3588 [.3245,.3854]        |
+| 20k×30 | .487422 → .092482           | .677496 → .282036; −58.37%   | −58.93% / −57.36%; .4140 [.4003,.4787]        |
+| 50k×30 | 2.878350 → .616742          | 3.711688 → 1.420763; −61.72% | −61.89% / −61.68%; .3800 [.3722,.4137]        |
+| 20k×8  | .027032 → .009656           | .053880 → .034656; −35.68%   | −33.89% / −37.12%; .6423 [.5672,.7384]        |
+| 20k×2  | .002605 → .001986           | .022062 → .021778; −1.29%    | +1.62% / −4.00%; .9716 [.8642,1.0885]         |
 
 Packing is included in core timing. Primary C core gains are −76.41% to −81.22%; 20k×8 is also a gain. Noisy 20k×2 core/full-fit results are **no effect**, not equivalence or demonstrated speedup.
 
@@ -599,11 +598,12 @@ The existing `kd_host_baseline` Rust/Rayon tool and dev-dependency are retained.
 
 `summary.json` derives B/C first-minus-warm full-fit differences of **.167724/.230859 s** at 20k×2, **.162807/.247842 s** at 20k×16 and **.209539/.278575 s** at 20k×30. These are differences across measurement groups, not isolated compilation costs.
 
-All **11 experimental and 11 final-clean Step 3 gates passed**, with required CUDA on designated CUDA gates (`experiment_gates.json`, `final_clean_gates.json`). Experimental coverage includes all arms/host widths; final-clean coverage includes selected production at every host width and retained CUDA coverage. Bitwise IDs/distances and diagnostics are checked under the valid-tree contract. `integration_clean.json` records final `analyze_hdbscan_stages.sh` exits **0** at **20k and 100k**; both `pipeline_clean_20000/benchmark.json` and `pipeline_clean_100000/benchmark.json` have `correctness.labels_equal=true` (checked directly). Earlier `final_gates.json`, `integration.json`, pipeline outputs and logs are retained as earlier receipts, not substituted for this clean-boundary verification.
+All **11 experimental and 11 final-clean Step 3 gates passed**, with required CUDA on designated CUDA gates (`experiment_gates.json`, `final_clean_gates.json`). Experimental coverage includes all arms/host widths; final-clean coverage includes selected production at every host width and retained CUDA coverage. Bitwise IDs/distances and diagnostics are checked under the valid-tree contract. `integration_clean.json` records final `scripts/analyze_hdbscan_stages.sh` exits **0** at **20k and 100k**; both `pipeline_clean_20000/benchmark.json` and `pipeline_clean_100000/benchmark.json` have `correctness.labels_equal=true` (checked directly). Earlier `final_gates.json`, `integration.json`, pipeline outputs and logs are retained as earlier receipts, not substituted for this clean-boundary verification.
 
 The full `all_cuda` campaign retains pre-existing unrelated ignored hardware-campaign tests; these are not required KD CUDA runtime skips. The final KD suite reports **16 passed, 0 ignored**. Initial final clippy introduced warnings despite exit0; these were corrected before the clean rerun. `logs/final_clean_clippy.log` retains only pre-existing seed-literal grouping, integration-oracle range-loop and dependency future-incompatibility warnings; no introduced warning remains and no warning suppression is claimed. `summary.json` records that README/AGENTS were searched: neither enumerates the changed CPU query schedule or resource buffers, so no guidance update was needed; mandatory 20k/100k guidance remains applicable.
 
 `codegen_evidence.json` links hashed optimized LLVM IR from reporting-only 257-row d16 diagnostic probes, not timing binaries. Selected IR has **16 `load <16 x float>`**, **16 `fsub <16 x float>`**, **17 `llvm.fmuladd.v16f32`** matches; baseline has zero of these and **33 scalar `llvm.fmuladd.f32`** matches versus selected **17**. These textual counts include declarations, not dynamic instruction counts or assembly/ISA proof. Observed vector FMA supports candidate-axis vectorization but independently proves neither correctness nor the entire speedup. Independent review receipts are maintained separately in the ultragoal ledger.
+
 ## Phase 7 results: CUDA flat plane kernel F2 accepted
 
 **Decision:** accept **F2**, fixed **two planes per cube**, dimension gate **16**, **no row-count gate**. CPU C16 is unchanged. CUDA retains the per-query kernel below 16 features, above 32, on non-plane devices and with insufficient launch/shared-memory resources. This is pre-launch routing, not execution-error recovery. F scans all candidates, staging leaf-ordered padded rows for plane broadcasts, retaining original IDs/output rows, the output-backed heap and ordered scalar feature arithmetic. Experimental arms/measurement overrides are removed in finalization; below-gate forcing is test-only.
@@ -614,14 +614,14 @@ Evidence: `artifacts/cubecl_kernels_perf/phase7/summary.json`, `experiments/{sel
 
 Four interleaved blocks in A and four reversed blocks in B yield **eight process medians per arm/cell**, each reducing three measured fits. Pairing is within block; fits within one process are not independent observations. Core includes packing. No guard cells were run. Values below are seconds: median [minimum, maximum] across process medians, not confidence intervals. Exact labels agree in each comparison cell.
 
-| Cell | Arm | Processes | Core seconds | Full-fit seconds |
-| --- | --- | ---: | --- | --- |
-| 50k×16 | B | 8 | .081274975 [.079497385,.081589532] | .344502836 [.338933851,.350434888] |
-| 50k×16 | T2 | 8 | .020770730 [.020288903,.021904879] | .282018535 [.277249858,.301995144] |
-| 50k×16 | F2 | 8 | .019142247 [.018906253,.020449292] | .282762217 [.279065369,.290641309] |
-| 300k×16 | B | 8 | 5.458147029 [5.406012669,5.505541137] | 8.148663046 [8.083295341,8.214601698] |
-| 300k×16 | T2 | 8 | .488467727 [.480982227,.493652909] | 3.182441613 [3.128015232,3.209343435] |
-| 300k×16 | F2 | 8 | .476285891 [.468212442,.480946523] | 3.171553079 [3.155536712,3.218120805] |
+| Cell    | Arm | Processes | Core seconds                          | Full-fit seconds                      |
+| ------- | --- | --------: | ------------------------------------- | ------------------------------------- |
+| 50k×16  | B   |         8 | .081274975 [.079497385,.081589532]    | .344502836 [.338933851,.350434888]    |
+| 50k×16  | T2  |         8 | .020770730 [.020288903,.021904879]    | .282018535 [.277249858,.301995144]    |
+| 50k×16  | F2  |         8 | .019142247 [.018906253,.020449292]    | .282762217 [.279065369,.290641309]    |
+| 300k×16 | B   |         8 | 5.458147029 [5.406012669,5.505541137] | 8.148663046 [8.083295341,8.214601698] |
+| 300k×16 | T2  |         8 | .488467727 [.480982227,.493652909]    | 3.182441613 [3.128015232,3.209343435] |
+| 300k×16 | F2  |         8 | .476285891 [.468212442,.480946523]    | 3.171553079 [3.155536712,3.218120805] |
 
 F2 core Δ: **−76.44755% / −91.27385%**, with **8/8 paired ratios below 1** at 50k/300k. T2 also gains: **−74.44388% / −91.05067%**, 8/8 each. F2 is accepted by the **large-size override** and also satisfies **standard eligibility**. No 50k regression is ignored and there is **no judgment departure**. Full-fit F2 Δ: **−17.92166% / −61.07885%**; T2: **−18.13753% / −60.94523%**. These are scoped full-fit results, not isolated neighbor-kernel speedups.
 
@@ -631,31 +631,31 @@ S uses six process medians per arm/cell, each from three measured fits, **never 
 
 T gate selection uses separate six-process groups at 300k×2/8/16: B core medians .011764237/.311471664/5.494453881 s; T2 .019636370/.071913957/.489031505 s. Thus T's selected gate is **8**, not the predicted 16; 2D fails. **T2 is not retained. F's fixed gate is 16**, not inherited from T. Raw S core/full-fit medians and ranges are tabulated below.
 
-| S planes cell | Arm | Processes | Core seconds | Full-fit seconds |
-| --- | --- | ---: | --- | --- |
-| 50000×16 | B | 6 | .080915468 [.079364360,.082346767] | .344954763 [.334696385,.353197455] |
-| 50000×16 | F1 | 6 | .023531956 [.022177004,.024165243] | .282584847 [.278557993,.286498762] |
-| 50000×16 | F2 | 6 | .018763580 [.018331581,.019365160] | .277636557 [.271683756,.280519361] |
-| 50000×16 | F4 | 6 | .019995508 [.019621459,.021091858] | .280526630 [.278251591,.286034875] |
-| 50000×16 | T1 | 6 | .027557338 [.026900096,.028034268] | .288563656 [.281932998,.302113999] |
-| 50000×16 | T2 | 6 | .020418030 [.020027070,.021780674] | .281473519 [.276166356,.284225358] |
-| 50000×16 | T4 | 6 | .020969542 [.020357486,.021761711] | .282009726 [.275594258,.289706449] |
-| 300000×16 | B | 6 | 5.473774395 [5.445902474,5.481680337] | 8.147657364 [8.125146821,8.189191907] |
-| 300000×16 | F1 | 6 | .568501482 [.565934748,.569244336] | 3.245857948 [3.237674011,3.259044396] |
-| 300000×16 | F2 | 6 | .476576222 [.475044167,.480683666] | 3.151467626 [3.149414248,3.190279835] |
-| 300000×16 | F4 | 6 | .500840791 [.495101261,.504383897] | 3.181553553 [3.160859505,3.196365693] |
-| 300000×16 | T1 | 6 | .621755854 [.618925151,.624836905] | 3.299158210 [3.273621430,3.308667082] |
-| 300000×16 | T2 | 6 | .485891982 [.483647490,.491700598] | 3.152823881 [3.142802097,3.168609457] |
-| 300000×16 | T4 | 6 | .490142895 [.485945593,.490798814] | 3.148546950 [3.139007290,3.164783162] |
+| S planes cell | Arm | Processes | Core seconds                          | Full-fit seconds                      |
+| ------------- | --- | --------: | ------------------------------------- | ------------------------------------- |
+| 50000×16      | B   |         6 | .080915468 [.079364360,.082346767]    | .344954763 [.334696385,.353197455]    |
+| 50000×16      | F1  |         6 | .023531956 [.022177004,.024165243]    | .282584847 [.278557993,.286498762]    |
+| 50000×16      | F2  |         6 | .018763580 [.018331581,.019365160]    | .277636557 [.271683756,.280519361]    |
+| 50000×16      | F4  |         6 | .019995508 [.019621459,.021091858]    | .280526630 [.278251591,.286034875]    |
+| 50000×16      | T1  |         6 | .027557338 [.026900096,.028034268]    | .288563656 [.281932998,.302113999]    |
+| 50000×16      | T2  |         6 | .020418030 [.020027070,.021780674]    | .281473519 [.276166356,.284225358]    |
+| 50000×16      | T4  |         6 | .020969542 [.020357486,.021761711]    | .282009726 [.275594258,.289706449]    |
+| 300000×16     | B   |         6 | 5.473774395 [5.445902474,5.481680337] | 8.147657364 [8.125146821,8.189191907] |
+| 300000×16     | F1  |         6 | .568501482 [.565934748,.569244336]    | 3.245857948 [3.237674011,3.259044396] |
+| 300000×16     | F2  |         6 | .476576222 [.475044167,.480683666]    | 3.151467626 [3.149414248,3.190279835] |
+| 300000×16     | F4  |         6 | .500840791 [.495101261,.504383897]    | 3.181553553 [3.160859505,3.196365693] |
+| 300000×16     | T1  |         6 | .621755854 [.618925151,.624836905]    | 3.299158210 [3.273621430,3.308667082] |
+| 300000×16     | T2  |         6 | .485891982 [.483647490,.491700598]    | 3.152823881 [3.142802097,3.168609457] |
+| 300000×16     | T4  |         6 | .490142895 [.485945593,.490798814]    | 3.148546950 [3.139007290,3.164783162] |
 
-| S gate cell | Arm | Processes | Core seconds | Full-fit seconds |
-| --- | --- | ---: | --- | --- |
-| 300000×2 | B | 6 | .011764237 [.011310006,.012632526] | .200977907 [.196996622,.204125473] |
-| 300000×2 | T2 | 6 | .019636370 [.018960290,.020064999] | .210581808 [.206515663,.216234925] |
-| 300000×8 | B | 6 | .311471664 [.309335683,.313060663] | .777289958 [.769647988,.782020752] |
-| 300000×8 | T2 | 6 | .071913957 [.070629623,.073216825] | .539097727 [.538067510,.544797206] |
-| 300000×16 | B | 6 | 5.494453881 [5.475897269,5.530640062] | 8.182252261 [8.157842485,8.236976192] |
-| 300000×16 | T2 | 6 | .489031505 [.486256728,.490875794] | 3.176813347 [3.173110644,3.183297610] |
+| S gate cell | Arm | Processes | Core seconds                          | Full-fit seconds                      |
+| ----------- | --- | --------: | ------------------------------------- | ------------------------------------- |
+| 300000×2    | B   |         6 | .011764237 [.011310006,.012632526]    | .200977907 [.196996622,.204125473]    |
+| 300000×2    | T2  |         6 | .019636370 [.018960290,.020064999]    | .210581808 [.206515663,.216234925]    |
+| 300000×8    | B   |         6 | .311471664 [.309335683,.313060663]    | .777289958 [.769647988,.782020752]    |
+| 300000×8    | T2  |         6 | .071913957 [.070629623,.073216825]    | .539097727 [.538067510,.544797206]    |
+| 300000×16   | B   |         6 | 5.494453881 [5.475897269,5.530640062] | 8.182252261 [8.157842485,8.236976192] |
+| 300000×16   | T2  |         6 | .489031505 [.486256728,.490875794]    | 3.176813347 [3.173110644,3.183297610] |
 
 ### H3: all seven arms × two cells
 
@@ -663,54 +663,54 @@ Counters sample the **first warmup neighbor launch**, not full-fit timing. Separ
 
 In the table: DRAM is raw read bytes, B/op and L2 sectors/op use those denominators, L1 s/r is global-load sectors/request, occupancy is achieved active-warps %, LS is long-scoreboard stall %, local is load/store sectors, shared is dynamic bytes/block (static zero throughout). Raw names, units and provenance remain in the counter summary.
 
-| Arm | Rows | Denominator | DRAM bytes | B/op | L2 sectors/op | L1 s/r | L2 hit % | L1 throughput % | Registers | Occupancy % | LS % | Local ld/st sectors | Shared bytes | Branch uniform % | Threads/instruction |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |
-| B | 50000 | 1364757656 | 2406746240 | 1.7635 | 2.6703 | 10.1028 | 98.11 | 81.07 | 64 | 46.05 | 77.27 | 71821777/96994880 | 0 | 98.01 | 10.32 |
-| B | 300000 | 29377727608 | 1933837973504 | 65.8267 | 2.8270 | 8.4880 | 29.64 | 28.72 | 64 | 63.41 | 94.68 | 1195111370/1554076006 | 0 | 98.77 | 8.57 |
-| T1 | 50000 | 2456784320 | 257896192 | .1050 | .0781 | 3.9816 | 96.10 | 35.94 | 114 | 24.86 | 14.12 | 25312674/25716696 | 2176 | 97.76 | 19.76 |
-| T1 | 300000 | 79270631488 | 119892487680 | 1.5124 | .0754 | 4.8576 | 44.41 | 43.32 | 114 | 31.21 | 17.02 | 560563512/562963512 | 2176 | 97.79 | 14.37 |
-| T2 | 50000 | 2456784320 | 418921856 | .1705 | .0846 | 3.9945 | 94.77 | 50.55 | 63 | 42.07 | 15.51 | 25312674/25716696 | 4352 | 97.76 | 19.78 |
-| T2 | 300000 | 79270631488 | 128738542720 | 1.6240 | .0782 | 4.8820 | 42.19 | 57.74 | 63 | 60.14 | 15.71 | 560563512/562963512 | 4352 | 97.79 | 14.44 |
-| T4 | 50000 | 2456784320 | 544766208 | .2217 | .0859 | 3.9945 | 93.98 | 49.94 | 56 | 43.06 | 16.10 | 31700358/25722948 | 8704 | 97.76 | 19.79 |
-| T4 | 300000 | 79270631488 | 132947671424 | 1.6771 | .0796 | 4.8821 | 41.18 | 58.46 | 56 | 66.83 | 15.25 | 705670544/563001012 | 8704 | 97.79 | 14.44 |
-| F1 | 50000 | 2500800000 | 97200384 | .0389 | .0441 | 6.8189 | 101.69 | 39.12 | 63 | 24.75 | 9.03 | 0/0 | 2176 | 99.22 | 31.11 |
-| F1 | 300000 | 90000000000 | 3905547392 | .0434 | .0377 | 10.5505 | 98.75 | 49.06 | 63 | 32.26 | 6.77 | 0/0 | 2176 | 99.82 | 31.78 |
-| F2 | 50000 | 2500800000 | 91820032 | .0367 | .0678 | 6.8161 | 98.45 | 50.15 | 62 | 39.65 | 9.17 | 0/0 | 4352 | 99.22 | 31.12 |
-| F2 | 300000 | 90000000000 | 8390150144 | .0932 | .0558 | 10.5490 | 94.27 | 60.16 | 62 | 63.16 | 4.76 | 0/0 | 4352 | 99.82 | 31.79 |
-| F4 | 50000 | 2500800000 | 77178496 | .0309 | .0641 | 6.8160 | 99.17 | 47.82 | 48 | 41.54 | 9.53 | 0/0 | 8704 | 99.22 | 31.18 |
-| F4 | 300000 | 90000000000 | 5368952704 | .0597 | .0457 | 10.5489 | 96.58 | 59.08 | 48 | 77.49 | 5.12 | 0/0 | 8704 | 99.82 | 31.80 |
+| Arm |   Rows | Denominator |    DRAM bytes |    B/op | L2 sectors/op |  L1 s/r | L2 hit % | L1 throughput % | Registers | Occupancy % |  LS % | Local ld/st sectors   | Shared bytes | Branch uniform % | Threads/instruction |
+| --- | -----: | ----------: | ------------: | ------: | ------------: | ------: | -------: | --------------: | --------: | ----------: | ----: | --------------------- | -----------: | ---------------: | ------------------: |
+| B   |  50000 |  1364757656 |    2406746240 |  1.7635 |        2.6703 | 10.1028 |    98.11 |           81.07 |        64 |       46.05 | 77.27 | 71821777/96994880     |            0 |            98.01 |               10.32 |
+| B   | 300000 | 29377727608 | 1933837973504 | 65.8267 |        2.8270 |  8.4880 |    29.64 |           28.72 |        64 |       63.41 | 94.68 | 1195111370/1554076006 |            0 |            98.77 |                8.57 |
+| T1  |  50000 |  2456784320 |     257896192 |   .1050 |         .0781 |  3.9816 |    96.10 |           35.94 |       114 |       24.86 | 14.12 | 25312674/25716696     |         2176 |            97.76 |               19.76 |
+| T1  | 300000 | 79270631488 |  119892487680 |  1.5124 |         .0754 |  4.8576 |    44.41 |           43.32 |       114 |       31.21 | 17.02 | 560563512/562963512   |         2176 |            97.79 |               14.37 |
+| T2  |  50000 |  2456784320 |     418921856 |   .1705 |         .0846 |  3.9945 |    94.77 |           50.55 |        63 |       42.07 | 15.51 | 25312674/25716696     |         4352 |            97.76 |               19.78 |
+| T2  | 300000 | 79270631488 |  128738542720 |  1.6240 |         .0782 |  4.8820 |    42.19 |           57.74 |        63 |       60.14 | 15.71 | 560563512/562963512   |         4352 |            97.79 |               14.44 |
+| T4  |  50000 |  2456784320 |     544766208 |   .2217 |         .0859 |  3.9945 |    93.98 |           49.94 |        56 |       43.06 | 16.10 | 31700358/25722948     |         8704 |            97.76 |               19.79 |
+| T4  | 300000 | 79270631488 |  132947671424 |  1.6771 |         .0796 |  4.8821 |    41.18 |           58.46 |        56 |       66.83 | 15.25 | 705670544/563001012   |         8704 |            97.79 |               14.44 |
+| F1  |  50000 |  2500800000 |      97200384 |   .0389 |         .0441 |  6.8189 |   101.69 |           39.12 |        63 |       24.75 |  9.03 | 0/0                   |         2176 |            99.22 |               31.11 |
+| F1  | 300000 | 90000000000 |    3905547392 |   .0434 |         .0377 | 10.5505 |    98.75 |           49.06 |        63 |       32.26 |  6.77 | 0/0                   |         2176 |            99.82 |               31.78 |
+| F2  |  50000 |  2500800000 |      91820032 |   .0367 |         .0678 |  6.8161 |    98.45 |           50.15 |        62 |       39.65 |  9.17 | 0/0                   |         4352 |            99.22 |               31.12 |
+| F2  | 300000 | 90000000000 |    8390150144 |   .0932 |         .0558 | 10.5490 |    94.27 |           60.16 |        62 |       63.16 |  4.76 | 0/0                   |         4352 |            99.82 |               31.79 |
+| F4  |  50000 |  2500800000 |      77178496 |   .0309 |         .0641 |  6.8160 |    99.17 |           47.82 |        48 |       41.54 |  9.53 | 0/0                   |         8704 |            99.22 |               31.18 |
+| F4  | 300000 | 90000000000 |    5368952704 |   .0597 |         .0457 | 10.5489 |    96.58 |           59.08 |        48 |       77.49 |  5.12 | 0/0                   |         8704 |            99.82 |               31.80 |
 
 F1's reported 50k L2 hit rate **101.69%** is retained as a profiler/replay anomaly, not a physical hit probability. At **50k**, B already has **98.11% L2 hits**: gains are consistent with reduced **L1/LSU traffic**, not curing L2 misses. F2 reduces raw DRAM reads 2,406,746,240→91,820,032 bytes, L1 throughput 81.07→50.15% and long-scoreboard stalls 77.27→9.17%. At **300k**, B/F2 L2 hits are 29.64/94.27%, DRAM reads 1,933,837,973,504/8,390,150,144 bytes and stalls 94.68/4.76%. This supports improved access/reuse on this workload, not universal causation. F2 occupancy is 63.16% versus B 63.41% at 300k, so increased achieved occupancy is not the explanation. F has zero measured local sectors; T retains stack traffic.
 
 Additional H3 metrics: sampled-stall share is long-scoreboard samples / all PC samples, distinct from the active-warp stall percentage above.
 
-| Arm | Rows | L1 hit % | Raw L2 read sectors | Sampled long-scoreboard share % |
-| --- | ---: | ---: | ---: | ---: |
-| B | 50000 | 52.06 | 3644256214 | 76.14 |
-| B | 300000 | 48.27 | 83051656826 | 95.13 |
-| T1 | 50000 | 29.67 | 191783768 | 14.74 |
-| T1 | 300000 | 17.29 | 5977954147 | 18.03 |
-| T2 | 50000 | 19.06 | 207776570 | 16.04 |
-| T2 | 300000 | 11.73 | 6199803424 | 16.82 |
-| T4 | 50000 | 19.51 | 211092322 | 16.87 |
-| T4 | 300000 | 11.62 | 6310018125 | 16.28 |
-| F1 | 50000 | 49.51 | 110253381 | 9.88 |
-| F1 | 300000 | 47.34 | 3394683171 | 7.65 |
-| F2 | 50000 | 23.12 | 169638777 | 10.02 |
-| F2 | 300000 | 23.28 | 5024922622 | 6.24 |
-| F4 | 50000 | 26.54 | 160392434 | 10.23 |
-| F4 | 300000 | 35.92 | 4115254260 | 6.38 |
+| Arm |   Rows | L1 hit % | Raw L2 read sectors | Sampled long-scoreboard share % |
+| --- | -----: | -------: | ------------------: | ------------------------------: |
+| B   |  50000 |    52.06 |          3644256214 |                           76.14 |
+| B   | 300000 |    48.27 |         83051656826 |                           95.13 |
+| T1  |  50000 |    29.67 |           191783768 |                           14.74 |
+| T1  | 300000 |    17.29 |          5977954147 |                           18.03 |
+| T2  |  50000 |    19.06 |           207776570 |                           16.04 |
+| T2  | 300000 |    11.73 |          6199803424 |                           16.82 |
+| T4  |  50000 |    19.51 |           211092322 |                           16.87 |
+| T4  | 300000 |    11.62 |          6310018125 |                           16.28 |
+| F1  |  50000 |    49.51 |           110253381 |                            9.88 |
+| F1  | 300000 |    47.34 |          3394683171 |                            7.65 |
+| F2  |  50000 |    23.12 |           169638777 |                           10.02 |
+| F2  | 300000 |    23.28 |          5024922622 |                            6.24 |
+| F4  |  50000 |    26.54 |           160392434 |                           10.23 |
+| F4  | 300000 |    35.92 |          4115254260 |                            6.38 |
 
 ### Reporting-only first fit and CPU crossover
 
 Cold reporting is **50k×16 only**; CPU C16 versus F2 is **300k×16 only**. Each uses three processes per arm. On-disk caches were **not cleared**. Fresh-process first fits include initialization/JIT/cache effects, but are neither guaranteed cache-cold compilations nor clean JIT isolation. Summary medians: 50k B/F2 first fit .511248672/.453236648 s, warm core .081349122/.019258328, warm fit .352412340/.283256005; 300k CPU/F2 first fit 9.861194983/3.333289634, warm core 4.568857219/.471445421, warm fit 8.856450496/3.170908501 s. Ranges are tabulated below. F2 beats CPU in both core and full fit in this repeat; it does not locate a universal new crossover.
 
-| Reporting cell | Arm | Processes | First-fit seconds | Warm core seconds | Warm full-fit seconds |
-| --- | --- | ---: | --- | --- | --- |
-| 50000×16 | B | 3 | .511248672 [.509199486,.542216513] | .081349122 [.080881877,.082980450] | .352412340 [.345315310,.353396557] |
-| 50000×16 | F2 | 3 | .453236648 [.438009840,.453861062] | .019258328 [.019119082,.019780093] | .283256005 [.274036447,.289352386] |
-| 300000×16 | CPU | 3 | 9.861194983 [9.381330220,10.188934254] | 4.568857219 [4.529079635,4.762274275] | 8.856450496 [8.740564941,8.934927530] |
-| 300000×16 | F2 | 3 | 3.333289634 [3.304519547,3.334004207] | .471445421 [.467081494,.481710093] | 3.170908501 [3.136429184,3.191483266] |
+| Reporting cell | Arm | Processes | First-fit seconds                      | Warm core seconds                     | Warm full-fit seconds                 |
+| -------------- | --- | --------: | -------------------------------------- | ------------------------------------- | ------------------------------------- |
+| 50000×16       | B   |         3 | .511248672 [.509199486,.542216513]     | .081349122 [.080881877,.082980450]    | .352412340 [.345315310,.353396557]    |
+| 50000×16       | F2  |         3 | .453236648 [.438009840,.453861062]     | .019258328 [.019119082,.019780093]    | .283256005 [.274036447,.289352386]    |
+| 300000×16      | CPU |         3 | 9.861194983 [9.381330220,10.188934254] | 4.568857219 [4.529079635,4.762274275] | 8.856450496 [8.740564941,8.934927530] |
+| 300000×16      | F2  |         3 | 3.333289634 [3.304519547,3.334004207]  | .471445421 [.467081494,.481710093]    | 3.170908501 [3.136429184,3.191483266] |
 
 Exact labels digests agree across arms within each S planes, S gate, acceptance, cold and crossover cell; this is stage-output evidence for these inputs, not a universal clustering claim.
 
@@ -720,7 +720,7 @@ Fixed synthetic Gaussian k5/min-cluster-size5 measurements on this **RTX 3080 / 
 
 **Final-source verification passed.** Under `artifacts/cubecl_kernels_perf/phase7/`, `final_gates/results.json` records exit0 for core tests, required-CUDA release and default debug suites, workspace/all-target clippy, formatting checks and Python analysis/campaign tests (145 passed). `final_gates/ir.json` records 44 tile variants with warp synchronization present throughout and no CTA barrier. `summary.json` records final verification passed. These receipts cover retained-source gates rather than reusing experimental-arm results.
 
-`final_integration.json` records both required commands, `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000`, exiting **0** with real CPU/CUDA execution and exact `labels_equal=true`: `artifacts/hdbscan_stages/run-20000-bgHeQylR` and `artifacts/hdbscan_stages/run-100000-xQPWOUox`. Both counter-family receipts identify **`kd_neighbors_tile_kernel`**. These integration runs establish correctness/tool integration, not new acceptance timing cells. Independent review status/receipts are tracked separately in the Ultragoal ledger.
+`final_integration.json` records both required commands, `bash scripts/analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000`, exiting **0** with real CPU/CUDA execution and exact `labels_equal=true`: `artifacts/hdbscan_stages/run-20000-bgHeQylR` and `artifacts/hdbscan_stages/run-100000-xQPWOUox`. Both counter-family receipts identify **`kd_neighbors_tile_kernel`**. These integration runs establish correctness/tool integration, not new acceptance timing cells. Independent review status/receipts are tracked separately in the Ultragoal ledger.
 
 ## CPU approximate-prediction leaf-SoA (Phase A)
 
@@ -739,16 +739,16 @@ rank-5 core searches, rank-10 external searches and reference upload/preparation
 
 Warm end-to-end / warm query-search speedups (baseline divided by SoA):
 
-| Reference rows | Features | 1k queries | All-row queries |
-| ---: | ---: | ---: | ---: |
-| 20k | 2 | 0.69× / 0.64× | 1.02× / 1.00× |
-| 20k | 8 | 1.11× / 1.39× | 1.36× / 1.51× |
-| 20k | 16 | 1.13× / 2.34× | 1.90× / 2.06× |
-| 20k | 33 | 1.74× / 2.86× | 2.99× / 3.30× |
-| 100k | 2 | 1.08× / 1.36× | 1.00× / 0.98× |
-| 100k | 8 | 1.27× / 1.86× | 1.72× / 1.87× |
-| 100k | 16 | 1.92× / 3.54× | 3.18× / 3.39× |
-| 100k | 33 | 3.45× / 5.64× | 4.76× / 5.00× |
+| Reference rows | Features |    1k queries | All-row queries |
+| -------------: | -------: | ------------: | --------------: |
+|            20k |        2 | 0.69× / 0.64× |   1.02× / 1.00× |
+|            20k |        8 | 1.11× / 1.39× |   1.36× / 1.51× |
+|            20k |       16 | 1.13× / 2.34× |   1.90× / 2.06× |
+|            20k |       33 | 1.74× / 2.86× |   2.99× / 3.30× |
+|           100k |        2 | 1.08× / 1.36× |   1.00× / 0.98× |
+|           100k |        8 | 1.27× / 1.86× |   1.72× / 1.87× |
+|           100k |       16 | 1.92× / 3.54× |   3.18× / 3.39× |
+|           100k |       33 | 3.45× / 5.64× |   4.76× / 5.00× |
 
 The apparent 20k×2/1k regression was investigated with **seven additional
 alternating process pairs**, each retaining three warm calls and raw traces.

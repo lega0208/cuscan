@@ -135,9 +135,7 @@ Add a public lightweight `HDBSCANPredictor` in `python/fast_umap/hdbscan.py`, ex
 ```python
 predictor = fitted_hdbscan.to_predictor()
 labels, strengths = predictor.approximate_predict(X)
-labels, strengths, connectors = predictor.approximate_predict(
-    X, return_connecting_points=True
-)
+labels, strengths, connectors = predictor.approximate_predict(X, return_connecting_points=True)
 ```
 
 `HDBSCAN.to_predictor()` requires the estimator to be fitted, converts through its native fitted object, and stores only the returned native predictor plus `n_features_in_`; it must not retain the parent estimator or its fitted arrays. Reuse the same input normalization, finite-value/feature validation, strict flag handling, tuple shaping, dtype conversion, and warning stack-level behavior as `HDBSCAN.approximate_predict`. The existing fitted estimator method remains available and unchanged to callers.
