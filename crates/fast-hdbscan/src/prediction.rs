@@ -27,7 +27,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use burn::{
-    backend::Dispatch,
+    backend::{Dispatch, DispatchDevice},
     tensor::{Device, Int, Tensor, TensorData, Transaction},
 };
 use fast_cubecl_common::{BackendChoice, selected_device};
@@ -46,6 +46,7 @@ use crate::estimator::{
     check_device_allocation, check_device_tensor_allocation, checked_allocation_bytes,
     map_backend_error, tensor_allocation_bytes, upload_kd_tree,
 };
+use crate::kernels::{KdCandidateLayout, KdNeighborPlan};
 
 /// Maximum query rows per bounded prediction batch before device-limit planning.
 pub(crate) const PREDICTION_BATCH_ROWS: usize = 1024;
@@ -505,6 +506,7 @@ fn planned_tree_nodes(levels: usize) -> Result<usize> {
 /// Planning passes planned shapes and upload passes the actual tree shapes through this one
 /// function, so both agree on what fits.
 fn reference_device_bytes(
+    plan: KdNeighborPlan,
     rows: usize,
     index_len: usize,
     nodes: usize,
@@ -523,6 +525,22 @@ fn reference_device_bytes(
             .checked_mul(padded)
             .ok_or(HdbscanError::Overflow(subject))?;
         check_device_allocation(elements, ELEMENT_BYTES, limit, subject)?;
+    }
+    if let KdCandidateLayout::LeafSoa { lanes } = plan.layout {
+        let slots = rows
+            .checked_add(lanes - 1)
+            .map(|rounded| rounded / lanes * lanes)
+            .ok_or(HdbscanError::Overflow("prediction SoA slots"))?;
+        let elements = slots
+            .checked_mul(features)
+            .ok_or(HdbscanError::Overflow("prediction SoA elements"))?;
+        for (count, subject) in [
+            (slots, "prediction SoA slot allocation"),
+            (elements, "prediction SoA candidate allocation"),
+        ] {
+            u32::try_from(count).map_err(|_| HdbscanError::Overflow(subject))?;
+            check_device_allocation(count, ELEMENT_BYTES, limit, subject)?;
+        }
     }
     let data = tensor_allocation_bytes(
         &[rows, features],
@@ -575,7 +593,7 @@ fn reference_device_bytes(
         row_pitched,
         "prediction KD maximum bounds",
     )?;
-    let pack = crate::kernels::kd_reference_pack_bytes(rows, nodes, features)
+    let pack = crate::kernels::kd_reference_pack_bytes(plan, rows, nodes, features)
         .ok_or(HdbscanError::Overflow("prediction reference pack bytes"))?;
     checked_live_sum(
         &[
@@ -583,6 +601,21 @@ fn reference_device_bytes(
         ],
         "prediction reference live bytes",
     )
+}
+
+/// Prepare additionally retains padded rows until leaf-SoA packing finishes.
+fn reference_prepare_bytes(
+    plan: KdNeighborPlan,
+    steady: usize,
+    rows: usize,
+    nodes: usize,
+    features: usize,
+) -> Result<usize> {
+    let pack = crate::kernels::kd_reference_pack_bytes(plan, rows, nodes, features)
+        .ok_or(HdbscanError::Overflow("prediction reference pack bytes"))?;
+    let peak = crate::kernels::kd_reference_pack_peak_bytes(plan, rows, nodes, features)
+        .ok_or(HdbscanError::Overflow("prediction reference prepare bytes"))?;
+    checked_live_sum(&[steady, peak - pack], "prediction reference prepare bytes")
 }
 
 /// Checked total of allocations live together; totals beyond `isize::MAX` are rejected.
@@ -609,7 +642,7 @@ pub struct PredictionPlan {
     pub query_batch: usize,
     /// Reference rows per cold prediction-core batch.
     pub core_batch: usize,
-    /// Largest planned device live set over the cold core and warm query phases, in bytes.
+    /// Largest planned device live set over reference preparation, cores and queries, in bytes.
     pub device_peak_bytes: usize,
     /// Largest planned host live set over upload, cold core and warm query phases, in bytes.
     pub host_peak_bytes: usize,
@@ -621,6 +654,7 @@ pub struct PredictionPlan {
 /// live set is summed with checked arithmetic: the cache tree is live throughout, and upload clones
 /// of geometry and tree overlap it.
 fn plan_prediction(
+    kd_plan: KdNeighborPlan,
     queries: usize,
     reference: usize,
     features: usize,
@@ -646,8 +680,17 @@ fn plan_prediction(
     let core_batch = plan_batch_rows(reference, s, features, limit, row_pitched)?;
 
     // Device reference: the same checked sizing `CallReference::upload` applies to the actual tree.
-    let device_reference =
-        reference_device_bytes(reference, reference, nodes, features, limit, row_pitched)?;
+    let device_reference = reference_device_bytes(
+        kd_plan,
+        reference,
+        reference,
+        nodes,
+        features,
+        limit,
+        row_pitched,
+    )?;
+    let prepare_device =
+        reference_prepare_bytes(kd_plan, device_reference, reference, nodes, features)?;
     let core_pack = crate::kernels::kd_query_pack_bytes(core_batch, features, s)
         .ok_or(HdbscanError::Overflow("prediction core pack bytes"))?;
     let core_device = checked_live_sum(
@@ -750,13 +793,14 @@ fn plan_prediction(
     Ok(PredictionPlan {
         query_batch,
         core_batch,
-        device_peak_bytes: core_device.max(query_device),
+        device_peak_bytes: prepare_device.max(core_device).max(query_device),
         host_peak_bytes: upload_host.max(core_host).max(query_host_live),
     })
 }
 
 /// Preflight only the cold reference/core phases used by conversion, without a fake query row.
 fn plan_core_preparation(
+    kd_plan: KdNeighborPlan,
     reference: usize,
     features: usize,
     s: usize,
@@ -767,8 +811,16 @@ fn plan_core_preparation(
     let levels = planned_tree_levels(reference)?;
     let nodes = planned_tree_nodes(levels)?;
     let batch = plan_batch_rows(reference, s, features, limit, row_pitched)?;
-    let device_reference =
-        reference_device_bytes(reference, reference, nodes, features, limit, row_pitched)?;
+    let device_reference = reference_device_bytes(
+        kd_plan,
+        reference,
+        reference,
+        nodes,
+        features,
+        limit,
+        row_pitched,
+    )?;
+    reference_prepare_bytes(kd_plan, device_reference, reference, nodes, features)?;
     let core_pack = crate::kernels::kd_query_pack_bytes(batch, features, s)
         .ok_or(HdbscanError::Overflow("prediction core pack bytes"))?;
     checked_live_sum(
@@ -817,6 +869,11 @@ struct Target {
 }
 
 impl Target {
+    fn query_plan(&self, features: usize) -> KdNeighborPlan {
+        let DispatchDevice::Cube(device) = self.device.as_dispatch();
+        crate::kernels::kd_query_plan(&device.client(), features)
+    }
+
     fn resolve(backend: BackendChoice) -> Result<Self> {
         let (target, actual) = Self::resolve_choice(backend)?;
         if actual != backend {
@@ -1137,7 +1194,14 @@ pub(crate) fn prepare_predictor(
         return Ok(());
     }
     let target = Target::resolve(runtime.backend())?;
-    let batch = plan_core_preparation(n, state.n_features, s, target.limit, target.row_pitched)?;
+    let batch = plan_core_preparation(
+        target.query_plan(state.n_features),
+        n,
+        state.n_features,
+        s,
+        target.limit,
+        target.row_pitched,
+    )?;
     let tree = runtime.tree(state)?;
     let _init = runtime.init()?;
     if runtime.ready_cores()?.is_some() {
@@ -1166,8 +1230,10 @@ impl CallReference {
         let row_pitched = target.row_pitched;
         let n = state.n_finite();
         let features = state.n_features;
+        let plan = target.query_plan(features);
         // Validates the actual tree arrays with the same reference sizing that planning uses.
-        reference_device_bytes(
+        let steady = reference_device_bytes(
+            plan,
             n,
             tree.indices.len(),
             tree.starts.len(),
@@ -1175,6 +1241,7 @@ impl CallReference {
             limit,
             row_pitched,
         )?;
+        reference_prepare_bytes(plan, steady, n, tree.starts.len(), features)?;
         #[cfg(test)]
         tests::count_upload();
         #[cfg(feature = "tracing")]
@@ -1187,6 +1254,13 @@ impl CallReference {
         let reference = <Dispatch as HdbscanOps>::prepare_kd_reference(
             data.clone().into_dispatch(),
             device_tree,
+            match plan.layout {
+                KdCandidateLayout::PaddedRows => 0,
+                KdCandidateLayout::LeafSoa { lanes } => lanes as u32,
+                KdCandidateLayout::LeafRows { .. } => {
+                    unreachable!("query layout is never LeafRows")
+                }
+            },
         );
         #[cfg(feature = "tracing")]
         device.sync().map_err(|error| {
@@ -1312,6 +1386,7 @@ fn preflight(
     }
     let target = Target::resolve(runtime.backend())?;
     let plan = plan_prediction(
+        target.query_plan(state.n_features),
         m,
         state.n_finite(),
         state.n_features,
@@ -1678,15 +1753,19 @@ pub(crate) mod tests {
         let n = 60;
         let features = 2;
         let rank = 3;
+        let plan = Target::resolve(BackendChoice::Cpu)
+            .unwrap()
+            .query_plan(features);
         let limit = DeviceAllocationLimit {
             // Reference padding for 60x2 (including the device pack) is the dominant
             // allocation; use a page limit large enough for the real reference footprint.
             max_page_bytes: 8192,
             alignment: 16,
         };
-        assert!(plan_core_preparation(n, features, rank, limit, false).is_ok());
+        assert!(plan_core_preparation(plan, n, features, rank, limit, false).is_ok());
         assert!(matches!(
             plan_core_preparation(
+                plan,
                 n,
                 usize::MAX,
                 rank,
@@ -1700,6 +1779,7 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             plan_core_preparation(
+                plan,
                 n,
                 features,
                 rank,
@@ -1713,7 +1793,7 @@ pub(crate) mod tests {
         ));
         // The API takes only reference/core dimensions: conversion does not manufacture query or
         // output rows to reuse plan_prediction's combined query-plus-core accounting.
-        assert!(plan_core_preparation(n, features, rank, limit, false).is_ok());
+        assert!(plan_core_preparation(plan, n, features, rank, limit, false).is_ok());
     }
 
     #[test]
@@ -1874,14 +1954,27 @@ mod resource_plan_tests {
         ] {
             assert!(
                 matches!(
-                    plan_prediction(queries, reference, 2, s, UNBOUNDED, false),
+                    plan_prediction(padded_plan(), queries, reference, 2, s, UNBOUNDED, false),
                     Err(HdbscanError::InvalidInput(_))
                 ),
                 "queries={queries} reference={reference} s={s}"
             );
         }
-        let plan = plan_prediction(37, 90, 2, 3, UNBOUNDED, false).unwrap();
+        let plan = plan_prediction(padded_plan(), 37, 90, 2, 3, UNBOUNDED, false).unwrap();
         assert_eq!((plan.query_batch, plan.core_batch), (37, 90));
+    }
+
+    fn padded_plan() -> KdNeighborPlan {
+        KdNeighborPlan {
+            layout: KdCandidateLayout::PaddedRows,
+            order: crate::kernels::KdQueryOrder::Cyclic,
+        }
+    }
+
+    fn cpu_plan(features: usize) -> KdNeighborPlan {
+        Target::resolve(BackendChoice::Cpu)
+            .unwrap()
+            .query_plan(features)
     }
 
     fn limit_with(alignment: usize) -> DeviceAllocationLimit {
@@ -1935,19 +2028,19 @@ mod resource_plan_tests {
             );
             assert!(
                 matches!(
-                    reference_device_bytes(5, 5, 9, 3, limit, true),
+                    reference_device_bytes(padded_plan(), 5, 5, 9, 3, limit, true),
                     Err(HdbscanError::BackendUnavailable(_))
                 ),
                 "alignment={alignment}"
             );
             // Flat tensors never pitch, so the alignment is irrelevant to them.
             assert!(
-                reference_device_bytes(5, 5, 9, 3, limit, false).is_ok(),
+                reference_device_bytes(padded_plan(), 5, 5, 9, 3, limit, false).is_ok(),
                 "alignment={alignment}"
             );
         }
         assert!(matches!(
-            plan_prediction(10, 30, 3, 3, limit_with(8), true),
+            plan_prediction(padded_plan(), 10, 30, 3, 3, limit_with(8), true),
             Err(HdbscanError::BackendUnavailable(_))
         ));
         assert!(matches!(
@@ -1974,6 +2067,7 @@ mod resource_plan_tests {
                 for pitched in [false, true] {
                     assert_eq!(
                         reference_device_bytes(
+                            cpu_plan(features),
                             rows,
                             tree.indices.len(),
                             tree.starts.len(),
@@ -1982,8 +2076,16 @@ mod resource_plan_tests {
                             pitched
                         )
                         .unwrap(),
-                        reference_device_bytes(rows, rows, nodes, features, limit, pitched)
-                            .unwrap(),
+                        reference_device_bytes(
+                            cpu_plan(features),
+                            rows,
+                            rows,
+                            nodes,
+                            features,
+                            limit,
+                            pitched
+                        )
+                        .unwrap(),
                         "rows={rows} features={features} pitched={pitched}"
                     );
                 }
@@ -1995,11 +2097,13 @@ mod resource_plan_tests {
     fn plan_peaks_are_the_checked_helper_totals() {
         let (reference, features, s, queries) = (90usize, 2usize, 3usize, 37usize);
         let limit = limit_with(16);
-        let plan = plan_prediction(queries, reference, features, s, limit, true).unwrap();
+        let kd_plan = cpu_plan(features);
+        let plan = plan_prediction(kd_plan, queries, reference, features, s, limit, true).unwrap();
         let k = candidate_width(s, reference).unwrap();
         let nodes = planned_tree_nodes(planned_tree_levels(reference).unwrap()).unwrap();
         let device_reference =
-            reference_device_bytes(reference, reference, nodes, features, limit, true).unwrap();
+            reference_device_bytes(kd_plan, reference, reference, nodes, features, limit, true)
+                .unwrap();
         let core = device_reference
             + crate::kernels::kd_query_pack_bytes(plan.core_batch, features, s).unwrap();
         let query = device_reference
@@ -2012,7 +2116,9 @@ mod resource_plan_tests {
             )
             .unwrap()
             + crate::kernels::kd_query_pack_bytes(plan.query_batch, features, k).unwrap();
-        assert_eq!(plan.device_peak_bytes, core.max(query));
+        let prepare =
+            reference_prepare_bytes(kd_plan, device_reference, reference, nodes, features).unwrap();
+        assert_eq!(plan.device_peak_bytes, prepare.max(core).max(query));
         assert_eq!(
             plan.query_batch,
             plan_batch_rows(queries, k, features, limit, true).unwrap()
@@ -2022,6 +2128,46 @@ mod resource_plan_tests {
             plan_batch_rows(reference, s, features, limit, true).unwrap()
         );
         assert!(plan.host_peak_bytes >= reference * features * ELEMENT_BYTES);
+    }
+
+    #[test]
+    fn soa_prepare_peak_and_allocation_limit_are_checked() {
+        let (rows, features) = (10000, 33);
+        let nodes = planned_tree_nodes(planned_tree_levels(rows).unwrap()).unwrap();
+        for kd_plan in [padded_plan(), cpu_plan(features)] {
+            let steady =
+                reference_device_bytes(kd_plan, rows, rows, nodes, features, UNBOUNDED, false)
+                    .unwrap();
+            let prepare = reference_prepare_bytes(kd_plan, steady, rows, nodes, features).unwrap();
+            let plan = plan_prediction(kd_plan, 1, rows, features, 1, UNBOUNDED, false).unwrap();
+            let core =
+                steady + crate::kernels::kd_query_pack_bytes(plan.core_batch, features, 1).unwrap();
+            let query = steady
+                + features * 4
+                + crate::kernels::kd_query_pack_bytes(1, features, 2).unwrap();
+            assert_eq!(plan.device_peak_bytes, prepare.max(core).max(query));
+            if matches!(kd_plan.layout, KdCandidateLayout::LeafSoa { .. }) {
+                assert!(prepare > core && prepare > query);
+            } else {
+                assert_eq!(prepare, steady);
+            }
+        }
+        // Compact geometry and temporary padded rows fit; the rounded SoA does not.
+        let kd_plan = KdNeighborPlan {
+            layout: KdCandidateLayout::LeafSoa { lanes: 16 },
+            order: crate::kernels::KdQueryOrder::Cyclic,
+        };
+        let limit = DeviceAllocationLimit {
+            max_page_bytes: 300,
+            alignment: 4,
+        };
+        assert!(reference_device_bytes(padded_plan(), 17, 17, 1, 3, limit, false).is_ok());
+        assert!(matches!(
+            reference_device_bytes(kd_plan, 17, 17, 1, 3, limit, false),
+            Err(HdbscanError::Overflow(
+                "prediction SoA candidate allocation"
+            ))
+        ));
     }
 
     #[test]
@@ -2053,10 +2199,16 @@ mod resource_plan_tests {
         // Data and packed reference each fit one allocation, but together they exceed isize::MAX.
         let rows = i32::MAX as usize;
         assert!(matches!(
-            plan_prediction(1, rows, 1 << 29, 1, UNBOUNDED, false),
+            plan_prediction(padded_plan(), 1, rows, 1 << 29, 1, UNBOUNDED, false),
             Err(HdbscanError::Overflow("prediction reference live bytes"))
         ));
         // Halving features keeps the same live set inside isize::MAX.
-        assert!(plan_prediction(1, rows, 1 << 28, 1, UNBOUNDED, false).is_ok());
+        assert!(plan_prediction(padded_plan(), 1, rows, 1 << 28, 1, UNBOUNDED, false).is_ok());
+        assert!(matches!(
+            plan_prediction(cpu_plan(2), 1, rows, 2, 1, UNBOUNDED, false),
+            Err(HdbscanError::Overflow(
+                "prediction SoA candidate allocation"
+            ))
+        ));
     }
 }

@@ -34,14 +34,19 @@ pub struct DeviceKdTree<B: Backend> {
 ///
 /// Built once by [`HdbscanOps::prepare_kd_reference`] from compact reference
 /// rows and their tree; every bounded query batch clones this value instead of
-/// repacking. `padded_data` holds `rows * 4⌈n_features/4⌉` zero-padded
-/// reference values and `padded_min`/`padded_max` hold `nodes` padded bounds.
+/// repacking. `candidates` holds padded rows when `lanes == 0`, otherwise
+/// lane-tiled leaf SoA data; `slot_ids` holds the corresponding IDs.
+/// `padded_min`/`padded_max` hold padded bounds.
+/// The former `padded_data` field is replaced by `candidates`, `slot_ids` and
+/// `lanes`; this is a deliberate Rust API break with no compatibility shim.
 /// The tree preconditions of [`DeviceKdTree`] apply to the source data/tree.
 /// Drop the value at the end of the call to release its device allocations.
 #[derive(Clone, ExtensionType)]
 #[extension_type(fusion)]
 pub struct DeviceKdReference<B: Backend> {
-    pub padded_data: FloatTensor<B>,
+    pub candidates: FloatTensor<B>,
+    pub slot_ids: IntTensor<B>,
+    pub lanes: usize,
     pub padded_min: FloatTensor<B>,
     pub padded_max: FloatTensor<B>,
     pub indices: IntTensor<B>,
@@ -117,16 +122,22 @@ pub trait HdbscanOps: Backend {
         k: u32,
     ) -> (IntTensor<Self>, FloatTensor<Self>);
 
-    #[fusion(meta = |data, tree| {
+    #[fusion(meta = |data, tree, lanes| {
         let rows = data.shape[0];
         let features = data.shape[1];
         let nodes = tree.starts.shape[0];
         let width = features.div_ceil(4) * 4;
+        let lanes = *lanes as usize;
+        let slots = if lanes == 0 { rows } else { rows.div_ceil(lanes) * lanes };
         let float = |len: usize| {
             burn::backend::fusion::custom::TensorSpec::new([len].into(), data.dtype)
         };
         DeviceKdReferenceMetadata {
-            padded_data: float(rows * width),
+            candidates: float(if lanes == 0 { rows * width } else { slots * features }),
+            slot_ids: if lanes == 0 { tree.indices.clone() } else {
+                burn::backend::fusion::custom::TensorSpec::new([slots].into(), burn::tensor::DType::I32)
+            },
+            lanes,
             padded_min: float(nodes * width),
             padded_max: float(nodes * width),
             indices: tree.indices.clone(),
@@ -142,9 +153,14 @@ pub trait HdbscanOps: Backend {
     /// Validates shapes/dtypes and packs compact reference rows and tree bounds
     /// once for repeated [`HdbscanOps::exact_neighbors_kd_query`] batches. The
     /// tree-content preconditions on [`DeviceKdTree`] are not checked.
+    /// `lanes = 0` selects padded rows on any device; a nonzero width requires a CPU client
+    /// and a supported `io_optimized_vector_sizes(4)` width no greater than 16.
+    /// Violating these layout preconditions panics. The explicit `lanes` argument
+    /// is a deliberate Rust API break; Python's prediction API is unchanged.
     fn prepare_kd_reference(
         data: FloatTensor<Self>,
         #[extension_type] tree: DeviceKdTree<Self>,
+        lanes: u32,
     ) -> DeviceKdReference<Self>;
 
     #[fusion(meta = |query, reference, k, exclude_self, query_offset| {
@@ -162,8 +178,14 @@ pub trait HdbscanOps: Backend {
     /// query row order with shape `[query rows, k]`. Absent slots are padded
     /// with `(inf, reference rows)`. With `exclude_self`, query row `r` skips
     /// reference ID `query_offset + r`; identical coordinates are never
-    /// excluded by value. Always uses bounds-pruned per-query traversal; nodes
-    /// whose bound equals the current worst distance are still visited.
+    /// excluded by value. CPU prediction selects bounds-pruned traversal over leaf SoA;
+    /// references prepared with `lanes = 0` use padded rows on any device.
+    /// Equal bounds are still visited. Results
+    /// are exact under the kernel's per-feature arithmetic; floating-point
+    /// contraction can change rounding and near-tie IDs across layouts, affecting
+    /// downstream labels, probabilities and connectors. Exactly representable
+    /// quantized squared sums agree bitwise; arbitrary inputs need not agree with
+    /// the previous CPU release or with another backend.
     fn exact_neighbors_kd_query(
         query: FloatTensor<Self>,
         #[extension_type] reference: DeviceKdReference<Self>,

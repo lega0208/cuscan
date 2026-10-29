@@ -588,6 +588,15 @@ reproduce `probabilities_`. Nonempty cluster trees require at least
 than being clamped. Nonfinite training rows remain excluded and connectors are
 mapped back to original row IDs.
 
+CPU prediction uses C16's per-query pruned traversal over a call-local leaf-tiled
+SoA reference pack; CUDA prediction keeps the padded-row per-query kernel.
+Neighbors are exact in `(squared distance, reference ID)` order under each kernel's
+own per-feature float32 arithmetic, with `(inf, n)` padding. Exactly representable
+quantized squared sums agree bitwise. On arbitrary inputs, vector/scalar FMA
+contraction can round differently: CPU prediction distances may differ by rounding
+from the previous release, and near ties can change neighbors, labels, strengths
+or connectors. CPU prediction cores now use the same arithmetic as CPU fitting.
+
 Models retain compact float32 geometry (`4*n*d` bytes), hierarchy metadata and
 host KD trees built during fitting. Other routes build their host tree lazily.
 The first prediction additionally computes and caches `8*n` bytes of float64

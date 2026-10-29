@@ -13,6 +13,13 @@
 
 Trace actual consumers before documenting or changing configuration behavior.
 
+HDBSCAN `approximate_predict` CPU KD queries use the C16 leaf-SoA candidate scan in
+input query order, including cold prediction-core batches. CUDA queries retain the
+padded-row per-query kernel. The call-local SoA replaces padded reference rows;
+checked prediction planning includes its lane-rounded IDs/data and the transient
+padded-row preparation peak. Vector/scalar contraction can change rounding and
+near-tie prediction outputs; exact ordering is under each kernel's own arithmetic.
+
 HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses the Phase 7 F2 flat plane kernel at 16–32 features when plane operations/synchronization and device resources permit: two planes per cube, no row-count gate. Other CUDA cases use the per-query kernel; this is pre-launch routing, not recovery from execution errors. Leaf-ordered packs preserve original IDs/output rows and scalar feature-sum order. Valid builder trees (or equivalent low-level permutation/tree preconditions) are required; no runtime content scan is added. The estimator consumes `kd_neighbor_plan`, `kd_neighbor_pack_bytes` and `kd_neighbor_pack_allocations` for matching checked live-buffer accounting and allocation limits: tile-rounded padded leaf rows replace padded data, padded bounds remain, and staging counters are diagnostics-only. F2 diagnostics report zero node pops, n scanned positions per query (including self), and separately summed staged positions per tile. Phase 7 final-source verification passed (`artifacts/cubecl_kernels_perf/phase7/final_gates/{results,ir}.json` and `final_integration.json`). Independent review status/receipts are tracked separately in the Ultragoal ledger. Experimental H1/release/debug gates are not substituted for final-source proof.
 
 ## Key Directories

@@ -721,3 +721,76 @@ Fixed synthetic Gaussian k5/min-cluster-size5 measurements on this **RTX 3080 / 
 **Final-source verification passed.** Under `artifacts/cubecl_kernels_perf/phase7/`, `final_gates/results.json` records exit0 for core tests, required-CUDA release and default debug suites, workspace/all-target clippy, formatting checks and Python analysis/campaign tests (145 passed). `final_gates/ir.json` records 44 tile variants with warp synchronization present throughout and no CTA barrier. `summary.json` records final verification passed. These receipts cover retained-source gates rather than reusing experimental-arm results.
 
 `final_integration.json` records both required commands, `bash analyze_hdbscan_stages.sh --rows 20000` and `--rows 100000`, exiting **0** with real CPU/CUDA execution and exact `labels_equal=true`: `artifacts/hdbscan_stages/run-20000-bgHeQylR` and `artifacts/hdbscan_stages/run-100000-xQPWOUox`. Both counter-family receipts identify **`kd_neighbors_tile_kernel`**. These integration runs establish correctness/tool integration, not new acceptance timing cells. Independent review status/receipts are tracked separately in the Ultragoal ledger.
+
+## CPU approximate-prediction leaf-SoA (Phase A)
+
+**Accepted; Phase B remains excluded.** Evidence is in
+`artifacts/approx_query_cpu/{baseline,soa}/`, `summary.json`, `provenance.json`,
+`small_query_repeats.json`, `fit_regression.json` and `stage_validation.json`.
+The baseline is pristine revision `63af3234b04cab7441120d07210273cdef111bb1`,
+with only label/connector JSON output added to the same tracing-enabled release
+profiler. Both binaries read identical non-quantized float32 matrices: eight
+separated Gaussian clusters, seed `20261029+n+d`, min_samples 5. The final matrix
+ran sequentially without competing builds/tests, with one cold and three warm
+calls per process. Persistent JIT caches were not cleared; cold is the first
+prediction after fit, not guaranteed cache-cold compilation. Raw traces separate
+rank-5 core searches, rank-10 external searches and reference upload/preparation.
+`summarize.py` regenerates input hashes and the trace-separated summary.
+
+Warm end-to-end / warm query-search speedups (baseline divided by SoA):
+
+| Reference rows | Features | 1k queries | All-row queries |
+| ---: | ---: | ---: | ---: |
+| 20k | 2 | 0.69× / 0.64× | 1.02× / 1.00× |
+| 20k | 8 | 1.11× / 1.39× | 1.36× / 1.51× |
+| 20k | 16 | 1.13× / 2.34× | 1.90× / 2.06× |
+| 20k | 33 | 1.74× / 2.86× | 2.99× / 3.30× |
+| 100k | 2 | 1.08× / 1.36× | 1.00× / 0.98× |
+| 100k | 8 | 1.27× / 1.86× | 1.72× / 1.87× |
+| 100k | 16 | 1.92× / 3.54× | 3.18× / 3.39× |
+| 100k | 33 | 3.45× / 5.64× | 4.76× / 5.00× |
+
+The apparent 20k×2/1k regression was investigated with **seven additional
+alternating process pairs**, each retaining three warm calls and raw traces.
+Median-of-process-medians was **1.950 ms baseline versus 1.998 ms SoA** (+2.4%,
+0.047 ms), with overlapping process samples (baseline 1.524–2.322 ms, SoA
+1.750–2.404 ms). This does not support a material small-query regression or a
+query-count routing gate. Search improves in most shapes; narrow 2D searches are
+roughly neutral. **Cold prediction regresses in 8/16 cases**, including both query
+counts for 20k×2, 20k×8, 20k×16 and 100k×2. Examples are 20k×8/1k
+**0.075 → 0.128 s**, 20k×8/all **0.121 → 0.152 s**, and 20k×16/1k
+**0.111 → 0.147 s**. Cold core-search spans regress in four of eight reference
+shapes: 20k×{2,8,16} and 100k×2. The first rank-5 batch at 20k×2/1k costs
+approximately **106 ms SoA versus 42 ms baseline**, while the remaining core
+batches total about 13 ms in each. This is consistent with extra first-launch/JIT
+cost, but persistent caches were not cleared and these traces do not isolate JIT
+causally. The warm-time acceptance gate does not erase these cold-call tradeoffs.
+The routing remains CPU SoA for all shapes, with no fallback. Larger-feature
+cold/core gains and preparation costs remain explicit in `summary.json`.
+
+All **16 cases had zero label and connector differences** against baseline;
+each profiler invocation independently checked cold/warm labels, strengths and
+connectors. This measures these inputs only: contraction-sensitive near-tie
+differences remain permitted. Planned device peaks increase, not decrease: for
+example 100k×16/1k rises **14,521,860 → 21,113,856 bytes**, and 20k×33/1k rises
+**6,246,308 → 8,610,272 bytes**, including the temporary padded preparation rows.
+
+Both required stage analyses passed with real CPU/CUDA execution and exact
+labels: `run-20000-aCNH51me` and `run-100000-DBaYLcaS`. The latter measured CPU
+fit **1.306 s**, CUDA **0.589 s**, and retained CUDA's `kd_neighbors_tile_kernel`
+fit family. The historical Phase 7 integration directories cited above are not
+present in this checkout, so they are not claimed as a fresh timing comparison.
+Instead, three alternating baseline/SoA process pairs on the exact final-stage
+100k×16 input, with three measured fits after one excluded warmup each, gave CPU
+fit medians-of-process-medians **1.346 s versus 1.326 s**. This supplies a current
+same-input fit-regression check against the accepted pre-change C16 source.
+
+### Requested 300k×16 comparison, 10k queries
+
+Using the same release binaries, seeded eight-cluster workload and min_samples 5,
+CPU prediction measured **11.337 → 2.327 s cold (4.87×)** and
+**384.975 → 83.511 ms warm median (4.61×, three calls)**. Labels and connectors
+had zero differences across all 10k queries; each binary checked cold/warm
+strengths too. Planned device peak increased **42,040,964 → 62,227,968 bytes**.
+These are one process per arm, not confidence intervals. Raw outputs/traces and
+input SHA-256 are retained under `artifacts/approx_query_cpu/300k/`.

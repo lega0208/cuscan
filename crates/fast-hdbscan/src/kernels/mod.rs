@@ -5,12 +5,13 @@ mod kdtree;
 pub const COMPONENT_REDUCTION_TILE_WIDTH: usize = 512;
 
 pub use boruvka::{BoruvkaCandidateSizing, validate_boruvka_candidate_sizing};
-#[cfg(test)]
-pub(crate) use kdtree::kd_padded_bytes;
 pub(crate) use kdtree::{
-    KdCandidateLayout, kd_neighbor_pack_allocations, kd_neighbor_pack_bytes, kd_neighbor_plan,
-    kd_padded_width, kd_query_pack_bytes, kd_reference_pack_bytes,
+    KdCandidateLayout, KdNeighborPlan, kd_neighbor_pack_allocations, kd_neighbor_pack_bytes,
+    kd_neighbor_plan, kd_padded_width, kd_query_pack_bytes, kd_query_plan, kd_reference_pack_bytes,
+    kd_reference_pack_peak_bytes,
 };
+#[cfg(test)]
+pub(crate) use kdtree::{KdQueryOrder, kd_padded_bytes};
 
 use burn::backend::{
     TensorMetadata,
@@ -73,8 +74,9 @@ impl crate::backend::HdbscanOps for CubeBackend {
     fn prepare_kd_reference(
         data: FloatTensor<Self>,
         tree: crate::backend::DeviceKdTree<Self>,
+        lanes: u32,
     ) -> crate::backend::DeviceKdReference<Self> {
-        kdtree::prepare_kd_reference(data, tree)
+        kdtree::prepare_kd_reference(data, tree, lanes)
     }
 
     fn exact_neighbors_kd_query(

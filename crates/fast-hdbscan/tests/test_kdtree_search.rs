@@ -1,5 +1,5 @@
 use burn::{
-    backend::Dispatch,
+    backend::{Dispatch, DispatchDevice},
     tensor::{Device, Int, Tensor, TensorData},
 };
 use fast_hdbscan::BackendChoice;
@@ -682,34 +682,60 @@ fn prepared_query(
 ) -> impl Fn(&[f32], usize, bool, usize) -> (Vec<i32>, Vec<u32>) {
     let n = values.len() / d;
     let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n, d]), device);
-    let reference = <Dispatch as HdbscanOps>::prepare_kd_reference(
-        data.into_dispatch(),
-        host_tree_to_device(tree, device),
-    );
+    let DispatchDevice::Cube(cube) = device.as_dispatch();
+    let client = cube.client();
+    let mut widths = vec![0];
+    if client.properties().hardware.num_cpu_cores.is_some() {
+        widths.push(
+            client
+                .io_optimized_vector_sizes(4)
+                .filter(|&lanes| lanes <= 16)
+                .max()
+                .unwrap(),
+        );
+    }
+    let references: Vec<_> = widths
+        .into_iter()
+        .map(|lanes| {
+            <Dispatch as HdbscanOps>::prepare_kd_reference(
+                data.clone().into_dispatch(),
+                host_tree_to_device(tree, device),
+                lanes as u32,
+            )
+        })
+        .collect();
     let device = device.clone();
     move |query: &[f32], k: usize, exclude_self: bool, offset: usize| {
-        let rows = query.len() / d;
-        let tensor = Tensor::<2>::from_data(TensorData::new(query.to_vec(), [rows, d]), &device);
-        let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd_query(
-            tensor.into_dispatch(),
-            reference.clone(),
-            k as u32,
-            exclude_self,
-            offset as u32,
-        );
-        let ids = Tensor::<2, Int>::from_dispatch(ids)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap();
-        assert_eq!(ids.len(), rows * k, "output is query rows by k");
-        let distances = Tensor::<2>::from_dispatch(distances)
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap()
-            .into_iter()
-            .map(f32::to_bits)
-            .collect();
-        (ids, distances)
+        let mut results = Vec::new();
+        for reference in &references {
+            let rows = query.len() / d;
+            let tensor =
+                Tensor::<2>::from_data(TensorData::new(query.to_vec(), [rows, d]), &device);
+            let (ids, distances) = <Dispatch as HdbscanOps>::exact_neighbors_kd_query(
+                tensor.into_dispatch(),
+                reference.clone(),
+                k as u32,
+                exclude_self,
+                offset as u32,
+            );
+            let ids = Tensor::<2, Int>::from_dispatch(ids)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap();
+            assert_eq!(ids.len(), rows * k, "output is query rows by k");
+            let distances = Tensor::<2>::from_dispatch(distances)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            results.push((ids, distances));
+        }
+        for result in &results[1..] {
+            assert_eq!(result, &results[0], "public fused layouts agree");
+        }
+        results.remove(0)
     }
 }
 

@@ -55,14 +55,17 @@ pub(crate) fn kd_neighbor_plan(client: &cubecl::client::Client, features: usize)
             order: KdQueryOrder::Cyclic,
         };
     }
-    let lanes = client
-        .io_optimized_vector_sizes(4)
-        .find(|&w| w <= KD_SOA_MAX_LANES)
-        .expect("CPU KD vector width");
+    let lanes = kd_cpu_soa_lanes(client);
     KdNeighborPlan {
         layout: KdCandidateLayout::LeafSoa { lanes },
         order: KdQueryOrder::LeafBlocks,
     }
+}
+fn kd_cpu_soa_lanes(client: &cubecl::client::Client) -> usize {
+    client
+        .io_optimized_vector_sizes(4)
+        .find(|&w| w <= KD_SOA_MAX_LANES)
+        .expect("CPU KD vector width")
 }
 fn kd_soa_slots(rows: usize, lanes: usize) -> Option<usize> {
     if lanes == 0 {
@@ -1319,8 +1322,11 @@ fn kd_neighbors_cpu_kernel<F: Float, I: Int, Lanes: Size>(
     n: u32,
     k: u32,
     d_chunks: u32,
+    query_offset: u32,
     #[comptime] reg_features: usize,
     #[comptime] diagnostics_enabled: bool,
+    #[comptime] leaf_order: bool,
+    #[comptime] exclude_self: bool,
     out_indices: &mut Tensor<I>,
     out_distances: &mut Tensor<F>,
     diagnostics: &mut Tensor<I>,
@@ -1331,8 +1337,12 @@ fn kd_neighbors_cpu_kernel<F: Float, I: Int, Lanes: Size>(
     let mut local_row = unit * KD_QUERY_BLOCK;
     let row_stride = (CUBE_DIM_X * CUBE_COUNT_X) as usize;
     while local_row < row_count as usize {
-        if local_row < n as usize {
-            let row = u32::cast_from(indices[local_row]) as usize;
+        if local_row < row_count as usize {
+            let row = if comptime![leaf_order] {
+                u32::cast_from(indices[local_row]) as usize
+            } else {
+                local_row
+            };
             let n = n as usize;
             let d_chunks = d_chunks as usize;
             let width = k as usize;
@@ -1416,7 +1426,8 @@ fn kd_neighbors_cpu_kernel<F: Float, I: Int, Lanes: Size>(
                                                 u32::cast_from(slot_ids[position]) as usize;
                                             let distance = acc.extract(lane);
 
-                                            if candidate != row
+                                            if (comptime![!exclude_self]
+                                                || candidate != query_offset as usize + row)
                                                 && (distance < worst_distance
                                                     || (distance == worst_distance
                                                         && candidate < worst_index))
@@ -1819,19 +1830,56 @@ pub(super) fn exact_neighbors_kd(
     (output_indices, output_distances)
 }
 
-/// Launch plan of every query/reference search: bounds-pruned per-query traversal
-/// over padded rows. Exhaustive F2 tiles and CPU leaf-SoA blocks stay exclusive to
-/// the fitting self-query entry point; this is a fixed choice, not a fallback.
-pub(crate) const fn kd_query_plan() -> KdNeighborPlan {
+/// Choose the query candidate layout before preparing the reference.
+pub(crate) fn kd_query_plan(client: &cubecl::client::Client, _features: usize) -> KdNeighborPlan {
     KdNeighborPlan {
-        layout: KdCandidateLayout::PaddedRows,
+        layout: if client.properties().hardware.num_cpu_cores.is_some() {
+            KdCandidateLayout::LeafSoa {
+                lanes: kd_cpu_soa_lanes(client),
+            }
+        } else {
+            KdCandidateLayout::PaddedRows
+        },
         order: KdQueryOrder::Cyclic,
     }
 }
 
-/// Device bytes of one prepared reference pack (padded rows and bounds).
-pub(crate) fn kd_reference_pack_bytes(rows: usize, nodes: usize, features: usize) -> Option<usize> {
-    kd_padded_bytes(rows, nodes, features)
+/// Steady device bytes of a prepared reference pack and bounds.
+pub(crate) fn kd_reference_pack_bytes(
+    plan: KdNeighborPlan,
+    rows: usize,
+    nodes: usize,
+    features: usize,
+) -> Option<usize> {
+    match plan.layout {
+        KdCandidateLayout::PaddedRows => kd_padded_bytes(rows, nodes, features),
+        KdCandidateLayout::LeafSoa { lanes } => nodes
+            .checked_mul(kd_padded_width(features)?)?
+            .checked_mul(8)?
+            .checked_add(
+                kd_soa_slots(rows, lanes)?
+                    .checked_mul(features.checked_add(1)?)?
+                    .checked_mul(4)?,
+            ),
+        KdCandidateLayout::LeafRows { .. } => None,
+    }
+}
+
+/// Peak pack bytes while preparing the reference.
+pub(crate) fn kd_reference_pack_peak_bytes(
+    plan: KdNeighborPlan,
+    rows: usize,
+    nodes: usize,
+    features: usize,
+) -> Option<usize> {
+    let steady = kd_reference_pack_bytes(plan, rows, nodes, features)?;
+    match plan.layout {
+        KdCandidateLayout::LeafSoa { .. } => steady.checked_add(
+            rows.checked_mul(kd_padded_width(features)?)?
+                .checked_mul(4)?,
+        ),
+        _ => Some(steady),
+    }
 }
 
 /// Live device bytes of one query batch: padded query copy, `[rows, k]` outputs
@@ -1852,6 +1900,7 @@ pub(crate) fn kd_query_pack_bytes(query_rows: usize, features: usize, k: usize) 
 pub(super) fn prepare_kd_reference(
     data: FloatTensor<CubeBackend>,
     tree: DeviceKdTree<CubeBackend>,
+    lanes: u32,
 ) -> DeviceKdReference<CubeBackend> {
     let data = into_contiguous(data);
     let tree = into_contiguous_tree(tree);
@@ -1859,8 +1908,28 @@ pub(super) fn prepare_kd_reference(
     let [rows, features] = data.shape().dims::<2>();
     let [nodes] = tree.starts.shape().dims::<1>();
     u32::try_from(rows).expect("KD reference rows must fit u32");
+    let lanes = lanes as usize;
+    if lanes > 0 {
+        assert!(
+            data.client.properties().hardware.num_cpu_cores.is_some(),
+            "CPU KD plan on non-CPU client"
+        );
+        assert!(
+            lanes <= KD_SOA_MAX_LANES
+                && data.client.io_optimized_vector_sizes(4).any(|w| w == lanes),
+            "unsupported CPU KD lane width"
+        );
+    }
+    let padded = pad_rows(&data, rows, features);
+    let (candidates, slot_ids) = if lanes == 0 {
+        (padded, tree.indices.clone())
+    } else {
+        pack_leaf_soa(&data, &padded, &tree.indices, rows, features, lanes)
+    };
     DeviceKdReference {
-        padded_data: pad_rows(&data, rows, features),
+        candidates,
+        slot_ids,
+        lanes,
         padded_min: pad_rows(&tree.bounds_min, nodes, features),
         padded_max: pad_rows(&tree.bounds_max, nodes, features),
         indices: tree.indices,
@@ -1911,7 +1980,16 @@ fn validate_reference(reference: &DeviceKdReference<CubeBackend>) {
     i32::try_from(rows).expect("KD reference rows must fit destination indices");
     i32::try_from(nodes).expect("KD node count must fit diagnostic counters");
     for (tensor, len, name) in [
-        (&reference.padded_data, rows * width, "padded data"),
+        (
+            &reference.candidates,
+            if reference.lanes == 0 {
+                rows * width
+            } else {
+                kd_soa_slots(rows, reference.lanes).expect("KD slots overflow")
+                    * reference.n_features
+            },
+            "candidates",
+        ),
         (
             &reference.padded_min,
             nodes * width,
@@ -1932,6 +2010,15 @@ fn validate_reference(reference: &DeviceKdReference<CubeBackend>) {
     }
     for (tensor, len, name) in [
         (&reference.indices, rows, "indices"),
+        (
+            &reference.slot_ids,
+            if reference.lanes == 0 {
+                rows
+            } else {
+                kd_soa_slots(rows, reference.lanes).expect("KD slots overflow")
+            },
+            "slot IDs",
+        ),
         (&reference.starts, nodes, "starts"),
         (&reference.ends, nodes, "ends"),
         (&reference.is_leaf, nodes, "leaf flags"),
@@ -1966,7 +2053,8 @@ fn launch_kd_query(
 ) {
     let query = into_contiguous(query);
     let reference = DeviceKdReference {
-        padded_data: into_contiguous(reference.padded_data),
+        candidates: into_contiguous(reference.candidates),
+        slot_ids: into_contiguous(reference.slot_ids),
         padded_min: into_contiguous(reference.padded_min),
         padded_max: into_contiguous(reference.padded_max),
         indices: into_contiguous(reference.indices),
@@ -1996,9 +2084,54 @@ fn launch_kd_query(
     let diagnostics = allocate_diagnostics(&query, rows, diagnostics_enabled);
     let client = query.client.clone();
     let (d_chunks, reg_features) = kd_vector_chunks(features);
-    // Fixed pruned-traversal plan: never the fitting F2 or leaf-SoA specializations.
-    assert_eq!(kd_query_plan().layout, KdCandidateLayout::PaddedRows);
     let query_padded = pad_rows(&query, rows, features);
+    if reference.lanes > 0 {
+        let lanes = reference.lanes;
+        assert!(client.properties().hardware.num_cpu_cores.is_some());
+        assert!(
+            lanes <= KD_SOA_MAX_LANES && client.io_optimized_vector_sizes(4).any(|w| w == lanes)
+        );
+        let (cube_count, dim) =
+            kd_launch_geometry_with_width(&client, rows, KD_CUBE_DIM, max_cubes_override);
+        kd_neighbors_cpu_kernel::launch(
+            &client,
+            cube_count,
+            dim,
+            lanes as VectorSize,
+            padded_vector_view(&query_padded, rows, d_chunks),
+            query.clone().into_tensor_arg(),
+            soa_vector_view(
+                &reference.candidates,
+                kd_soa_slots(reference.rows, lanes).unwrap() / lanes * features,
+                lanes,
+            ),
+            reference.slot_ids.clone().into_tensor_arg(),
+            reference.indices.clone().into_tensor_arg(),
+            reference.starts.clone().into_tensor_arg(),
+            reference.ends.clone().into_tensor_arg(),
+            reference.is_leaf.clone().into_tensor_arg(),
+            padded_vector_view(&reference.padded_min, reference.nodes, d_chunks),
+            padded_vector_view(&reference.padded_max, reference.nodes, d_chunks),
+            features as u32,
+            rows_u32,
+            reference.rows as u32,
+            k,
+            d_chunks as u32,
+            query_offset,
+            reg_features,
+            diagnostics_enabled,
+            false,
+            exclude_self,
+            output_indices.clone().into_tensor_arg(),
+            output_distances.clone().into_tensor_arg(),
+            diagnostics.clone().into_tensor_arg(),
+            [
+                dtype_to_storage_type(DType::F32),
+                dtype_to_storage_type(DType::I32),
+            ],
+        );
+        return (output_indices, output_distances, diagnostics);
+    }
     let (cube_count, dim) = kd_launch_geometry_with_width(
         &client,
         rows,
@@ -2009,7 +2142,7 @@ fn launch_kd_query(
         &client,
         cube_count,
         dim,
-        padded_vector_view(&reference.padded_data, reference.rows, d_chunks),
+        padded_vector_view(&reference.candidates, reference.rows, d_chunks),
         padded_vector_view(&query_padded, rows, d_chunks),
         reference.indices.clone().into_tensor_arg(),
         reference.starts.clone().into_tensor_arg(),
@@ -2236,8 +2369,11 @@ fn launch_kd_neighbors_impl(
             n as u32,
             k,
             d_chunks as u32,
+            0,
             reg_features,
             diagnostics_enabled,
+            true,
+            true,
             output_indices.clone().into_tensor_arg(),
             output_distances.clone().into_tensor_arg(),
             diagnostics.clone().into_tensor_arg(),
@@ -3167,15 +3303,6 @@ mod tests {
     }
 
     fn check_query_routes(device: &CubeDevice) {
-        // The query plan never adopts the fitting F2 or leaf-SoA routes, even at
-        // widths where the fitting plan does.
-        assert_eq!(
-            kd_query_plan(),
-            KdNeighborPlan {
-                layout: KdCandidateLayout::PaddedRows,
-                order: KdQueryOrder::Cyclic,
-            }
-        );
         for features in [2usize, 16, 30, 33] {
             let n = 203usize;
             // Eighth-quantized values keep every squared sum exact, so the host
@@ -3187,11 +3314,22 @@ mod tests {
             };
             let values = quantize(splitmix_values(n, features));
             let (data, tree) = make_neighbor_inputs(&values, n, features, device);
+            let plan = kd_query_plan(&data.client, features);
+            let lanes = match plan.layout {
+                KdCandidateLayout::LeafSoa { lanes } => lanes,
+                KdCandidateLayout::PaddedRows => 0,
+                _ => panic!("unexpected query layout"),
+            };
+            assert_eq!(plan.order, KdQueryOrder::Cyclic);
+            assert_eq!(
+                lanes > 0,
+                data.client.properties().hardware.num_cpu_cores.is_some()
+            );
             let fitting_plan = kd_neighbor_plan(&data.client, features);
             if data.client.properties().hardware.num_cpu_cores.is_some() {
                 assert_eq!(fitting_plan.order, KdQueryOrder::LeafBlocks);
             }
-            let reference = prepare_kd_reference(data.clone(), tree);
+            let reference = prepare_kd_reference(data.clone(), tree, lanes as u32);
             let rows = 71usize;
             let query_values = quantize(
                 splitmix_values(rows + 5, features)[5 * features..]
@@ -3281,6 +3419,217 @@ mod tests {
     }
 
     #[test]
+    fn kd_query_soa_all_lanes_and_long_batches() {
+        let device = CubeDevice::Cpu(Default::default());
+        for features in [2usize, 16, 30, 33] {
+            for (n, rows) in [
+                (71usize, 203usize),
+                (71, 2053),
+                (1, 67),
+                (71, 1),
+                (71, 63),
+                (71, 65),
+            ] {
+                let quantize = |values: Vec<f32>| {
+                    values
+                        .into_iter()
+                        .map(|x| (x * 8.0).round() / 8.0)
+                        .collect::<Vec<_>>()
+                };
+                let values = quantize(splitmix_values(n, features));
+                let query_values =
+                    quantize(splitmix_values(rows + 7, features)[7 * features..].to_vec());
+                let (data, _) = make_neighbor_inputs(&values, n, features, &device);
+                let query = CubeBackend::float_from_data(
+                    TensorData::new(query_values.clone(), [rows, features]),
+                    &device,
+                );
+                let expected = brute_query(&query_values, &values, features, 9, None);
+                let mut widths = vec![0];
+                widths.extend(
+                    data.client
+                        .io_optimized_vector_sizes(4)
+                        .filter(|&w| w <= KD_SOA_MAX_LANES),
+                );
+                let mut padded_counters = None;
+                for lanes in widths {
+                    let tree = make_neighbor_inputs(&values, n, features, &device).1;
+                    let reference = prepare_kd_reference(data.clone(), tree, lanes as u32);
+                    for diagnostics in [false, true] {
+                        let (ids, distances, counters) = launch_kd_query(
+                            query.clone(),
+                            reference.clone(),
+                            9,
+                            false,
+                            0,
+                            diagnostics,
+                            64,
+                            Some(1),
+                        );
+                        let ids = into_data_sync(ids).try_to_vec::<i32>().unwrap();
+                        let distances = into_data_sync(distances)
+                            .try_to_vec::<f32>()
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            (ids, distances),
+                            expected,
+                            "n={n} rows={rows} d={features} lanes={lanes}"
+                        );
+                        if diagnostics {
+                            let counters = into_data_sync(counters).try_to_vec::<i32>().unwrap();
+                            assert_eq!(counters.len(), rows * 2);
+                            assert!(
+                                counters
+                                    .chunks(2)
+                                    .all(|c| c[0] > 0 && c[1] > 0 && c[1] <= n as i32)
+                            );
+                            if lanes == 0 {
+                                padded_counters = Some(counters);
+                            } else {
+                                assert_eq!(
+                                    Some(&counters),
+                                    padded_counters.as_ref(),
+                                    "all query rows retain traversal diagnostics"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported CPU KD lane width")]
+    fn kd_reference_rejects_invalid_lanes() {
+        let device = CubeDevice::Cpu(Default::default());
+        let (data, tree) = make_neighbor_inputs(&[0.0, 1.0], 2, 1, &device);
+        prepare_kd_reference(data, tree, 17);
+    }
+
+    #[test]
+    fn kd_query_excludes_ids_not_equal_values() {
+        let device = CubeDevice::Cpu(Default::default());
+        let values = vec![0.0f32, 0.0, 1.0];
+        let (data, tree) = make_neighbor_inputs(&values, 3, 1, &device);
+        let lanes = kd_cpu_soa_lanes(&data.client);
+        let reference = prepare_kd_reference(data, tree, lanes as u32);
+        let query = CubeBackend::float_from_data(TensorData::new(vec![0.0f32], [1, 1]), &device);
+        let (ids, distances) = exact_neighbors_kd_query(query, reference, 3, true, 0);
+        assert_eq!(
+            into_data_sync(ids).try_to_vec::<i32>().unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            into_data_sync(distances).try_to_vec::<f32>().unwrap(),
+            vec![0.0, 1.0, f32::INFINITY]
+        );
+    }
+
+    #[test]
+    fn kd_query_soa_nonquantized_f64_oracle() {
+        let device = CubeDevice::Cpu(Default::default());
+        let (n, rows, features, k) = (71, 83, 33, 9);
+        let values = splitmix_values(n, features);
+        let queries = splitmix_values(rows + 11, features)[11 * features..].to_vec();
+        let (data, tree) = make_neighbor_inputs(&values, n, features, &device);
+        let lanes = kd_cpu_soa_lanes(&data.client);
+        let reference = prepare_kd_reference(data, tree, lanes as u32);
+        let query = CubeBackend::float_from_data(
+            TensorData::new(queries.clone(), [rows, features]),
+            &device,
+        );
+        let (ids, _) = exact_neighbors_kd_query(query, reference, k as u32, false, 0);
+        let ids = into_data_sync(ids).try_to_vec::<i32>().unwrap();
+        for row in 0..rows {
+            let mut oracle = (0..n)
+                .map(|id| {
+                    let distance = (0..features)
+                        .map(|f| {
+                            let delta = queries[row * features + f] as f64
+                                - values[id * features + f] as f64;
+                            delta * delta
+                        })
+                        .sum::<f64>();
+                    (distance, id)
+                })
+                .collect::<Vec<_>>();
+            oracle.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for rank in 0..k {
+                let actual = ids[row * k + rank] as usize;
+                assert!(actual < n);
+                let distance = oracle.iter().find(|entry| entry.1 == actual).unwrap().0;
+                let tolerance = 16.0 * f32::EPSILON as f64 * oracle[rank].0.max(1.0);
+                assert!(actual == oracle[rank].1 || (distance - oracle[rank].0).abs() <= tolerance);
+            }
+        }
+    }
+
+    #[test]
+    fn kd_reference_rejects_soa_on_cuda() {
+        let Some(device) = phase7_cuda() else { return };
+        let (data, tree) = make_neighbor_inputs(&[0.0, 1.0], 2, 1, &device);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_kd_reference(
+                data, tree, 1
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kd_reference_fusion_metadata_matches_backend() {
+        use crate::backend::HdbscanOps;
+        use burn::backend::Dispatch;
+        use burn::tensor::{Int, Tensor};
+        use fast_cubecl_common::{BackendChoice, selected_device};
+        let (device, _) = selected_device(BackendChoice::Cpu).unwrap();
+        let cube = CubeDevice::Cpu(Default::default());
+        let (rows, features) = (17, 3);
+        let values = splitmix_values(rows, features);
+        let host = fast_hdbscan_core::KdTree::build(&values, rows, features).unwrap();
+        let (data, _) = make_neighbor_inputs(&values, rows, features, &cube);
+        let lanes = kd_cpu_soa_lanes(&data.client);
+        for width in [0, lanes] {
+            let tree = make_neighbor_inputs(&values, rows, features, &cube).1;
+            let direct = prepare_kd_reference(data.clone(), tree, width as u32);
+            let input =
+                Tensor::<2>::from_data(TensorData::new(values.clone(), [rows, features]), &device);
+            let fused = <Dispatch as HdbscanOps>::prepare_kd_reference(
+                input.into_dispatch(),
+                crate::estimator::upload_kd_tree(&host, &device),
+                width as u32,
+            );
+            assert_eq!(fused.rows, direct.rows);
+            assert_eq!(fused.nodes, direct.nodes);
+            assert_eq!(fused.n_features, direct.n_features);
+            assert_eq!(fused.n_levels, direct.n_levels);
+            assert_eq!(fused.lanes, direct.lanes);
+            assert_eq!(fused.candidates.shape(), direct.candidates.shape());
+            assert_eq!(fused.slot_ids.shape(), direct.slot_ids.shape());
+            assert_eq!(fused.padded_min.shape(), direct.padded_min.shape());
+            assert_eq!(fused.padded_max.shape(), direct.padded_max.shape());
+            let fused_values = Tensor::<1>::from_dispatch(fused.candidates)
+                .to_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let direct_values = into_data_sync(direct.candidates)
+                .try_to_vec::<f32>()
+                .unwrap();
+            assert_eq!(fused_values, direct_values);
+            let fused_ids = Tensor::<1, Int>::from_dispatch(fused.slot_ids)
+                .to_data()
+                .try_to_vec::<i32>()
+                .unwrap();
+            let direct_ids = into_data_sync(direct.slot_ids).try_to_vec::<i32>().unwrap();
+            assert_eq!(fused_ids, direct_ids);
+        }
+    }
+
+    #[test]
     fn kd_query_pruned_routes_cuda() {
         let Some(device) = phase7_cuda() else { return };
         check_query_routes(&device);
@@ -3288,7 +3637,32 @@ mod tests {
 
     #[test]
     fn kd_query_sizing_checked() {
-        assert_eq!(kd_reference_pack_bytes(10, 3, 5), kd_padded_bytes(10, 3, 5));
+        let padded = KdNeighborPlan {
+            layout: KdCandidateLayout::PaddedRows,
+            order: KdQueryOrder::Cyclic,
+        };
+        let soa = KdNeighborPlan {
+            layout: KdCandidateLayout::LeafSoa { lanes: 16 },
+            order: KdQueryOrder::Cyclic,
+        };
+        assert_eq!(
+            kd_reference_pack_bytes(padded, 10, 3, 5),
+            kd_padded_bytes(10, 3, 5)
+        );
+        assert_eq!(
+            kd_reference_pack_peak_bytes(padded, 10, 3, 5),
+            kd_padded_bytes(10, 3, 5)
+        );
+        assert_eq!(
+            kd_reference_pack_bytes(soa, 17, 3, 3),
+            Some(3 * 4 * 8 + 32 * 4 * 4)
+        );
+        assert_eq!(
+            kd_reference_pack_peak_bytes(soa, 17, 3, 3),
+            Some(3 * 4 * 8 + 32 * 4 * 4 + 17 * 4 * 4)
+        );
+        assert_eq!(kd_reference_pack_bytes(soa, usize::MAX, 3, 3), None);
+        assert_eq!(kd_reference_pack_peak_bytes(soa, 17, usize::MAX, 3), None);
         let diagnostics = if kd_diagnostics_enabled() { 7 * 8 } else { 4 };
         assert_eq!(
             kd_query_pack_bytes(7, 5, 3),

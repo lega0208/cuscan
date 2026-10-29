@@ -101,6 +101,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "fit_seconds": fit_seconds, "cold_seconds": cold_seconds,
             "warm_seconds": warm_seconds, "no_cluster_tree": cold.no_cluster_tree,
             "noise_count": cold.labels.iter().filter(|&&v| v < 0).count(),
+            "labels": cold.labels,
+            "connecting_points": cold.connecting_points,
             "geometry_bytes": finite_rows * features * 4,
             "prediction_core_bytes": prediction_core_bytes,
             "canonical_host_bytes": after.canonical_bytes,

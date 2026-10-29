@@ -1,6 +1,9 @@
 # CPU leaf-SoA kernel for HDBSCAN `approximate_predict` KD queries
 
-Status: draft for architect/critic review. No code has changed.
+Status: Phase A implemented and verified. Phase B remains excluded. Correctness,
+performance and stage-validation evidence is in `artifacts/approx_query_cpu/`;
+acceptance rationale is in `hdbscan_perf_report.md`. Final independent review
+and completion receipts are tracked in the active Ultragoal ledger.
 
 ## 1. Goal
 
