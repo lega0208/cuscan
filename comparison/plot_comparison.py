@@ -9,7 +9,7 @@ import polars as pl
 from plotly.subplots import make_subplots
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "feedback_clustered.parquet"
+DEFAULT_INPUT = SCRIPT_DIR / "data.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "umap_comparison.html"
 SAMPLE_SEED = 42
 N_NEIGHBORS = 30

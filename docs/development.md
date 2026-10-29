@@ -51,14 +51,14 @@ built extension. The reference implementations are **umap-learn 0.5.12** and
 
 The local parquet datasets under `comparison/` are gitignored and are not shipped.
 Commands using them require user-provided schema-compatible parquet files. For the
-default point-plot workflow, supply `feedback_clustered.parquet` with `embedding`
+default point-plot workflow, supply `data.parquet` with `embedding`
 and `topic_global` columns; `save_embeddings.py` reads that fixed path and produces
 the `embedding_2d` and `embedding_16d` columns used by the HDBSCAN plots.
 
 #### Side-by-side point plots
 
 - `comparison/plot_comparison.py` fits reference and local UMAP on the same
-  sampled `embedding` rows from `comparison/feedback_clustered.parquet`.
+  sampled `embedding` rows from `comparison/data.parquet`.
   Points are colored by the input `topic_global` column. The default output is
   `comparison/umap_comparison.html`.
 - `comparison/save_embeddings.py` reads that same input file and writes `embedding_2d`
