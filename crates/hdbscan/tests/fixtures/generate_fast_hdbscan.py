@@ -269,7 +269,10 @@ def resolve_persistence_boundary(condensed, n_points: int) -> dict:
 
 
 def tie_evidence(x: np.ndarray, core: np.ndarray, mst: np.ndarray, condensed, params: dict) -> dict:
-    squared = np.sum((x[:, None, :] - x[None, :, :]) ** 2, axis=2, dtype=np.float32)
+    # The overflow fixture deliberately produces infinite float32 distances.
+    # Preserve those values without emitting an expected overflow warning.
+    with np.errstate(over="ignore"):
+        squared = np.sum((x[:, None, :] - x[None, :, :]) ** 2, axis=2, dtype=np.float32)
     i, j = np.triu_indices(len(x), 1)
     euclidean = np.sqrt(squared, dtype=np.float32)
     candidate_weights = np.maximum(euclidean[i, j], np.maximum(core[i], core[j]))
