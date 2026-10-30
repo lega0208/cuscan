@@ -92,7 +92,7 @@ def digest(path):
 
 record = {
     "variant": args.variant,
-    "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "captured_at": datetime.datetime.now(datetime.UTC).isoformat(),
     "worktree": str(worktree),
     "head": subprocess.check_output(
         ["git", "-C", str(worktree), "rev-parse", "HEAD"], text=True

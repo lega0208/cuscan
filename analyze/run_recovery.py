@@ -87,7 +87,7 @@ for name, n, d, ms in profile_cases:
                     "--trace-output",
                     trace,
                 ]
-                started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                started = datetime.datetime.now(datetime.UTC).isoformat()
                 run(command, env, output, prefix.with_suffix(".stderr"))
                 profile = json.loads(output.read_text())
                 assert len(profile["fit_seconds"]) == 3

@@ -88,9 +88,17 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/ci-env
       - uses: ./.github/actions/setup-python-uv
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: actionlint@1.7.12
+      - name: Install actionlint
+        shell: bash
+        run: |
+          install_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$install_dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$install_dir/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 '"$install_dir/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$install_dir/actionlint.tar.gz" -C "$install_dir" actionlint
+          echo "$install_dir" >> "$GITHUB_PATH"
       - run: actionlint
       - run: uvx zizmor==1.22.0 --min-severity medium .github
         env:
