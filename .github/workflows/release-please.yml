@@ -19,12 +19,10 @@ jobs:
     steps:
       - name: Reject local event emulation before credentials
         id: guard
-        env:
-          EVENT_PATH: ${{ github.event_path }}
         run: |
           python3 - <<'PY'
           import json, os
-          event = json.load(open(os.environ['EVENT_PATH']))
+          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
           enabled = os.environ.get('ACT', '').lower() != 'true' and event.get('act') is not True
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f"enabled={str(enabled).lower()}\n")
