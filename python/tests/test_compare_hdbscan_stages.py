@@ -231,7 +231,7 @@ def test_main_passes_label_outputs_and_records_label_metadata(monkeypatch, tmp_p
     monkeypatch.setattr(module, "validate_native_stages", lambda _: None)
     monkeypatch.setattr(module.importlib.metadata, "version", lambda _: "0.3.2")
     monkeypatch.setattr(module.os, "cpu_count", lambda: 8)
-    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: {0, 2, 4})
+    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: {0, 2, 4}, raising=False)
     assert module.main() == 0
     assert "--labels-output" in calls[0][0]
     assert "--_worker-labels-output" in calls[1][0]

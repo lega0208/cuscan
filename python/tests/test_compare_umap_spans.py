@@ -327,7 +327,7 @@ def test_benchmark_cli_mocked_campaign_exercises_complete_orchestration(
     assert len(completed_references) == report["coverage"]["quality_runs"]
     assert len({(row["pair"], row["mode"], row["seed"]) for row in completed_references}) == 6
     assert all(
-        call[1:5] == [str(report["raw_artifact_directory"] + "/train.f32le"), "32", "2", "10"]
+        call[1:5] == [str(Path(report["raw_artifact_directory"]) / "train.f32le"), "32", "2", "10"]
         for call in cuda_calls
     )
     assert report["configuration"]["neighbors"] == 25
@@ -385,10 +385,35 @@ def test_input_generation_is_deterministic_and_balanced(tmp_path: Path) -> None:
     assert all(max(row["label_counts"]) - min(row["label_counts"]) <= 1 for row in first["queries"])
 
 
+def test_resource_telemetry_incomplete_ancestry_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "process_descendants",
+        lambda pid: {"pids": [pid], "ancestry": {str(pid): [pid]}, "complete": False},
+    )
+
+    def unexpected_query(*args, **kwargs):
+        pytest.fail("incomplete ancestry must not be attributed")
+
+    monkeypatch.setattr(module, "_nvidia_smi", unexpected_query)
+    telemetry = module.GpuProcessTelemetry()
+    telemetry.sample(42, module.Deadline(2))
+    assert telemetry.evidence["status"] == "unavailable"
+    assert telemetry.evidence["sampled_max_bytes"] is None
+    assert "process attribution is incomplete" in telemetry.evidence["explanation"]
+
+
 def test_resource_telemetry_unavailable_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(*args, **kwargs):
         raise FileNotFoundError("nvidia-smi missing in WSL")
 
+    monkeypatch.setattr(
+        module,
+        "process_descendants",
+        lambda pid: {"pids": [pid], "ancestry": {str(pid): [pid]}, "complete": True},
+    )
     monkeypatch.setattr(module, "_nvidia_smi", unavailable)
     telemetry = module.GpuProcessTelemetry()
     telemetry.sample(42, module.Deadline(2))
@@ -408,6 +433,11 @@ def test_resource_telemetry_timeout_skips_sample_without_disabling(
             raise subprocess.TimeoutExpired(["nvidia-smi"], 0.05)
         return subprocess.CompletedProcess(["nvidia-smi", *args], 0, "", "")
 
+    monkeypatch.setattr(
+        module,
+        "process_descendants",
+        lambda pid: {"pids": [pid], "ancestry": {str(pid): [pid]}, "complete": True},
+    )
     monkeypatch.setattr(module, "_nvidia_smi", slow_then_answer)
     telemetry = module.GpuProcessTelemetry()
     telemetry.sample(42, module.Deadline(2))

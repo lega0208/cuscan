@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -372,6 +373,45 @@ def test_precommit_failures_clean_temporary_and_preserve_destination(
     assert sorted(path.name for path in tmp_path.iterdir()) == (["target.h5"] if overwrite else [])
 
 
+def test_file_sync_uses_writable_descriptor_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cuscan import _serialization_common
+
+    path = tmp_path / "model.h5"
+    real_fsync = os.fsync
+    synced = False
+
+    def check_file_sync(fd: int) -> None:
+        nonlocal synced
+        if not synced:
+            assert not path.exists()
+            assert os.write(fd, b"") == 0
+            synced = True
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", check_file_sync)
+    _serialization_common._publish(path, False, lambda file, *_: None, "test")
+    assert synced
+    with h5py.File(path, "r"):
+        pass
+
+
+def test_windows_directory_sync_does_not_use_crt_directory_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cuscan import _serialization_common
+
+    def unexpected_open(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Windows directory must not be opened as a CRT descriptor")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(os, "open", unexpected_open)
+        _serialization_common._sync_directory(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot fsync directory CRT descriptors")
 def test_postcommit_directory_fsync_failure_identifies_committed_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
