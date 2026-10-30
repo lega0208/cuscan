@@ -274,7 +274,7 @@ class GpuProcessTelemetry:
                         }
                     )
             reading = {
-                "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(),
                 "monotonic_seconds": time.monotonic(),
                 "root_pid": root_pid,
                 "telemetry_api": self.evidence["telemetry_api"],
@@ -2306,7 +2306,7 @@ def _ann_construction_cli(argv: list[str]) -> int:
         "protocol_admissible": False,
         "configuration": configuration,
         "provenance": {
-            "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "created_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "data": {"path": str(data), "sha256": sha256_file(data), "bytes": data.stat().st_size},
             "harness": {
                 "path": str(Path(__file__).resolve()),

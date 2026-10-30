@@ -9,10 +9,10 @@ import importlib.metadata
 import inspect
 import json
 import tempfile
+import tomllib
 from pathlib import Path
 
 import numpy as np
-import tomllib
 from sklearn.datasets import make_blobs, make_moons
 
 ROOT = Path(__file__).resolve().parents[4]
