@@ -68,17 +68,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}
-          APP_ID: ${{ secrets.RELEASE_PLEASE_APP_ID }}
           ACTION_PRS: ${{ steps.release.outputs.prs }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, subprocess
+          import json, os, pathlib, subprocess, urllib.request
           def api(path):
-              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+              request = urllib.request.Request(
+                  'https://api.github.com' + path,
+                  headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'release-please'},
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  return json.load(response)
+          # The pinned token action obtains this slug from the repository installation lookup,
+          # authenticated with a JWT signed by the configured App ID and private key.
           slug = os.environ['APP_SLUG']
-          app = api(f'/apps/{slug}')
-          if str(app['id']) != os.environ['APP_ID'] or app['slug'] != slug:
-              raise SystemExit('App metadata mismatch')
+          if not slug:
+              raise SystemExit('Missing App slug')
           login = slug + '[bot]'
           bot = api('/users/' + login)
           if bot['login'] != login or bot['type'] != 'Bot':

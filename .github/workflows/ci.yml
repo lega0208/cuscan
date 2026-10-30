@@ -27,10 +27,11 @@ jobs:
       - name: Validate Conventional Commit title and shared release state
         env:
           GH_TOKEN: ${{ github.token }}
-          APP_ID: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          BOT_ID: ${{ vars.RELEASE_PLEASE_BOT_ID }}
+          BOT_LOGIN: ${{ vars.RELEASE_PLEASE_BOT_LOGIN }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, subprocess, sys, tempfile
+          import json, os, pathlib, re, subprocess, sys, tempfile
           sys.path.insert(0, 'scripts/ci')
           import check_release_pr
           event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
@@ -50,17 +51,17 @@ jobs:
                       if current['head']['sha'] != pr['head']['sha']:
                           raise SystemExit('Release PR advanced; fresh head checks are required')
                       pr = current
-                      login = pr['user']['login']
-                      if not login.endswith('[bot]'):
-                          raise SystemExit('Release manifest proposal requires the configured App')
-                      app = api('/apps/' + login[:-5])
-                      bot = api('/users/' + login)
-                      if (str(app['id']) != os.environ['APP_ID'] or bot['id'] != pr['user']['id']
-                          or bot['type'] != 'Bot' or pr['user']['type'] != 'Bot'
+                      bot_id = os.environ.get('BOT_ID', '')
+                      bot_login = os.environ.get('BOT_LOGIN', '')
+                      if (not re.fullmatch(r'[1-9][0-9]*', bot_id)
+                          or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\[bot\]', bot_login)):
+                          raise SystemExit('Invalid configured release bot identity')
+                      if (type(pr['user']['id']) is not int or pr['user']['id'] != int(bot_id)
+                          or pr['user']['login'] != bot_login or pr['user']['type'] != 'Bot'
                           or pr['head']['repo']['full_name'] != os.environ['GITHUB_REPOSITORY']
                           or pr['base']['repo']['full_name'] != os.environ['GITHUB_REPOSITORY']
                           or pr['base']['ref'] != 'main'
-                          or pr['head']['ref'] != 'release-please--branches--main'
+                          or pr['head']['ref'] != check_release_pr.BRANCH
                           or 'autorelease: pending' not in [label['name'] for label in pr['labels']]):
                           raise SystemExit('Release PR identity/branch/label mismatch')
                   command = ['python3', helper, 'verify', '--base', directory, '--candidate', '.']

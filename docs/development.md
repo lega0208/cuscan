@@ -51,8 +51,12 @@ Owner prerequisites (not changed by implementation):
 1. Install a repository-scoped GitHub App with Contents and Pull requests read/write,
    and Issues read/write for Release Please lifecycle labels. No Actions write,
    administration, packages or environment access. Set repository variable
-   `RELEASE_PLEASE_APP_ID` and secret `RELEASE_PLEASE_APP_PRIVATE_KEY`. The token is
-   short-lived, revoked by the token action, and never used for PyPI publication.
+   `RELEASE_PLEASE_APP_ID` and secret `RELEASE_PLEASE_APP_PRIVATE_KEY` for token
+   creation. Also set repository variables `RELEASE_PLEASE_BOT_ID` (the bot user
+   numeric ID, not the App ID) and `RELEASE_PLEASE_BOT_LOGIN` (its exact login,
+   including `[bot]`) for proposal PR identity checks. Obtain the ID and verify the
+   login and `Bot` type with `gh api 'users/APP-SLUG[bot]'`. The token is short-lived,
+   revoked by the token action, and never used for PyPI publication.
 2. Allow that App's release-branch pushes and `v*` tag creation under applicable
    rules, but do not grant main bypass. Retain reviews and required `ci-ok`, use
    squash merges and retain protected `pypi`/`testpypi` environments and OIDC trusted
