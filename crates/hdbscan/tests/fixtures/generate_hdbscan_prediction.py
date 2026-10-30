@@ -102,12 +102,17 @@ def enc_map(mapping: dict) -> dict[str, Any]:
 # Reference identity.
 
 
+def prediction_source_sha256(source: bytes) -> str:
+    """Hash source with CRLF normalized to LF, independent of installation platform."""
+    return hashlib.sha256(source.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def reference_identity() -> dict[str, str]:
     source = Path(hp.__file__).read_bytes()
     return {
         "package": "hdbscan",
         "version": importlib.metadata.version("hdbscan"),
-        "prediction_py_sha256": hashlib.sha256(source).hexdigest(),
+        "prediction_py_sha256": prediction_source_sha256(source),
         "numpy": np.__version__,
         "scikit_learn": importlib.metadata.version("scikit-learn"),
     }

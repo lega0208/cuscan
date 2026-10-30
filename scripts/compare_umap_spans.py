@@ -234,7 +234,8 @@ class GpuProcessTelemetry:
             self.evidence.update(
                 status="unavailable",
                 explanation=(
-                    "/proc process ancestry snapshot exceeded its bounded scan budget; "
+                    "/proc process ancestry snapshot unavailable or "
+                    "exceeded its bounded scan budget; "
                     "process attribution is incomplete."
                 ),
             )

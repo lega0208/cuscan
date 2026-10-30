@@ -163,23 +163,35 @@ def label_alignment(ours: np.ndarray, reference: np.ndarray) -> dict[int, int]:
 # Layer 1: reference oracle identity and fixture reproducibility.
 
 
-def test_reference_identity_matches_fixture_provenance() -> None:
-    import hashlib
+@pytest.fixture(scope="module")
+def prediction_generator() -> Any:
+    spec = importlib.util.spec_from_file_location("generate_hdbscan_prediction", GENERATOR_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_reference_source_hash_normalizes_only_crlf(prediction_generator: Any) -> None:
+    digest = prediction_generator.prediction_source_sha256
+    source = b"first line\nsecond line\n"
+    assert digest(source) == digest(source.replace(b"\n", b"\r\n"))
+    assert digest(source) != digest(b"first line\nchanged line\n")
+    assert digest(source) != digest(source.replace(b"\n", b"\r"))
+
+
+def test_reference_identity_matches_fixture_provenance(prediction_generator: Any) -> None:
     import importlib.metadata
 
     reference = FIXTURE["reference"]
     assert reference["package"] == "hdbscan"
     assert importlib.metadata.version("hdbscan") == reference["version"]
-    digest = hashlib.sha256(Path(hp.__file__).read_bytes()).hexdigest()
+    digest = prediction_generator.prediction_source_sha256(Path(hp.__file__).read_bytes())
     assert digest == reference["prediction_py_sha256"]
 
 
-def test_fixture_regenerates_byte_identically() -> None:
-    spec = importlib.util.spec_from_file_location("generate_hdbscan_prediction", GENERATOR_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert module.dumps(module.generate()) == FIXTURE_PATH.read_text()
+def test_fixture_regenerates_byte_identically(prediction_generator: Any) -> None:
+    assert prediction_generator.dumps(prediction_generator.generate()) == FIXTURE_PATH.read_text()
 
 
 def test_fixture_pins_core_rank_conventions() -> None:

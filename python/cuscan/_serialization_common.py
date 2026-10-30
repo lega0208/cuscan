@@ -152,6 +152,19 @@ def _create_dataset(group: Any, name: str, value: Any, dtype: str, plugin: Any) 
     )
 
 
+def _sync_directory(parent: Path) -> None:
+    # Windows cannot fsync a directory through Python's CRT descriptors. There,
+    # publication is atomic and file data is flushed, but directory-entry
+    # durability across a crash is not guaranteed.
+    if os.name == "nt":
+        return
+    directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _publish(
     path: str | os.PathLike[str],
     overwrite: bool,
@@ -168,18 +181,16 @@ def _publish(
     try:
         with h5py.File(temporary, "w") as file:
             writer(file, h5py, plugin)
-        with open(temporary, "rb") as stream:
+        # Windows _commit (used by os.fsync) requires a writable CRT descriptor;
+        # the HDF5 VFD handle is not necessarily a Python CRT descriptor.
+        with open(temporary, "r+b") as stream:
             os.fsync(stream.fileno())
         if overwrite:
             os.replace(temporary, destination)
         else:
             os.link(temporary, destination)
         try:
-            directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _sync_directory(parent)
         except OSError as error:
             raise DurabilityUncertainError(
                 f"model is committed at {destination}, but directory durability is uncertain"

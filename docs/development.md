@@ -571,9 +571,10 @@ extension with `uv run maturin develop --release`. Saving exports the already-re
 prediction state before filesystem publication and performs no prediction or
 core preparation. Files use the shared strict schema-v1 HDF5 publisher with
 atomic no-clobber publication by default; `overwrite=True` explicitly replaces
-an existing file. Publication uses a same-directory temporary file and syncs the
-directory on the documented Linux target; a post-commit sync failure reports
-uncertain durability without rolling back the published file. Loading validates
+an existing file. Publication flushes a same-directory temporary file and syncs the
+directory on POSIX; a post-commit sync failure reports uncertain durability without
+rolling back the published file. Windows flushes file data and commits atomically,
+but does not guarantee directory-entry durability across a crash. Loading validates
 the predictor schema and rebuilds the host KD tree, then chooses a runtime
 backend independently of fit provenance:
 `HDBSCANPredictor.load(path, backend="auto", device_index=0)` uses the normal

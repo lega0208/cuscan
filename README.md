@@ -49,7 +49,7 @@ predictor = clusterer.to_predictor()
 predictor.save("predictor.h5")
 ```
 
-`UMAP` saves fitted state; HDBSCAN serialization is for `HDBSCANPredictor`, not the fitted estimator or its fit outputs. Load a predictor with `HDBSCANPredictor.load(path, backend="auto", device_index=0)`. Backend and device are chosen at load time. `save` refuses to overwrite by default; `overwrite=True` explicitly replaces a file. Publication uses a same-directory temporary file and atomic commit; a post-commit directory-sync failure reports uncertain durability.
+`UMAP` saves fitted state; HDBSCAN serialization is for `HDBSCANPredictor`, not the fitted estimator or its fit outputs. Load a predictor with `HDBSCANPredictor.load(path, backend="auto", device_index=0)`. Backend and device are chosen at load time. `save` refuses to overwrite by default; `overwrite=True` explicitly replaces a file. Publication flushes a same-directory temporary file and commits atomically. On POSIX, a post-commit directory-sync failure reports uncertain durability. Windows flushes file data but does not guarantee directory-entry durability across a crash.
 
 Files use a versioned HDF5 schema and lossless Blosc2 Zstandard compression, not pickle. External HDF5 readers need the Blosc2 filter plugin (ID 32026). Files contain training data or geometry and derived model state; protect them like the original data. Schema validation and compression do not authenticate files. Rust does not provide an HDF5 persistence API. Serialized numeric state does not guarantee identical execution across hardware, software versions or backends.
 
