@@ -615,6 +615,91 @@ def equal_array(a: np.ndarray, b: np.ndarray) -> bool:
     return np.array_equal(a, b, equal_nan=True)
 
 
+def array_mismatch(name: str, expected: np.ndarray, actual: np.ndarray) -> list[str]:
+    """Compare topology exactly and allow bounded drift only in derived floats."""
+    if expected.dtype != actual.dtype or expected.shape != actual.shape:
+        return [
+            f"{name}: expected dtype={expected.dtype}, shape={expected.shape}; "
+            f"actual dtype={actual.dtype}, shape={actual.shape}"
+        ]
+    if expected.dtype.fields:
+        return [
+            detail
+            for field in expected.dtype.names or ()
+            for detail in array_mismatch(f"{name}.{field}", expected[field], actual[field])
+        ]
+    if name in {"mst", "linkage", "remapped_linkage"}:
+        return [
+            detail
+            for column in range(expected.shape[1])
+            for detail in array_mismatch(
+                f"{name}[{column}]", expected[:, column], actual[:, column]
+            )
+        ]
+    equal = expected == actual
+    if np.issubdtype(expected.dtype, np.inexact):
+        equal = equal | (np.isnan(expected) & np.isnan(actual))
+        numerical = name in {
+            "mst_weights",
+            "core_distances",
+            "probabilities",
+            "mst[2]",
+            "linkage[2]",
+            "remapped_linkage[2]",
+            "condensed_tree.lambda_val",
+            "remapped_condensed_tree.lambda_val",
+            "boundary_input.lambda_val",
+            "boundary_below.lambda_val",
+            "boundary_equal.lambda_val",
+            "boundary_above.lambda_val",
+            "overflow_probe_squared_distances",
+        }
+        if numerical:
+            # The relative bound matches the existing core-distance contract;
+            # the small absolute floor handles values near zero. Only finite values
+            # are approximate: NaNs and signed infinities must match exactly.
+            finite = np.isfinite(expected) & np.isfinite(actual)
+            equal = equal | (finite & np.isclose(expected, actual, rtol=1e-6, atol=1e-7))
+    if np.all(equal):
+        return []
+    index = tuple(int(i) for i in np.argwhere(~equal)[0])
+    return [
+        f"{name}: {np.count_nonzero(~equal)} differing values; first at {index}: "
+        f"expected={expected[index]!r}, actual={actual[index]!r}"
+    ]
+
+
+def metadata_mismatch(expected: object, actual: object, path: str = "") -> list[str]:
+    """Keep metadata exact except explicitly named derived boundary evidence."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        details = [f"{path}: missing={missing}, extra={extra}"] if missing or extra else []
+        for key in sorted(set(expected) & set(actual)):
+            child = f"{path}.{key}" if path else key
+            details.extend(metadata_mismatch(expected[key], actual[key], child))
+        return details
+    if (
+        path
+        in {
+            "persistence_boundary_evidence.threshold",
+            "persistence_boundary_evidence.birth_min",
+            "persistence_boundary_evidence.death",
+        }
+        and type(expected) is float
+        and type(actual) is float
+    ):
+        if (
+            np.isfinite(expected)
+            and np.isfinite(actual)
+            and np.isclose(expected, actual, rtol=1e-6, atol=1e-7)
+        ):
+            return []
+    if type(expected) is not type(actual) or expected != actual:
+        return [f"{path}: expected={expected!r}, actual={actual!r}"]
+    return []
+
+
 def validate_manifest(manifest: dict, schema: dict) -> None:
     if manifest["schema_version"] != schema["schema_version"]:
         raise RuntimeError("manifest/schema version mismatch")
@@ -693,14 +778,26 @@ def main() -> int:
                     np.load(FIXTURES / f"{stem}.npz", allow_pickle=False) as old,
                     np.load(temp / f"{stem}.npz", allow_pickle=False) as new,
                 ):
-                    if set(old.files) != set(new.files) or any(
-                        not equal_array(old[k], new[k]) for k in old.files
-                    ):
-                        raise RuntimeError(f"array mismatch while regenerating {stem}")
+                    missing = sorted(set(old.files) - set(new.files))
+                    extra = sorted(set(new.files) - set(old.files))
+                    details = [
+                        detail
+                        for key in sorted(set(old.files) & set(new.files))
+                        for detail in array_mismatch(key, old[key], new[key])
+                    ]
+                    if missing or extra or details:
+                        raise RuntimeError(
+                            f"array mismatch while regenerating {stem}: "
+                            f"missing={missing}, extra={extra}\n" + "\n".join(details)
+                        )
                 old_meta = json.loads((FIXTURES / f"{stem}.json").read_text())
                 new_meta = json.loads((temp / f"{stem}.json").read_text())
-                if old_meta != new_meta:
-                    raise RuntimeError(f"semantic metadata mismatch while regenerating {stem}")
+                metadata_details = metadata_mismatch(old_meta, new_meta)
+                if metadata_details:
+                    raise RuntimeError(
+                        f"semantic metadata mismatch while regenerating {stem}:\n"
+                        + "\n".join(metadata_details)
+                    )
             print(f"verified regeneration of {len(manifest['cases'])} cases")
         return 0
     write_cases(FIXTURES, manifest, proof)

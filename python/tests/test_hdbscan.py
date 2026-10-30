@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import warnings
 from pathlib import Path
@@ -34,6 +35,81 @@ KNOWN_UPSTREAM_DIVERGENCES = {
     "blobs_d50": "upstream public estimator uses approximate neighbors above 30 dimensions",
     "moons_leaf": "measured leaf-extraction traversal/tie-sensitive membership difference",
 }
+
+
+def test_fixture_regeneration_mismatch_diagnostics() -> None:
+    path = FIXTURE_DIR / "generate_fast_hdbscan.py"
+    spec = importlib.util.spec_from_file_location("fixture_generator", path)
+    assert spec is not None and spec.loader is not None
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+
+    dtype = np.dtype([("weight", "f4"), ("child", "i8")])
+    expected = np.array([(np.nan, 1), (1.0, 2)], dtype=dtype)
+    actual = np.array([(np.nan, 1), (np.nextafter(np.float32(1), np.float32(2)), 3)], dtype=dtype)
+    details = generator.array_mismatch("tree", expected, actual)
+    assert len(details) == 2
+    assert "tree.weight: 1 differing values; first at (1,)" in details[0]
+    assert "tree.child: 1 differing values; first at (1,)" in details[1]
+    assert generator.array_mismatch("tree", expected, expected.copy()) == []
+    assert "shape=(2,)" in generator.array_mismatch("tree", expected, expected[:1])[0]
+
+
+def test_fixture_regeneration_comparison_policy() -> None:
+    path = FIXTURE_DIR / "generate_fast_hdbscan.py"
+    spec = importlib.util.spec_from_file_location("fixture_generator", path)
+    assert spec is not None and spec.loader is not None
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+
+    close = np.nextafter(np.float32(1), np.float32(2))
+    expected = np.array([1.0, np.nan, np.inf, -np.inf], dtype=np.float32)
+    actual = np.array([close, np.nan, np.inf, -np.inf], dtype=np.float32)
+    assert not generator.array_mismatch("core_distances", expected, actual)
+    assert generator.array_mismatch("input", expected, actual)
+    actual[0] = 1.01
+    assert generator.array_mismatch("core_distances", expected, actual)
+    for index, value in ((1, 0.0), (2, -np.inf), (3, np.nan)):
+        actual = expected.copy()
+        actual[index] = value
+        assert generator.array_mismatch("core_distances", expected, actual)
+    assert generator.array_mismatch("core_distances", expected, expected.astype(np.float64))
+
+    dtype = np.dtype([("parent", "i8"), ("child", "i8"), ("lambda_val", "f4")])
+    tree = np.array([(1, 2, 1.0)], dtype=dtype)
+    changed = tree.copy()
+    changed["lambda_val"] = close
+    assert not generator.array_mismatch("condensed_tree", tree, changed)
+    changed["child"] = 3
+    assert generator.array_mismatch("condensed_tree", tree, changed)
+    for name, row in (("mst", [1.0, 2.0, 1.0]), ("linkage", [1.0, 2.0, 1.0, 3.0])):
+        matrix = np.array([row])
+        changed_matrix = matrix.copy()
+        changed_matrix[0, 2] = close
+        assert not generator.array_mismatch(name, matrix, changed_matrix)
+        changed_matrix[0, 0] = np.nextafter(1.0, 2.0)
+        assert generator.array_mismatch(name, matrix, changed_matrix)
+        if name == "linkage":
+            changed_matrix[0, 0] = 1.0
+            changed_matrix[0, 3] = np.nextafter(3.0, 4.0)
+            assert generator.array_mismatch(name, matrix, changed_matrix)
+
+    metadata = {
+        "persistence_boundary_evidence": {"birth_min": 1.0},
+        "parameters": {"persistence": 1.0},
+        "tie_classification": ["near"],
+    }
+    changed_metadata = {
+        "persistence_boundary_evidence": {"birth_min": float(close)},
+        "parameters": {"persistence": 1.0},
+        "tie_classification": ["near"],
+    }
+    assert not generator.metadata_mismatch(metadata, changed_metadata)
+    changed_metadata["parameters"]["persistence"] = float(close)
+    assert generator.metadata_mismatch(metadata, changed_metadata)
+    changed_metadata["parameters"]["persistence"] = 1.0
+    changed_metadata["tie_classification"] = ["exact"]
+    assert generator.metadata_mismatch(metadata, changed_metadata)
 
 
 def fixture_data(case_id: str) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:

@@ -418,6 +418,15 @@ cargo test -p hdbscan-core --test test_fixtures
 cargo test -p hdbscan-core --features test-support
 ```
 
+Regeneration preserves input arrays, labels, neighbors, topology, counts, dtypes,
+shapes, nonfinite values and provenance exactly. Named derived floating outputs
+(distances, weights, probabilities and hierarchy lambda values) use `rtol=1e-6`
+and `atol=1e-7`, allowing small CPU-target-dependent upstream arithmetic differences.
+The same bounds apply only to the derived persistence-boundary evidence fields;
+parameters and categorical metadata remain exact. The below/equal/above persistence
+boundary assertions also remain exact. Checked-in fixtures are not rewritten by
+`--check`.
+
 The reference remains unpatched: upstream [PR #72](https://github.com/TutteInstitute/fast_hdbscan/pull/72)
 fixes leaf traversal in `segments_in_branch` after 0.3.2, preventing unrelated
 clusters from being dropped during epsilon selection. The fixture catalogue
