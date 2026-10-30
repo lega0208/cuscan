@@ -111,9 +111,20 @@ jobs:
               version = email.message_from_bytes(metadata)['Version']
               assert version == os.environ['EXPECTED'], (path, version)
           PY
-      - name: Publish to PyPI
+      - name: Verify existing release and select unpublished distributions
+        id: prepare
         if: github.event_name == 'push' && env.ACT != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify.outputs.pep440_version }}
+        run: python3 scripts/ci/release_artifacts.py prepare --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse HEAD^{commit})"
+      - name: Publish to PyPI
+        if: github.event_name == 'push' && env.ACT != 'true' && steps.prepare.outputs.publish_needed == 'true'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist-pending/
       - name: Publish to TestPyPI
         if: github.event_name == 'workflow_dispatch' && env.ACT != 'true'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
@@ -142,19 +153,11 @@ jobs:
         if: env.ACT != 'true'
         with:
           subject-path: dist/*
-      - name: Create GitHub release
+      - name: Attach assets to existing GitHub release
         if: env.ACT != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, re
-          version = os.environ['TAG'][1:]
-          text = pathlib.Path('CHANGELOG.md').read_text()
-          match = re.search(r'^## \[' + re.escape(version) + r'\][^\n]*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
-          if not match:
-              raise SystemExit('Changelog section not found')
-          pathlib.Path('/tmp/release-notes.md').write_text(match.group(1).strip() + '\n')
-          PY
-          gh release create "$TAG" dist/* --notes-file /tmp/release-notes.md
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify.outputs.pep440_version }}
+        run: python3 scripts/ci/release_artifacts.py upload --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse HEAD^{commit})"

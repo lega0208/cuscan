@@ -25,7 +25,12 @@ def classify(paths: list[str]) -> set[str]:
     for path in paths:
         parts = path.split("/")
         flags: set[str] = set()
-        if path.startswith((".github/", "scripts/ci/")) or path == ".actrc":
+        if path.startswith((".github/", "scripts/ci/")) or path in {
+            ".actrc",
+            "version.txt",
+            "release-please-config.json",
+            ".release-please-manifest.json",
+        }:
             return ALL.copy()
         if path.startswith(("crates/", ".cargo/")) or path in {
             "Cargo.toml",

@@ -18,6 +18,81 @@ An extracted plain sdist built and imported in fresh manylinux without `.cargo`,
 
 CI caches are an optimization, not correctness evidence: Cargo caches are separated by build class and releases build without caches. Bump `CI_CACHE_EPOCH` in the shared `ci-env` action to orphan suspect or bloated caches. CubeCL's runtime cache is not shared across runners. GitHub cache, runner-disk and release behavior have not been validated; estimates in `ci_workflows_plan.md` are not measured GitHub results. The user approved the scoped `paste` exception: `deny.toml` ignores only RUSTSEC-2024-0436 with rationale, and all four `cargo deny` checks passed with ordinary duplicate and license warnings.
 
+### Release activation and recovery
+
+Release Please maintains a single root release PR on main using the simple
+strategy. `Cargo.toml` workspace version remains build authority; `version.txt`,
+the proposed `.release-please-manifest.json` version and six local Cargo.lock
+entries must agree. Member versions stay inherited; Python metadata stays dynamic.
+On ordinary main commits the manifest records the last release, not a new proposal.
+The bot synchronizes only Cargo.lock after validating the full candidate as data;
+trusted main primes Cargo first, then candidate synchronization is offline.
+
+Squash merge normal PRs with Conventional Commit titles: `feat: add a capability`,
+`fix: correct validation`, `perf: reduce allocations`, `revert: undo a regression`.
+Use `feat!: change an API` or a `BREAKING CHANGE: description` commit footer for
+breaking changes. Below 1.0, features and breaking changes bump minor and fixes
+bump patch; at/above 1.0 breaking changes bump major. Ordinary docs/chore/test
+commits do not independently release. Review the bot PR and require fresh `ci-ok`
+on its final synchronized head; never auto-merge or exempt the App from checks.
+
+**One-time 0.1.0 bootstrap:** the manifest starts empty, not at a fictitious prior
+release. The historical boundary is exactly
+`c76bb96e2284c8404b79daabe6df5fb10d11594b` (exclusive). Merge setup with a releasable
+title such as `feat(ci): automate reviewed releases`. Verify one generated 0.1.0
+section, preserved baseline prose, unchanged 0.1.0 Cargo/version.txt values and a
+proposed 0.1.0 manifest. After the first successful release, remove `release-as`
+from the root package config and root `bootstrap-sha` in a separate reviewed
+housekeeping PR **before accepting another release PR**. Repeated/non-increasing
+proposals fail closed rather than retagging.
+
+Owner prerequisites (not changed by implementation):
+
+1. Install a repository-scoped GitHub App with Contents and Pull requests read/write,
+   and Issues read/write for Release Please lifecycle labels. No Actions write,
+   administration, packages or environment access. Set repository variable
+   `RELEASE_PLEASE_APP_ID` and secret `RELEASE_PLEASE_APP_PRIVATE_KEY`. The token is
+   short-lived, revoked by the token action, and never used for PyPI publication.
+2. Allow that App's release-branch pushes and `v*` tag creation under applicable
+   rules, but do not grant main bypass. Retain reviews and required `ci-ok`, use
+   squash merges and retain protected `pypi`/`testpypi` environments and OIDC trusted
+   publishers. Keep Dependabot GitHub Actions coverage.
+3. Disable immutable GitHub releases: assets are attached after public release
+   creation. Validate asset mutability in an explicitly authorized disposable
+   repository. Production requires the API's explicit mutable status, exact tag
+   commit and non-draft/non-prerelease release before publishing.
+4. Check PyPI version availability read-only before activation. Test real App PR
+   checks and tag-trigger chaining only in an authorized sandbox without publishing.
+   Hosted App event propagation, repository settings and asset mutability remain
+   activation prerequisites, not claims made by offline/ACT verification.
+
+Merging the reviewed release PR creates `vVERSION` at that merged commit and the
+public GitHub release immediately. The tag workflow cold-builds wheels and sdist,
+smoke-builds the extracted sdist and verifies all versions before protected OIDC
+publication. It then attests and uploads assets to the existing release, preserving
+bot notes/title. A public release can exist while builds/publication have failed.
+Missing releases retry only bounded 404 visibility; identity/authorization failures
+are errors, never fallback release creation. Manual dispatch remains `-dev.N`
+TestPyPI rehearsal, never production. ACT performs no release API reads or writes.
+
+Publication is nontransactional. Before a failed-publish rerun, inspect PyPI
+metadata/hashes read-only and recover the original successful workflow artifacts.
+The helper stages only missing filenames; already published files must have exact
+matching SHA256 hashes. Unknown/conflicting files stop recovery; there is no blanket
+`skip-existing`. Do not silently rebuild different bytes for a published filename.
+Existing GitHub assets likewise require matching hashes; missing digest or conflict
+fails without overwrite. Do not delete releases/assets or move tags.
+
+If no tag workflow queued or tagged automation cannot be repaired by rerun, the
+owner-approved exception applies **only after proving no distribution exists for
+that version on PyPI**. An unavailable/ambiguous lookup or any published file blocks
+this exception. Fix main with a releasable `fix(ci): ...`, append a failure/superseded
+notice to the old release without replacing notes or tag, remove stale bootstrap
+forcing through review if needed, and review the next patch release PR. Never
+republish 0.1.0 from another commit or dispatch production. Partial publication
+requires maintainer recovery, not a version bump to hide it. Actual operational
+release/publication and remote writes require separate owner authorization.
+
 ### Local act
 
 Install Docker and `act`, then from the repository root:

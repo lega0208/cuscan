@@ -1,7 +1,7 @@
 name: CI
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
   push:
     branches: [main]
   merge_group:
@@ -12,6 +12,64 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: true
 jobs:
+  release-consistency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - name: Validate Conventional Commit title and shared release state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys, tempfile
+          sys.path.insert(0, 'scripts/ci')
+          import check_release_pr
+          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          pr = event.get('pull_request')
+          helper = 'scripts/ci/check_release_pr.py'
+          if pr:
+              subprocess.run(['python3', helper, 'title', pr['title']], check=True)
+          base = pr['base']['sha'] if pr else subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip()
+          with tempfile.TemporaryDirectory() as directory:
+              subprocess.run(['git', 'worktree', 'add', '--detach', directory, base], check=True)
+              try:
+                  proposal = check_release_pr.is_proposal(pathlib.Path(directory), pathlib.Path('.'), pr)
+                  if proposal and pr:
+                      def api(path):
+                          return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+                      current = api('/repos/' + os.environ['GITHUB_REPOSITORY'] + '/pulls/' + str(pr['number']))
+                      if current['head']['sha'] != pr['head']['sha']:
+                          raise SystemExit('Release PR advanced; fresh head checks are required')
+                      pr = current
+                      login = pr['user']['login']
+                      if not login.endswith('[bot]'):
+                          raise SystemExit('Release manifest proposal requires the configured App')
+                      app = api('/apps/' + login[:-5])
+                      bot = api('/users/' + login)
+                      if (str(app['id']) != os.environ['APP_ID'] or bot['id'] != pr['user']['id']
+                          or bot['type'] != 'Bot' or pr['user']['type'] != 'Bot'
+                          or pr['head']['repo']['full_name'] != os.environ['GITHUB_REPOSITORY']
+                          or pr['base']['repo']['full_name'] != os.environ['GITHUB_REPOSITORY']
+                          or pr['base']['ref'] != 'main'
+                          or pr['head']['ref'] != 'release-please--branches--main'
+                          or 'autorelease: pending' not in [label['name'] for label in pr['labels']]):
+                          raise SystemExit('Release PR identity/branch/label mismatch')
+                  command = ['python3', helper, 'verify', '--base', directory, '--candidate', '.']
+                  if not proposal:
+                      command.append('--ordinary')
+                  subprocess.run(command, check=True)
+              finally:
+                  subprocess.run(['git', 'worktree', 'remove', '--force', directory], check=True)
+          PY
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -100,6 +158,12 @@ jobs:
           tar -xzf "$install_dir/actionlint.tar.gz" -C "$install_dir" actionlint
           echo "$install_dir" >> "$GITHUB_PATH"
       - run: actionlint
+      - name: Verify pinned Release Please schema and generation
+        env:
+          NODE_PATH: ${{ runner.temp }}/release-please/node_modules
+        run: |
+          npm install --prefix "$RUNNER_TEMP/release-please" --ignore-scripts --no-audit --no-fund release-please@17.1.3 ajv@8 ajv-formats@3
+          node scripts/ci/tests/release_please_generator.cjs
       - run: uvx zizmor==1.22.0 --min-severity medium .github
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,7 +216,7 @@ jobs:
       pythons: '["3.12","3.14"]'
   ci-ok:
     if: always()
-    needs: [changes, lint-rust, lint-python, lint-workflows, deny, test-rust, wheels-linux, wheels-windows]
+    needs: [release-consistency, changes, lint-rust, lint-python, lint-workflows, deny, test-rust, wheels-linux, wheels-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

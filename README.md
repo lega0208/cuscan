@@ -69,6 +69,13 @@ See [development and analysis](docs/development.md) for Rust API examples, detai
 
 The [CI and release guidance](docs/development.md#continuous-integration) describes the intended `ci-ok` gate, local act, independent CUDA validation, trusted publishing and the maintainer's settings checklist.
 
+Releases use one reviewed Release Please PR and a shared Cargo/Python version.
+Squash PRs with Conventional Commit titles (`feat:`, `fix:`, or `feat!:` for a
+breaking change). Before 1.0, breaking changes bump minor. Merging the release PR
+creates the public GitHub release first; PyPI artifacts arrive only after the
+separate cold-build publishing workflow succeeds. A GitHub release alone is not
+proof of publication. See the [activation checklist](docs/development.md#release-activation-and-recovery).
+
 Unmodified engineering reports are retained under `archive/engineering/`; its
 `index.json` maps original paths to archived files and records their content hashes.
 Their commands, identities and source paths describe historical revisions, not the

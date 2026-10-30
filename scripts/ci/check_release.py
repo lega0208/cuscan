@@ -63,6 +63,20 @@ def check_ancestry(commit: str) -> None:
                 raise ValueError("unable to deepen history to establish release ancestry")
 
 
+def changelog_versions(changelog: str) -> list[str]:
+    """Read whole stable version tokens, rejecting duplicate version sections."""
+    headings = re.findall(
+        r"^## (?:\[([0-9]+\.[0-9]+\.[0-9]+)\](?:\([^\n)]+\))?"
+        r"|([0-9]+\.[0-9]+\.[0-9]+))(?=\s|$)[^\n]*$",
+        changelog,
+        re.MULTILINE,
+    )
+    versions = [bracketed or plain for bracketed, plain in headings]
+    if len(versions) != len(set(versions)):
+        raise ValueError("duplicate CHANGELOG version: expected exactly one section per version")
+    return versions
+
+
 def validate(mode: str, version: str, tag: str | None, changelog: str) -> str:
     pep = pep440_version(version)
     is_dev = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+", version) is not None
@@ -70,12 +84,12 @@ def validate(mode: str, version: str, tag: str | None, changelog: str) -> str:
         if not is_dev:
             raise ValueError("rehearsal requires a -dev.N version")
     else:
-        if is_dev:
-            raise ValueError("production cannot use a -dev.N version")
+        if "-" in version:
+            raise ValueError("production requires a stable version")
         if tag != f"v{version}":
             raise ValueError("tag does not match Cargo version")
-        if not re.search(rf"^## \[{re.escape(version)}\](?:\s|$)", changelog, re.MULTILINE):
-            raise ValueError("CHANGELOG is missing the version heading")
+        if changelog_versions(changelog).count(version) != 1:
+            raise ValueError("CHANGELOG must contain exactly one version heading")
     return pep
 
 
