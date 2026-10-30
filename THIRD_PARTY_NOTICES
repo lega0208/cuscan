@@ -2,20 +2,10 @@ Third-party notices and provenance limitations
 ==============================================
 
 The inherited project MIT notice remains in LICENSE. This file supplements it;
-it does not establish that all material is first-party, that all obligations
-have been identified, or that any distribution is ready for release. See
-migration_provenance.json for evidence, scope, and unresolved release blockers.
-The following notices are supplied for the indicated material, including
-reference-related notices where the extent of adaptation remains to be assessed.
 
 Burn
 ----
 Reference books and examples under references/burn-* are associated with Burn;
-their exact upstream snapshots and content-specific license scope remain
-unresolved. Burn 0.22.1 appears in the candidate wheel's dependency SBOM;
-the SBOM alone does not establish linked components. The following MIT text is from
-https://raw.githubusercontent.com/tracel-ai/burn/v0.22.1/LICENSE-MIT.
-It is not evidence that every reference file comes from that release.
 
 MIT License
 
@@ -41,12 +31,7 @@ SOFTWARE.
 
 CubeCL
 ------
-Reference books and examples under references/cubecl-* and runtime-associated
-analyze/runtime-observer-source/{client.rs,dry_run.rs,observer.rs} require
-source and patch provenance investigation. CubeCL 0.11.1 appears in the candidate
-wheel's dependency SBOM, which does not establish linked components. The following MIT
-text is from https://raw.githubusercontent.com/tracel-ai/cubecl/v0.11.1/LICENSE-MIT.
-It does not establish the exact origin or license of each snapshot or patch.
+Reference books and examples under references/cubecl-* are associated with CubeCL;
 
 MIT License
 
@@ -77,8 +62,7 @@ states it was copied and modified from the PyTorch MNIST example under BSD-3.
 The exact copied source revision is unknown. The upstream LICENSE at
 https://raw.githubusercontent.com/pytorch/examples/a38cbfc6f817d9015fc67a6309d3a0be9ff94ab6/LICENSE
 is the last license change found before the local addition, not proof of the
-original copied revision. Model weights and training data have separate
-unresolved provenance.
+original copied revision.
 
 BSD 3-Clause License
 
@@ -113,10 +97,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 fast_hdbscan reference
 ----------------------
 The HDBSCAN fixture generator identifies fast_hdbscan 0.3.2 as a reference.
-This notice is from the published 0.3.2 wheel, SHA-256
-619b42963935e6c3ab1e51de7895dd35260f3ef9ebe4627ff4317073fe51a667.
-Reference use or generated numerical outputs alone do not establish whether
-code was copied; that assessment remains open.
 
 BSD 2-Clause License
 
@@ -145,10 +125,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 hdbscan reference
 -----------------
-The prediction fixture generator imports hdbscan.prediction; the lock file
-identifies hdbscan 0.8.44. The notice below is from that release's sdist,
-SHA-256 1ac6196fabdd42072284b60c9be7b9b504b5f4f25cf7a551a8af29a3c7963a4d.
-Whether the generator or other sources contain adapted code remains open.
 
 Copyright (c) 2015, Leland McInnes
 All rights reserved.
@@ -165,11 +141,6 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 umap-learn reference
 --------------------
-The UMAP fixture generators use umap-learn, including version 0.5.12.
-This notice is from the published 0.5.12 wheel, SHA-256
-f2a85d2a2adcb52b541bed9b27a23ca169b56bb1b23283abeebfb8dfb8a42fe5.
-Whether individual generators or other sources contain adapted code remains
-subject to investigation.
 
 BSD 3-Clause License
 
@@ -200,36 +171,6 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-Plotly.js
----------
-comparison/hdbscan_stages.html embeds plotly.js and identifies it as v4.1.1,
-Copyright 2012-2026, Plotly, Inc., licensed MIT. The following complete MIT
-license is from https://raw.githubusercontent.com/plotly/plotly.js/v4.1.1/LICENSE.
-Its distinct copyright wording is retained alongside the embedded header;
-embedded third-party components and exact bundle provenance still require review.
-
-MIT License
-
-Copyright (c) 2016-2024 Plotly Technologies Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 LLVM 23.1.0
 -----------
