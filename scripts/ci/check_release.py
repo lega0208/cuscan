@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate release inputs and emit pep440_version to stdout and GITHUB_OUTPUT.
 
-Run with Python 3.11+ from the repository root. Production takes --tag or
+Run with Python 3.12+ from the repository root. Production takes --tag or
 GITHUB_REF_NAME and checks the checkout and origin/main ancestry. Rehearsal
 requires -dev.N.
 """
@@ -10,9 +10,8 @@ import argparse
 import os
 import re
 import subprocess
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"

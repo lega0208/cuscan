@@ -10,7 +10,7 @@ license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 maintainers = [{ name = "M L" }]
 dynamic = ["version"]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = ["numpy>=1.24"]
 
 [project.urls]

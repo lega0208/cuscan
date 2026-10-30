@@ -86,7 +86,7 @@ uv run maturin develop --release && uv run --no-sync myscript.py
 
 ## Runtime/Tooling Preferences
 
-Use Cargo for Rust (edition 2024) and uv for Python (3.10+). Maturin builds the native Python module. `rust-toolchain.toml` pins `nightly-2026-08-08` (rustc `1a98b1e13`); `.cargo/config.toml` configures `/usr/sbin/clang`, mold and nightly-only flags for x86-64 Linux. Install those tools or deliberately adjust the local configuration. `.vscode/settings.json` is optional personal editor configuration; no soldr editor extension is required.
+Use Cargo for Rust (edition 2024) and uv for Python (3.12+). Maturin builds the native Python module. `rust-toolchain.toml` pins `nightly-2026-08-08` (rustc `1a98b1e13`); `.cargo/config.toml` configures `/usr/sbin/clang`, mold and nightly-only flags for x86-64 Linux. Install those tools or deliberately adjust the local configuration. `.vscode/settings.json` is optional personal editor configuration; no soldr editor extension is required.
 
 CPU (CubeCL LLVM) and CUDA backends are always compiled; default-feature selection does not disable either backend. The local LLVM bundle/build/JIT path can require network access, cache space, and LLVM support. The documented deployment target is Linux x86-64 including WSL2; the locally validated wheel baseline is manylinux 2.34, not a claim of other platform support or publication. CUDA still needs NVIDIA runtime support when selected and is not initialized merely by compiling it. Standard backend selection is Auto/Cpu/Cuda: Auto prefers discovered usable CUDA and uses CPU only when discovery confirms CUDA unavailable; explicit selections are strict, with no execution fallback.
 

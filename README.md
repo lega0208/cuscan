@@ -4,7 +4,7 @@ cuscan 0.1.0 provides non-parametric [UMAP](https://github.com/lmcinnes/umap) di
 
 ## Local build
 
-The documented local target is Linux x86-64, including WSL2. Python 3.10+, uv and Maturin are required. `rust-toolchain.toml` pins `nightly-2026-08-08` (rustc `1a98b1e13`), and the x86-64 Linux Cargo configuration requires `/usr/sbin/clang` and mold and enables nightly flags. From the repository root:
+The documented local target is Linux x86-64, including WSL2. Python 3.12+, uv and Maturin are required. `rust-toolchain.toml` pins `nightly-2026-08-08` (rustc `1a98b1e13`), and the x86-64 Linux Cargo configuration requires `/usr/sbin/clang` and mold and enables nightly flags. From the repository root:
 
 ```sh
 uv sync

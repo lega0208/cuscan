@@ -2,15 +2,14 @@
 """Print a uniquely locked package version; append version=... to GITHUB_OUTPUT.
 
 Usage: python scripts/ci/locked_version.py PACKAGE [--lock uv.lock]
-Requires Python 3.11 or newer.
+Requires Python 3.12 or newer.
 """
 
 import argparse
 import os
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 
 def locked_version(path: Path, name: str) -> str:
