@@ -1,0 +1,33 @@
+name: CI environment
+description: Export shared CI environment constants
+runs:
+  using: composite
+  steps:
+    - name: Bootstrap Node for act
+      if: runner.os == 'Linux' && env.ACT == 'true'
+      shell: bash
+      run: | # zizmor: ignore[github-env] The runner temporary path is checked for line breaks before writing.
+        if ! command -v node >/dev/null; then
+          node_dir="$RUNNER_TEMP/ci-node-24.11.1"
+          if [[ "$node_dir" == *$'\n'* || "$node_dir" == *$'\r'* ]]; then
+            echo 'Node path must not contain line breaks' >&2
+            exit 1
+          fi
+          mkdir -p "$node_dir"
+          curl --proto '=https' --tlsv1.2 -sSfL https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-x64.tar.xz -o "$node_dir/node.tar.xz"
+          printf '%s  %s\n' '60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8' "$node_dir/node.tar.xz" | sha256sum -c -
+          tar -xJf "$node_dir/node.tar.xz" -C "$node_dir" --strip-components=1
+          printf '%s\n' "$node_dir/bin" >> "$GITHUB_PATH"
+        fi
+    - shell: bash
+      run: |
+        {
+          echo 'CARGO_TERM_COLOR=always'
+          echo 'CARGO_INCREMENTAL=0'
+          echo 'CARGO_NET_RETRY=10'
+          echo 'RUST_BACKTRACE=1'
+          echo 'CI_CACHE_EPOCH=1'
+          echo 'UV_VERSION=0.13.6'
+          echo 'UV_LOCKED=1'
+          echo 'PYTHONUNBUFFERED=1'
+        } >> "$GITHUB_ENV"

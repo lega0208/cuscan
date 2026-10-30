@@ -2,13 +2,13 @@
 //!
 //! # Canonical state and views
 //!
-//! A successful fit captures an immutable [`FittedState`] for fit outputs and a shared
-//! [`PredictionState`] containing only compact prediction geometry and validated
+//! A successful fit captures an immutable `FittedState` for fit outputs and a shared
+//! `PredictionState` containing only compact prediction geometry and validated
 //! hierarchy metadata. The public mutable fields of [`crate::FittedHDBSCAN`] are detached
 //! output views; mutating them affects neither prediction nor canonical state.
 //!
 //! Runtime concerns (selected runtime backend, initialization locks, `Arc` sharing) live
-//! in [`PredictionRuntime`]. Host KD tree and prediction-core payloads are published into
+//! in `PredictionRuntime`. Host KD tree and prediction-core payloads are published into
 //! that runtime cache as immutable `Arc`s.
 //!
 //! # Portable predictor state
@@ -821,6 +821,8 @@ fn plan_prediction(
     )
 }
 
+// The extra arguments are test-only controls for exercising planning branches.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 fn plan_prediction_impl(
     kd_plan: KdNeighborPlan,
     queries: usize,

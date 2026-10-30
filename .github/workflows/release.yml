@@ -1,0 +1,160 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      pep440_version: ${{ steps.verify.outputs.pep440_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - id: verify
+        env:
+          MODE: ${{ github.event_name == 'push' && 'production' || 'rehearsal' }}
+        run: python3 scripts/ci/check_release.py --mode "$MODE"
+  wheels-linux:
+    needs: verify
+    uses: ./.github/workflows/_wheels.yml
+    with:
+      platform: linux
+      use-cache: false
+      build-sdist: true
+      pythons: '["3.10","3.14"]'
+  wheels-windows:
+    needs: verify
+    uses: ./.github/workflows/_wheels.yml
+    with:
+      platform: windows
+      use-cache: false
+      pythons: '["3.10","3.14"]'
+  sdist-source-build:
+    needs: wheels-linux
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_34_x86_64@sha256:834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: sdist
+          use-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheel-linux
+          path: dist
+      - name: Build and smoke source distribution
+        shell: bash
+        run: |
+          mkdir -p /tmp/sdist-source
+          tar -xzf "$GITHUB_WORKSPACE"/dist/*.tar.gz -C /tmp/sdist-source
+          cd /tmp/sdist-source/*
+          test -f rust-toolchain.toml
+          test ! -e .cargo/config.toml
+          /opt/python/cp310-cp310/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
+          /opt/python/cp310-cp310/bin/python -m pip install /tmp/sdist-wheel/*.whl
+          /opt/python/cp310-cp310/bin/python -c 'import cuscan; print(cuscan.__file__)'
+  publish:
+    if: ${{ !github.event.act }}
+    needs: [verify, wheels-linux, wheels-windows, sdist-source-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ github.event_name == 'push' && 'pypi' || 'testpypi' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: Verify distribution metadata
+        env:
+          EXPECTED: ${{ needs.verify.outputs.pep440_version }}
+        run: |
+          python3 - <<'PY'
+          import email, os, pathlib, tarfile, zipfile
+          files = sorted(pathlib.Path('dist').iterdir())
+          assert len(files) == 3 and sum(p.suffix == '.whl' for p in files) == 2 and sum(p.name.endswith('.tar.gz') for p in files) == 1, files
+          for path in files:
+              if path.suffix == '.whl':
+                  with zipfile.ZipFile(path) as archive:
+                      names = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+                      assert len(names) == 1, names
+                      metadata = archive.read(names[0])
+              else:
+                  with tarfile.open(path) as archive:
+                      names = [n for n in archive.getnames() if n.count('/') == 1 and n.endswith('/PKG-INFO')]
+                      assert len(names) == 1, names
+                      metadata = archive.extractfile(names[0]).read()
+              version = email.message_from_bytes(metadata)['Version']
+              assert version == os.environ['EXPECTED'], (path, version)
+          PY
+      - name: Publish to PyPI
+        if: github.event_name == 'push' && env.ACT != 'true'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && env.ACT != 'true'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+  github-release:
+    if: ${{ github.event_name == 'push' && !github.event.act }}
+    needs: [verify, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: env.ACT != 'true'
+        with:
+          subject-path: dist/*
+      - name: Create GitHub release
+        if: env.ACT != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          version = os.environ['TAG'][1:]
+          text = pathlib.Path('CHANGELOG.md').read_text()
+          match = re.search(r'^## \[' + re.escape(version) + r'\][^\n]*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+          if not match:
+              raise SystemExit('Changelog section not found')
+          pathlib.Path('/tmp/release-notes.md').write_text(match.group(1).strip() + '\n')
+          PY
+          gh release create "$TAG" dist/* --notes-file /tmp/release-notes.md

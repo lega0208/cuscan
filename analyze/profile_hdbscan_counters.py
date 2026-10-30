@@ -61,6 +61,8 @@ def _number(value: str) -> float:
 
 
 def normalize_metric(name: str, value: float, unit: str) -> tuple[float, str]:
+    # int is accepted by the float API, but int.is_integer requires Python 3.12.
+    value = float(value)
     unit = unit.strip()
     if name == "gpu__time_duration.sum":
         factors = {

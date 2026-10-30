@@ -1,12 +1,10 @@
 # cuscan
 
-cuscan 0.1.0 provides non-parametric UMAP dimensionality reduction and HDBSCAN clustering in Rust and Python. UMAP follows umap-learn 0.5.12 semantics. The implementation uses [Burn](https://github.com/tracel-ai/burn) and [CubeCL](https://github.com/tracel-ai/cubecl) for CPU and CUDA execution.
-
-Repository: <https://github.com/lega0208/cuscan>
+cuscan 0.1.0 provides non-parametric [UMAP](https://github.com/lmcinnes/umap) dimensionality reduction and [HDBSCAN](https://github.com/TutteInstitute/fast_hdbscan) clustering in Rust and Python. UMAP follows umap-learn 0.5.12 semantics. The implementation uses [Burn](https://github.com/tracel-ai/burn) and [CubeCL](https://github.com/tracel-ai/cubecl) for CPU and CUDA execution.
 
 ## Local build
 
-The documented local target is Linux x86-64, including WSL2. Python 3.10+, Rust nightly, uv and Maturin are required. `rust-toolchain.toml` selects the floating nightly channel, and the x86-64 Linux Cargo configuration requires `/usr/sbin/clang` and mold and enables nightly flags. From the repository root:
+The documented local target is Linux x86-64, including WSL2. Python 3.10+, uv and Maturin are required. `rust-toolchain.toml` pins `nightly-2026-08-08` (rustc `1a98b1e13`), and the x86-64 Linux Cargo configuration requires `/usr/sbin/clang` and mold and enables nightly flags. From the repository root:
 
 ```sh
 uv sync
@@ -17,24 +15,8 @@ Use `uv run --no-sync` for subsequent scripts or tests so syncing does not repla
 
 ### Wheel validation
 
-The lowest validated Linux x86-64 wheel baseline is **manylinux 2.34**, not a
-proven universal minimum. A Docker manylinux 2.34 build of the final sdist used
-official Rust nightly 1.99.0 (1a98b1e13, 2026-08-07) mounted read-only at
-`/opt/rust`; `auditwheel show` confirmed the 2.34 tag. The resulting local ABI3
-wheel passed CPU container smoke checks on Python 3.10 and 3.14 for UMAP and
-HDBSCAN fit/predict, new persistence and rejection of old files, and a host
-Python 3.14 CUDA smoke check for the same wheel. This does not establish that
-every Python version from 3.10 onward was tested.
-The image digest was `sha256:834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d`;
-the local wheel was `/tmp/cuscan-manylinux-dist/cuscan-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl`.
-
-The manylinux 2.28 image failed to build because `tracel-llvm-23.1.0-4`'s
-`llvm-config` requires GLIBC 2.32, 2.33 and 2.34. A native glibc 2.44 wheel was
-rejected by PyPI; use the validated manylinux wheel for release instead. No PyPI
-upload or GitHub rename has been completed, and remote and provenance blockers
-remain; registry installation is not established.
-The failed 2.28 image digest was
-`sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3`.
+The lowest validated Linux x86-64 wheel baseline is **manylinux 2.34**. The manylinux 2.28 image fails to build because `tracel-llvm-23.1.0-4`'s
+`llvm-config` requires GLIBC 2.32, 2.33 and 2.34.
 
 ## Python
 
@@ -84,6 +66,8 @@ cargo test -p hdbscan
 ```
 
 See [development and analysis](docs/development.md) for Rust API examples, detailed backend behavior, profiling, comparisons, serialization benchmarks and testing guidance. Historical benchmark measurements there are not cuscan rebenchmarks.
+
+The [CI and release guidance](docs/development.md#continuous-integration) describes the intended `ci-ok` gate, local act, independent CUDA validation, trusted publishing and the maintainer's settings checklist.
 
 Unmodified engineering reports are retained under `archive/engineering/`; its
 `index.json` maps original paths to archived files and records their content hashes.

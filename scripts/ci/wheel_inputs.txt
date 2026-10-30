@@ -1,0 +1,18 @@
+# manylinux_2_34_x86_64@sha256:834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d
+crates/*/Cargo.toml
+crates/*/src/**
+crates/*/build.rs
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+.cargo/**
+burn.toml
+pyproject.toml
+uv.lock
+python/cuscan/**
+README.md
+LICENSE
+THIRD_PARTY_NOTICES
+.github/workflows/_wheels.yml
+.github/actions/**
+scripts/ci/wheel_inputs.txt

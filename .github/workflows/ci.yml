@@ -1,0 +1,196 @@
+name: CI
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+      python_pkg: ${{ steps.classify.outputs.python_pkg }}
+      python_tests: ${{ steps.classify.outputs.python_tests }}
+      workflows: ${{ steps.classify.outputs.workflows }}
+      deps: ${{ steps.classify.outputs.deps }}
+      fixtures: ${{ steps.classify.outputs.fixtures }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - name: Fetch push base
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ && ! "$BEFORE" =~ ^0+$ ]]; then
+            git fetch --no-tags --depth=1 origin "$BEFORE" || echo 'Base unavailable; classifier will run all jobs.'
+          fi
+      - id: classify
+        run: python3 scripts/ci/classify_changes.py
+  lint-rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: check
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked --features umap/tracing,hdbscan/tracing,cuscan-python/tracing,hdbscan-core/test-support -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+  lint-python:
+    needs: changes
+    if: needs.changes.outputs.python_pkg == 'true' || needs.changes.outputs.python_tests == 'true' || needs.changes.outputs.fixtures == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.14'
+      - run: uv lock --check
+      - run: uv sync --locked --no-install-project --extra serialization
+      - run: uv run --no-sync ruff check
+      - run: uv run --no-sync ruff format --check
+      - run: uv run --no-sync ty check
+      - run: uv run --no-sync python crates/hdbscan/tests/fixtures/generate_fast_hdbscan.py --verify-provenance
+      - run: uv run --no-sync python crates/hdbscan/tests/fixtures/generate_fast_hdbscan.py --check
+      - run: uv run --no-sync pytest scripts/ci/tests
+  lint-workflows:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-python-uv
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: actionlint@1.7.12
+      - run: actionlint
+      - run: uvx zizmor==1.22.0 --min-severity medium .github
+        env:
+          GH_TOKEN: ${{ github.token }}
+  deny:
+    needs: changes
+    if: needs.changes.outputs.deps == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
+  test-rust:
+    needs: changes
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true') && github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: test
+          cache-on-failure: 'true'
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-run
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-fail-fast
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --doc
+  wheels-linux:
+    needs: changes
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python_pkg == 'true' || needs.changes.outputs.python_tests == 'true' || needs.changes.outputs.workflows == 'true') && github.event.pull_request.draft != true
+    uses: ./.github/workflows/_wheels.yml
+    with:
+      platform: linux
+      use-cache: true
+      pythons: '["3.10","3.14"]'
+  wheels-windows:
+    needs: changes
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python_pkg == 'true' || needs.changes.outputs.python_tests == 'true' || needs.changes.outputs.workflows == 'true') && github.event.pull_request.draft != true
+    uses: ./.github/workflows/_wheels.yml
+    with:
+      platform: windows
+      use-cache: true
+      pythons: '["3.10","3.14"]'
+  ci-ok:
+    if: always()
+    needs: [changes, lint-rust, lint-python, lint-workflows, deny, test-rust, wheels-linux, wheels-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - name: Summarize jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['NEEDS'])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('| Job | Result |\n| --- | --- |\n')
+              for name, data in needs.items():
+                  summary.write(f"| {name} | {data['result']} |\n")
+          if any(job['result'] in ('failure', 'cancelled') for job in needs.values()):
+              raise SystemExit(1)
+          PY
+      - name: Report repository caches
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh cache list --limit 1000 --json key,sizeInBytes,ref > "$RUNNER_TEMP/caches.json"; then
+            python3 - <<'PY'
+          import json, os
+          from collections import defaultdict
+          from pathlib import Path
+          caches = json.loads((Path(os.environ['RUNNER_TEMP']) / 'caches.json').read_text())
+          totals = defaultdict(int)
+          for cache in caches:
+              key = cache['key']
+              label = next((name for name in ('check-linux', 'test-linux', 'wheel-linux', 'wheel-windows', 'test-windows') if name in key), 'other')
+              totals[(label, cache['ref'] == 'refs/heads/main')] += cache['sizeInBytes']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\n### Cache usage (up to 1000 entries)\n\n| Class | Main GiB | Other refs GiB |\n| --- | ---: | ---: |\n')
+              for label in sorted({name for name, _ in totals}):
+                  summary.write(f'| {label} | {totals[label, True] / 2**30:.2f} | {totals[label, False] / 2**30:.2f} |\n')
+              summary.write(f"| Total | {sum(v for (_, main), v in totals.items() if main) / 2**30:.2f} | {sum(v for (_, main), v in totals.items() if not main) / 2**30:.2f} |\n")
+          PY
+          else
+            echo 'Cache usage unavailable.' >> "$GITHUB_STEP_SUMMARY"
+          fi

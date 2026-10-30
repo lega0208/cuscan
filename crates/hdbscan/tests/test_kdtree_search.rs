@@ -287,19 +287,16 @@ fn check_kd_oracle_high_dim(device: &Device) {
                 candidates.push((distance, candidate as i32));
             }
             candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            for slot in 0..5 {
+            for (slot, candidate) in candidates.iter().take(5).enumerate() {
                 let offset = row * 5 + slot;
-                assert_eq!(
-                    neighbors[offset], candidates[slot].1,
-                    "row {row}, d={features}"
-                );
+                assert_eq!(neighbors[offset], candidate.1, "row {row}, d={features}");
                 assert_eq!(
                     distances[offset].to_bits(),
-                    candidates[slot].0.to_bits(),
+                    candidate.0.to_bits(),
                     "distance bits at row {row}, d={features}, slot {slot}"
                 );
                 assert!(
-                    candidates[slot].0 > 0.0,
+                    candidate.0 > 0.0,
                     "selected distance must exercise accumulation at row {row}, d={features}, slot {slot}"
                 );
             }

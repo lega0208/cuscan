@@ -18,8 +18,8 @@ Three layers are recorded:
   test-only same-hierarchy adapter (they must agree).
 * ``core_rank`` / ``width``: core-rank conventions and width failures.
 
-Usage: ``python generate_hdbscan_prediction.py [--check]``. ``--check``
-regenerates in memory and fails if the stored JSON differs.
+Usage: ``python generate_hdbscan_prediction.py [--check] [--output PATH]``.
+``--check`` regenerates in memory and fails if the selected JSON differs.
 """
 
 from __future__ import annotations
@@ -684,14 +684,15 @@ def dumps(payload: dict[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--output", type=Path, default=FIXTURE_PATH)
     args = parser.parse_args()
     text = dumps(generate())
     if args.check:
-        if FIXTURE_PATH.read_text() != text:
-            print("hdbscan_prediction.json is stale", file=sys.stderr)
+        if args.output.read_text() != text:
+            print(f"{args.output} is stale", file=sys.stderr)
             return 1
         return 0
-    FIXTURE_PATH.write_text(text)
+    args.output.write_text(text)
     return 0
 
 

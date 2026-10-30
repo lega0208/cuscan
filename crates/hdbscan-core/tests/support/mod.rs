@@ -167,6 +167,7 @@ pub(crate) fn load_npz(
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry
             .name()
+            .map_err(|e| e.to_string())?
             .strip_suffix(".npy")
             .ok_or("NPZ entry is not an NPY array")?
             .to_owned();

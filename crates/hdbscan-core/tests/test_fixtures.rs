@@ -128,7 +128,7 @@ fn replace_npz_entry(path: &Path, entry_name: &str, mut mutate: impl FnMut(&mut 
     let mut entries = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_owned();
+        let name = entry.name().unwrap().into_owned();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         if name == entry_name {
@@ -140,7 +140,7 @@ fn replace_npz_entry(path: &Path, entry_name: &str, mut mutate: impl FnMut(&mut 
     let mut writer = zip::ZipWriter::new(file);
     for (name, bytes) in entries {
         writer
-            .start_file(name, zip::write::FileOptions::default())
+            .start_file(name, zip::write::SimpleFileOptions::default())
             .unwrap();
         writer.write_all(&bytes).unwrap();
     }

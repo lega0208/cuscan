@@ -45,8 +45,10 @@ fn read_matrix(path: &Path, rows: usize, features: usize) -> Result<Vec<Vec<f32>
         .into());
     }
     let flat: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     let matrix = flat.chunks_exact(features).map(<[f32]>::to_vec).collect();
     Ok(matrix)

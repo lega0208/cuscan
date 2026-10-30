@@ -40,7 +40,7 @@ module-name = "cuscan._cuscan"
 features = ["pyo3/extension-module"]
 include = [
     { path = "docs/development.md", format = "sdist" },
-    { path = "migration_provenance.json", format = "sdist" },
+    { path = "rust-toolchain.toml", format = "sdist" },
 ]
 
 [tool.uv]
