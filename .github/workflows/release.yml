@@ -119,7 +119,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.verify.outputs.pep440_version }}
-        run: python3 scripts/ci/release_artifacts.py prepare --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse HEAD^{commit})"
+        run: python3 scripts/ci/release_artifacts.py prepare --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse 'HEAD^{commit}')"
       - name: Publish to PyPI
         if: github.event_name == 'push' && env.ACT != 'true' && steps.prepare.outputs.publish_needed == 'true'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
@@ -160,4 +160,4 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.verify.outputs.pep440_version }}
-        run: python3 scripts/ci/release_artifacts.py upload --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse HEAD^{commit})"
+        run: python3 scripts/ci/release_artifacts.py upload --tag "$TAG" --repo "$REPO" --version "$VERSION" --sha "$(git rev-parse 'HEAD^{commit}')"
