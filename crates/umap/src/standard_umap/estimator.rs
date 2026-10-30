@@ -439,19 +439,6 @@ impl ValidatedFitGraph {
     }
 }
 
-#[cfg(all(test, feature = "tracing"))]
-struct OriginalFitState {
-    config: UMAPConfig,
-    backend: crate::standard_umap::BackendChoice,
-    search: NeighborSearch,
-    n_features: usize,
-    training_data: Tensor<2>,
-    fit_graph: Tensor<2, Int>,
-    embedding_tensor: Tensor<2>,
-    a: f32,
-    b: f32,
-}
-
 impl FittedUMAP {
     /// Export an exact, storage-independent snapshot of fitted state.
     pub fn export_state(&self) -> Result<super::ModelState> {
@@ -724,25 +711,6 @@ impl FittedUMAP {
     }
     pub fn n_features(&self) -> usize {
         self.n_features
-    }
-
-    #[cfg(all(test, feature = "tracing"))]
-    fn original_fit_state(&self) -> OriginalFitState {
-        let fit_graph = match &self.fit_graph {
-            Some(graph) => graph.0.clone(),
-            None => Tensor::<2, Int>::zeros([1, 0], &self.training_data.device()),
-        };
-        OriginalFitState {
-            config: self.config.clone(),
-            backend: self.backend,
-            search: self.search,
-            n_features: self.n_features,
-            training_data: self.training_data.clone(),
-            fit_graph,
-            embedding_tensor: self.embedding_tensor.clone(),
-            a: self.a,
-            b: self.b,
-        }
     }
 
     /// Diagnostic read-only copy of the fit's non-self neighbor ids, row-major

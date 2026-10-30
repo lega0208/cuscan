@@ -1,0 +1,33 @@
+name: Set up Python and uv
+description: Install a pinned uv and select Python with an optional CI cache
+inputs:
+  python-version:
+    description: Python version
+    default: '3.10'
+  use-cache:
+    description: Restore and save the uv cache when permitted
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: ${{ env.UV_VERSION }}
+        python-version: ${{ inputs.python-version }}
+        enable-cache: ${{ inputs.use-cache }}
+        save-cache: ${{ inputs.use-cache == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        cache-dependency-glob: uv.lock
+        cache-suffix: python-${{ inputs.python-version }}
+        prune-cache: 'true'
+    - name: Install and select Python
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: | # zizmor: ignore[github-env] The uv binary directory is checked for line breaks before writing.
+        uv python install --default --force "$PYTHON_VERSION"
+        python_bin=$(uv python dir --bin)
+        if [[ -z "$python_bin" || "$python_bin" == *$'\n'* || "$python_bin" == *$'\r'* ]]; then
+          echo 'Invalid uv Python binary directory' >&2
+          exit 1
+        fi
+        printf '%s\n' "$python_bin" >> "$GITHUB_PATH"

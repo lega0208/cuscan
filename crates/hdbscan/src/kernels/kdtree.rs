@@ -3209,7 +3209,7 @@ mod tests {
     }
 
     fn splitmix_values(rows: usize, features: usize) -> Vec<f32> {
-        let mut state = 0x5eed_cafe_d15c_a11u64;
+        let mut state = 0x05ee_dcaf_ed15_ca11u64;
         (0..rows * features)
             .map(|index| {
                 state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);

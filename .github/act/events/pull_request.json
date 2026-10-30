@@ -1,0 +1,11 @@
+{
+  "act": true,
+  "action": "synchronize",
+  "number": 1,
+  "pull_request": {
+    "number": 1,
+    "draft": false,
+    "base": {"ref": "main"},
+    "head": {"ref": "act-pr"}
+  }
+}

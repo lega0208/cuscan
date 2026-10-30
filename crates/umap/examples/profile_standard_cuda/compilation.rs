@@ -46,11 +46,19 @@ struct CompilationSample {
     outcome: CompilationOutcome,
 }
 
+type PhaseIntervals =
+    std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration)>;
+type CompilationSummary = (
+    serde_json::Map<String, serde_json::Value>,
+    [f64; 3],
+    [usize; 3],
+    usize,
+);
+
 fn phase_intervals(
     labels: &[String],
     marks: &[(String, std::time::Duration, std::time::Duration)],
-) -> Result<std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration)>, String>
-{
+) -> Result<PhaseIntervals, String> {
     let mut intervals = std::collections::BTreeMap::new();
     for label in labels {
         let matching = marks
@@ -77,17 +85,9 @@ fn phase_intervals(
 
 fn summarize_compilations(
     labels: &[String],
-    intervals: &std::collections::BTreeMap<String, (std::time::Duration, std::time::Duration)>,
+    intervals: &PhaseIntervals,
     samples: &[CompilationSample],
-) -> Result<
-    (
-        serde_json::Map<String, serde_json::Value>,
-        [f64; 3],
-        [usize; 3],
-        usize,
-    ),
-    String,
-> {
+) -> Result<CompilationSummary, String> {
     let mut phase_json = serde_json::Map::new();
     let mut outcome_seconds = [0.0f64; 3];
     let mut outcome_counts = [0usize; 3];

@@ -9,6 +9,9 @@ use umap::{
 
 pub(crate) mod hdbscan;
 
+#[cfg(feature = "tracing")]
+type DiagnosticTransformArrays<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i32>>);
+
 #[pyclass(frozen, unsendable)]
 struct FittedUMAP {
     inner: RustFittedUMAP,
@@ -123,7 +126,7 @@ impl FittedUMAP {
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f32>,
-    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i32>>)> {
+    ) -> PyResult<DiagnosticTransformArrays<'py>> {
         let data: Vec<Vec<f32>> = x
             .as_array()
             .rows()

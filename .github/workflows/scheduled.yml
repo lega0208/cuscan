@@ -1,0 +1,168 @@
+name: Scheduled CI
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  nightly-canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: test
+          save-cache: false
+      - run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
+          rustup override set nightly
+          rustc -vV | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked --features umap/tracing,hdbscan/tracing,cuscan-python/tracing,hdbscan-core/test-support -- -D warnings
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-fail-fast
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --doc
+  test-rust-windows:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.14'
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: test-windows
+          use-cache: false
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-fail-fast
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --doc
+  long-quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: test
+      - run: cargo test -p umap --locked --test test_standard_quality long_quality
+        env:
+          CUSCAN_RUN_LONG_QUALITY: '1'
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: check
+      - run: bash scripts/test_features.sh
+  wheels-linux:
+    uses: ./.github/workflows/_wheels.yml
+    with:
+      platform: linux
+      use-cache: true
+      build-sdist: true
+  min-deps:
+    needs: wheels-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-python-uv
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheel-linux
+          path: dist
+      - run: |
+          unset UV_LOCKED
+          uv venv --python 3.10 .venv-min
+          uv pip install --python .venv-min dist/*.whl 'numpy==1.24.*' pytest
+          CUSCAN_TEST_BACKEND=cpu .venv-min/bin/python -m pytest python/tests/test_standard_umap.py python/tests/test_hdbscan_resources.py python/tests/test_hdbscan_predictor_native.py
+  sdist-build:
+    needs: wheels-linux
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_34_x86_64@sha256:834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: sdist
+          use-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheel-linux
+          path: dist
+      - shell: bash
+        run: |
+          mkdir -p /tmp/sdist-source
+          tar -xzf "$GITHUB_WORKSPACE"/dist/*.tar.gz -C /tmp/sdist-source
+          cd /tmp/sdist-source/*
+          test -f rust-toolchain.toml
+          test ! -e .cargo/config.toml
+          /opt/python/cp310-cp310/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
+          /opt/python/cp310-cp310/bin/python -m pip install /tmp/sdist-wheel/*.whl
+          /opt/python/cp310-cp310/bin/python -c 'import cuscan; print(cuscan.__file__)'
+  cold-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-rust
+        with:
+          class: test
+          use-cache: false
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-run
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --lib --bins --tests --no-fail-fast
+      - run: cargo test --workspace --locked --features hdbscan-core/test-support --doc
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
+  report:
+    if: ${{ always() && !github.event.act && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    needs: [nightly-canary, test-rust-windows, long-quality, contracts, wheels-linux, min-deps, sdist-build, cold-build, deny]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - name: Update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/issue_on_failure.py

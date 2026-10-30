@@ -1,0 +1,124 @@
+name: Set up Rust
+description: Install the repository toolchain and configure a build-class cache
+inputs:
+  class:
+    description: 'Build class: check, test, wheel-linux, wheel-windows, test-windows, or sdist'
+    required: true
+  use-cache:
+    description: Restore and save the Rust cache when permitted
+    default: 'true'
+  save-cache:
+    description: Save the Rust cache after success
+    default: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+  cache-on-failure:
+    description: Retain a trusted main-push dependency cache after a test failure
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: | # zizmor: ignore[github-env] The runner home-derived path is checked for line breaks before writing.
+        if ! command -v rustup >/dev/null; then
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            curl --proto '=https' --tlsv1.2 -sSfL https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -o "$RUNNER_TEMP/rustup-init.exe"
+            "$RUNNER_TEMP/rustup-init.exe" -y --no-modify-path --default-toolchain none
+            cargo_bin="$(cygpath -u "$USERPROFILE")/.cargo/bin"
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+            cargo_bin="$HOME/.cargo/bin"
+          fi
+          if [[ "$cargo_bin" == *$'\n'* || "$cargo_bin" == *$'\r'* ]]; then
+            echo 'Rust binary path must not contain line breaks' >&2
+            exit 1
+          fi
+          printf '%s\n' "$cargo_bin" >> "$GITHUB_PATH"
+          export PATH="$cargo_bin:$PATH"
+        fi
+        channel=''
+        while IFS= read -r line; do
+          if [[ "$line" =~ ^[[:space:]]*channel[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+            channel="${BASH_REMATCH[1]}"
+            break
+          fi
+        done < rust-toolchain.toml
+        if [[ -z "$channel" ]]; then
+          echo 'Missing toolchain channel in rust-toolchain.toml' >&2
+          exit 1
+        fi
+        rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+    - name: Configure build class
+      shell: bash
+      env:
+        BUILD_CLASS: ${{ inputs.class }}
+      run: | # zizmor: ignore[github-env] Only literal values and an allowlisted single-line build class are written.
+        case "$BUILD_CLASS" in
+          check|test)
+            echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang' >> "$GITHUB_ENV"
+            echo 'RUSTFLAGS=-C link-arg=-fuse-ld=mold -Zshare-generics=y' >> "$GITHUB_ENV"
+            echo "CI_RUST_CACHE_CLASS=$BUILD_CLASS-linux" >> "$GITHUB_ENV"
+            ;;
+          wheel-linux)
+            echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc' >> "$GITHUB_ENV"
+            # Selecting gcc overrides Rust's default gnu-lld-cc flavor. Restore
+            # bundled LLD explicitly: GNU ld cannot resolve LLVM archive cycles.
+            echo 'RUSTFLAGS=-Zshare-generics=y -Zunstable-options -C linker-features=+lld -C link-self-contained=+linker' >> "$GITHUB_ENV"
+            echo 'PYO3_PYTHON=/opt/python/cp310-cp310/bin/python' >> "$GITHUB_ENV"
+            echo "CI_RUST_CACHE_CLASS=$BUILD_CLASS" >> "$GITHUB_ENV"
+            ;;
+          wheel-windows|test-windows)
+            echo "CI_RUST_CACHE_CLASS=$BUILD_CLASS" >> "$GITHUB_ENV"
+            ;;
+          sdist)
+            # Install only the pinned toolchain; source builds must stand alone.
+            ;;
+          *) echo "Unknown Rust build class: $BUILD_CLASS" >&2; exit 1 ;;
+        esac
+        if [[ "$BUILD_CLASS" == test || "$BUILD_CLASS" == test-windows ]]; then
+          echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
+        fi
+    - name: Free disk space when needed
+      if: runner.os == 'Linux' && (inputs.class == 'check' || inputs.class == 'test')
+      shell: bash
+      run: |
+        available=$(df -Pk / | { read -r _; read -r _ _ _ available _; echo "$available"; })
+        if (( available < 20 * 1024 * 1024 )); then
+          sudo rm -rf /usr/local/lib/android /opt/ghc
+        fi
+    - name: Install host link prerequisites
+      if: runner.os == 'Linux' && (inputs.class == 'check' || inputs.class == 'test')
+      shell: bash
+      run: |
+        packages=()
+        if ! command -v clang >/dev/null; then
+          packages+=(clang)
+        fi
+        # Workspace libtests link the PyO3 extension against the host Python.
+        if ! python3 -c 'import pathlib,sysconfig; assert (pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY")).exists()'; then
+          packages+=(python3-dev)
+        fi
+        if (( ${#packages[@]} )); then
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "${packages[@]}"
+        fi
+    - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+      if: runner.os == 'Linux' && (inputs.class == 'check' || inputs.class == 'test')
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      if: inputs.use-cache == 'true'
+      with:
+        shared-key: ${{ env.CI_RUST_CACHE_CLASS }}
+        prefix-key: v${{ env.CI_CACHE_EPOCH }}-rust
+        cache-directories: ~/.cache/tracel
+        cache-bin: 'false'
+        save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        cache-on-failure: ${{ inputs.cache-on-failure == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    - name: Report toolchain and disk space
+      shell: bash
+      run: |
+        {
+          echo '### Rust toolchain and disk space'
+          echo '```'
+          rustc -vV
+          df -h
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

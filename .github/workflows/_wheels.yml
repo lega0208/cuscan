@@ -1,0 +1,186 @@
+name: Wheels
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      use-cache:
+        type: boolean
+        default: true
+      pythons:
+        type: string
+        default: '["3.10","3.14"]'
+      build-sdist:
+        type: boolean
+        default: false
+      artifact-retention-days:
+        type: number
+        default: 7
+permissions:
+  contents: read
+jobs:
+  build-linux:
+    if: inputs.platform != 'windows'
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_34_x86_64@sha256:834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps: &build-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - name: Validate platform
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          case "$PLATFORM" in
+            linux|windows) ;;
+            *) echo "Unsupported wheel platform: $PLATFORM" >&2; exit 1 ;;
+          esac
+      - uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: '3.10'
+          use-cache: ${{ inputs.use-cache }}
+      - name: Compute wheel key
+        id: key
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          if [[ "$PLATFORM" == linux ]]; then
+            export IMAGE=834a2a31de5eabacd4411417b3bbc9fcb6ff9f959972711ab3b73355e7b0928d
+          else
+            : "${ImageOS:?missing ImageOS}" "${ImageVersion:?missing ImageVersion}"
+            export IMAGE="$ImageOS-$ImageVersion"
+          fi
+          uv run --no-project --python 3.11 python - <<'PY'
+          import glob, hashlib, os
+          from pathlib import Path
+          paths = set()
+          for pattern in Path('scripts/ci/wheel_inputs.txt').read_text().splitlines():
+              pattern = pattern.strip()
+              if pattern and not pattern.startswith('#'):
+                  paths.update(Path(p) for p in glob.glob(pattern, recursive=True, include_hidden=True) if Path(p).is_file())
+          digest = hashlib.sha256()
+          for path in sorted(paths):
+              digest.update(path.as_posix().encode() + b'\0')
+              digest.update(hashlib.sha256(path.read_bytes()).digest())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"key=wheel-v{os.environ['CI_CACHE_EPOCH']}-{os.environ['PLATFORM']}-{os.environ['IMAGE']}-{digest.hexdigest()}\n")
+          PY
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: wheel-cache
+        if: inputs.use-cache
+        with:
+          path: dist/*.whl
+          key: ${{ steps.key.outputs.key }}
+      - uses: ./.github/actions/setup-rust
+        if: steps.wheel-cache.outputs.cache-hit != 'true' || inputs.build-sdist
+        with:
+          class: ${{ inputs.platform == 'linux' && 'wheel-linux' || 'wheel-windows' }}
+          use-cache: ${{ inputs.use-cache }}
+      - name: Build wheel
+        if: steps.wheel-cache.outputs.cache-hit != 'true'
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          RELEASE_BUILD: ${{ !inputs.use-cache }}
+        timeout-minutes: 100
+        run: |
+          version=$(uv run --no-project --python 3.11 python scripts/ci/locked_version.py maturin)
+          if [[ "$PLATFORM" == linux ]]; then
+            args=(--compatibility manylinux_2_34 --auditwheel check -i /opt/python/cp310-cp310/bin/python)
+          else
+            args=(-i python)
+          fi
+          build() { uvx --from "maturin==$version" maturin build --release --locked "${args[@]}" -o dist; }
+          log="$RUNNER_TEMP/tracel-wheel-build.log"
+          if build 2>&1 | tee "$log"; then exit 0; else status=${PIPESTATUS[0]}; fi
+          # tracel-llvm-bundler 23.1.0-4 build.rs:66 unwraps ureq request errors.
+          # Contextual download errors include the tracel-llvm release URL.
+          if [[ "$RELEASE_BUILD" == true ]] && { grep -Eq 'panicked at .*tracel-llvm-bundler-23\.1\.0-4/build\.rs:66:[0-9]+' "$log" || grep -Eq '(downloading|re-downloading) https://github.com/tracel-ai/tracel-llvm/releases/download/' "$log"; }; then
+            echo 'Retrying once after tracel LLVM download failure.'
+            build
+          else
+            exit "$status"
+          fi
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.use-cache && steps.wheel-cache.outputs.cache-hit != 'true'
+        with:
+          path: dist/*.whl
+          key: ${{ steps.key.outputs.key }}
+      - name: Validate wheel
+        run: |
+          uvx twine==7.0.0 check --strict dist/*
+          uvx abi3audit==0.0.26 --strict dist/*.whl
+      - name: Lowest glibc smoke
+        if: inputs.platform == 'linux'
+        run: |
+          /opt/python/cp310-cp310/bin/python -m pip install dist/*.whl
+          /opt/python/cp310-cp310/bin/python - <<'PY'
+          import numpy as np
+          from cuscan import UMAP, HDBSCAN
+          x = np.random.default_rng(42).normal(size=(80, 4)).astype('float32')
+          UMAP(n_neighbors=10, n_epochs=10, backend='cpu').fit(x)
+          HDBSCAN(min_cluster_size=5, knn_k=15, backend='cpu').fit(x)
+          PY
+      - name: Build sdist
+        if: inputs.build-sdist && inputs.platform == 'linux'
+        run: |
+          version=$(uv run --no-project --python 3.11 python scripts/ci/locked_version.py maturin)
+          uvx --from "maturin==$version" maturin sdist -o dist
+          uvx twine==7.0.0 check --strict dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-${{ inputs.platform }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.artifact-retention-days }}
+  build-windows:
+    if: inputs.platform == 'windows'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps: *build-steps
+  test:
+    needs: [build-linux, build-windows]
+    if: always() && (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-24.04' || 'windows-2025' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(inputs.pythons) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-env
+      - uses: ./.github/actions/setup-python-uv
+        with:
+          python-version: ${{ matrix.python }}
+          use-cache: ${{ inputs.use-cache }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheel-${{ inputs.platform }}
+          path: dist
+      - run: uv sync --locked --no-install-project --extra serialization --python "$PYTHON_VERSION"
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+      - run: uv pip install --no-deps dist/*.whl
+      - name: Verify installed package and run tests
+        env:
+          CUSCAN_TEST_BACKEND: cpu
+        run: |
+          uv run --no-sync python -c "import cuscan, pathlib, sys; assert pathlib.Path(cuscan.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()), cuscan.__file__"
+          uv run --no-sync pytest python/tests
+      - if: inputs.platform == 'linux'
+        run: uv run --no-sync pytest analyze/tests

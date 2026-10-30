@@ -41,6 +41,7 @@ def test_worker_timeout_is_reported_as_incomplete_deadline() -> None:
     assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_supervised_check_false_returns_nonzero_process_result() -> None:
     result = module.run_supervised(
         [sys.executable, "-c", "raise SystemExit(7)"], module.Deadline(2), check=False
@@ -48,6 +49,7 @@ def test_supervised_check_false_returns_nonzero_process_result() -> None:
     assert result.returncode == 7
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_supervisor_kills_process_group_on_deadline(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child-pid"
     code = (
@@ -65,6 +67,7 @@ def test_supervisor_kills_process_group_on_deadline(tmp_path: Path) -> None:
     assert not Path(f"/proc/{child_pid}").exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_supervisor_kills_descendants_resisting_term_after_success(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child-pid"
     code = (
@@ -83,6 +86,7 @@ def test_supervisor_kills_descendants_resisting_term_after_success(tmp_path: Pat
     assert not Path(f"/proc/{child_pid}").exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_supervisor_kills_tree_on_unexpected_telemetry_error(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child-pid"
     code = (
@@ -94,11 +98,9 @@ def test_supervisor_kills_tree_on_unexpected_telemetry_error(tmp_path: Path) -> 
 
     class BrokenTelemetry:
         def sample(self, root_pid, deadline):
-            for _ in range(20):
-                if child_pid_file.exists():
-                    raise RuntimeError("unexpected telemetry failure")
-                __import__("time").sleep(0.01)
-            raise RuntimeError("worker did not spawn descendant")
+            while not child_pid_file.exists():
+                __import__("time").sleep(min(0.01, deadline.remaining()))
+            raise RuntimeError("unexpected telemetry failure")
 
     with pytest.raises(RuntimeError, match="unexpected telemetry"):
         module.run_supervised(
@@ -566,6 +568,7 @@ def test_gpu_provenance_distinguishes_driver_compatibility_from_runtime(
     assert gpu["devices"][0]["cuda_runtime_version"] is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_over_cap_sample_kills_supervised_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -619,6 +622,7 @@ def test_over_cap_sample_kills_supervised_worker(
     assert not Path(f"/proc/{child_pid}").exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 def test_profile_worker_timeout_is_interruptible() -> None:
     with pytest.raises(module.DeadlineExceeded):
         module.run_supervised(

@@ -179,7 +179,18 @@ def test_fixture_regenerates_byte_identically() -> None:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.dumps(module.generate()) == FIXTURE_PATH.read_text()
+    reference = module.reference_identity()
+    stack = (reference["numpy"], reference["scikit_learn"])
+    canonical = FIXTURE["reference"]
+    if stack == (canonical["numpy"], canonical["scikit_learn"]):
+        path = FIXTURE_PATH
+    else:
+        path = FIXTURE_DIR / "hdbscan_prediction_py310.json"
+        floor = json.loads(path.read_text())["reference"]
+        assert stack == (floor["numpy"], floor["scikit_learn"]), (
+            f"No HDBSCAN prediction fixture for NumPy/scikit-learn stack {stack}"
+        )
+    assert module.dumps(module.generate()) == path.read_text()
 
 
 def test_fixture_pins_core_rank_conventions() -> None:
