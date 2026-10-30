@@ -63,7 +63,7 @@ runs:
             # Selecting gcc overrides Rust's default gnu-lld-cc flavor. Restore
             # bundled LLD explicitly: GNU ld cannot resolve LLVM archive cycles.
             echo 'RUSTFLAGS=-Zshare-generics=y -Zunstable-options -C linker-features=+lld -C link-self-contained=+linker' >> "$GITHUB_ENV"
-            echo 'PYO3_PYTHON=/opt/python/cp310-cp310/bin/python' >> "$GITHUB_ENV"
+            echo 'PYO3_PYTHON=/opt/python/cp312-cp312/bin/python' >> "$GITHUB_ENV"
             echo "CI_RUST_CACHE_CLASS=$BUILD_CLASS" >> "$GITHUB_ENV"
             ;;
           wheel-windows|test-windows)

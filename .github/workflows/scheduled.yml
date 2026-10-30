@@ -91,8 +91,8 @@ jobs:
           path: dist
       - run: |
           unset UV_LOCKED
-          uv venv --python 3.10 .venv-min
-          uv pip install --python .venv-min dist/*.whl 'numpy==1.24.*' pytest
+          uv venv --python 3.12 .venv-min
+          uv pip install --python .venv-min dist/*.whl 'numpy==1.26.*' pytest
           CUSCAN_TEST_BACKEND=cpu .venv-min/bin/python -m pytest python/tests/test_standard_umap.py python/tests/test_hdbscan_resources.py python/tests/test_hdbscan_predictor_native.py
   sdist-build:
     needs: wheels-linux
@@ -119,9 +119,9 @@ jobs:
           cd /tmp/sdist-source/*
           test -f rust-toolchain.toml
           test ! -e .cargo/config.toml
-          /opt/python/cp310-cp310/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
-          /opt/python/cp310-cp310/bin/python -m pip install /tmp/sdist-wheel/*.whl
-          /opt/python/cp310-cp310/bin/python -c 'import cuscan; print(cuscan.__file__)'
+          /opt/python/cp312-cp312/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
+          /opt/python/cp312-cp312/bin/python -m pip install /tmp/sdist-wheel/*.whl
+          /opt/python/cp312-cp312/bin/python -c 'import cuscan; print(cuscan.__file__)'
   cold-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120

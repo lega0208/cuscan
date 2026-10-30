@@ -33,14 +33,14 @@ jobs:
       platform: linux
       use-cache: false
       build-sdist: true
-      pythons: '["3.10","3.14"]'
+      pythons: '["3.12","3.14"]'
   wheels-windows:
     needs: verify
     uses: ./.github/workflows/_wheels.yml
     with:
       platform: windows
       use-cache: false
-      pythons: '["3.10","3.14"]'
+      pythons: '["3.12","3.14"]'
   sdist-source-build:
     needs: wheels-linux
     runs-on: ubuntu-24.04
@@ -67,9 +67,9 @@ jobs:
           cd /tmp/sdist-source/*
           test -f rust-toolchain.toml
           test ! -e .cargo/config.toml
-          /opt/python/cp310-cp310/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
-          /opt/python/cp310-cp310/bin/python -m pip install /tmp/sdist-wheel/*.whl
-          /opt/python/cp310-cp310/bin/python -c 'import cuscan; print(cuscan.__file__)'
+          /opt/python/cp312-cp312/bin/python -m pip wheel --no-deps . -w /tmp/sdist-wheel
+          /opt/python/cp312-cp312/bin/python -m pip install /tmp/sdist-wheel/*.whl
+          /opt/python/cp312-cp312/bin/python -c 'import cuscan; print(cuscan.__file__)'
   publish:
     if: ${{ !github.event.act }}
     needs: [verify, wheels-linux, wheels-windows, sdist-source-build]

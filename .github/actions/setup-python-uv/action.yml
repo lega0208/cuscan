@@ -3,7 +3,7 @@ description: Install a pinned uv and select Python with an optional CI cache
 inputs:
   python-version:
     description: Python version
-    default: '3.10'
+    default: '3.12'
   use-cache:
     description: Restore and save the uv cache when permitted
     default: 'true'

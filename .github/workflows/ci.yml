@@ -133,7 +133,7 @@ jobs:
     with:
       platform: linux
       use-cache: true
-      pythons: '["3.10","3.14"]'
+      pythons: '["3.12","3.14"]'
   wheels-windows:
     needs: changes
     if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python_pkg == 'true' || needs.changes.outputs.python_tests == 'true' || needs.changes.outputs.workflows == 'true') && github.event.pull_request.draft != true
@@ -141,7 +141,7 @@ jobs:
     with:
       platform: windows
       use-cache: true
-      pythons: '["3.10","3.14"]'
+      pythons: '["3.12","3.14"]'
   ci-ok:
     if: always()
     needs: [changes, lint-rust, lint-python, lint-workflows, deny, test-rust, wheels-linux, wheels-windows]

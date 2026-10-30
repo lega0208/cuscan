@@ -6,17 +6,15 @@ Run commands from the repository root. Measurements below are historical results
 
 The workflow suite is intended to run on pull requests, main pushes, merge queues and dispatch. `ci-ok` aggregates results and treats intentionally skipped jobs as success; configure it as the sole required check in the branch ruleset. Pull requests and pushes classify changed paths; unknown paths and workflow changes run the full suite. Draft PRs defer heavy tests until ready. The weekly scheduled workflow adds a floating-nightly canary, Windows Rust tests, long-quality and feature contracts, minimum NumPy, source-distribution build, cold build and cargo-deny; failures are reported to the open `Scheduled CI failure` issue. The pinned compiler is `nightly-2026-08-08` (rustc `1a98b1e13`).
 
-| Change | Intended work |
-| --- | --- |
-| Docs only | Change classification and `ci-ok` |
-| Python tests | Python lint, wheel reuse/build and wheel tests |
-| Python package or Rust source | Relevant lint, wheel builds and wheel tests; Rust changes also run Rust tests |
-| Dependency manifests or lockfiles | Relevant checks plus cargo-deny |
-| Workflows, CI scripts or unknown paths | Full suite |
+| Change                                 | Intended work                                                                 |
+| -------------------------------------- | ----------------------------------------------------------------------------- |
+| Docs only                              | Change classification and `ci-ok`                                             |
+| Python tests                           | Python lint, wheel reuse/build and wheel tests                                |
+| Python package or Rust source          | Relevant lint, wheel builds and wheel tests; Rust changes also run Rust tests |
+| Dependency manifests or lockfiles      | Relevant checks plus cargo-deny                                               |
+| Workflows, CI scripts or unknown paths | Full suite                                                                    |
 
-The release-profile ABI3 wheels target Linux x86-64 manylinux 2.34 and Windows x86-64, with a Python 3.10/3.14 test matrix. A local Linux wheel passed auditwheel, twine, abi3audit and lowest-glibc smoke; final act wheel runs on both Python 3.10 and 3.14 each passed 400 Python and 113 analysis tests (`artifact://81`). Windows and GitHub matrix execution remain unverified. Python 3.10 uses the separately generated strict full `hdbscan_prediction_py310.json` oracle for tie/order and provenance drift with locked NumPy 2.2.6 and scikit-learn 1.7.2, not a skip or relaxed tolerance; the Python-floor `normalize_metric` float cast was also fixed.
-
-An extracted plain sdist built and imported in fresh manylinux without `.cargo`, linker or `RUSTFLAGS` overrides and without an extension `build.rs` (`artifact://76`). The pinned Rust target defaults to self-contained `gnu-lld-cc`; the wheel-linux class explicitly chooses gcc, which changes the flavor to GNU ld and exposes LLVM archive-order failure, so it explicitly selects bundled LLD. The sdist class installs only the toolchain and sets no such flags. The prior extension build-script root fix was insufficient and removed.
+An extracted plain sdist built and imported in fresh manylinux without `.cargo`, linker or `RUSTFLAGS` overrides and without an extension `build.rs` (`artifact://76`). The pinned Rust target defaults to self-contained `gnu-lld-cc`; the wheel-linux class explicitly chooses gcc, which changes the flavor to GNU ld and exposes LLVM archive-order failure, so it explicitly selects bundled LLD. The sdist class installs only the toolchain and sets no such flags.
 
 CI caches are an optimization, not correctness evidence: Cargo caches are separated by build class and releases build without caches. Bump `CI_CACHE_EPOCH` in the shared `ci-env` action to orphan suspect or bloated caches. CubeCL's runtime cache is not shared across runners. GitHub cache, runner-disk and release behavior have not been validated; estimates in `ci_workflows_plan.md` are not measured GitHub results. The user approved the scoped `paste` exception: `deny.toml` ignores only RUSTSEC-2024-0436 with rationale, and all four `cargo deny` checks passed with ordinary duplicate and license warnings.
 
@@ -36,9 +34,7 @@ scripts/ci/act.sh pr -j wheels-linux
 scripts/ci/act.sh release-dry
 ```
 
-`release-dry` performs a real Linux rehearsal build and checks that the sdist source build executed; it requires a `-dev.N` workspace version. The other `dry` commands only evaluate the graph. The docs-only scenario uses synthetic `ci_changed_paths` honored only when the event has `act: true`; real GitHub events use the normal change classifier. ACT manylinux bootstraps pinned Node 24.11.1, and setup-uv installs the requested Python because setup-python does not support AlmaLinux. act does not emulate Windows jobs, environment approvals, OIDC publishing, attestations or issue reporting. Its local cache server is separate from GitHub's and cannot validate GitHub quota/eviction or runner disk headroom. Docker without an NVIDIA runtime cannot validate CUDA; use the native lane below. act is not a substitute for GitHub acceptance runs.
-
-The act Rust test job including doctests passed (`artifact://85`); Python lint, extension-free fixture provenance and 85 CI script tests passed (`artifact://86`). Upload action v7 and v6 were incompatible with act 0.2.89 (`mime_type`/unauthorized); the SHA-verified artifact actions are upload v4.6.2 (`ea165f8d65b6e75b540449e92b4886f43607fa02`) and download v4.3.0 (`d3f86a106a0bac45b974a628896c90dbdf5c8093`).
+`release-dry` performs a real Linux rehearsal build and checks that the sdist source build executed; it requires a `-dev.N` workspace version. The other `dry` commands only evaluate the graph. The docs-only scenario uses synthetic `ci_changed_paths` honored only when the event has `act: true`; real GitHub events use the normal change classifier. ACT manylinux bootstraps pinned Node 24.11.1, and setup-uv installs the requested Python because setup-python does not support AlmaLinux. act does not emulate Windows jobs, environment approvals, OIDC publishing, attestations or issue reporting. Its local cache server is separate from GitHub's and cannot validate GitHub quota/eviction or runner disk headroom. Docker without an NVIDIA runtime cannot validate CUDA; use the native lane below.
 
 ### CUDA lane
 
@@ -50,19 +46,7 @@ scripts/ci/cuda_lane.sh --ref <commit>
 
 The script tests the selected commit in a detached worktree, requires CUDA for Rust and Python, and records logs under `${XDG_CACHE_HOME:-$HOME/.cache}/cuscan-cuda/logs/`. Optional `--rows 20000` or `--rows 100000` runs diagnostic HDBSCAN analysis and requires the relevant Nsight/counter access. Running a selected commit executes its code on the host; review it first.
 
-The lane builds the extension with `maturin develop --release --features tracing`. CUDA-required host evidence: Rust 500 passed (`artifact://47`); Python 413 passed and 2 skipped (`artifact://89`).
-
-### Maintainer setup and release
-
-Repository and registry settings are external maintainer actions, not configured by these files or blockers for the amended local acceptance:
-
-- Configure the production `pypi` environment with required reviewers, prevent self-review, disallow administrator bypass, and permit deployments only from `v*` tags.
-- Register the PyPI trusted publisher for `lega0208/cuscan`, workflow `release.yml`, environment `pypi`; confirm package ownership/name availability and enable PyPI account 2FA.
-- Restrict creation, update and deletion of `v*` tags. Protect `main` with required `ci-ok`, reviews and linear history.
-- Set default token permissions read-only, require approval for outside-collaborator PR workflows, and restrict allowed actions to the needed GitHub-owned and approved third-party actions. Do not register a self-hosted runner on this repository. Review provenance and third-party notices separately.
-- Configure a `testpypi` environment and trusted publisher only if future TestPyPI use is desired; neither configuration nor testing is part of this goal.
-
-Publishing configuration is implemented, but publication and TestPyPI testing are outside this goal. The maintainer owns commits, pushes, settings, tags and any future publication; no hosted validation or publication is claimed.
+The lane builds the extension with `maturin develop --release --features tracing`
 
 ## Historical serialization benchmark
 
