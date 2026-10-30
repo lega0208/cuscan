@@ -1438,6 +1438,22 @@ def test_run_command_rejects_invalid_executable_and_timeout(tmp_path: Path) -> N
         )
 
 
+def process_exited(proc_stat: Path) -> bool:
+    try:
+        return proc_stat.read_text(encoding="utf-8").split()[2] == "Z"
+    except FileNotFoundError:
+        # Reaping can remove the entry at any point, including during the read.
+        return True
+
+
+@pytest.mark.parametrize("state", ["missing", "Z", "S"])
+def test_process_exited_handles_reaping(tmp_path: Path, state: str) -> None:
+    proc_stat = tmp_path / "stat"
+    if state != "missing":
+        proc_stat.write_text(f"123 (python) {state} 0", encoding="utf-8")
+    assert process_exited(proc_stat) is (state != "S")
+
+
 def test_run_command_timeout_kills_process_group_and_reaps_child(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child.pid"
     child_code = (
@@ -1465,11 +1481,9 @@ def test_run_command_timeout_kills_process_group_and_reaps_child(tmp_path: Path)
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
     proc_stat = Path(f"/proc/{child_pid}/stat")
     deadline = time.monotonic() + 2
-    while proc_stat.exists() and time.monotonic() < deadline:
-        if proc_stat.read_text(encoding="utf-8").split()[2] == "Z":
-            break
+    while not process_exited(proc_stat) and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert not proc_stat.exists() or proc_stat.read_text(encoding="utf-8").split()[2] == "Z"
+    assert process_exited(proc_stat)
 
 
 def test_run_command_interrupt_stops_and_reaps_process_group(tmp_path: Path, monkeypatch) -> None:

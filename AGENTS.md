@@ -107,6 +107,15 @@ Rust uses `#[test]` integration/unit tests and Criterion benchmarks; Python uses
 
 CI uses the `ci-ok` aggregator as the intended sole required check. Changes are classified so unaffected jobs can skip; the weekly nightly canary intentionally uses a floating nightly. For workflow changes use `scripts/ci/act.sh list` and the relevant scenarios, but act cannot validate Windows, trusted publishing or GPU execution. See [CI and release runbooks](docs/development.md#continuous-integration) for setup, CUDA and release requirements.
 
+Release Please owns the reviewed release PR, tag and GitHub release notes. Cargo
+workspace version is build authority; version.txt, root manifest proposal and all
+six workspace lock entries must agree in release PRs. Never execute candidate
+release-branch scripts during lock synchronization. Keep App credentials out of
+Cargo and use a leased Cargo.lock-only push. Production remains tag-only; dispatch
+is TestPyPI rehearsal. Never create a missing release, overwrite assets, blanket
+skip existing PyPI files or move tags to recover publication. Initial 0.1.0 needs
+the bootstrap cleanup and owner prerequisites in the release activation checklist.
+
 For required CUDA coverage rather than silent hardware skips:
 
 ```sh

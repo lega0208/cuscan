@@ -1,0 +1,130 @@
+name: Release Please
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
+jobs:
+  reconcile:
+    if: github.ref == 'refs/heads/main' && !github.event.act && !github.event.repository.fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Reject local event emulation before credentials
+        id: guard
+        env:
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          event = json.load(open(os.environ['EVENT_PATH']))
+          enabled = os.environ.get('ACT', '').lower() != 'true' and event.get('act') is not True
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"enabled={str(enabled).lower()}\n")
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.guard.outputs.enabled == 'true'
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: trusted
+      - uses: ./trusted/.github/actions/ci-env
+        if: steps.guard.outputs.enabled == 'true'
+      - name: Install trusted pinned toolchain
+        if: steps.guard.outputs.enabled == 'true'
+        working-directory: trusted
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal
+      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        if: steps.guard.outputs.enabled == 'true'
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0 (release-please 17.1.3)
+        if: steps.guard.outputs.enabled == 'true'
+        id: release
+        with:
+          token: ${{ steps.app.outputs.token }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Select authenticated root release PR
+        if: steps.guard.outputs.enabled == 'true'
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          APP_ID: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          ACTION_PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+          slug = os.environ['APP_SLUG']
+          app = api(f'/apps/{slug}')
+          if str(app['id']) != os.environ['APP_ID'] or app['slug'] != slug:
+              raise SystemExit('App metadata mismatch')
+          login = slug + '[bot]'
+          bot = api('/users/' + login)
+          if bot['login'] != login or bot['type'] != 'Bot':
+              raise SystemExit('Unexpected App bot identity')
+          pages = json.loads(subprocess.check_output([
+              'gh', 'api', '--paginate', '--slurp',
+              '/repos/' + os.environ['REPOSITORY'] + '/pulls?state=open&base=main&per_page=100'
+          ], text=True))
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          (temp / 'prs.json').write_text(json.dumps([pr for page in pages for pr in page]))
+          (temp / 'action-prs.json').write_text(os.environ['ACTION_PRS'])
+          selected = subprocess.check_output([
+              'python3', 'trusted/scripts/ci/check_release_pr.py', 'select',
+              '--prs', str(temp / 'prs.json'), '--output', str(temp / 'action-prs.json'),
+              '--repo', os.environ['REPOSITORY'], '--bot', login, '--bot-id', str(bot['id'])
+          ], text=True)
+          pr = json.loads(selected)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"present={str(pr is not None).lower()}\n")
+              if pr:
+                  for key in ('branch', 'head'):
+                      output.write(f'{key}={pr[key]}\n')
+                  output.write(f'bot={login}\nemail={bot["id"]}+{login}@users.noreply.github.com\n')
+          PY
+      - name: Prime Cargo from trusted main
+        if: steps.select.outputs.present == 'true'
+        working-directory: trusted
+        run: cargo fetch --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.select.outputs.present == 'true'
+        with:
+          ref: ${{ steps.select.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate
+      - name: Validate candidate and synchronize only Cargo.lock
+        if: steps.select.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ steps.select.outputs.branch }}
+          HEAD_SHA: ${{ steps.select.outputs.head }}
+          BOT_NAME: ${{ steps.select.outputs.bot }}
+          BOT_EMAIL: ${{ steps.select.outputs.email }}
+        run: |
+          python3 trusted/scripts/ci/check_release_pr.py sync \
+            --base trusted --candidate candidate --branch "$BRANCH" --head "$HEAD_SHA" \
+            --bot-name "$BOT_NAME" --bot-email "$BOT_EMAIL"

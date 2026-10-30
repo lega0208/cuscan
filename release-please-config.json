@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.1.3/schemas/config.json",
+  "bootstrap-sha": "c76bb96e2284c8404b79daabe6df5fb10d11594b",
+  "packages": {
+    ".": {
+      "package-name": "cuscan",
+      "release-type": "simple",
+      "version-file": "version.txt",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "draft": false,
+      "prerelease": false,
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
+      "release-as": "0.1.0",
+      "extra-files": [
+        {"type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version"}
+      ],
+      "changelog-sections": [
+        {"type": "feat", "section": "Features"},
+        {"type": "fix", "section": "Bug Fixes"},
+        {"type": "perf", "section": "Performance"},
+        {"type": "revert", "section": "Reverts"},
+        {"type": "docs", "section": "Documentation", "hidden": true},
+        {"type": "chore", "section": "Miscellaneous Chores", "hidden": true},
+        {"type": "test", "section": "Tests", "hidden": true}
+      ]
+    }
+  }
+}
