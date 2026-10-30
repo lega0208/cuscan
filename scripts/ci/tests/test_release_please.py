@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,60 @@ def test_select_action_and_noop():
         helper.select_pr([pr, pr], [], "owner/repo", "release[bot]", 123)
     with pytest.raises(ValueError):
         helper.select_pr([pr], [{"number": 11}], "owner/repo", "release[bot]", 123)
+
+
+def test_select_cli_real_release_pr_metadata(tmp_path):
+    pr = {
+        "number": 7,
+        "state": "open",
+        "user": {"login": "release-please-lega0208[bot]", "id": 350427668, "type": "Bot"},
+        "labels": [{"name": "autorelease: pending"}],
+        "base": {"ref": "main", "repo": {"full_name": "lega0208/cuscan"}},
+        "head": {
+            "ref": "release-please--branches--main--components--cuscan",
+            "sha": "ba1673f929561f3e56ee27791da6b53daab72e48",
+            "repo": {"full_name": "lega0208/cuscan"},
+        },
+    }
+    prs = tmp_path / "prs.json"
+    output = tmp_path / "output.json"
+    prs.write_text(json.dumps([pr]))
+    output.write_text(json.dumps([{"number": 7}]))
+    result = subprocess.check_output(
+        [
+            sys.executable,
+            str(HELPER),
+            "select",
+            "--prs",
+            str(prs),
+            "--output",
+            str(output),
+            "--repo",
+            "lega0208/cuscan",
+            "--bot",
+            "release-please-lega0208[bot]",
+            "--bot-id",
+            "350427668",
+        ],
+        text=True,
+    )
+    assert json.loads(result) == {
+        "number": 7,
+        "branch": "release-please--branches--main--components--cuscan",
+        "head": "ba1673f929561f3e56ee27791da6b53daab72e48",
+    }
+
+
+def test_obsolete_branch_is_not_canonical(tmp_path):
+    base, candidate = fixture_repo(tmp_path)
+    pr = sample_pr()
+    pr["head"]["ref"] = "release-please--branches--main"
+    assert helper.select_pr([pr], [], "owner/repo", "release[bot]", 123) is None
+    with pytest.raises(ValueError, match="action output"):
+        helper.select_pr([pr], [{"number": 10}], "owner/repo", "release[bot]", 123)
+    head = command(candidate, "git", "rev-parse", "HEAD")
+    with pytest.raises(ValueError, match="unexpected branch or head"):
+        helper.sync(base, candidate, pr["head"]["ref"], head, "Bot", "bot@example.com")
 
 
 @pytest.mark.parametrize("mutation", ["owner", "base", "branchrepo", "label", "sha", "type"])

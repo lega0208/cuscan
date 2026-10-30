@@ -26,7 +26,7 @@ ALLOWED = {
     "version.txt",
     ".release-please-manifest.json",
 }
-BRANCH = "release-please--branches--main"
+BRANCH = "release-please--branches--main--components--cuscan"
 BOOTSTRAP = "c76bb96e2284c8404b79daabe6df5fb10d11594b"
 REQUIRED_CONFIG = {
     "package-name": "cuscan",
