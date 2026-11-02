@@ -319,6 +319,150 @@ fn many_components_use_matrix_free_centroid_affinity_layout() {
     }
 }
 
+type SquareGraph = (Vec<Vec<f32>>, Vec<usize>, Vec<usize>, Vec<f32>);
+
+/// `count` unit-square 4-cycles with component offsets `(component * dx, component * dy)`.
+fn square_components(count: usize, dx: f32, dy: f32) -> SquareGraph {
+    let mut data = Vec::new();
+    let mut heads = Vec::new();
+    let mut tails = Vec::new();
+    let mut weights = Vec::new();
+    for component in 0..count {
+        let base = component * 4;
+        for point in [[0.0_f32, 0.0_f32], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]] {
+            data.push(vec![
+                point[0] + component as f32 * dx,
+                point[1] + component as f32 * dy,
+            ]);
+        }
+        for offset in 0..4 {
+            heads.push(base + offset);
+            tails.push(base + (offset + 1) % 4);
+            weights.push(1.0);
+        }
+    }
+    (data, heads, tails, weights)
+}
+
+#[test]
+fn separated_centroids_report_actionable_underflow_error() {
+    if isolated_spectral_case(
+        "separated_centroids_report_actionable_underflow_error",
+        "main",
+    ) {
+        return;
+    }
+    // Offsets of 40 give pairwise squared centroid distances >= 1600; exp(-1600) == 0.
+    let (data, heads, tails, weights) = square_components(5, 40.0, 0.0);
+    for dimensions in [1, 2] {
+        let result = initialize(
+            &data,
+            &heads,
+            &tails,
+            &weights,
+            &spectral_config(dimensions),
+            91,
+        );
+        let Err(UmapError::Numerical(message)) = result else {
+            panic!("expected numerical error for {dimensions} dimensions, got {result:?}");
+        };
+        for fragment in [
+            "5 connected components".to_owned(),
+            format!("2 * n_components = {}", 2 * dimensions),
+            "5 of 5".to_owned(),
+            "underflows exp".to_owned(),
+            "init=\"random\"".to_owned(),
+        ] {
+            assert!(
+                message.contains(&fragment),
+                "{fragment:?} missing: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_isolated_component_reports_its_own_distance() {
+    if isolated_spectral_case("single_isolated_component_reports_its_own_distance", "main") {
+        return;
+    }
+    // Components 0..4 are 1 apart (linked); component 4 is moved 100 away and isolated.
+    let (mut data, heads, tails, weights) = square_components(5, 1.0, 0.0);
+    for row in &mut data[16..20] {
+        row[0] += 100.0;
+    }
+    let result = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91);
+    let Err(UmapError::Numerical(message)) = result else {
+        panic!("expected numerical error, got {result:?}");
+    };
+    for fragment in ["1 of 5", "first: component 4, 4 rows", "is 1.020e4"] {
+        assert!(
+            message.contains(fragment),
+            "{fragment:?} missing: {message}"
+        );
+    }
+}
+
+#[test]
+fn close_centroids_one_dimension_spectral_succeeds() {
+    if isolated_spectral_case("close_centroids_one_dimension_spectral_succeeds", "main") {
+        return;
+    }
+    let (data, heads, tails, weights) = square_components(5, 3.1, 0.37);
+    let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91)
+        .expect("one-dimensional centroid layout");
+    assert_eq!(embedding.len(), 20);
+    assert!(
+        embedding
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
+    );
+    assert!(
+        embedding
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            .abs()
+            < 1.0e-6
+    );
+    assert!((embedding.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
+}
+
+#[test]
+fn partially_underflowed_centroid_affinity_is_accepted() {
+    if isolated_spectral_case(
+        "partially_underflowed_centroid_affinity_is_accepted",
+        "main",
+    ) {
+        return;
+    }
+    // Chain with offsets of 15: consecutive squared distance 225 gives exp(-225) ~ 1.9e-98
+    // (nonzero); ends are 60 apart, squared 3600, so exp(-3600) == 0. Every component keeps
+    // at least one nonzero link, so the partially underflowed operator must be accepted.
+    assert!((-225.0_f64).exp() > 0.0 && (-3600.0_f64).exp() == 0.0);
+    let (data, heads, tails, weights) = square_components(5, 15.0, 0.0);
+    let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91)
+        .expect("partial underflow keeps the centroid operator connected");
+    assert_eq!(embedding.len(), 20);
+    assert!(embedding.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn few_separated_components_use_axes_without_underflow() {
+    if isolated_spectral_case(
+        "few_separated_components_use_axes_without_underflow",
+        "main",
+    ) {
+        return;
+    }
+    // 4 <= 2 * 2 components use signed axes, so separation alone is not an error.
+    let (data, heads, tails, weights) = square_components(4, 40.0, 0.0);
+    let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(2), 91)
+        .expect("signed-axis component placement");
+    assert_eq!(embedding.len(), 32);
+    assert!(embedding.iter().all(|value| value.is_finite()));
+}
+
 #[test]
 fn one_sample_reference_zero_span_is_explicitly_zero() {
     if isolated_spectral_case("one_sample_reference_zero_span_is_explicitly_zero", "main") {

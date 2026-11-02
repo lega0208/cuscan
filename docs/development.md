@@ -376,6 +376,15 @@ projected = model.transform(X_new)
   `ValueError` (input/config) or `RuntimeError` (backend/numerical). As in
   umap-learn, a one-row fit yields a zero embedding and cannot transform, and a
   graph with no edges (for example two rows) is an error.
+- **Spectral initialization of disconnected graphs:** with more than
+  `2 × n_components` graph components, component centres follow umap-learn's
+  centroid-affinity spectral layout, `exp(-squared distance)` over raw-feature
+  centroids. If any component's affinity to all others underflows to zero, cuscan
+  raises `UmapError::Numerical` (Python `RuntimeError`) naming the component count
+  and smallest squared centroid distance, instead of umap-learn's warning plus
+  arbitrary placement; this intentional deviation follows the no-silent-recovery
+  rule. Partial underflow is accepted and any `n_components ≥ 1` is supported.
+  Remedies: `init="random"`, a larger `n_neighbors`, or feature scaling.
 - **Exact unique fitting:** set `UMAPConfig { unique: true, ..Default::default() }`
   or Python `UMAP(unique=True)` to fit first-occurrence distinct input rows.
   The default remains false. Signed zeros compare equal; nonfinite inputs are

@@ -847,3 +847,83 @@ mod seeded_drift {
         eprintln!("wrote {}", output.display());
     }
 }
+
+/// 6 blobs x 40 rows x 8 features, centres `blob * 50` on axis `blob % 8`, unit jitter.
+fn separated_blobs() -> Vec<Vec<f32>> {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let mut random = StdRng::seed_from_u64(7);
+    (0..240)
+        .map(|row| {
+            let blob = row / 40;
+            (0..8)
+                .map(|feature| {
+                    let centre = if feature == blob % 8 {
+                        blob as f32 * 50.0
+                    } else {
+                        0.0
+                    };
+                    centre + random.random_range(-1.0_f32..1.0)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn spectral_underflow_backends() -> Vec<BackendChoice> {
+    let mut backends = vec![BackendChoice::Cpu];
+    if umap::cuda_backend::device(0).is_some() {
+        backends.push(BackendChoice::Cuda { device_index: 0 });
+    } else if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+        panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+    } else {
+        eprintln!("SKIPPED CUDA: no CUDA device");
+    }
+    backends
+}
+
+#[test]
+fn spectral_fit_on_separated_blobs_returns_actionable_error() {
+    let data = separated_blobs();
+    for backend in spectral_underflow_backends() {
+        for n_components in [1, 2] {
+            let result = UMAP::new(
+                UMAPConfig {
+                    n_neighbors: 10,
+                    n_components,
+                    init: Init::Spectral,
+                    random_state: Some(7),
+                    ..Default::default()
+                },
+                backend,
+                NeighborSearch::Exact,
+            )
+            .fit(&data);
+            let Err(umap::UmapError::Numerical(message)) = result else {
+                panic!("expected numerical error on {backend:?}/{n_components}");
+            };
+            // The exact k-NN graph splits into exactly the 6 blobs.
+            assert!(message.contains("6 connected components"), "{message}");
+            assert!(message.contains("underflows exp"), "{message}");
+        }
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 10,
+                n_components: 1,
+                init: Init::Random,
+                random_state: Some(7),
+                ..Default::default()
+            },
+            backend,
+            NeighborSearch::Exact,
+        )
+        .fit(&data)
+        .expect("init=random workaround fits");
+        assert_eq!(fitted.embedding().len(), 240);
+        assert!(
+            fitted
+                .embedding()
+                .iter()
+                .all(|row| row.len() == 1 && row[0].is_finite())
+        );
+    }
+}
