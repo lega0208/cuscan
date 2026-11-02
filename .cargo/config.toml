@@ -4,5 +4,5 @@ rustflags = [
   "-C",
   "link-arg=-fuse-ld=mold",
   "-Zshare-generics=y",
-  "-Zthreads=14",
+  "-Zthreads=8",
 ]

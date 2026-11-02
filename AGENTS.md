@@ -34,19 +34,19 @@ HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses th
 
 ## Development Commands
 
-Run from the repository root. Use Cargo. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
+Run from the repository root. Prefer `soldr cargo` whenever `soldr` is available on PATH; use plain `cargo` only when `soldr` is unavailable or keeps failing. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
 
 ```sh
-cargo build -p umap --release
-cargo test -p umap-core
-cargo test -p cuscan-common
-cargo test -p hdbscan-core
-cargo test -p hdbscan
-cargo test -p umap
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test -p umap
-cargo bench -p umap --bench standard_umap_cpu
+soldr cargo build -p umap --release
+soldr cargo test -p umap-core
+soldr cargo test -p cuscan-common
+soldr cargo test -p hdbscan-core
+soldr cargo test -p hdbscan
+soldr cargo test -p umap
+soldr cargo fmt --all -- --check
+soldr cargo clippy --workspace --all-targets
+soldr cargo test -p umap
+soldr cargo bench -p umap --bench standard_umap_cpu
 ```
 
 Python development and checks:
