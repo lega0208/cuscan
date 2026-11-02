@@ -252,7 +252,7 @@ struct CentroidGraph {
 }
 
 impl CentroidGraph {
-    fn new(data: &[Vec<f32>], components: &[Vec<usize>]) -> Result<Self> {
+    fn new(data: &[Vec<f32>], components: &[Vec<usize>], dimensions: usize) -> Result<Self> {
         let n_features = data[0].len();
         let centroids = components
             .iter()
@@ -280,14 +280,35 @@ impl CentroidGraph {
         {
             return Err(numerical("component-centroid affinity has invalid degree"));
         }
-        for i in 0..components.len() {
-            if components.len() > 1
-                && (0..components.len())
-                    .all(|j| i == j || centroid_affinity(&centroids[i], &centroids[j]) == 0.0)
-            {
-                return Err(numerical(
-                    "component-centroid affinities underflowed and split the complete affinity operator",
-                ));
+        let m = components.len();
+        if m > 1 {
+            let mut isolated = 0usize;
+            let mut first = None;
+            let mut min_sq = f64::INFINITY;
+            for i in 0..m {
+                let mut linked = false;
+                let mut row_min_sq = f64::INFINITY;
+                for j in 0..m {
+                    if i == j {
+                        continue;
+                    }
+                    let squared_distance = centroid_squared_distance(&centroids[i], &centroids[j]);
+                    row_min_sq = row_min_sq.min(squared_distance);
+                    linked |= (-squared_distance).exp() != 0.0;
+                }
+                if !linked {
+                    // Only isolated rows: linked pairs never underflow.
+                    min_sq = min_sq.min(row_min_sq);
+                    isolated += 1;
+                    first.get_or_insert(i);
+                }
+            }
+            if let Some(first) = first {
+                return Err(numerical(format!(
+                    "spectral initialization failed: the k-NN graph has {m} connected components (more than 2 * n_components = {}), so components are placed by a spectral layout of centroid affinities exp(-squared distance); {isolated} of {m} components (first: component {first}, {} rows) have zero affinity to every other component because their smallest squared centroid distance is {min_sq:.3e}, which underflows exp. umap-learn 0.5.12 would only warn and place these components arbitrarily; cuscan rejects the fit. Use init=\"random\", increase n_neighbors so the graph connects, or scale the features so cluster centroids are closer.",
+                    2 * dimensions,
+                    components[first].len(),
+                )));
             }
         }
         let n = components.len();
@@ -335,13 +356,15 @@ impl CentroidGraph {
     }
 }
 
-fn centroid_affinity(left: &[f64], right: &[f64]) -> f64 {
-    let squared_distance = left
-        .iter()
+fn centroid_squared_distance(left: &[f64], right: &[f64]) -> f64 {
+    left.iter()
         .zip(right)
         .map(|(&a, &b)| (a - b).powi(2))
-        .sum::<f64>();
-    (-squared_distance).exp()
+        .sum::<f64>()
+}
+
+fn centroid_affinity(left: &[f64], right: &[f64]) -> f64 {
+    (-centroid_squared_distance(left, right)).exp()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -517,7 +540,7 @@ fn centroid_layout(
     dimensions: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<Vec<f64>>> {
-    let centroid_graph = CentroidGraph::new(data, components)?;
+    let centroid_graph = CentroidGraph::new(data, components, dimensions)?;
     let laplacian_modes = modes_with_source_fallback(
         BaseOperator::Centroids(&centroid_graph),
         dimensions,

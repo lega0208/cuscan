@@ -10,7 +10,13 @@ from . import _cuscan
 
 
 class UMAP:
-    """Standard nonparametric UMAP estimator."""
+    """Standard nonparametric UMAP estimator.
+
+    ``init="spectral"`` raises ``RuntimeError`` when the k-NN graph has more than
+    ``2 * n_components`` components and some component's centroid affinity to all others
+    underflows to zero (umap-learn only warns there); use ``init="random"``, a larger
+    ``n_neighbors``, or scaled features instead.
+    """
 
     def __init__(
         self,

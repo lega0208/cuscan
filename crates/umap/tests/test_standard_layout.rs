@@ -719,3 +719,365 @@ fn standard_layout_matches_frozen_optimizer_epochs_on_cuda() {
     verify_fixture(&device, false);
     verify_zero_controls_and_repeats(&device, false);
 }
+
+// A 37-edge high-degree head crosses a plane chunk boundary. Thirteen heads
+// produce four fit batches of 4, 4, 4, 1 vertices.
+fn verify_layout_kernel_paths(device: &Device, dimensions: usize, shared: bool) -> Vec<i64> {
+    let rows = 13usize;
+    let heads: Vec<i32> = (0..37).map(|_| 0).chain(1..rows as i32).collect();
+    let tails: Vec<i32> = (0..heads.len())
+        .map(|i| ((i * 7 + 1) % rows) as i32)
+        .collect();
+    let edges = heads.len();
+    let weights = vec![1.0f32; edges];
+    let next_positive: Vec<f64> = (0..edges)
+        .map(|i| if i % 3 == 0 { 3.0 } else { 0.0 })
+        .collect();
+    let next_negative: Vec<f64> = (0..edges)
+        .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+        .collect();
+    let head_values: Vec<f32> = (0..rows * dimensions)
+        .map(|i| (i as f32 * 0.13).sin())
+        .collect();
+    let tail_values: Vec<f32> = if shared {
+        head_values.clone()
+    } else {
+        head_values.iter().map(|x| x + 2.0).collect()
+    };
+    let initial_rng: Vec<i64> = (0..rows)
+        .flat_map(|i| {
+            [
+                524288 + i as i64 * 11,
+                1234567 + i as i64 * 13,
+                9876543 + i as i64 * 17,
+            ]
+        })
+        .collect();
+    let mut expected_rng = initial_rng.clone();
+    let mut expected_positive = next_positive.clone();
+    let mut expected_negative = next_negative.clone();
+    for edge in 0..edges {
+        if next_positive[edge] <= 2.0 {
+            expected_positive[edge] += 1.0;
+            let draws = (2.0 - next_negative[edge]) as usize;
+            expected_negative[edge] += draws as f64;
+            let row = heads[edge] as usize;
+            for _ in 0..draws {
+                tausworthe_step(&mut expected_rng[row * 3..row * 3 + 3]);
+            }
+        }
+    }
+    let float = |values: Vec<f64>| {
+        Tensor::<1>::from_data(
+            TensorData::new(values, [edges]),
+            (device, burn::tensor::DType::F64),
+        )
+        .into_dispatch()
+    };
+    let (offsets, ids) = csr(device, &heads, &weights, rows);
+    let (head, tail, positive, negative, rng) = <Dispatch as StandardUmapOps>::optimize_epoch(
+        Tensor::<2>::from_data(TensorData::new(head_values, [rows, dimensions]), device)
+            .into_dispatch(),
+        Tensor::<2>::from_data(
+            TensorData::new(tail_values.clone(), [rows, dimensions]),
+            device,
+        )
+        .into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(heads, [edges]), device).into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(tails, [edges]), device).into_dispatch(),
+        Tensor::<1>::from_data(TensorData::new(weights, [edges]), device).into_dispatch(),
+        float(vec![1.0; edges]),
+        float(next_positive),
+        float(vec![1.0; edges]),
+        float(next_negative),
+        Tensor::<2, Int>::from_data(
+            TensorData::new(initial_rng, [rows, 3]),
+            (device, burn::tensor::DType::I64),
+        )
+        .into_dispatch(),
+        offsets,
+        ids,
+        2,
+        1.576_943_5,
+        0.895_060_9,
+        1.7,
+        0.25,
+        1.0,
+        shared,
+        shared,
+    );
+    let head = Tensor::<2>::from_dispatch(head);
+    let tail = Tensor::<2>::from_dispatch(tail);
+    assert_eq!(head.dims(), [rows, dimensions]);
+    assert_eq!(tail.dims(), [rows, dimensions]);
+    let head_values = head.to_data().try_to_vec::<f32>().unwrap();
+    let actual_tail = tail.to_data().try_to_vec::<f32>().unwrap();
+    assert!(
+        head_values
+            .iter()
+            .chain(&actual_tail)
+            .all(|x| x.is_finite())
+    );
+    if shared {
+        assert_eq!(actual_tail, head_values);
+    } else {
+        assert_eq!(actual_tail, tail_values);
+    }
+    assert_eq!(
+        Tensor::<1>::from_dispatch(positive)
+            .to_data()
+            .try_to_vec::<f64>()
+            .unwrap(),
+        expected_positive
+    );
+    assert_eq!(
+        Tensor::<1>::from_dispatch(negative)
+            .to_data()
+            .try_to_vec::<f64>()
+            .unwrap(),
+        expected_negative
+    );
+    let actual_rng = Tensor::<2, Int>::from_dispatch(rng)
+        .to_data()
+        .try_to_vec::<i64>()
+        .unwrap();
+    assert_eq!(
+        actual_rng, expected_rng,
+        "dimensions={dimensions} shared={shared}"
+    );
+    actual_rng
+}
+
+fn verify_positive_only_update(device: &Device, shared: bool) {
+    let head = vec![0.0f32, 1.0];
+    let tail = vec![1.0f32, 3.0];
+    let (offsets, ids) = csr(device, &[0], &[1.0], 2);
+    let f =
+        |value| Tensor::<1>::from_data(TensorData::new(vec![value], [1]), device).into_dispatch();
+    let (head_out, tail_out, _, _, rng) = <Dispatch as StandardUmapOps>::optimize_epoch(
+        Tensor::<2>::from_data(TensorData::new(head.clone(), [2, 1]), device).into_dispatch(),
+        Tensor::<2>::from_data(
+            TensorData::new(if shared { head.clone() } else { tail.clone() }, [2, 1]),
+            device,
+        )
+        .into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), device).into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(vec![1i32], [1]), device).into_dispatch(),
+        f(1.0),
+        f(1.0),
+        f(0.0),
+        f(1.0),
+        f(0.0),
+        Tensor::<2, Int>::from_data(
+            TensorData::new(
+                vec![524288i64, 1234567, 9876543, 524300, 1234580, 9876560],
+                [2, 3],
+            ),
+            (device, burn::tensor::DType::I64),
+        )
+        .into_dispatch(),
+        offsets,
+        ids,
+        0,
+        1.0,
+        1.0,
+        1.0,
+        0.25,
+        0.0,
+        shared,
+        shared,
+    );
+    let distance = if shared { 1.0f32 } else { 9.0 };
+    let difference = if shared { -1.0f32 } else { -3.0 };
+    let delta = (-2.0 * difference / (distance + 1.0)).clamp(-4.0, 4.0) * 0.25;
+    let expected = if shared {
+        vec![delta, 1.0 - delta]
+    } else {
+        vec![delta, 1.0]
+    };
+    let actual = Tensor::<2>::from_dispatch(head_out)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    check_close(&actual, &expected, "positive-only analytical update");
+    let actual_tail = Tensor::<2>::from_dispatch(tail_out)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    if shared {
+        check_close(&actual_tail, &expected, "shared analytical tail");
+    } else {
+        assert_eq!(actual_tail, tail);
+    }
+    assert_eq!(
+        Tensor::<2, Int>::from_dispatch(rng)
+            .to_data()
+            .try_to_vec::<i64>()
+            .unwrap(),
+        vec![524288, 1234567, 9876543, 524300, 1234580, 9876560]
+    );
+}
+
+/// Rows: head (0), tail (1) and an untouched sentinel (2, last) that must stay
+/// bit-identical, so that a stray write from padded register slots of either
+/// edge row is detected.
+fn verify_multidimensional_update(
+    device: &Device,
+    dimensions: usize,
+    shared: bool,
+    negative: bool,
+) {
+    const ROWS: usize = 3;
+    let first: Vec<f32> = (0..dimensions).map(|c| 0.12 + c as f32 * 0.021).collect();
+    let second: Vec<f32> = (0..dimensions).map(|c| -0.3 + c as f32 * 0.013).collect();
+    let sentinel: Vec<f32> = (0..dimensions).map(|c| 0.77 - c as f32 * 0.017).collect();
+    let positions: Vec<f32> = first
+        .iter()
+        .chain(&second)
+        .chain(&sentinel)
+        .copied()
+        .collect();
+    let fixed_tail = positions.clone();
+    let rng_rows = vec![
+        524292i64, 1234567, 9876543, 524300, 1234580, 9876560, 524311, 1234591, 9876577,
+    ];
+    let mut initial_rng = rng_rows.clone();
+    let sampled = if negative {
+        tausworthe_step(&mut initial_rng[..3]).rem_euclid(ROWS as i32) as usize
+    } else {
+        1
+    };
+    assert_eq!(sampled, 1, "negative sample must be the tail row");
+    let diffs: Vec<f32> = first.iter().zip(&second).map(|(x, y)| x - y).collect();
+    let distance: f32 = diffs.iter().map(|x| x * x).sum();
+    let (a, b, gamma, alpha) = (1.576_943_5f32, 0.895_060_9f32, 1.7f32, 0.25f32);
+    let coefficient = if negative {
+        2.0 * gamma * b / ((0.001 + distance) * (a * distance.powf(b) + 1.0))
+    } else {
+        -2.0 * a * b * distance.powf(b - 1.0) / (a * distance.powf(b) + 1.0)
+    };
+    let mut expected = positions.clone();
+    for c in 0..dimensions {
+        let update = (coefficient * diffs[c]).clamp(-4.0, 4.0) * alpha;
+        expected[c] += update;
+        if shared && !negative {
+            expected[dimensions + c] -= update;
+        }
+    }
+    let tail_index = if negative { 0i32 } else { 1 };
+    let (offsets, ids) = csr(device, &[0], &[1.0], ROWS);
+    let f =
+        |value| Tensor::<1>::from_data(TensorData::new(vec![value], [1]), device).into_dispatch();
+    let (head, tail, _, _, rng) = <Dispatch as StandardUmapOps>::optimize_epoch(
+        Tensor::<2>::from_data(
+            TensorData::new(positions.clone(), [ROWS, dimensions]),
+            device,
+        )
+        .into_dispatch(),
+        Tensor::<2>::from_data(
+            TensorData::new(fixed_tail.clone(), [ROWS, dimensions]),
+            device,
+        )
+        .into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), device).into_dispatch(),
+        Tensor::<1, Int>::from_data(TensorData::new(vec![tail_index], [1]), device).into_dispatch(),
+        f(1.0),
+        f(1.0),
+        f(0.0),
+        f(1.0),
+        f(0.0),
+        Tensor::<2, Int>::from_data(
+            TensorData::new(rng_rows, [ROWS, 3]),
+            (device, burn::tensor::DType::I64),
+        )
+        .into_dispatch(),
+        offsets,
+        ids,
+        u32::from(negative),
+        a,
+        b,
+        gamma,
+        alpha,
+        f32::from(negative),
+        shared,
+        shared,
+    );
+    let actual = Tensor::<2>::from_dispatch(head)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    check_close(&actual, &expected, "multidimensional analytical update");
+    let sentinel_range = 2 * dimensions..;
+    assert_eq!(
+        actual[sentinel_range.clone()]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        sentinel.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "sentinel row modified (dimensions={dimensions}, shared={shared}, negative={negative})"
+    );
+    let actual_tail = Tensor::<2>::from_dispatch(tail)
+        .to_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    if shared {
+        check_close(&actual_tail, &expected, "multidimensional shared tail");
+    } else {
+        assert_eq!(actual_tail, fixed_tail);
+    }
+    let actual_rng = Tensor::<2, Int>::from_dispatch(rng)
+        .to_data()
+        .try_to_vec::<i64>()
+        .unwrap();
+    assert_eq!(actual_rng, initial_rng);
+}
+
+#[test]
+fn standard_layout_multidimensional_analytical_updates() {
+    let cuda = umap::cuda_backend::device(0);
+    if cuda.is_none() {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        eprintln!("SKIPPED: CUDA numerical coverage; no CUDA device");
+    }
+    for device in std::iter::once(Device::cpu()).chain(cuda) {
+        for dimensions in [8, 16, 17, 20, 21, 27, 32, 33] {
+            for shared in [true, false] {
+                for negative in [false, true] {
+                    verify_multidimensional_update(&device, dimensions, shared, negative);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn standard_layout_kernel_paths_and_rng_cross_backend() {
+    let cpu = Device::cpu();
+    let cuda = umap::cuda_backend::device(0);
+    if cuda.is_none() {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        eprintln!("SKIPPED: CUDA comparison; no CUDA device");
+    }
+    for shared in [true, false] {
+        verify_positive_only_update(&cpu, shared);
+        if let Some(device) = &cuda {
+            verify_positive_only_update(device, shared);
+        }
+        for dimensions in [1, 2, 8, 16, 17, 20, 21, 27, 32, 33] {
+            let cpu_rng = verify_layout_kernel_paths(&cpu, dimensions, shared);
+            if let Some(device) = &cuda {
+                let cuda_rng = verify_layout_kernel_paths(device, dimensions, shared);
+                assert_eq!(
+                    cpu_rng, cuda_rng,
+                    "backend RNG mismatch dimensions={dimensions} shared={shared}"
+                );
+            }
+        }
+    }
+}

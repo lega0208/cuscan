@@ -7,7 +7,7 @@
 ## Architecture & Data Flow
 
 - The workspace contains backend-free `umap-core` and `hdbscan-core`, shared runtime crate `cuscan-common`, facades `umap` and `hdbscan`, and the `cuscan-python` extension. Python depends on both facades; each facade depends on its own core and common, never on the other facade. HDBSCAN core owns host extraction, finite-row remapping, MST helpers and deterministic KD-tree construction; its independent exact MST oracle requires the non-default `test-support` feature. The HDBSCAN facade owns the Rust `HDBSCAN`/`FittedHDBSCAN` API, exact brute-force/KD device search and graph routing; the Python HDBSCAN wrapper forwards validated options through the extension. UMAP core owns configuration, errors, model state, sizing and host spectral initialization; HDBSCAN must not acquire its spectral dependencies.
-- `crates/umap/src/standard_umap/` owns the `UMAP`/`FittedUMAP` estimator. Query, fuzzy graph and layout remain in UMAP's forward-only `StandardUmapOps`; common owns approximate neighbors (including candidate-width sizing), exact neighbors and squared distance blocks through `NeighborOps`. ANN callers validate launches with common's typed preflight before dispatch. Each extension trait and its `CubeBackend` implementation stay in the same crate (orphan rule). UMAP neighbor search explicitly uses unsquared mode; common exact squared mode has different infinity/padding semantics. Kernels import host helpers from cores, never estimator modules. Spectral initialization remains host-side. The CUDA layout kernel updates embedding/clock/RNG operands in place, so callers must pass unaliased buffers. Feature values are used as-is, without scaling.
+- `crates/umap/src/standard_umap/` owns the `UMAP`/`FittedUMAP` estimator. Query, fuzzy graph and layout remain in UMAP's forward-only `StandardUmapOps`; common owns approximate neighbors (including candidate-width sizing), exact neighbors and squared distance blocks through `NeighborOps`. ANN callers validate launches with common's typed preflight before dispatch. Each extension trait and its `CubeBackend` implementation stay in the same crate (orphan rule). UMAP neighbor search explicitly uses unsquared mode; common exact squared mode has different infinity/padding semantics. Kernels import host helpers from cores, never estimator modules. Spectral initialization remains host-side. Layout kernels are selected by capability before launch: fused plane kernel up to 32 components on 32-lane plane devices (CUDA; padded virtually above 16), head-cache kernel up to 32 components elsewhere (CPU), atomic kernel beyond; all update embedding/clock/RNG operands in place, so callers must pass unaliased buffers. Feature values are used as-is, without scaling.
 - `cuscan-common` owns backend choice/errors, CUDA discovery and device resolution. CPU and CUDA implementations are always compiled; UMAP maps common errors locally to preserve its error contract.
 
 Trace actual consumers before documenting or changing configuration behavior.
@@ -34,19 +34,19 @@ HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses th
 
 ## Development Commands
 
-Run from the repository root. Use Cargo. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
+Run from the repository root. Prefer `soldr cargo` whenever `soldr` is available on PATH; use plain `cargo` only when `soldr` is unavailable or keeps failing. CPU and CUDA backends are always compiled; only optional capabilities such as tracing need feature selection:
 
 ```sh
-cargo build -p umap --release
-cargo test -p umap-core
-cargo test -p cuscan-common
-cargo test -p hdbscan-core
-cargo test -p hdbscan
-cargo test -p umap
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test -p umap
-cargo bench -p umap --bench standard_umap_cpu
+soldr cargo build -p umap --release
+soldr cargo test -p umap-core
+soldr cargo test -p cuscan-common
+soldr cargo test -p hdbscan-core
+soldr cargo test -p hdbscan
+soldr cargo test -p umap
+soldr cargo fmt --all -- --check
+soldr cargo clippy --workspace --all-targets
+soldr cargo test -p umap
+soldr cargo bench -p umap --bench standard_umap_cpu
 ```
 
 Python development and checks:

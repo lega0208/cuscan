@@ -300,3 +300,14 @@ def test_cuda_transform_releases_gil_for_at_least_half_second() -> None:
     )
     assert output.shape == (len(query), model.n_components)
     assert np.isfinite(output).all()
+
+
+def test_spectral_init_on_separated_blobs_raises_actionable_error() -> None:
+    rng = np.random.default_rng(7)
+    x = rng.uniform(-1.0, 1.0, size=(240, 8)).astype(np.float32)
+    for blob in range(6):
+        x[blob * 40 : (blob + 1) * 40, blob % 8] += blob * 50.0
+    with pytest.raises(RuntimeError, match="underflows exp"):
+        UMAP(n_components=1, n_neighbors=10, init="spectral", backend="cpu", random_state=7).fit(x)
+    model = UMAP(n_components=1, n_neighbors=10, init="random", backend="cpu", random_state=7)
+    assert model.fit_transform(x).shape == (240, 1)

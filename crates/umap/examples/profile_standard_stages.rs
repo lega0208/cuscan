@@ -3,7 +3,11 @@
 //! usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS
 //!        [--backend cpu|cuda] [--search exact|approximate] [--runs R]
 //!        [--neighbors K] [--init random|spectral] [--seed S] [--min-dist D]
-//!        [--trace PATH]
+//!        [--trace PATH] [--components N] [--embedding-out PATH]
+//!
+//! `--components` sets `n_components` (default 2). `--embedding-out PATH` writes
+//! each run's fitted embedding as raw little-endian f32 row-major bytes to
+//! `PATH.<run>`.
 //!
 //! Runs R fits in this process without warmup, so run 0 is process-cold
 //! (includes kernel JIT/compilation) and later runs are warm. Stage spans come
@@ -74,7 +78,7 @@ fn stage_seconds(events: &[serde_json::Value]) -> Result<BTreeMap<String, Vec<f6
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        return Err("usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS [--backend cpu|cuda] [--search exact|approximate] [--runs R] [--neighbors K] [--init random|spectral] [--seed S] [--min-dist D] [--trace PATH]".into());
+        return Err("usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS [--backend cpu|cuda] [--search exact|approximate] [--runs R] [--neighbors K] [--init random|spectral] [--seed S] [--min-dist D] [--trace PATH] [--components N] [--embedding-out PATH]".into());
     }
     let rows: usize = args[2].parse()?;
     let features: usize = args[3].parse()?;
@@ -87,6 +91,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut seed = 42u64;
     let mut min_dist = 0.1f32;
     let mut trace = None;
+    let mut components = 2usize;
+    let mut embedding_out: Option<String> = None;
     let mut rest = args[5..].iter();
     while let Some(flag) = rest.next() {
         let value = rest.next().ok_or(format!("{flag} requires a value"))?;
@@ -117,6 +123,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--seed" => seed = value.parse()?,
             "--min-dist" => min_dist = value.parse()?,
             "--trace" => trace = Some(value.clone()),
+            "--components" => components = value.parse()?,
+            "--embedding-out" => embedding_out = Some(value.clone()),
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -147,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let model = UMAP::new(
             UMAPConfig {
                 n_neighbors: neighbors,
-                n_components: 2,
+                n_components: components,
                 n_epochs: Some(epochs),
                 min_dist,
                 init,
@@ -176,6 +184,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         if fitted.embedding().iter().flatten().any(|v| !v.is_finite()) {
             return Err("fit produced a non-finite embedding".into());
         }
+        if let Some(path) = &embedding_out {
+            let bytes: Vec<u8> = fitted
+                .embedding()
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            std::fs::write(format!("{path}.{run}"), bytes)?;
+        }
     }
     drop(guard);
     let events: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&trace_path)?)?;
@@ -193,6 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "init": format!("{init:?}"),
             "neighbors": neighbors,
             "epochs": epochs,
+            "components": components,
         })
     );
     Ok(())

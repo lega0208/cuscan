@@ -1404,6 +1404,50 @@ fn optimize(
         rng = Tensor::from_dispatch(new_rng);
         alpha = learning_rate * (1.0 - epoch as f32 / n_epochs.max(1) as f32);
     }
+    // Atomic position bindings are read-only to CubeCL's failure tracker. The
+    // vertex kernel also writes RNG, so retain and check every output handle.
+    let head_dispatch = head.clone().into_dispatch();
+    let positive_dispatch = next_positive.into_dispatch();
+    let negative_dispatch = next_negative.into_dispatch();
+    let rng_dispatch = rng.into_dispatch();
+    use burn::backend::{BackendTensor, DispatchTensorKind};
+    let (
+        DispatchTensorKind::Cube(BackendTensor::Float(head_raw)),
+        DispatchTensorKind::Cube(BackendTensor::Float(positive_raw)),
+        DispatchTensorKind::Cube(BackendTensor::Float(negative_raw)),
+        DispatchTensorKind::Cube(BackendTensor::Int(rng_raw)),
+    ) = (
+        head_dispatch.kind,
+        positive_dispatch.kind,
+        negative_dispatch.kind,
+        rng_dispatch.kind,
+    )
+    else {
+        return Err(UmapError::Numerical("unsupported layout backend".into()));
+    };
+    let head_raw = head_raw
+        .client
+        .clone()
+        .resolve_tensor_float::<burn_cubecl::CubeBackend>(head_raw);
+    let positive_raw = positive_raw
+        .client
+        .clone()
+        .resolve_tensor_float::<burn_cubecl::CubeBackend>(positive_raw);
+    let negative_raw = negative_raw
+        .client
+        .clone()
+        .resolve_tensor_float::<burn_cubecl::CubeBackend>(negative_raw);
+    let rng_raw = rng_raw
+        .client
+        .clone()
+        .resolve_tensor_int::<burn_cubecl::CubeBackend>(rng_raw);
+    burn::cubecl::future::block_on(head_raw.client.sync_buffers([
+        &head_raw.handle,
+        &positive_raw.handle,
+        &negative_raw.handle,
+        &rng_raw.handle,
+    ]))
+    .map_err(|error| UmapError::Numerical(format!("layout execution failed: {error}")))?;
     Ok(head)
 }
 
@@ -1577,6 +1621,61 @@ fn tensor_embedding(tensor: &Tensor<2>) -> Result<Embedding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_launch_failure_surfaces_for_fit_and_transform() {
+        use std::sync::atomic::Ordering;
+        struct InjectionGuard(u32);
+        impl InjectionGuard {
+            fn new(alpha: f32) -> Self {
+                Self(
+                    crate::kernels::INJECT_BAD_LAYOUT_LAUNCH
+                        .swap(alpha.to_bits(), Ordering::SeqCst),
+                )
+            }
+        }
+        impl Drop for InjectionGuard {
+            fn drop(&mut self) {
+                crate::kernels::INJECT_BAD_LAYOUT_LAUNCH.store(self.0, Ordering::SeqCst);
+            }
+        }
+        if crate::cuda_backend::device(0).is_none() {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        }
+        let data: Vec<Vec<f32>> = (0..12).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+        let config = UMAPConfig {
+            n_neighbors: 4,
+            n_epochs: Some(3),
+            init: Init::Random,
+            random_state: Some(31),
+            learning_rate: 0.987_654_3,
+            ..Default::default()
+        };
+        let estimator = UMAP::new(
+            config,
+            crate::standard_umap::BackendChoice::Cuda { device_index: 0 },
+            NeighborSearch::Exact,
+        );
+        let fitted = estimator.fit(&data).unwrap();
+        let guard = InjectionGuard::new(0.987_654_3 / 4.0);
+        let transform = fitted.transform(&[vec![0.1, 0.0], vec![5.1, 0.0]]);
+        drop(guard);
+        let guard = InjectionGuard::new(0.987_654_3);
+        let fit = estimator.fit(&data);
+        drop(guard);
+        assert!(
+            matches!(transform, Err(UmapError::Numerical(ref message)) if message.contains("layout execution failed")),
+            "transform did not report a layout failure: {transform:?}"
+        );
+        assert!(
+            matches!(fit, Err(UmapError::Numerical(ref message)) if message.contains("layout execution failed")),
+            "fit did not report a layout failure"
+        );
+    }
 
     #[test]
     fn transform_flat_preserves_validation_errors() {

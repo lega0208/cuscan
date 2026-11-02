@@ -666,3 +666,78 @@ fn approximate_query_marks_invalid_graph_indices_in_stats_on_cuda() {
     };
     assert_invalid_graph_indices_in_stats(&device);
 }
+
+/// Transform at 21 components (padded fused G=8 on CUDA, head-cache on CPU): the
+/// non-shared path reads the fitted tail at stride `n_components`, separately from fit.
+fn assert_twenty_one_component_transform(backend: umap::standard_umap::BackendChoice) {
+    use umap::standard_umap::{Init, NeighborSearch, UMAP, UMAPConfig};
+    const COMPONENTS: usize = 21;
+    let data: Vec<Vec<f32>> = (0..64)
+        .map(|row| {
+            let value = row as f32;
+            let offset = if row < 32 { 0.0 } else { 6.0 };
+            vec![
+                offset + (value * 0.37).sin(),
+                (value * 0.19).cos(),
+                value * 0.01,
+            ]
+        })
+        .collect();
+    let config = UMAPConfig {
+        n_components: COMPONENTS,
+        n_neighbors: 10,
+        n_epochs: Some(50),
+        init: Init::Random,
+        random_state: Some(7),
+        transform_seed: 7,
+        ..UMAPConfig::default()
+    };
+    let fitted = UMAP::new(config, backend, NeighborSearch::Exact)
+        .fit(&data)
+        .unwrap();
+    let query: Vec<Vec<f32>> = (0..9)
+        .map(|row| {
+            let value = row as f32;
+            vec![(value * 0.5).sin() + 0.1, (value * 0.3).cos(), value * 0.02]
+        })
+        .collect();
+    let first = fitted.transform(&query).unwrap();
+    assert_eq!(first.len(), query.len(), "{backend:?}");
+    assert!(
+        first
+            .iter()
+            .all(|row| row.len() == COMPONENTS && row.iter().all(|value| value.is_finite())),
+        "{backend:?}: transform output shape or finiteness"
+    );
+    let bits = |embedding: &[Vec<f32>]| {
+        embedding
+            .iter()
+            .map(|row| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let repeated = fitted.transform(&query).unwrap();
+    assert_eq!(
+        bits(&first),
+        bits(&repeated),
+        "{backend:?}: transform determinism"
+    );
+}
+
+#[test]
+fn transform_twenty_one_components_cpu() {
+    assert_twenty_one_component_transform(umap::standard_umap::BackendChoice::Cpu);
+}
+
+#[test]
+fn transform_twenty_one_components_cuda() {
+    if umap::cuda_backend::device(0).is_none() {
+        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    assert_twenty_one_component_transform(umap::standard_umap::BackendChoice::Cuda {
+        device_index: 0,
+    });
+}

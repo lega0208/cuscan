@@ -154,6 +154,77 @@ fn device_for_cuda() -> Option<Device> {
     Some(device)
 }
 
+fn run_cluster_quality(device: &Device, n_components: usize) {
+    let start = std::time::Instant::now();
+    let (reference, cases) = fixture();
+    let (_, train, _) = cases
+        .iter()
+        .find(|(name, _, _)| name == "clusters")
+        .unwrap();
+    let seeds = reference["controls"]["seeds"].as_array().unwrap();
+    let controls = &reference["controls"]["fit"];
+    let mut scores = Vec::new();
+    for seed in seeds {
+        let seed = seed.as_u64().unwrap();
+        let config = UMAPConfig {
+            n_components,
+            n_neighbors: reference["controls"]["n_neighbors"].as_u64().unwrap() as usize,
+            min_dist: controls["min_dist"].as_f64().unwrap() as f32,
+            spread: controls["spread"].as_f64().unwrap() as f32,
+            local_connectivity: controls["local_connectivity"].as_f64().unwrap() as f32,
+            set_op_mix_ratio: controls["set_op_mix_ratio"].as_f64().unwrap() as f32,
+            n_epochs: Some(controls["n_epochs"].as_u64().unwrap() as usize),
+            learning_rate: controls["learning_rate"].as_f64().unwrap() as f32,
+            negative_sample_rate: controls["negative_sample_rate"].as_u64().unwrap() as usize,
+            repulsion_strength: controls["repulsion_strength"].as_f64().unwrap() as f32,
+            init: Init::Spectral,
+            random_state: Some(seed),
+            transform_seed: seed,
+            ..UMAPConfig::default()
+        };
+        let fitted = UMAP::new(config, backend(device), NeighborSearch::Exact)
+            .fit(&train.rows_as_vec())
+            .unwrap();
+        let embedding = matrix_from_embedding(fitted.embedding());
+        assert_eq!((embedding.rows, embedding.cols), (train.rows, n_components));
+        let score = bounded_trustworthiness(train, &embedding, 15);
+        assert!(score.is_finite(), "seed {seed}: non-finite trustworthiness");
+        scores.push(score);
+    }
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    eprintln!(
+        "{n_components}-component cluster quality {:?}: scores={scores:?}, mean={mean:.6}, elapsed={:?}",
+        backend(device),
+        start.elapsed()
+    );
+    assert!(mean >= 0.90, "mean trustworthiness@15 {mean:.6} below 0.90");
+}
+
+#[test]
+fn cpu_sixteen_component_cluster_quality() {
+    run_cluster_quality(&Device::cpu(), 16);
+}
+
+/// 21 components: head-cache on CPU, padded fused (G=8, width 24) on CUDA.
+#[test]
+fn cpu_twenty_one_component_cluster_quality() {
+    run_cluster_quality(&Device::cpu(), 21);
+}
+
+#[test]
+fn cuda_sixteen_component_cluster_quality() {
+    if let Some(device) = device_for_cuda() {
+        run_cluster_quality(&device, 16);
+    }
+}
+
+#[test]
+fn cuda_twenty_one_component_cluster_quality() {
+    if let Some(device) = device_for_cuda() {
+        run_cluster_quality(&device, 21);
+    }
+}
+
 fn backend(device: &Device) -> BackendChoice {
     if umap::cuda_backend::device(0).as_ref() == Some(device) {
         BackendChoice::Cuda { device_index: 0 }
