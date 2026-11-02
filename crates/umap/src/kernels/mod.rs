@@ -3,6 +3,9 @@ use burn_cubecl::CubeBackend;
 
 mod standard_umap;
 
+#[cfg(test)]
+pub(crate) use standard_umap::layout::INJECT_BAD_LAYOUT_LAUNCH;
+
 impl crate::backend::StandardUmapOps for CubeBackend {
     fn approximate_query(
         query: FloatTensor<Self>,
