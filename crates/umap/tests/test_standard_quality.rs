@@ -154,7 +154,7 @@ fn device_for_cuda() -> Option<Device> {
     Some(device)
 }
 
-fn run_sixteen_component_cluster_quality(device: &Device) {
+fn run_cluster_quality(device: &Device, n_components: usize) {
     let start = std::time::Instant::now();
     let (reference, cases) = fixture();
     let (_, train, _) = cases
@@ -167,7 +167,7 @@ fn run_sixteen_component_cluster_quality(device: &Device) {
     for seed in seeds {
         let seed = seed.as_u64().unwrap();
         let config = UMAPConfig {
-            n_components: 16,
+            n_components,
             n_neighbors: reference["controls"]["n_neighbors"].as_u64().unwrap() as usize,
             min_dist: controls["min_dist"].as_f64().unwrap() as f32,
             spread: controls["spread"].as_f64().unwrap() as f32,
@@ -186,14 +186,14 @@ fn run_sixteen_component_cluster_quality(device: &Device) {
             .fit(&train.rows_as_vec())
             .unwrap();
         let embedding = matrix_from_embedding(fitted.embedding());
-        assert_eq!((embedding.rows, embedding.cols), (train.rows, 16));
+        assert_eq!((embedding.rows, embedding.cols), (train.rows, n_components));
         let score = bounded_trustworthiness(train, &embedding, 15);
         assert!(score.is_finite(), "seed {seed}: non-finite trustworthiness");
         scores.push(score);
     }
     let mean = scores.iter().sum::<f64>() / scores.len() as f64;
     eprintln!(
-        "16-component cluster quality {:?}: scores={scores:?}, mean={mean:.6}, elapsed={:?}",
+        "{n_components}-component cluster quality {:?}: scores={scores:?}, mean={mean:.6}, elapsed={:?}",
         backend(device),
         start.elapsed()
     );
@@ -202,13 +202,26 @@ fn run_sixteen_component_cluster_quality(device: &Device) {
 
 #[test]
 fn cpu_sixteen_component_cluster_quality() {
-    run_sixteen_component_cluster_quality(&Device::cpu());
+    run_cluster_quality(&Device::cpu(), 16);
+}
+
+/// 21 components: head-cache on CPU, padded fused (G=8, width 24) on CUDA.
+#[test]
+fn cpu_twenty_one_component_cluster_quality() {
+    run_cluster_quality(&Device::cpu(), 21);
 }
 
 #[test]
 fn cuda_sixteen_component_cluster_quality() {
     if let Some(device) = device_for_cuda() {
-        run_sixteen_component_cluster_quality(&device);
+        run_cluster_quality(&device, 16);
+    }
+}
+
+#[test]
+fn cuda_twenty_one_component_cluster_quality() {
+    if let Some(device) = device_for_cuda() {
+        run_cluster_quality(&device, 21);
     }
 }
 

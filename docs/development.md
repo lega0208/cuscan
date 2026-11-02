@@ -403,10 +403,10 @@ projected = model.transform(X_new)
   runtime and separately approved quality margins remain acceptance gates;
   passing numerical or older quality tests alone does not establish acceptance.
 - **Layout kernel selection:** fixed by device capability before launch, with no
-  environment or configuration knob. Up to 16 components, devices with 32-lane
-  plane operations and synchronization (CUDA) use the fused plane kernel; other
-  devices (CubeCL CPU) use the head-cache kernel; above 16 components every backend
-  uses the atomic kernel. Fused and head-cache trade some within-epoch staleness for
+  environment or configuration knob. Up to 32 components, devices with 32-lane
+  plane operations and synchronization (CUDA) use the fused plane kernel (padded
+  virtually above 16 components); other devices (CubeCL CPU) use the head-cache
+  kernel; above 32 components every backend uses the atomic kernel. Fused and head-cache trade some within-epoch staleness for
   speed; the measured quality tradeoff and kernel semantics are documented in
   `crates/umap/src/kernels/standard_umap/layout.rs`. `profile_standard_stages`
   accepts `--components N` and `--embedding-out PATH` for layout benchmarks.

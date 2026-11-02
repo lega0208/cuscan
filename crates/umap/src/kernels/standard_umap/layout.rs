@@ -14,8 +14,12 @@
 //!
 //! | `n_components` | 32-lane plane device (Ops+Sync, 64-thread cube, 256 B shared) | other devices |
 //! | --- | --- | --- |
-//! | 1..=16 | `layout_vertex_fused_kernel`, group G (16→4, 8/10/12/14→2, else 1), 2 planes per cube | `layout_vertex_headcache_kernel` |
-//! | > 16 | `layout_vertex_atomic_kernel` | `layout_vertex_atomic_kernel` |
+//! | 1..=16 | `layout_vertex_fused_kernel`, group G (16→4, 8/10/12/14→2, else 1), no padding, 2 planes per cube | `layout_vertex_headcache_kernel` |
+//! | 17..=32 | `layout_vertex_fused_kernel`, G=4 while `ceil(d/4) <= 5` (17–20), else G=8 (21–32), padded virtually to a multiple of G | `layout_vertex_headcache_kernel` |
+//! | > 32 | `layout_vertex_atomic_kernel` | `layout_vertex_atomic_kernel` |
+//!
+//! The 17..=32 G rule is a heuristic tuned on one device (RTX 3080); register
+//! pressure at 5 values per lane is untested on other GPUs.
 //!
 //! Semantics. Coordinates are read with `Atomic::load` and every tail update is
 //! an atomic add, so no update is lost and every vertex consumes exactly the
@@ -27,6 +31,10 @@
 //! - Fused additionally applies the events of one plane step (up to `32/G`,
 //!   positives and negatives mixed) against the same head snapshot and sums
 //!   their moves at once; the cross-group reduction changes summation order.
+//! - Padding above 16 components is virtual: storage and output keep the real
+//!   width. Each fused lane holds `padded / G` register slots; slots past the
+//!   real width are never loaded, read, updated or flushed, so they contribute
+//!   exactly 0 to the distance. Only the butterfly summation order changes.
 //! - The atomic kernel uses a runtime coordinate loop that rereads differences
 //!   and does not cache the head.
 //!
@@ -34,12 +42,15 @@
 //! MNIST (16 and 2 components, spectral/random init, 3 seeds) fused matched
 //! head-cache kNN preservation and accuracy; on 200k×64 blobs, fused G=4
 //! preservation was 0.0598–0.0631 versus head-cache 0.0767–0.0787 (about 20%
-//! relative loss) for a faster layout. This is not universal quality
-//! equivalence.
+//! relative loss) for a faster layout. On MNIST at 17–32 components (random
+//! init, kNN preservation k=15) fused was 1.0–1.1% below atomic (at 32:
+//! .2895–.2911 versus .2926–.2929) with equal 15-NN accuracy (.969–.972), for
+//! a 9–22× faster layout on 200k×64. Padding alone had no measurable quality
+//! effect. This is not universal quality equivalence.
 //!
 //! Fit (`shared`) returns the next buffer for both head and tail; transform
 //! (`shared = false`) uses the same kernels with tail moves compiled out and
-//! returns the fitted tail unchanged. Each `(shared, reg_dims, group)`
+//! returns the fitted tail unchanged. Each `(shared, reg_dims, dims, group)`
 //! combination is a separate JIT specialization. Launch failures surface at the
 //! estimator's operation boundary (`sync_buffers` over the written handles).
 
@@ -120,9 +131,13 @@ fn layout_copy_kernel<F: Float>(old_head: &Tensor<F>, next: &mut Tensor<F>) {
     }
 }
 
-/// Number of components handled by the unrolled register path; larger counts use
-/// the runtime loop with re-reads.
-pub(crate) const LAYOUT_REGISTER_MAX_DIMS: usize = 16;
+/// Largest `n_components` handled by the fused plane kernel (padded virtually above 16).
+const FUSED_MAX_DIMS: usize = 32;
+
+/// Largest `n_components` handled by the head-cache kernel on non-plane devices.
+/// Measured on CubeCL LLVM CPU (100k×32, random init, 200 epochs, warm optimization s):
+/// head-cache vs atomic 8.2/13.3 at 17, 9.7/18.1 at 24, 11.6/23.3 at 32 components.
+const HEADCACHE_MAX_DIMS: usize = 32;
 
 /// Squared distance between head row and tail row.
 #[cube]
@@ -502,6 +517,7 @@ fn layout_vertex_fused_kernel<F: Float, I: Int, J: Int, M: Int>(
     head_end: u32,
     #[comptime] shared: bool,
     #[comptime] reg_dims: usize,
+    #[comptime] dims: usize,
     #[comptime] group: usize,
     #[comptime] planes: usize,
     #[define(F, I, J, M)] _dtypes: [ElemType; 4],
@@ -525,7 +541,11 @@ fn layout_vertex_fused_kernel<F: Float, I: Int, J: Int, M: Int>(
         let mut step_delta = Array::<F>::new(per);
         #[unroll]
         for j in 0..per {
-            head[j] = positions[vertex * reg_dims + col0 + j].load();
+            // Padded slots (`col0 + j >= dims`) stay 0 and are never loaded or written.
+            head[j] = F::new(0.0f32);
+            if comptime![dims == reg_dims] || col0 + j < dims {
+                head[j] = positions[vertex * dims + col0 + j].load();
+            }
             delta[j] = F::new(0.0f32);
         }
         let out_start = u32::cast_from(head_offsets[vertex]) as usize;
@@ -631,17 +651,19 @@ fn layout_vertex_fused_kernel<F: Float, I: Int, J: Int, M: Int>(
                 if active {
                     #[unroll]
                     for j in 0..per {
-                        let value = layout_coordinate(
-                            positions,
-                            tail_rows,
-                            shared,
-                            other,
-                            col0 + j,
-                            reg_dims,
-                        );
-                        let difference = head[j] - value;
-                        diffs[j] = difference;
-                        partial += difference * difference;
+                        if comptime![dims == reg_dims] || col0 + j < dims {
+                            let value = layout_coordinate(
+                                positions,
+                                tail_rows,
+                                shared,
+                                other,
+                                col0 + j,
+                                dims,
+                            );
+                            let difference = head[j] - value;
+                            diffs[j] = difference;
+                            partial += difference * difference;
+                        }
                     }
                 }
                 let distance = layout_group_sum::<F>(partial, group);
@@ -659,8 +681,9 @@ fn layout_vertex_fused_kernel<F: Float, I: Int, J: Int, M: Int>(
                             (coefficient * diffs[j]).clamp(F::new(-4.0f32), F::new(4.0f32));
                         let update = gradient * F::cast_from(alpha);
                         step_delta[j] = update;
-                        if shared && is_positive {
-                            positions[other * reg_dims + col0 + j].fetch_add(-update);
+                        if shared && is_positive && (comptime![dims == reg_dims] || col0 + j < dims)
+                        {
+                            positions[other * dims + col0 + j].fetch_add(-update);
                         }
                     }
                 }
@@ -677,7 +700,9 @@ fn layout_vertex_fused_kernel<F: Float, I: Int, J: Int, M: Int>(
         if event == 0 {
             #[unroll]
             for j in 0..per {
-                positions[vertex * reg_dims + col0 + j].fetch_add(delta[j]);
+                if comptime![dims == reg_dims] || col0 + j < dims {
+                    positions[vertex * dims + col0 + j].fetch_add(delta[j]);
+                }
             }
         }
         if rng_used && lane == 0 {
@@ -698,7 +723,7 @@ pub(crate) static INJECT_BAD_LAYOUT_LAUNCH: std::sync::atomic::AtomicU32 =
 enum LayoutKernel {
     Atomic,
     HeadCache,
-    Fused { group: usize },
+    Fused { group: usize, padded: usize },
 }
 
 fn plane_capable_values(
@@ -731,12 +756,24 @@ fn plane_capable(client: &burn::cubecl::client::Client) -> bool {
     )
 }
 
-fn fused_group(dims: usize) -> usize {
-    let mut group = 1;
-    while dims.is_multiple_of(group * 2) && dims / (group * 2) >= 4 {
-        group *= 2;
-    }
-    group
+/// Fused lane grouping: `(group, padded_width)`. ≤ 16 keeps the measured divisor rule
+/// (largest power-of-two divisor with ≥ 4 values per lane, no padding); 17..=32 uses
+/// G=4 up to 5 values per lane, else G=8, padded virtually to a multiple of G.
+fn fused_layout(dims: usize) -> (usize, usize) {
+    debug_assert!((1..=FUSED_MAX_DIMS).contains(&dims));
+    let (group, padded) = if dims <= 16 {
+        let mut group = 1;
+        while dims.is_multiple_of(group * 2) && dims / (group * 2) >= 4 {
+            group *= 2;
+        }
+        (group, dims)
+    } else {
+        let group = if dims.div_ceil(4) <= 5 { 4 } else { 8 };
+        (group, dims.div_ceil(group) * group)
+    };
+    debug_assert!(padded.is_multiple_of(group) && padded - dims < group);
+    debug_assert!(dims <= 16 || padded / group >= 3);
+    (group, padded)
 }
 
 fn empty(template: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
@@ -903,19 +940,13 @@ pub(crate) fn optimize_epoch(
     // Shared fit reads updated coordinates atomically from `next`; transform
     // reads the immutable fitted tail and still reads its mutable head atomically.
     let tail_rows = tail_embedding.clone();
-    let reg_dims = if dimensions <= LAYOUT_REGISTER_MAX_DIMS {
-        dimensions
-    } else {
-        0
-    };
-    let kernel = if reg_dims == 0 {
-        LayoutKernel::Atomic
-    } else if plane_capable(&client) {
-        LayoutKernel::Fused {
-            group: fused_group(reg_dims),
-        }
-    } else {
+    let kernel = if dimensions <= FUSED_MAX_DIMS && plane_capable(&client) {
+        let (group, padded) = fused_layout(dimensions);
+        LayoutKernel::Fused { group, padded }
+    } else if dimensions <= HEADCACHE_MAX_DIMS {
         LayoutKernel::HeadCache
+    } else {
+        LayoutKernel::Atomic
     };
     let dtypes = [
         dtype_to_storage_type(DType::F32),
@@ -926,7 +957,7 @@ pub(crate) fn optimize_epoch(
     let launch_vertex_batch = |head_start: u32, head_end: u32| {
         let count = CubeCount::Static((head_end - head_start).div_ceil(cube_dim.x), 1, 1);
         match kernel {
-            LayoutKernel::Fused { group } => {
+            LayoutKernel::Fused { group, padded } => {
                 #[cfg(test)]
                 let fused_dim = {
                     let sentinel =
@@ -961,7 +992,8 @@ pub(crate) fn optimize_epoch(
                     head_start,
                     head_end,
                     shared_embeddings,
-                    reg_dims,
+                    padded,
+                    dimensions,
                     group,
                     FUSED_PLANES_PER_CUBE as usize,
                     dtypes,
@@ -985,7 +1017,7 @@ pub(crate) fn optimize_epoch(
                 head_start,
                 head_end,
                 shared_embeddings,
-                reg_dims,
+                dimensions,
                 dtypes,
             ),
             LayoutKernel::Atomic => layout_vertex_atomic_kernel::launch(
@@ -1038,13 +1070,32 @@ pub(crate) fn optimize_epoch(
 
 #[cfg(test)]
 mod tests {
-    use super::{fused_group, plane_capable_values};
+    use super::{fused_layout, plane_capable_values};
 
     #[test]
-    fn layout_fused_group_mapping() {
+    fn layout_fused_layout_mapping() {
         let expected = [1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 1, 2, 1, 2, 1, 4];
-        for (dims, expected) in (1..=16).zip(expected) {
-            assert_eq!(fused_group(dims), expected, "dimensions={dims}");
+        for (dims, group) in (1..=16).zip(expected) {
+            assert_eq!(fused_layout(dims), (group, dims), "dimensions={dims}");
+        }
+        for dims in 17..=20 {
+            assert_eq!(fused_layout(dims), (4, 20), "dimensions={dims}");
+        }
+        for dims in 21..=24 {
+            assert_eq!(fused_layout(dims), (8, 24), "dimensions={dims}");
+        }
+        for dims in 25..=32 {
+            assert_eq!(fused_layout(dims), (8, 32), "dimensions={dims}");
+        }
+        // G=8 is chosen at 28 (7 values per lane at G=4), so 28 pads to 32 although it
+        // is a multiple of 4.
+        assert_eq!(fused_layout(28), (8, 32));
+        for dims in 1..=32 {
+            let (group, padded) = fused_layout(dims);
+            assert!(padded.is_multiple_of(group) && padded >= dims && padded - dims < group);
+            if dims > 16 {
+                assert!(padded / group >= 3, "dimensions={dims}");
+            }
         }
     }
 

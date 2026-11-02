@@ -918,23 +918,36 @@ fn verify_positive_only_update(device: &Device, shared: bool) {
     );
 }
 
+/// Rows: head (0), tail (1) and an untouched sentinel (2, last) that must stay
+/// bit-identical, so that a stray write from padded register slots of either
+/// edge row is detected.
 fn verify_multidimensional_update(
     device: &Device,
     dimensions: usize,
     shared: bool,
     negative: bool,
 ) {
+    const ROWS: usize = 3;
     let first: Vec<f32> = (0..dimensions).map(|c| 0.12 + c as f32 * 0.021).collect();
     let second: Vec<f32> = (0..dimensions).map(|c| -0.3 + c as f32 * 0.013).collect();
-    let positions: Vec<f32> = first.iter().chain(&second).copied().collect();
+    let sentinel: Vec<f32> = (0..dimensions).map(|c| 0.77 - c as f32 * 0.017).collect();
+    let positions: Vec<f32> = first
+        .iter()
+        .chain(&second)
+        .chain(&sentinel)
+        .copied()
+        .collect();
     let fixed_tail = positions.clone();
-    let mut initial_rng = vec![524288i64, 1234567, 9876543, 524300, 1234580, 9876560];
+    let rng_rows = vec![
+        524292i64, 1234567, 9876543, 524300, 1234580, 9876560, 524311, 1234591, 9876577,
+    ];
+    let mut initial_rng = rng_rows.clone();
     let sampled = if negative {
-        tausworthe_step(&mut initial_rng[..3]).rem_euclid(2) as usize
+        tausworthe_step(&mut initial_rng[..3]).rem_euclid(ROWS as i32) as usize
     } else {
         1
     };
-    assert_eq!(sampled, 1, "negative sample must not be the shared head");
+    assert_eq!(sampled, 1, "negative sample must be the tail row");
     let diffs: Vec<f32> = first.iter().zip(&second).map(|(x, y)| x - y).collect();
     let distance: f32 = diffs.iter().map(|x| x * x).sum();
     let (a, b, gamma, alpha) = (1.576_943_5f32, 0.895_060_9f32, 1.7f32, 0.25f32);
@@ -952,14 +965,20 @@ fn verify_multidimensional_update(
         }
     }
     let tail_index = if negative { 0i32 } else { 1 };
-    let (offsets, ids) = csr(device, &[0], &[1.0], 2);
+    let (offsets, ids) = csr(device, &[0], &[1.0], ROWS);
     let f =
         |value| Tensor::<1>::from_data(TensorData::new(vec![value], [1]), device).into_dispatch();
     let (head, tail, _, _, rng) = <Dispatch as StandardUmapOps>::optimize_epoch(
-        Tensor::<2>::from_data(TensorData::new(positions.clone(), [2, dimensions]), device)
-            .into_dispatch(),
-        Tensor::<2>::from_data(TensorData::new(fixed_tail.clone(), [2, dimensions]), device)
-            .into_dispatch(),
+        Tensor::<2>::from_data(
+            TensorData::new(positions.clone(), [ROWS, dimensions]),
+            device,
+        )
+        .into_dispatch(),
+        Tensor::<2>::from_data(
+            TensorData::new(fixed_tail.clone(), [ROWS, dimensions]),
+            device,
+        )
+        .into_dispatch(),
         Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), device).into_dispatch(),
         Tensor::<1, Int>::from_data(TensorData::new(vec![tail_index], [1]), device).into_dispatch(),
         f(1.0),
@@ -968,10 +987,7 @@ fn verify_multidimensional_update(
         f(1.0),
         f(0.0),
         Tensor::<2, Int>::from_data(
-            TensorData::new(
-                vec![524288i64, 1234567, 9876543, 524300, 1234580, 9876560],
-                [2, 3],
-            ),
+            TensorData::new(rng_rows, [ROWS, 3]),
             (device, burn::tensor::DType::I64),
         )
         .into_dispatch(),
@@ -991,6 +1007,15 @@ fn verify_multidimensional_update(
         .try_to_vec::<f32>()
         .unwrap();
     check_close(&actual, &expected, "multidimensional analytical update");
+    let sentinel_range = 2 * dimensions..;
+    assert_eq!(
+        actual[sentinel_range.clone()]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        sentinel.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "sentinel row modified (dimensions={dimensions}, shared={shared}, negative={negative})"
+    );
     let actual_tail = Tensor::<2>::from_dispatch(tail)
         .to_data()
         .try_to_vec::<f32>()
@@ -1018,7 +1043,7 @@ fn standard_layout_multidimensional_analytical_updates() {
         eprintln!("SKIPPED: CUDA numerical coverage; no CUDA device");
     }
     for device in std::iter::once(Device::cpu()).chain(cuda) {
-        for dimensions in [8, 16, 17] {
+        for dimensions in [8, 16, 17, 20, 21, 27, 32, 33] {
             for shared in [true, false] {
                 for negative in [false, true] {
                     verify_multidimensional_update(&device, dimensions, shared, negative);
@@ -1044,7 +1069,7 @@ fn standard_layout_kernel_paths_and_rng_cross_backend() {
         if let Some(device) = &cuda {
             verify_positive_only_update(device, shared);
         }
-        for dimensions in [1, 2, 8, 16, 17] {
+        for dimensions in [1, 2, 8, 16, 17, 20, 21, 27, 32, 33] {
             let cpu_rng = verify_layout_kernel_paths(&cpu, dimensions, shared);
             if let Some(device) = &cuda {
                 let cuda_rng = verify_layout_kernel_paths(device, dimensions, shared);
