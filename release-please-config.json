@@ -1,6 +1,5 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.1.3/schemas/config.json",
-  "bootstrap-sha": "c76bb96e2284c8404b79daabe6df5fb10d11594b",
   "packages": {
     ".": {
       "package-name": "cuscan",
