@@ -136,6 +136,12 @@ jobs:
       - run: uv run --no-sync python crates/hdbscan/tests/fixtures/generate_fast_hdbscan.py --verify-provenance
       - run: uv run --no-sync python crates/hdbscan/tests/fixtures/generate_fast_hdbscan.py --check
       - run: uv run --no-sync pytest scripts/ci/tests
+      - name: Verify pinned Release Please schema and generation
+        env:
+          NODE_PATH: ${{ runner.temp }}/release-please/node_modules
+        run: |
+          npm install --prefix "$RUNNER_TEMP/release-please" --ignore-scripts --no-audit --no-fund release-please@17.1.3 ajv@8 ajv-formats@3
+          node scripts/ci/tests/release_please_generator.cjs
   lint-workflows:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
@@ -159,12 +165,6 @@ jobs:
           tar -xzf "$install_dir/actionlint.tar.gz" -C "$install_dir" actionlint
           echo "$install_dir" >> "$GITHUB_PATH"
       - run: actionlint
-      - name: Verify pinned Release Please schema and generation
-        env:
-          NODE_PATH: ${{ runner.temp }}/release-please/node_modules
-        run: |
-          npm install --prefix "$RUNNER_TEMP/release-please" --ignore-scripts --no-audit --no-fund release-please@17.1.3 ajv@8 ajv-formats@3
-          node scripts/ci/tests/release_please_generator.cjs
       - run: uvx zizmor==1.22.0 --min-severity medium .github
         env:
           GH_TOKEN: ${{ github.token }}

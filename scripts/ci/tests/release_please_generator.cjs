@@ -19,27 +19,34 @@ const ajv = new Ajv({strict: false});
 addFormats(ajv);
 const validate = ajv.compile(schema);
 assert.ok(validate(config), JSON.stringify(validate.errors));
-assert.equal(config['bootstrap-sha'], 'c76bb96e2284c8404b79daabe6df5fb10d11594b');
+assert.equal(config['bootstrap-sha'], undefined);
 const pkg = config.packages['.'];
+assert.equal(pkg['release-as'], undefined);
+const released = JSON.parse(fs.readFileSync(path.join(root, '.release-please-manifest.json'), 'utf8'))['.'];
+const releaseSha = 'b'.repeat(40);
 const github = {
   repository: {owner: 'example', repo: 'cuscan', defaultBranch: 'main'},
   getFileJson: async name => JSON.parse(fs.readFileSync(path.join(root, name), 'utf8')),
   getFileContentsOnBranch: async name => ({parsedContent: fs.readFileSync(path.join(root, name), 'utf8')}),
-  async *releaseIterator() {},
+  async *releaseIterator() {
+    yield {tagName: `v${released}`, sha: releaseSha, notes: '', url: 'https://example.invalid'};
+  },
   async *tagIterator() {},
   async *mergeCommitIterator() {
-    yield {sha: 'a'.repeat(40), message: 'feat(ci): automate reviewed releases', files: ['README.md']};
-    yield {sha: config['bootstrap-sha'], message: 'feat!: EXCLUDED_BOUNDARY', files: ['README.md']};
+    yield {sha: 'a'.repeat(40), message: 'feat: add capability', files: ['README.md']};
+    yield {sha: releaseSha, message: `chore(main): release ${released}`, files: ['README.md']};
     yield {sha: 'c'.repeat(40), message: 'feat: EXCLUDED_OLD_HISTORY', files: ['README.md']};
   },
 };
-async function proposal(old, message, force = false) {
+async function proposal(old, message) {
+  const bump = {
+    bumpMinorPreMajor: pkg['bump-minor-pre-major'],
+    bumpPatchForMinorPreMajor: pkg['bump-patch-for-minor-pre-major'],
+  };
   const strategy = new Simple({
-    github, targetBranch: 'main', packageName: 'cuscan',
-    includeComponentInTag: false, includeVInTag: true,
-    bumpMinorPreMajor: true, bumpPatchForMinorPreMajor: false,
-    versioningStrategy: new DefaultVersioningStrategy({bumpMinorPreMajor: true, bumpPatchForMinorPreMajor: false}),
-    releaseAs: force ? '0.1.0' : undefined,
+    github, targetBranch: 'main', packageName: pkg['package-name'],
+    includeComponentInTag: pkg['include-component-in-tag'], includeVInTag: pkg['include-v-in-tag'],
+    ...bump, versioningStrategy: new DefaultVersioningStrategy(bump),
     extraFiles: pkg['extra-files'], changelogSections: pkg['changelog-sections'],
   });
   const commits = parseConventionalCommits([{sha: 'a'.repeat(40), message, files: ['README.md']}]);
@@ -50,7 +57,7 @@ async function proposal(old, message, force = false) {
 (async () => {
   const cases = [
     ['0.1.0', 'fix: repair', '0.1.1'],
-    ['0.1.0', 'feat: add capability', '0.2.0'],
+    ['0.1.0', 'feat: add capability', '0.1.1'],
     ['0.1.0', 'feat!: change API', '0.2.0'],
     ['1.0.0', 'feat!: change API', '2.0.0'],
     ['0.1.0', 'docs: instructions', undefined],
@@ -66,16 +73,15 @@ async function proposal(old, message, force = false) {
   const updates = requests[0].updates;
   const content = name => updates.find(update => update.path === name).updater.updateContent(
     fs.readFileSync(path.join(root, name), 'utf8'));
-  assert.equal(content('version.txt'), '0.1.0\n');
-  assert.match(content('Cargo.toml'), /version = "0\.1\.0"/);
-  assert.deepEqual(JSON.parse(content('.release-please-manifest.json')), {'.': '0.1.0'});
+  const next = Version.parse(released);
+  next.patch += 1;
+  const nextVersion = next.toString();
+  assert.equal(content('version.txt'), `${nextVersion}\n`);
+  assert.match(content('Cargo.toml'), new RegExp(`version = "${nextVersion.replaceAll('.', '\\.')}"`));
+  assert.deepEqual(JSON.parse(content('.release-please-manifest.json')), {'.': nextVersion});
   const changelog = content('CHANGELOG.md');
-  assert.equal((changelog.match(/^## 0\.1\.0 \(/gm) || []).length, 1);
   assert.ok(!changelog.includes('EXCLUDED_'));
-  assert.ok(changelog.includes('Pre-automation project baseline'));
-  const next = await proposal('0.1.0', 'fix: repair publishing');
-  const nextLog = next.updates.find(update => update.path === 'CHANGELOG.md').updater.updateContent(changelog);
-  assert.match(nextLog, /^## \[0\.1\.1\]\(https:\/\/github.com\/example\/cuscan\/compare\/v0\.1\.0\.\.\.v0\.1\.1\) \(\d{4}-\d{2}-\d{2}\)$/m);
-  assert.equal((nextLog.match(/^## 0\.1\.0 \(/gm) || []).length, 1);
-  console.log('Pinned schema, exclusive bootstrap, first proposal, workspace updater and version policy passed');
+  assert.ok(changelog.includes(`compare/v${released}...v${nextVersion}`));
+  assert.equal((changelog.match(new RegExp(`^## \\[?${released.replaceAll('.', '\\.')}`, 'gm')) || []).length, 1);
+  console.log('Pinned schema, post-release proposal, workspace updater and version policy passed');
 })().catch(error => {console.error(error); process.exitCode = 1;});

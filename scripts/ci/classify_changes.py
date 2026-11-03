@@ -25,8 +25,15 @@ def classify(paths: list[str]) -> set[str]:
     for path in paths:
         parts = path.split("/")
         flags: set[str] = set()
-        if path.startswith((".github/", "scripts/ci/")) or path == ".actrc":
+        # Routing itself and workflow definitions can change any job's behavior.
+        if path.startswith(".github/") or path in {".actrc", "scripts/ci/classify_changes.py"}:
             return ALL.copy()
+        # Other CI helpers are linted and tested by lint-python (scripts/ci/tests).
+        if path.startswith("scripts/ci/"):
+            flags.add("python_tests")
+        # Wheel jobs consume these directly.
+        if path in {"scripts/ci/wheel_inputs.txt", "scripts/ci/locked_version.py"}:
+            flags.add("python_pkg")
         if path.startswith(("crates/", ".cargo/")) or path in {
             "Cargo.toml",
             "Cargo.lock",
