@@ -37,7 +37,7 @@ REQUIRED_CONFIG = {
     "draft": False,
     "prerelease": False,
     "bump-minor-pre-major": True,
-    "bump-patch-for-minor-pre-major": False,
+    "bump-patch-for-minor-pre-major": True,
     "changelog-path": "CHANGELOG.md",
     "extra-files": [
         {"type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version"}
@@ -49,6 +49,7 @@ BOOTSTRAP_CONFIG = {
     "packages": {
         ".": {
             **REQUIRED_CONFIG,
+            "bump-patch-for-minor-pre-major": False,
             "release-as": "0.1.0",
             "changelog-sections": [
                 {"type": "feat", "section": "Features"},

@@ -25,13 +25,15 @@ def classify(paths: list[str]) -> set[str]:
     for path in paths:
         parts = path.split("/")
         flags: set[str] = set()
-        if path.startswith((".github/", "scripts/ci/")) or path in {
-            ".actrc",
-            "version.txt",
-            "release-please-config.json",
-            ".release-please-manifest.json",
-        }:
+        # Routing itself and workflow definitions can change any job's behavior.
+        if path.startswith(".github/") or path in {".actrc", "scripts/ci/classify_changes.py"}:
             return ALL.copy()
+        # Other CI helpers are linted and tested by lint-python (scripts/ci/tests).
+        if path.startswith("scripts/ci/"):
+            flags.add("python_tests")
+        # Wheel jobs consume these directly.
+        if path in {"scripts/ci/wheel_inputs.txt", "scripts/ci/locked_version.py"}:
+            flags.add("python_pkg")
         if path.startswith(("crates/", ".cargo/")) or path in {
             "Cargo.toml",
             "Cargo.lock",
@@ -49,7 +51,15 @@ def classify(paths: list[str]) -> set[str]:
         if (
             path.startswith(("python/tests/", "analyze/", "comparison/"))
             or (len(parts) == 2 and parts[0] == "scripts" and path.endswith(".py"))
-            or path in {"uv.lock", ".python-version"}
+            or path
+            in {
+                "uv.lock",
+                ".python-version",
+                # Release metadata is consumed only by check_release_pr.py (scripts/ci/tests).
+                "version.txt",
+                "release-please-config.json",
+                ".release-please-manifest.json",
+            }
         ):
             flags.add("python_tests")
         if len(parts) >= 5 and parts[0] == "crates" and parts[2:4] == ["tests", "fixtures"]:
