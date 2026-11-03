@@ -108,7 +108,13 @@ runs:
       with:
         shared-key: ${{ env.CI_RUST_CACHE_CLASS }}
         prefix-key: v${{ env.CI_CACHE_EPOCH }}-rust
-        cache-directories: ~/.cache/tracel
+        # tracel-llvm-bundler installs LLVM into the platform data-local dir and its build
+        # script reruns (rebuilding every LLVM-dependent crate) whenever the install
+        # sentinel is missing or newer than its last run. Cache the installed tree, not the
+        # download archive, so restored target fingerprints stay fresh.
+        cache-directories: |
+          ~/.local/share/tracel
+          ~/AppData/Local/tracel
         cache-bin: 'false'
         save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
         cache-on-failure: ${{ inputs.cache-on-failure == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
