@@ -53,9 +53,10 @@ def test_supervised_check_false_returns_nonzero_process_result() -> None:
 def test_supervisor_kills_process_group_on_deadline(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child-pid"
     code = (
-        "import subprocess,time, pathlib; p=subprocess.Popen(['python','-c',"
+        "import os,subprocess,time,pathlib; p=subprocess.Popen(['python','-c',"
         '"import os,time; os.setsid(); time.sleep(30)"]); '
-        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
+        f"pathlib.Path({str(child_pid_file)!r} + '.tmp').write_text(str(p.pid)); "
+        f"os.replace({str(child_pid_file)!r} + '.tmp', {str(child_pid_file)!r}); time.sleep(30)"
     )
     with pytest.raises(module.DeadlineExceeded, match="supervised worker"):
         module.run_supervised([sys.executable, "-c", code], module.Deadline(0.3))
@@ -90,10 +91,11 @@ def test_supervisor_kills_descendants_resisting_term_after_success(tmp_path: Pat
 def test_supervisor_kills_tree_on_unexpected_telemetry_error(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child-pid"
     code = (
-        "import subprocess,pathlib,time; "
+        "import os,subprocess,pathlib,time; "
         "p=subprocess.Popen(['sleep','30'],stdin=subprocess.DEVNULL,"
         "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
-        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
+        f"pathlib.Path({str(child_pid_file)!r} + '.tmp').write_text(str(p.pid)); "
+        f"os.replace({str(child_pid_file)!r} + '.tmp', {str(child_pid_file)!r}); time.sleep(30)"
     )
 
     class BrokenTelemetry:

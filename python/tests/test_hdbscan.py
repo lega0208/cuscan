@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import warnings
 from pathlib import Path
 from typing import Any, Literal
 
@@ -380,10 +379,6 @@ def test_known_upstream_divergences_keep_exact_fixture_as_gate(
                 np.max(np.abs(expected["probabilities"] - reference.probabilities_))
             ),
         }
-    warnings.warn(
-        f"informational upstream comparison: {json.dumps(diagnostics, sort_keys=True)}",
-        stacklevel=1,
-    )
 
 
 def test_knn_graph_default_route_matches_fixture(hdbscan_backend: Literal["cpu", "cuda"]) -> None:
