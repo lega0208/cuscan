@@ -70,11 +70,20 @@ def fixture_repo(tmp_path):
     return base, candidate
 
 
+def mark_released(base, candidate):
+    (base / ".release-please-manifest.json").write_text('{".": "0.1.0"}\n')
+    repo_config = Path(__file__).resolve().parents[3] / "release-please-config.json"
+    (base / "release-please-config.json").write_text(repo_config.read_text())
+    commit(base, "released")
+    candidate_config = candidate / "release-please-config.json"
+    candidate_config.write_text(repo_config.read_text())
+    commit(candidate, "post-bootstrap config")
+
+
 def test_initial_proposal_and_repeated_release(tmp_path):
     base, candidate = fixture_repo(tmp_path)
     assert helper.verify(base, candidate) == "0.1.0"
-    (base / ".release-please-manifest.json").write_text('{".": "0.1.0"}\n')
-    commit(base, "released")
+    mark_released(base, candidate)
     command(candidate, "git", "fetch", "-q", str(base), "HEAD")
     with pytest.raises(ValueError, match="increase"):
         helper.verify(base, candidate)
@@ -82,8 +91,7 @@ def test_initial_proposal_and_repeated_release(tmp_path):
 
 def test_stale_release_branch_is_routed_as_proposal(tmp_path):
     base, candidate = fixture_repo(tmp_path)
-    (base / ".release-please-manifest.json").write_text('{".": "0.1.0"}\n')
-    commit(base, "released")
+    mark_released(base, candidate)
     command(candidate, "git", "fetch", "-q", str(base), "HEAD")
     assert not helper.is_proposal(base, candidate, None)
     assert helper.is_proposal(base, candidate, sample_pr())
@@ -315,8 +323,7 @@ def test_sync_noop_strips_app_credentials(tmp_path, monkeypatch):
 
 def test_sync_lease_rejects_racing_push(tmp_path, monkeypatch):
     base, candidate = fixture_repo(tmp_path)
-    (base / ".release-please-manifest.json").write_text('{".": "0.1.0"}\n')
-    commit(base, "released")
+    mark_released(base, candidate)
     command(candidate, "git", "fetch", "-q", str(base), "HEAD")
     (candidate / ".release-please-manifest.json").write_text('{".": "0.1.1"}\n')
     (candidate / "Cargo.toml").write_text(
