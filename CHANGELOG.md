@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.1](https://github.com/lega0208/cuscan/compare/v0.1.0...v0.1.1) (2026-11-03)
+
+
+### Features
+
+* umap layout optimizations ([#10](https://github.com/lega0208/cuscan/issues/10)) ([69c4272](https://github.com/lega0208/cuscan/commit/69c4272625877d1d49ca3f903b86ede2b30a766e))
+
+
+### Bug Fixes
+
+* broken release ([#13](https://github.com/lega0208/cuscan/issues/13)) ([519132e](https://github.com/lega0208/cuscan/commit/519132e93dbe6033cf679e710461a374c8d19015))
+* flaky python test ([#12](https://github.com/lega0208/cuscan/issues/12)) ([9ecc447](https://github.com/lega0208/cuscan/commit/9ecc447658173600371322472c7ff5f36b9ff924))
+
 ## 0.1.0 (2026-10-30)
 
 
