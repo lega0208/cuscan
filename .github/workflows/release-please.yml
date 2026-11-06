@@ -42,7 +42,7 @@ jobs:
         run: |
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal
-      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         if: steps.guard.outputs.enabled == 'true'
         id: app
         with:
@@ -53,7 +53,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
-      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0 (release-please 17.1.3)
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v4.4.0 (release-please 17.1.3)
         if: steps.guard.outputs.enabled == 'true'
         id: release
         with:
