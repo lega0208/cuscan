@@ -12,6 +12,10 @@
 //!   the parameters `UMAP::fit` derives for n=512, features=8, config.n_neighbors=15: nonself
 //!   k=14, iterations=9, seed 42. Files `{label}-estimator-ids.bin` (i32) and
 //!   `{label}-estimator-distance-bits.bin` (u32).
+//! - MultiTile (`capture_multitile_{cpu,cuda}`, `compare_multitile_{cpu,cuda}`): n=40,000,
+//!   features=8, k=14, seed 42, iterations `round(log2 n)` = 15. Both forest seeding and
+//!   refinement span more than one 4,194,304-slot staging tile, so the tile loop and nonzero
+//!   slot offsets are covered bit-exactly. Files `{label}-multitile-{ids,distance-bits}.bin`.
 //!
 //! Capture refuses to overwrite existing files; delete a file deliberately to recapture it.
 //! Compare fails on a missing or changed file and prints the capture command.
@@ -46,6 +50,10 @@ const B0_ITERATIONS: u32 = 8;
 /// `min(n_neighbors, n - 1) - 1`, and the estimator uses `round(log2(n)).max(5)` iterations.
 const ESTIMATOR_K: usize = 14;
 const ESTIMATOR_ITERATIONS: u32 = 9;
+/// MultiTile family: large enough that ANN pair slots exceed one staging tile.
+const MULTITILE_ROWS: usize = 40_000;
+const MULTITILE_K: usize = 14;
+const MULTITILE_ITERATIONS: u32 = 15;
 
 #[derive(Clone, Copy, Debug)]
 enum Target {
@@ -63,6 +71,7 @@ enum Mode {
 enum Family {
     B0,
     Estimator,
+    MultiTile,
 }
 
 impl Family {
@@ -70,6 +79,7 @@ impl Family {
         match self {
             Family::B0 => B0_K,
             Family::Estimator => ESTIMATOR_K,
+            Family::MultiTile => MULTITILE_K,
         }
     }
 
@@ -77,6 +87,14 @@ impl Family {
         match self {
             Family::B0 => B0_ITERATIONS,
             Family::Estimator => ESTIMATOR_ITERATIONS,
+            Family::MultiTile => MULTITILE_ITERATIONS,
+        }
+    }
+
+    fn rows(self) -> usize {
+        match self {
+            Family::B0 | Family::Estimator => ROWS,
+            Family::MultiTile => MULTITILE_ROWS,
         }
     }
 
@@ -86,6 +104,7 @@ impl Family {
         match self {
             Family::B0 => "",
             Family::Estimator => "estimator-",
+            Family::MultiTile => "multitile-",
         }
     }
 
@@ -94,6 +113,7 @@ impl Family {
         match self {
             Family::B0 => "",
             Family::Estimator => "estimator_",
+            Family::MultiTile => "multitile_",
         }
     }
 }
@@ -119,12 +139,12 @@ impl SplitMix64 {
 
 /// Seed-42 blob dataset: `BLOBS` centers in [-10, 10)^FEATURES, rows assigned round-robin,
 /// each coordinate jittered by a uniform offset in [-0.25, 0.25).
-fn blob_rows() -> Vec<Vec<f32>> {
+fn blob_rows(n_rows: usize) -> Vec<Vec<f32>> {
     let mut random = SplitMix64(SEED);
     let centers: Vec<Vec<f32>> = (0..BLOBS)
         .map(|_| (0..FEATURES).map(|_| random.unit() * 20.0 - 10.0).collect())
         .collect();
-    (0..ROWS)
+    (0..n_rows)
         .map(|row| {
             let center = &centers[row % BLOBS];
             center
@@ -154,14 +174,15 @@ fn target_device(target: Target) -> Option<(Device, BackendChoice)> {
 }
 
 /// The only ANN call site in this file. Uses `NeighborOps` with `squared = false`, the
-/// estimator's distance mode. Returns `(ids, distance bits)` for the `[ROWS, k]` table.
+/// estimator's distance mode. Returns `(ids, distance bits)` for the `[n_rows, k]` table.
 fn ann_neighbors(
     device: &Device,
     values: &[f32],
+    n_rows: usize,
     k: usize,
     iterations: u32,
 ) -> (Vec<i32>, Vec<u32>) {
-    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [ROWS, FEATURES]), device);
+    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n_rows, FEATURES]), device);
     let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
         data.into_dispatch(),
         k as u32,
@@ -308,10 +329,21 @@ fn run(target: Target, family: Family, mode: Mode) {
         return;
     };
     let label = target_label(target);
-    let rows = blob_rows();
+    assert_eq!(
+        MULTITILE_ITERATIONS,
+        (MULTITILE_ROWS as f64).log2().round() as u32,
+        "multitile iteration count drifted from round(log2 n)"
+    );
+    let rows = blob_rows(family.rows());
     let values: Vec<f32> = rows.iter().flatten().copied().collect();
 
-    let (ids, distance_bits) = ann_neighbors(&device, &values, family.k(), family.iterations());
+    let (ids, distance_bits) = ann_neighbors(
+        &device,
+        &values,
+        family.rows(),
+        family.k(),
+        family.iterations(),
+    );
     let mut artifacts = vec![
         ("ids.bin", to_le_bytes_i32(&ids)),
         ("distance-bits.bin", to_le_bytes_u32(&distance_bits)),
@@ -400,4 +432,28 @@ fn compare_estimator_cpu() {
 #[ignore = "compares CUDA estimator-parameter ANN ids and distance bits against the pristine baseline"]
 fn compare_estimator_cuda() {
     run(Target::Cuda, Family::Estimator, Mode::Compare);
+}
+
+#[test]
+#[ignore = "captures the multi-tile CPU ANN baseline (n=40000, k=14, 15 iterations); run from the pristine HEAD worktree"]
+fn capture_multitile_cpu() {
+    run(Target::Cpu, Family::MultiTile, Mode::Capture);
+}
+
+#[test]
+#[ignore = "captures the multi-tile CUDA ANN baseline (n=40000, k=14, 15 iterations); run from the pristine HEAD worktree"]
+fn capture_multitile_cuda() {
+    run(Target::Cuda, Family::MultiTile, Mode::Capture);
+}
+
+#[test]
+#[ignore = "compares CPU multi-tile ANN ids and distance bits against the pristine baseline"]
+fn compare_multitile_cpu() {
+    run(Target::Cpu, Family::MultiTile, Mode::Compare);
+}
+
+#[test]
+#[ignore = "compares CUDA multi-tile ANN ids and distance bits against the pristine baseline"]
+fn compare_multitile_cuda() {
+    run(Target::Cuda, Family::MultiTile, Mode::Compare);
 }

@@ -207,7 +207,8 @@ fn map_umap_error(error: UmapError) -> PyErr {
         UmapError::BackendUnavailable(_)
         | UmapError::Numerical(_)
         | UmapError::SpectralConvergence(_)
-        | UmapError::Overflow(_) => PyRuntimeError::new_err(message),
+        | UmapError::Overflow(_)
+        | UmapError::Capacity(_) => PyRuntimeError::new_err(message),
     }
 }
 
@@ -454,4 +455,20 @@ fn _cuscan(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(hdbscan::hdbscan_cuda_available, module)?)?;
     module.add_function(wrap_pyfunction!(load, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod umap_error_tests {
+    use super::*;
+
+    #[test]
+    fn umap_capacity_maps_to_runtime_error_with_unchanged_message() {
+        Python::initialize();
+        Python::attach(|py| {
+            let message = "ANN input copy buffer elements 4296000000 exceeds u32 addressing maximum 4294967295";
+            let error = map_umap_error(UmapError::Capacity(message.into()));
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            assert_eq!(error.value(py).to_string(), message);
+        });
+    }
 }

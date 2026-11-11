@@ -34,6 +34,18 @@ pub(super) const PREFIX_CHUNK: usize = 128;
 
 /// Build bounded forest leaf membership on the host. Distances and graph
 /// updates are executed by the shared pair-slot/endpoint pipeline.
+/// Device state produced by `forest_seed`: seeded heaps, the forest membership,
+/// its I32 leaf row offsets and I64 pair prefix, and the forest pair total.
+pub(super) struct ForestSeed {
+    pub(super) ids: CubeTensor,
+    pub(super) distances: CubeTensor,
+    pub(super) flags: CubeTensor,
+    pub(super) rows: CubeTensor,
+    pub(super) leaf_rows: CubeTensor,
+    pub(super) pair_prefix: CubeTensor,
+    pub(super) pair_count: usize,
+}
+
 pub(super) fn forest_seed(
     data: &CubeTensor,
     n: usize,
@@ -41,17 +53,7 @@ pub(super) fn forest_seed(
     heap_width: usize,
     max_candidates: usize,
     seed: u64,
-) -> Result<
-    (
-        CubeTensor,
-        CubeTensor,
-        CubeTensor,
-        CubeTensor,
-        CubeTensor,
-        usize,
-    ),
-    WorkspaceError,
-> {
+) -> Result<ForestSeed, WorkspaceError> {
     let trees = tree_count(n)?;
     let leaf_size = forest_leaf_limit(n, heap_width);
     let workspace = plan_workspace(n, heap_width, max_candidates, features, trees)?;
@@ -98,18 +100,15 @@ pub(super) fn forest_seed(
     for &id in &forest.row_ids {
         membership.push(i32::try_from(id).map_err(|_| WorkspaceError::InvalidDimensions)?);
     }
-    let mut leaf_offsets = Vec::with_capacity(
-        forest
-            .leaf_offsets
-            .len()
-            .checked_mul(2)
-            .ok_or(WorkspaceError::ArithmeticOverflow)?,
-    );
+    // Membership offsets stay I32 (bounded by trees * n <= i32::MAX); the pair
+    // prefix is I64 so the forest pair total is not limited to i32.
+    let mut leaf_rows = Vec::with_capacity(forest.leaf_offsets.len());
+    let mut leaf_pair_prefix = Vec::with_capacity(forest.leaf_offsets.len());
     let mut pair_prefix = 0usize;
     for (leaf, &offset) in forest.leaf_offsets.iter().enumerate() {
-        leaf_offsets.push(i32::try_from(offset).map_err(|_| WorkspaceError::InvalidDimensions)?);
-        leaf_offsets
-            .push(i32::try_from(pair_prefix).map_err(|_| WorkspaceError::ArithmeticOverflow)?);
+        leaf_rows.push(i32::try_from(offset).map_err(|_| WorkspaceError::InvalidDimensions)?);
+        leaf_pair_prefix
+            .push(i64::try_from(pair_prefix).map_err(|_| WorkspaceError::ArithmeticOverflow)?);
         if let Some(&end) = forest.leaf_offsets.get(leaf + 1) {
             let length = end - offset;
             pair_prefix = pair_prefix
@@ -129,12 +128,20 @@ pub(super) fn forest_seed(
         DType::I32,
         membership,
     );
-    let offsets_tensor = cube_tensor_from_vec(
+    debug_assert_eq!(leaf_rows.len(), leaf_pair_prefix.len());
+    let leaf_rows_tensor = cube_tensor_from_vec(
         data.client.clone(),
         data.device.clone(),
-        Shape::new([leaf_offsets.len() / 2, 2]),
+        Shape::new([leaf_rows.len()]),
         DType::I32,
-        leaf_offsets,
+        leaf_rows,
+    );
+    let pair_prefix_tensor = cube_tensor_from_vec(
+        data.client.clone(),
+        data.device.clone(),
+        Shape::new([leaf_pair_prefix.len()]),
+        DType::I64,
+        leaf_pair_prefix,
     );
     drop(forest);
     drop(features_host);
@@ -156,14 +163,15 @@ pub(super) fn forest_seed(
         distances,
     );
     let flags = cube_tensor_from_vec(client, device, shape, DType::I32, flags);
-    Ok((
+    Ok(ForestSeed {
         ids,
         distances,
         flags,
-        rows_tensor,
-        offsets_tensor,
-        forest_pair_slots,
-    ))
+        rows: rows_tensor,
+        leaf_rows: leaf_rows_tensor,
+        pair_prefix: pair_prefix_tensor,
+        pair_count: forest_pair_slots,
+    })
 }
 
 fn cube_tensor_from_vec<T: burn::tensor::Element>(
@@ -222,9 +230,16 @@ pub(super) fn approximate_neighbors(
     let max_total_slots = n
         .checked_mul(workspace.pair_slots_per_center)
         .expect("ANN pair slot count overflows usize");
-    let (mut candidates, mut distances, mut flags, forest_rows, forest_offsets, forest_pairs) =
-        forest_seed(&data, n, features, width, capacity, seed)
-            .map_err(|error| workspace_error("RP forest initialization", error))?;
+    let ForestSeed {
+        ids: mut candidates,
+        mut distances,
+        mut flags,
+        rows: forest_rows,
+        leaf_rows: forest_leaf_rows,
+        pair_prefix: forest_pair_prefix,
+        pair_count: forest_pairs,
+    } = forest_seed(&data, n, features, width, capacity, seed)
+        .map_err(|error| workspace_error("RP forest initialization", error))?;
     let pair_left = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
     let pair_right = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
     let pair_distances = empty_tensor(&data, Shape::new([pair_elements]), DType::F32);
@@ -250,12 +265,36 @@ pub(super) fn approximate_neighbors(
     let mut next_flags = empty_tensor(&data, Shape::new([n, width]), DType::I32);
     let new_count = empty_tensor(&data, Shape::new([1]), DType::I32);
     let pool_sizes = empty_tensor(&data, Shape::new([n * 2]), DType::I32);
-    let pair_counts = empty_tensor(&data, Shape::new([n]), DType::I32);
-    let center_offsets = empty_tensor(&data, Shape::new([n + 1]), DType::I32);
-    let center_cursors = empty_tensor(&data, Shape::new([n]), DType::I32);
-    let chunk_sums = empty_tensor(&data, Shape::new([n.div_ceil(PREFIX_CHUNK)]), DType::I32);
-    let prefix = |values: &CubeTensor, offsets: &CubeTensor, cursors: &CubeTensor| {
-        exclusive_prefix(&client, values, offsets, cursors, &chunk_sums, n)
+    // The join pair prefix is 64-bit; reverse and endpoint prefixes stay I32.
+    let pair_counts = empty_tensor(&data, Shape::new([n]), DType::I64);
+    let center_offsets = empty_tensor(&data, Shape::new([n + 1]), DType::I64);
+    let chunks = n.div_ceil(PREFIX_CHUNK);
+    let chunk_sums = empty_tensor(&data, Shape::new([chunks]), DType::I32);
+    let join_chunk_sums = empty_tensor(&data, Shape::new([chunks]), DType::I64);
+    // Fixed launch signature placeholder for the join prefix, which never seeds cursors.
+    // Passing `center_offsets` twice would alias two mutable bindings.
+    let join_cursor_placeholder = empty_tensor(&data, Shape::new([1]), DType::I64);
+    let prefix_i32 = |values: &CubeTensor, offsets: &CubeTensor, cursors: &CubeTensor| {
+        exclusive_prefix(
+            &client,
+            values,
+            offsets,
+            cursors,
+            &chunk_sums,
+            DType::I32,
+            true,
+        )
+    };
+    let join_prefix = || {
+        exclusive_prefix(
+            &client,
+            &pair_counts,
+            &center_offsets,
+            &join_cursor_placeholder,
+            &join_chunk_sums,
+            DType::I64,
+            false,
+        )
     };
     let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32)?;
     let (row_count, row_dim) = ann_independent_launch(&client, n_u32)?;
@@ -273,16 +312,18 @@ pub(super) fn approximate_neighbors(
             pair_dim,
             data.clone().into_tensor_arg(),
             forest_rows.clone().into_tensor_arg(),
-            forest_offsets.clone().into_tensor_arg(),
+            forest_leaf_rows.clone().into_tensor_arg(),
+            forest_pair_prefix.clone().into_tensor_arg(),
             pair_left.clone().into_tensor_arg(),
             pair_right.clone().into_tensor_arg(),
             pair_distances.clone().into_tensor_arg(),
             pair_valid.clone().into_tensor_arg(),
-            u32::try_from(forest_offset).expect("ANN forest offset exceeds CubeCL range"),
+            u64::try_from(forest_offset).expect("ANN forest offset exceeds u64"),
             slots_u32,
             [
                 dtype_to_storage_type(DType::F32),
                 dtype_to_storage_type(DType::I32),
+                dtype_to_storage_type(DType::I64),
             ],
         );
         endpoint_count_zero::launch(
@@ -303,7 +344,7 @@ pub(super) fn approximate_neighbors(
             slots_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+        prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
         endpoint_scatter_kernel::launch(
             &client,
             pair_count.clone(),
@@ -434,7 +475,7 @@ pub(super) fn approximate_neighbors(
             width_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix(&reverse_counts, &reverse_offsets, &reverse_cursors)?;
+        prefix_i32(&reverse_counts, &reverse_offsets, &reverse_cursors)?;
         reverse_scatter::launch(
             &client,
             reverse_count_units,
@@ -472,17 +513,20 @@ pub(super) fn approximate_neighbors(
             pair_counts.clone().into_tensor_arg(),
             n_u32,
             cap_u32,
-            dtype_to_storage_type(DType::I32),
+            [
+                dtype_to_storage_type(DType::I32),
+                dtype_to_storage_type(DType::I64),
+            ],
         );
-        prefix(&pair_counts, &center_offsets, &center_cursors)?;
+        join_prefix()?;
         let total_bytes = client.read_one_unchecked(
             center_offsets
                 .handle
                 .clone()
-                .offset_start((n * DType::I32.size()) as u64),
+                .offset_start((n * DType::I64.size()) as u64),
         );
         let total_slots =
-            i32::from_ne_bytes(total_bytes[..4].try_into().expect("ANN pair total is i32"));
+            i64::from_ne_bytes(total_bytes[..8].try_into().expect("ANN pair total is i64"));
         let total_slots = usize::try_from(total_slots).expect("ANN pair total is negative");
         assert!(
             total_slots <= max_total_slots,
@@ -519,12 +563,13 @@ pub(super) fn approximate_neighbors(
                 pair_right.clone().into_tensor_arg(),
                 pair_distances.clone().into_tensor_arg(),
                 pair_valid.clone().into_tensor_arg(),
-                u32::try_from(slot_offset).expect("ANN pair offset exceeds CubeCL range"),
+                u64::try_from(slot_offset).expect("ANN pair offset exceeds u64"),
                 slots_u32,
                 cap_u32,
                 [
                     dtype_to_storage_type(DType::F32),
                     dtype_to_storage_type(DType::I32),
+                    dtype_to_storage_type(DType::I64),
                 ],
             );
             endpoint_count_zero::launch(
@@ -545,7 +590,7 @@ pub(super) fn approximate_neighbors(
                 slots_u32,
                 dtype_to_storage_type(DType::I32),
             );
-            prefix(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+            prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
             endpoint_scatter_kernel::launch(
                 &client,
                 pair_count.clone(),
@@ -693,16 +738,25 @@ pub(super) fn approximate_neighbors(
     Ok((output_indices, output_distances))
 }
 
-/// Parallel exclusive prefix of `values[0..len]` into `offsets[0..=len]`,
-/// also seeding scatter cursors. Callers own the `ceil(len/128)` chunk buffer.
+/// Parallel exclusive prefix of `values[0..len]` into `offsets[0..=len]` in `dtype`,
+/// seeding scatter cursors only when `seed_cursors` is set. Callers own the
+/// `ceil(len/128)` chunk buffer of the same dtype.
 fn exclusive_prefix(
     client: &cubecl::client::Client,
     values: &CubeTensor,
     offsets: &CubeTensor,
     cursors: &CubeTensor,
     chunk_sums: &CubeTensor,
-    len: usize,
+    dtype: DType,
+    seed_cursors: bool,
 ) -> Result<(), AnnError> {
+    let len = values.shape()[0];
+    debug_assert!(
+        [values, offsets, cursors, chunk_sums]
+            .iter()
+            .all(|tensor| tensor.dtype == dtype),
+        "ANN prefix operands must share the prefix dtype"
+    );
     let chunks = u32::try_from(len.div_ceil(PREFIX_CHUNK)).expect("ANN prefix chunks exceed u32");
     let chunk = PREFIX_CHUNK as u32;
     let (count, dim) = ann_independent_launch(client, chunks)?;
@@ -713,14 +767,14 @@ fn exclusive_prefix(
         values.clone().into_tensor_arg(),
         chunk_sums.clone().into_tensor_arg(),
         chunk,
-        dtype_to_storage_type(DType::I32),
+        dtype_to_storage_type(dtype),
     );
     chunk_prefix_kernel::launch(
         client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_1d(1),
         chunk_sums.clone().into_tensor_arg(),
-        dtype_to_storage_type(DType::I32),
+        dtype_to_storage_type(dtype),
     );
     chunk_scatter_kernel::launch(
         client,
@@ -731,7 +785,8 @@ fn exclusive_prefix(
         offsets.clone().into_tensor_arg(),
         cursors.clone().into_tensor_arg(),
         chunk,
-        dtype_to_storage_type(DType::I32),
+        seed_cursors,
+        dtype_to_storage_type(dtype),
     );
     Ok(())
 }
@@ -1091,38 +1146,44 @@ pub(super) fn sampled_pool_kernel<I: Int>(
 }
 
 #[cube(launch)]
-pub(super) fn forest_pair_slots_kernel<F: Float, I: Int>(
+///
+/// `leaf_rows[leaf..=leaf+1]` bound a leaf's membership (I32); `pair_prefix` is the
+/// 64-bit exclusive within-leaf pair prefix with its total as the last entry. Both
+/// tables have `leaves + 1` entries. `slot_offset` is the 64-bit tile start.
+/// `local_pair` narrows to u32 after subtraction: it is below the leaf's pair count,
+/// which `forest_totals` bounds by `i32::MAX`.
+pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
     data: &Tensor<F>,
     forest_rows: &Tensor<I>,
-    leaf_offsets: &Tensor<I>,
+    leaf_rows: &Tensor<I>,
+    pair_prefix: &Tensor<P>,
     pair_left: &mut Tensor<I>,
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
     pair_valid: &mut Tensor<I>,
-    slot_offset: u32,
+    slot_offset: u64,
     slots: u32,
-    #[define(F, I)] _dtypes: [ElemType; 2],
+    #[define(F, I, P)] _dtypes: [ElemType; 3],
 ) {
     let slot = ABSOLUTE_POS_X as usize;
     if slot < slots as usize {
-        let global_pair = slot_offset as usize + slot;
-        let leaf_count = leaf_offsets.shape(0) - 1;
+        let global_pair = P::cast_from(slot_offset) + P::cast_from(slot as u32);
+        let leaf_count = pair_prefix.shape(0) - 1;
         let mut leaf = 0usize;
         let mut upper = leaf_count;
         while upper - leaf > 1 {
             let middle = leaf + (upper - leaf) / 2;
-            let prefix = u32::cast_from(leaf_offsets[middle * 2 + 1]) as usize;
-            if prefix <= global_pair {
+            if pair_prefix[middle] <= global_pair {
                 leaf = middle;
             } else {
                 upper = middle;
             }
         }
-        let found = global_pair < u32::cast_from(leaf_offsets[leaf_count * 2 + 1]) as usize;
+        let found = global_pair < pair_prefix[leaf_count];
         if found {
-            let mut local_pair = global_pair - u32::cast_from(leaf_offsets[leaf * 2 + 1]) as usize;
-            let start = u32::cast_from(leaf_offsets[leaf * 2]) as usize;
-            let end = u32::cast_from(leaf_offsets[(leaf + 1) * 2]) as usize;
+            let mut local_pair = u32::cast_from(global_pair - pair_prefix[leaf]) as usize;
+            let start = u32::cast_from(leaf_rows[leaf]) as usize;
+            let end = u32::cast_from(leaf_rows[leaf + 1]) as usize;
             let length = end - start;
             let mut left_slot = 0usize;
             while local_pair >= length - left_slot - 1 {
@@ -1157,13 +1218,13 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int>(
 /// valid prefix of each sampled class. Pools are priority-sorted with sentinel
 /// ids last, so the valid members are exactly the leading run.
 #[cube(launch)]
-pub(super) fn pool_pair_count_kernel<I: Int>(
+pub(super) fn pool_pair_count_kernel<I: Int, P: Int>(
     sampled_ids: &Tensor<I>,
     pool_sizes: &mut Tensor<I>,
-    pair_counts: &mut Tensor<I>,
+    pair_counts: &mut Tensor<P>,
     n: u32,
     capacity: u32,
-    #[define(I)] _dtype: ElemType,
+    #[define(I, P)] _dtypes: [ElemType; 2],
 ) {
     let row = ABSOLUTE_POS_X as usize;
     let n = n as usize;
@@ -1183,7 +1244,7 @@ pub(super) fn pool_pair_count_kernel<I: Int>(
         pool_sizes[row * 2] = I::cast_from(new_count as i32);
         pool_sizes[row * 2 + 1] = I::cast_from(old_count as i32);
         let pairs = new_count * (new_count.saturating_sub(1)) / 2 + new_count * old_count;
-        pair_counts[row] = I::cast_from(pairs as i32);
+        pair_counts[row] = P::cast_from(pairs as u32);
     }
 }
 
@@ -1225,7 +1286,8 @@ pub(super) fn chunk_prefix_kernel<I: Int>(
     }
 }
 
-/// Write `offsets[0..=len]` (exclusive prefix plus total) and seed cursors.
+/// Write `offsets[0..=len]` (exclusive prefix plus total). With `seed_cursors`,
+/// also copy the offsets into `cursors`; otherwise `cursors` is never touched.
 #[cube(launch)]
 pub(super) fn chunk_scatter_kernel<I: Int>(
     values: &Tensor<I>,
@@ -1233,6 +1295,7 @@ pub(super) fn chunk_scatter_kernel<I: Int>(
     offsets: &mut Tensor<I>,
     cursors: &mut Tensor<I>,
     chunk: u32,
+    #[comptime] seed_cursors: bool,
     #[define(I)] _dtype: ElemType,
 ) {
     let index = ABSOLUTE_POS_X as usize;
@@ -1244,7 +1307,9 @@ pub(super) fn chunk_scatter_kernel<I: Int>(
         let mut running = chunk_offsets[index];
         for position in start..end {
             offsets[position] = running;
-            cursors[position] = running;
+            if comptime![seed_cursors] {
+                cursors[position] = running;
+            }
             running += values[position];
         }
         if end == len {
@@ -1255,40 +1320,44 @@ pub(super) fn chunk_scatter_kernel<I: Int>(
 
 /// Emit compact local-join slots `[slot_offset, slot_offset+slots)` using the
 /// per-center exclusive pair offsets: new×new `i<j` first, then new×old.
+///
+/// `center_offsets` is the 64-bit exclusive prefix (`[n+1]`, total last) and
+/// `slot_offset` the 64-bit tile start. `local` narrows to u32 after subtraction:
+/// it is below `pair_counts[center] <= C(C-1)/2 + C^2` (5370 at C=60).
 #[cube(launch)]
-pub(super) fn pair_slots_kernel<F: Float, I: Int>(
+pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
     data: &Tensor<F>,
     sampled_ids: &Tensor<I>,
     pool_sizes: &Tensor<I>,
-    center_offsets: &Tensor<I>,
+    center_offsets: &Tensor<P>,
     pair_left: &mut Tensor<I>,
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
     pair_valid: &mut Tensor<I>,
-    slot_offset: u32,
+    slot_offset: u64,
     slots: u32,
     capacity: u32,
-    #[define(F, I)] _dtypes: [ElemType; 2],
+    #[define(F, I, P)] _dtypes: [ElemType; 3],
 ) {
     let slot = ABSOLUTE_POS_X as usize;
     let capacity = capacity as usize;
     if slot < slots as usize {
         let n = data.shape(0);
         let features = data.shape(1);
-        let flattened = slot_offset as usize + slot;
+        let flattened = P::cast_from(slot_offset) + P::cast_from(slot as u32);
         // Largest center with center_offsets[center] <= flattened.
         let mut low = 0usize;
         let mut high = center_offsets.shape(0) - 1;
         while high - low > 1 {
             let middle = (low + high) / 2;
-            if (u32::cast_from(center_offsets[middle]) as usize) <= flattened {
+            if center_offsets[middle] <= flattened {
                 low = middle;
             } else {
                 high = middle;
             }
         }
         let center = low;
-        let mut local = flattened - u32::cast_from(center_offsets[center]) as usize;
+        let mut local = u32::cast_from(flattened - center_offsets[center]) as usize;
         let new_count = u32::cast_from(pool_sizes[center * 2]) as usize;
         let old_count = u32::cast_from(pool_sizes[center * 2 + 1]) as usize;
         let base = center * capacity * 2;

@@ -28,6 +28,9 @@ pub enum UmapError {
     Numerical(String),
     SpectralConvergence(String),
     Overflow(&'static str),
+    /// Valid input exceeds a documented implementation limit; the message names the
+    /// quantity, its value, the limit and the shape.
+    Capacity(String),
 }
 
 impl std::fmt::Display for UmapError {
@@ -37,8 +40,11 @@ impl std::fmt::Display for UmapError {
             | Self::InvalidInput(message)
             | Self::BackendUnavailable(message)
             | Self::Numerical(message)
-            | Self::SpectralConvergence(message) => formatter.write_str(message),
-            Self::Overflow(subject) => write!(formatter, "{subject} overflows usize"),
+            | Self::SpectralConvergence(message)
+            | Self::Capacity(message) => formatter.write_str(message),
+            Self::Overflow(subject) => {
+                write!(formatter, "{subject} exceeds the supported integer range")
+            }
         }
     }
 }

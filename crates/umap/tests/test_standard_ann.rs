@@ -543,3 +543,171 @@ fn cuda_ann_runs_on_device_and_query_sentinels() {
     check_query_sentinels_and_budget(&device);
     check_finite_input_distance_overflow(&device);
 }
+
+/// SplitMix64 for the above-ceiling fixtures: fixed and dependency-free.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in [0, 1) with 24 bits of precision.
+    fn unit(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// Seeded blobs: 16 centers in [-10, 10)^features, rows assigned round-robin and
+/// jittered uniformly in [-0.5, 0.5).
+fn blob_values(n: usize, features: usize, seed: u64) -> Vec<f32> {
+    let mut random = SplitMix64(seed);
+    let centers: Vec<f32> = (0..16 * features)
+        .map(|_| random.unit() * 20.0 - 10.0)
+        .collect();
+    (0..n)
+        .flat_map(|row| {
+            let center = (row % 16) * features;
+            (0..features)
+                .map(|feature| centers[center + feature] + random.unit() - 0.5)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Recall over the given rows only: each row's exact k nearest (ties by id) are
+/// computed against all n rows, as in `recall_score`, which is infeasible at large n.
+fn sampled_recall_score(
+    ids: &[i32],
+    values: &[f32],
+    n: usize,
+    features: usize,
+    k: usize,
+    rows: &[usize],
+) -> f64 {
+    let mut hits = 0usize;
+    for &row in rows {
+        let mut exact = (0..n)
+            .filter(|&other| other != row)
+            .map(|other| {
+                let mut squared = 0.0f32;
+                for feature in 0..features {
+                    let delta =
+                        values[row * features + feature] - values[other * features + feature];
+                    squared += delta * delta;
+                }
+                (squared, other)
+            })
+            .collect::<Vec<_>>();
+        exact.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let truth = exact[..k]
+            .iter()
+            .map(|&(_, id)| id as i32)
+            .collect::<std::collections::HashSet<_>>();
+        hits += ids[row * k..(row + 1) * k]
+            .iter()
+            .filter(|id| truth.contains(id))
+            .count();
+    }
+    hits as f64 / (rows.len() * k) as f64
+}
+
+/// Large-shape row contract: valid unique non-self ids, finite distances within a
+/// relative tolerance of a host recomputation, and non-decreasing returned distances.
+/// Rows are ordered by `(squared distance, id)` on the device; the square root can map
+/// distinct squared distances to one output value, so the id tie-break is only
+/// observable on equal squared distances, and host recomputation (different rounding,
+/// e.g. FMA contraction) cannot recover them. Order is therefore judged on the
+/// kernel's own output distances.
+fn check_large_rows(
+    ids: &[i32],
+    distances: &[f32],
+    values: &[f32],
+    n: usize,
+    features: usize,
+    k: usize,
+) {
+    assert_eq!(ids.len(), n * k);
+    assert_eq!(distances.len(), n * k);
+    for row in 0..n {
+        let mut unique = std::collections::HashSet::new();
+        for slot in 0..k {
+            let index = row * k + slot;
+            let id = ids[index];
+            assert!(
+                (0..n as i32).contains(&id) && id != row as i32,
+                "invalid/self neighbor at row {row}"
+            );
+            assert!(unique.insert(id), "duplicate neighbor at row {row}");
+            let distance = distances[index];
+            assert!(
+                distance.is_finite() && distance >= 0.0,
+                "row {row} slot {slot}"
+            );
+            let mut squared = 0.0f32;
+            for feature in 0..features {
+                let delta =
+                    values[row * features + feature] - values[id as usize * features + feature];
+                squared += delta * delta;
+            }
+            let expected = squared.sqrt();
+            assert!(
+                (distance - expected).abs() <= 1e-5 * expected.max(1.0),
+                "row {row} id {id}: distance {distance} vs host {expected}"
+            );
+            if slot > 0 {
+                let previous = distances[index - 1];
+                assert!(
+                    previous <= distance,
+                    "row {row} distances decrease at slot {slot}: {previous} then {distance}"
+                );
+            }
+        }
+    }
+}
+
+/// 420,000 rows exceed the former i32 join prefix ceiling (399,903 rows at
+/// max_candidates=60); the 64-bit pair prefixes must carry the run end to end.
+fn run_above_former_join_ceiling(device: &Device) {
+    let (n, features, k) = (420_000usize, 8usize, 14usize);
+    assert!(n * 5370 > i32::MAX as usize);
+    let iterations = (n as f64).log2().round().max(5.0) as u32;
+    let values = blob_values(n, features, 42);
+    let started = std::time::Instant::now();
+    let (ids, distances) = approximate(device, values.clone(), n, features, k, 42, iterations);
+    eprintln!(
+        "ANN n={n} wall time {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    check_large_rows(&ids, &distances, &values, n, features, k);
+    let mut random = SplitMix64(7);
+    let rows: Vec<usize> = (0..256)
+        .map(|_| (random.next_u64() % n as u64) as usize)
+        .collect();
+    let recall = sampled_recall_score(&ids, &values, n, features, k, &rows);
+    eprintln!("ANN n={n} sampled recall {recall:.4}");
+    assert!(recall >= 0.95, "sampled recall {recall} below 0.95");
+}
+
+#[test]
+#[ignore = "420k-row ANN above the former i32 join ceiling; run in --release with an external timeout"]
+fn ann_above_former_join_ceiling_cpu() {
+    run_above_former_join_ceiling(&Device::cpu());
+}
+
+#[test]
+#[ignore = "420k-row ANN above the former i32 join ceiling; run in --release with an external timeout"]
+fn ann_above_former_join_ceiling_cuda() {
+    let Some(device) = umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    run_above_former_join_ceiling(&device);
+}

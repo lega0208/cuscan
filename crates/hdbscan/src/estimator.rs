@@ -102,7 +102,7 @@ pub(crate) fn map_ann_error(error: AnnError) -> HdbscanError {
         AnnError::InvalidInput(message) => HdbscanError::InvalidInput(message),
         AnnError::Capability(message) => HdbscanError::BackendUnavailable(message),
         AnnError::Workspace(message) => HdbscanError::Numerical(message),
-        AnnError::Overflow(_) => HdbscanError::Overflow("ANN workspace"),
+        AnnError::Overflow(message) => HdbscanError::Capacity(message),
     }
 }
 
@@ -1556,6 +1556,25 @@ impl HDBSCANPredictor {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[test]
+    fn ann_capacity_error_keeps_precise_message() {
+        let message =
+            "ANN input copy buffer elements 4296000000 exceeds u32 addressing maximum 4294967295";
+        let error = map_ann_error(AnnError::Overflow(message.into()));
+        assert_eq!(error, HdbscanError::Capacity(message.into()));
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn overflow_display_does_not_claim_usize() {
+        let text = HdbscanError::Overflow("KD-tree node index").to_string();
+        assert_eq!(
+            text,
+            "KD-tree node index exceeds the supported integer range"
+        );
+        assert!(!text.contains("usize"));
+    }
 
     #[test]
     fn auto_search_uses_kd_tree_from_256_rows_up_to_30_features_without_row_cap() {

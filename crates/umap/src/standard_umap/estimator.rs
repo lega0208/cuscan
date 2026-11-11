@@ -181,14 +181,7 @@ impl UMAP {
                 (neighbors.indices, neighbors.distances)
             }
             NeighborSearch::Approximate => {
-                ann_preflight(&device, n, features, widths.nonself).map_err(
-                    |error| match error {
-                        AnnError::InvalidInput(message) => UmapError::InvalidInput(message),
-                        AnnError::Capability(message) => UmapError::BackendUnavailable(message),
-                        AnnError::Workspace(message) => UmapError::Numerical(message),
-                        AnnError::Overflow(_) => UmapError::Overflow("ANN workspace"),
-                    },
-                )?;
+                ann_preflight(&device, n, features, widths.nonself).map_err(map_ann_error)?;
                 let iters = (n as f64).log2().round().max(5.0) as u32;
                 let (indices, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
                     training_data.clone().into_dispatch(),
@@ -1618,9 +1611,36 @@ fn tensor_embedding(tensor: &Tensor<2>) -> Result<Embedding> {
         .collect())
 }
 
+/// Maps ANN preflight failures onto the UMAP error contract. Capacity rejections keep the
+/// precise ANN message (quantity, value, limit and shape).
+fn map_ann_error(error: AnnError) -> UmapError {
+    match error {
+        AnnError::InvalidInput(message) => UmapError::InvalidInput(message),
+        AnnError::Capability(message) => UmapError::BackendUnavailable(message),
+        AnnError::Workspace(message) => UmapError::Numerical(message),
+        AnnError::Overflow(message) => UmapError::Capacity(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ann_capacity_error_keeps_precise_message() {
+        let message =
+            "ANN input copy buffer elements 4296000000 exceeds u32 addressing maximum 4294967295";
+        let error = map_ann_error(AnnError::Overflow(message.into()));
+        assert_eq!(error, UmapError::Capacity(message.into()));
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn overflow_display_does_not_claim_usize() {
+        let text = UmapError::Overflow("layout edge id").to_string();
+        assert_eq!(text, "layout edge id exceeds the supported integer range");
+        assert!(!text.contains("usize"));
+    }
 
     #[test]
     fn layout_launch_failure_surfaces_for_fit_and_transform() {

@@ -953,7 +953,7 @@ fn map_hdbscan_error(error: HdbscanError) -> PyErr {
         HdbscanError::BackendUnavailable(_) | HdbscanError::Numerical(_) => {
             PyRuntimeError::new_err(message)
         }
-        HdbscanError::Overflow(_) => PyOverflowError::new_err(message),
+        HdbscanError::Overflow(_) | HdbscanError::Capacity(_) => PyOverflowError::new_err(message),
     }
 }
 
@@ -983,6 +983,10 @@ mod tests {
             );
             assert!(
                 map_hdbscan_error(HdbscanError::Overflow("test"))
+                    .is_instance_of::<PyOverflowError>(py)
+            );
+            assert!(
+                map_hdbscan_error(HdbscanError::Capacity("limit".into()))
                     .is_instance_of::<PyOverflowError>(py)
             );
         });

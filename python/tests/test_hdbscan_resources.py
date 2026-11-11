@@ -154,6 +154,21 @@ def test_bridge_overflow_is_typed_and_allocates_nothing() -> None:
         _cuscan.estimate_hdbscan_resources(100, 2**63, backend="cpu", min_samples=5)
 
 
+def test_bridge_accepts_ann_shape_above_former_join_ceiling() -> None:
+    # 1.5M rows exceeded the former i32 join prefix (399,903 rows); the 64-bit prefix
+    # accepts it, and 256 features route through the approximate kNN graph.
+    knn = _native_knn(
+        _cuscan.estimate_hdbscan_resources(1_500_000, 256, backend="cpu", min_samples=5)
+    )
+    assert knn["source"] == "ann"
+
+
+def test_bridge_ann_addressing_gate_reports_precise_capacity_error() -> None:
+    # 1.5M x 2864 input elements exceed the 32-bit kernel addressing limit.
+    with pytest.raises(OverflowError, match=r"input copy.*4294967295"):
+        _cuscan.estimate_hdbscan_resources(1_500_000, 2_864, backend="cpu", min_samples=5)
+
+
 def test_bridge_rejects_rows_outside_device_index_range() -> None:
     with pytest.raises(ValueError, match=r"row count.*supported maximum"):
         _cuscan.estimate_hdbscan_resources(2**40, KNN_FEATURES, backend="cpu", min_samples=5)

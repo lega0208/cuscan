@@ -372,8 +372,37 @@ projected = model.transform(X_new)
   `Auto` (`Exact` up to `AUTO_EXACT_MAX_ROWS` rows, `Approximate` above).
   `transform_queue_size` (default 4.0) controls approximate transform effort and
   is rejected for exact search.
+- **ANN capacity limits:** approximate fit neighbors (UMAP fit and the HDBSCAN
+  ANN branch) are checked by `ann_preflight` and `ann_host_estimate` before any
+  allocation; the checks depend only on the shape. The join and forest pair
+  prefixes are 64-bit, so the total number of candidate pairs is not limited to
+  i32. The remaining limits come from 32-bit ids, offsets and kernel addressing:
+  - rows `n <= i32::MAX`;
+  - forest membership `trees x n <= i32::MAX`; the tree count reaches 64 at
+    1,368,900 rows, so this allows at most 33,554,431 rows;
+  - reverse prefix `n x min(k + 4, n - 1) <= i32::MAX`;
+  - pairs within one forest leaf `L(L-1)/2 <= i32::MAX`; every shape that passes
+    the reverse-prefix limit already satisfies this;
+  - every ANN buffer `<= u32::MAX` elements, because kernels use 32-bit
+    addressing. In practice only the input copy `n x features` binds: at 256
+    features at most 16,777,215 rows. Above 128 features this is the tightest
+    limit.
+
+  A rejected shape returns `UmapError::Capacity` or `HdbscanError::Capacity`. The
+  message names the quantity, its value, the limit and the shape. Previously,
+  shapes above about 400,000 rows (the old i32 join prefix, 399,903 rows at the
+  fixed 60 sampled candidates) were rejected. Their wall time and memory are not
+  measured beyond a 420,000 x 8 end-to-end test; at 1,500,000 x 256 the estimate
+  reports several GB of runtime and host memory. Performance at these sizes is a
+  separate follow-up. Inputs wider than the addressing limit (for example
+  `n x features > u32::MAX` below 400,000 rows) used to be accepted and indexed
+  out of range; they are now rejected.
 - **Errors:** invalid input or configuration returns `UmapError`; Python raises
-  `ValueError` (input/config) or `RuntimeError` (backend/numerical). As in
+  `ValueError` (input/config) or `RuntimeError` (backend/numerical). Valid
+  input that exceeds a documented implementation limit (see ANN capacity limits)
+  returns `UmapError::Capacity` with the precise message; Python raises
+  `RuntimeError`. `UmapError::Overflow` reports values outside the supported
+  integer range. As in
   umap-learn, a one-row fit yields a zero embedding and cannot transform, and a
   graph with no edges (for example two rows) is an error.
 - **Spectral initialization of disconnected graphs:** with more than
@@ -561,7 +590,10 @@ the exact complete mutual-reachability graph. Above 30 features it builds a kNN 
 The graph width is `min(max(knn_k or max(3 * min_samples, 15), min_samples), n_finite - 1)`.
 It uses exact neighbors when `n_finite <= 4096`. Above 4096 finite rows it uses approximate
 neighbors at the resolved width (CubeCL ANN, fixed seed 42, squared distances,
-`max(5, round(log2(n)))` iterations); the width is not separately capped. Kruskal runs over the kNN edges. Components left
+`max(5, round(log2(n)))` iterations); the width is not separately capped. ANN
+shape limits are listed under ANN capacity limits in the UMAP section; a rejected
+shape returns `HdbscanError::Capacity`, which Python raises as `OverflowError` with
+the precise message. Kruskal runs over the kNN edges. Components left
 disconnected are joined by `+inf` bridges between each component's smallest finite-row index.
 The exact branch costs O(n²·d) work, like the complete route. The ANN branch's width is
 independent of the exact-route row limit. Quality evidence is empirical: on synthetic 6000×40 and

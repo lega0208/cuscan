@@ -1,7 +1,7 @@
 //! Shared launch geometry, workspace planning and output conversion for sampled NN-descent.
 
 use super::ann_forest::{
-    MAX_CANDIDATES, WorkspaceError, WorkspacePlan, plan_workspace, tree_count,
+    MAX_CANDIDATES, WorkspaceError, WorkspacePlan, forest_leaf_limit, plan_workspace, tree_count,
 };
 use super::ann_sampled;
 use crate::error::AnnError;
@@ -65,7 +65,22 @@ pub(super) fn workspace_error(stage: &str, error: WorkspaceError) -> AnnError {
         WorkspaceError::InvalidDimensions => {
             AnnError::Workspace(format!("ANN {stage} rejected invalid dimensions"))
         }
-        WorkspaceError::ArithmeticOverflow => AnnError::Overflow(format!("ANN {stage} overflows")),
+        WorkspaceError::ArithmeticOverflow => {
+            AnnError::Overflow(format!("ANN {stage} overflows usize"))
+        }
+        WorkspaceError::Capacity {
+            quantity,
+            value,
+            limit,
+        } => AnnError::Overflow(format!("ANN {stage}: {quantity} {value} exceeds {limit}")),
+    }
+}
+
+/// Appends the shape context to a capacity message produced by `host_plan`.
+fn with_shape(error: AnnError, shape: &str) -> AnnError {
+    match error {
+        AnnError::Overflow(message) => AnnError::Overflow(format!("{message} ({shape})")),
+        other => other,
     }
 }
 
@@ -85,7 +100,11 @@ pub(super) fn check_page_limit(
     let rounded = bytes
         .div_ceil(alignment)
         .checked_mul(alignment)
-        .ok_or_else(|| AnnError::Overflow(format!("ANN {stage} allocation size overflows")))?;
+        .ok_or_else(|| {
+            AnnError::Overflow(format!(
+                "ANN {stage} allocation size {bytes} rounded to alignment {alignment} overflows usize"
+            ))
+        })?;
     if rounded > max_page {
         return Err(AnnError::Capability(format!(
             "ANN {stage} allocation of {rounded} bytes exceeds device max page of {max_page} bytes"
@@ -94,38 +113,66 @@ pub(super) fn check_page_limit(
     Ok(())
 }
 
-/// Byte size of each distinct ANN device allocation for this shape, mirroring
-/// the buffers created in `ann_sampled::approximate_neighbors` and
-/// `forest_seed`. Every entry is checked against the device page limit.
+/// Number of distinct ANN device buffers described by `ann_buffer_table`.
+const ANN_BUFFERS: usize = 15;
+
+/// One entry per distinct ANN device allocation, mirroring the buffers created in
+/// `ann_sampled::approximate_neighbors` and `forest_seed`: `(stage, elements,
+/// element bytes)`. Shared by the addressing gate, the page checks and the estimate.
+/// Takes raw inputs so `host_plan` can call it before a `HostPlan` exists.
+fn ann_buffer_table(
+    n: usize,
+    features: usize,
+    k: usize,
+    width: usize,
+    capacity: usize,
+    ws: &WorkspacePlan,
+) -> Option<[(&'static str, usize, usize); ANN_BUFFERS]> {
+    let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
+    let leaf_entries = ws.forest_leaf_count.checked_add(1)?;
+    let row_entries = n.checked_add(1)?;
+    Some([
+        ("input copy", n.checked_mul(features)?, 4),
+        ("forest membership", ws.forest_membership_len, 4),
+        ("forest leaf rows", leaf_entries, 4),
+        ("forest pair prefix", leaf_entries, 8),
+        ("heap and merge", n.checked_mul(width)?, 4),
+        ("pair staging", ws.max_pair_slots_per_tile, 4),
+        ("endpoint staging", ws.max_endpoint_records, 4),
+        ("sampled pools", n.checked_mul(capacity.checked_mul(2)?)?, 4),
+        ("pool sizes", n.checked_mul(2)?, 4),
+        ("pair counts", n, 8),
+        ("center offsets", row_entries, 8),
+        ("row offsets", row_entries, 4),
+        ("chunk sums", chunks, 4),
+        ("join chunk sums", chunks, 8),
+        ("output", n.checked_mul(k)?, 4),
+    ])
+}
+
+/// Byte size of each distinct ANN device allocation for this shape. Every entry
+/// is checked against the device page limit.
 fn ann_allocation_bytes(
     n: usize,
     features: usize,
     k: usize,
     host: &HostPlan,
-) -> Result<[(&'static str, usize); 11], AnnError> {
-    let overflow = || AnnError::Overflow("ANN allocation size overflows usize".into());
-    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
-    let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
-    let ws = host.workspace;
-    let w = host.width;
-    let c = host.capacity;
-    let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
-    Ok([
-        ("input copy", mul(mul(n, features)?, 4)?),
-        ("forest membership", mul(ws.forest_membership_len, 4)?),
-        (
-            "forest leaf offsets",
-            mul(add(ws.forest_leaf_count, 1)?, 8)?,
-        ),
-        ("heap and merge", mul(mul(n, w)?, 4)?),
-        ("pair staging", mul(ws.max_pair_slots_per_tile, 4)?),
-        ("endpoint staging", mul(ws.max_endpoint_records, 4)?),
-        ("sampled pools", mul(mul(n, c * 2)?, 4)?),
-        ("pool sizes", mul(mul(n, 2)?, 4)?),
-        ("row offsets", mul(add(n, 1)?, 4)?),
-        ("chunk sums", mul(chunks, 4)?),
-        ("output", mul(mul(n, k)?, 4)?),
-    ])
+) -> Result<[(&'static str, usize); ANN_BUFFERS], AnnError> {
+    let overflow = || {
+        AnnError::Overflow(format!(
+            "ANN allocation size overflows usize (n={n}, features={features}, k={k})"
+        ))
+    };
+    let table = ann_buffer_table(n, features, k, host.width, host.capacity, &host.workspace)
+        .ok_or_else(overflow)?;
+    let mut bytes = [("", 0usize); ANN_BUFFERS];
+    for (entry, (stage, elements, element_bytes)) in bytes.iter_mut().zip(table) {
+        *entry = (
+            stage,
+            elements.checked_mul(element_bytes).ok_or_else(overflow)?,
+        );
+    }
+    Ok(bytes)
 }
 
 /// Pure shape and workspace checks. No client access.
@@ -145,35 +192,47 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
             "ANN neighbor count k={k} must be in 1..{n}"
         )));
     }
+    let base_shape = format!("n={n}, features={features}, k={k}");
     if n > i32::MAX as usize {
         return Err(AnnError::Overflow(format!(
-            "ANN row count {n} exceeds i32 range"
+            "ANN row count {n} exceeds i32 maximum {} ({base_shape})",
+            i32::MAX
         )));
     }
     let width = candidate_width(n, k);
     let capacity = MAX_CANDIDATES.min(n - 1);
-    let trees = tree_count(n).map_err(|error| workspace_error("tree count", error))?;
+    let trees = tree_count(n)
+        .map_err(|error| with_shape(workspace_error("tree count", error), &base_shape))?;
+    let leaf_limit = forest_leaf_limit(n, width);
+    let shape = format!("{base_shape}, width={width}, trees={trees}, leaf limit={leaf_limit}");
     let workspace = plan_workspace(n, width, capacity, features, trees)
-        .map_err(|error| workspace_error("workspace plan", error))?;
-    u32::try_from(n)
-        .map_err(|_| AnnError::Overflow("ANN row count exceeds CubeCL range".into()))?;
-    u32::try_from(width)
-        .map_err(|_| AnnError::Overflow("ANN width exceeds CubeCL range".into()))?;
-    u32::try_from(capacity)
-        .map_err(|_| AnnError::Overflow("ANN sample capacity exceeds CubeCL range".into()))?;
-    let max_total_slots = n
-        .checked_mul(workspace.pair_slots_per_center)
-        .ok_or_else(|| AnnError::Overflow("ANN pair slot count overflows usize".into()))?;
-    if max_total_slots > i32::MAX as usize {
-        return Err(AnnError::Overflow(
-            "ANN pair slot prefix exceeds i32".into(),
-        ));
-    }
+        .map_err(|error| with_shape(workspace_error("workspace plan", error), &shape))?;
+    // n <= i32::MAX was checked above; width < n and capacity < n follow.
+    debug_assert!(u32::try_from(width).is_ok() && u32::try_from(capacity).is_ok());
     let reverse_elements = n
         .checked_mul(width)
-        .ok_or_else(|| AnnError::Overflow("ANN reverse size overflows usize".into()))?;
+        .ok_or_else(|| AnnError::Overflow(format!("ANN reverse size overflows usize ({shape})")))?;
     if reverse_elements > i32::MAX as usize {
-        return Err(AnnError::Overflow("ANN reverse prefix exceeds i32".into()));
+        return Err(AnnError::Overflow(format!(
+            "ANN reverse prefix {reverse_elements} (n x width) exceeds i32 maximum {} ({shape})",
+            i32::MAX
+        )));
+    }
+    // Kernels address buffers with 32-bit `usize` (CubeCL's default U32 address
+    // type), so every buffer must stay within u32::MAX elements. Only the input copy
+    // is independently reachable; the other entries are implied by the gates above.
+    let table = ann_buffer_table(n, features, k, width, capacity, &workspace).ok_or_else(|| {
+        AnnError::Overflow(format!(
+            "ANN buffer element count overflows usize ({shape})"
+        ))
+    })?;
+    for (stage, elements, _) in table {
+        if elements > u32::MAX as usize {
+            return Err(AnnError::Overflow(format!(
+                "ANN {stage} buffer elements {elements} exceeds u32 addressing maximum {} ({shape})",
+                u32::MAX
+            )));
+        }
     }
     Ok(HostPlan {
         width,
@@ -342,8 +401,12 @@ pub(super) fn plan_for_client(
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
     // Largest independent launch is bounded by rows and by one pair tile.
     let independent_units = n.max(host.workspace.max_pair_slots_per_tile);
-    let independent_units = u32::try_from(independent_units)
-        .map_err(|_| AnnError::Overflow("ANN independent launch exceeds CubeCL range".into()))?;
+    let independent_units = u32::try_from(independent_units).map_err(|_| {
+        AnnError::Overflow(format!(
+            "ANN independent launch units {independent_units} exceeds u32 maximum {}",
+            u32::MAX
+        ))
+    })?;
     let units_per_cube = crate::legal_cube_dim(client, CubeDim::new_1d(ANN_CUBE_DIM.x)).x;
     ann_independent_cube_count(
         independent_units,
@@ -422,32 +485,44 @@ fn estimate_from_plan(
     k: usize,
     host: &HostPlan,
 ) -> Result<AnnEstimate, AnnError> {
-    let overflow = || AnnError::Overflow("ANN allocation estimate overflows usize".into());
+    let overflow = || {
+        AnnError::Overflow(format!(
+            "ANN allocation estimate overflows usize (n={n}, features={features}, k={k})"
+        ))
+    };
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
     let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
     let ws = host.workspace;
     let w = host.width;
     let c = host.capacity;
-    // Every ANN element type is a 4-byte I32 or F32.
+    // Element types are 4-byte I32/F32 except the 64-bit join and forest pair
+    // prefixes (pair counts, center offsets, join chunk sums, the join cursor
+    // placeholder and the forest pair prefix), which are 8-byte I64.
     let input = mul(mul(n, features)?, 4)?;
     // Eleven n x H buffers: heap ids/dists/flags, merge destinations A/B,
     // merge workspace, next flags, and reverse sources (n x H elements).
     let heap = mul(mul(n, w)?, 44)?;
     // Heap ids/dists/flags created by forest initialization.
     let init_heap = mul(mul(n, w)?, 12)?;
-    // Forest membership is i32 (4 bytes). forest_seed stores one i32 pair per
-    // leaf offset entry, including the terminal offset: (leaves + 1) pairs.
+    // Forest: i32 membership, plus i32 leaf row offsets and i64 pair prefix that
+    // each include the terminal entry: 4*membership + 4*(L+1) + 8*(L+1).
+    let leaf_entries = add(ws.forest_leaf_count, 1)?;
     let forest = add(
         mul(ws.forest_membership_len, 4)?,
-        mul(add(ws.forest_leaf_count, 1)?, 8)?,
+        add(mul(leaf_entries, 4)?, mul(leaf_entries, 8)?)?,
     )?;
-    // Per-row and per-center scratch: 8n counts/pools/cursors, three (n+1)
-    // offsets, 4nC sampled ids/priorities, chunk sums, and new_count.
-    let scratch_elems = add(
-        add(mul(n, 8)?, mul(add(n, 1)?, 3)?)?,
-        add(mul(mul(n, c)?, 4)?, add(n.div_ceil(128), 1)?)?,
+    // I32 scratch: 6n endpoint/reverse counts and cursors plus pool sizes, two
+    // (n+1) reverse/endpoint offsets, 4nC sampled ids/priorities, chunk sums,
+    // and new_count.
+    let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
+    let scratch_i32 = add(
+        add(mul(n, 6)?, mul(add(n, 1)?, 2)?)?,
+        add(mul(mul(n, c)?, 4)?, add(chunks, 1)?)?,
     )?;
-    let scratch = mul(scratch_elems, 4)?;
+    // I64 scratch: n pair counts, n+1 center offsets, join chunk sums and the
+    // one-element join cursor placeholder.
+    let scratch_i64 = add(add(n, add(n, 1)?)?, add(chunks, 1)?)?;
+    let scratch = add(mul(scratch_i32, 4)?, mul(scratch_i64, 8)?)?;
     // Pair staging: four 4-byte pair arrays. Endpoint staging: id and distance.
     let staging = add(
         mul(ws.max_pair_slots_per_tile, 16)?,
@@ -652,14 +727,129 @@ mod tests {
     }
 
     #[test]
-    fn host_plan_forest_prefix_overflow_follows_passing_pair_slot_check() {
-        // Pair-slot prefix n * 5370 is below i32::MAX, so only forest totals fail.
-        assert!(390_000usize * 5370 <= i32::MAX as usize);
-        let error = ann_host_estimate(390_000, 2, 256).unwrap_err();
-        assert!(matches!(
-            &error,
-            AnnError::Overflow(message) if message.as_str() == "ANN workspace plan overflows"
-        ));
+    fn host_plan_accepts_forest_prefix_above_i32() {
+        // 36 trees x 74_072_640 pairs per tree = 2_666_615_040 forest pairs, above
+        // i32::MAX, carried by the I64 forest pair prefix (ann_forest.rs plan test).
+        let host = host_plan(390_000, 2, 256).unwrap();
+        assert_eq!(host.workspace.forest_pair_count, 2_666_615_040);
+        assert!(ann_host_estimate(390_000, 2, 256).is_ok());
+    }
+
+    fn overflow_message(n: usize, features: usize, k: usize) -> String {
+        match ann_host_estimate(n, features, k) {
+            Err(AnnError::Overflow(message)) => message,
+            other => panic!("expected AnnError::Overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_estimate_accepts_former_join_ceiling_shapes() {
+        // n * 5370 = 8_055_000_000 join slots are carried by the I64 join prefix.
+        for k in [14, 29] {
+            let estimate = ann_host_estimate(1_500_000, 256, k).unwrap();
+            assert_eq!(estimate.trees, 64);
+            let host = host_plan(1_500_000, 256, k).unwrap();
+            let ws = host.workspace;
+            let n = 1_500_000usize;
+            let c = 60usize;
+            let leaf_entries = ws.forest_leaf_count + 1;
+            let forest = 4 * ws.forest_membership_len + 4 * leaf_entries + 8 * leaf_entries;
+            let chunks = n.div_ceil(128);
+            let scratch =
+                4 * (6 * n + 2 * (n + 1) + 4 * n * c + chunks + 1) + 8 * (n + (n + 1) + chunks + 1);
+            let input = 4 * n * 256;
+            let heap = 44 * n * host.width;
+            let staging = 16 * ws.max_pair_slots_per_tile + 8 * ws.max_endpoint_records;
+            assert_eq!(
+                estimate.phases[2].runtime_bytes,
+                input + forest + heap + scratch + staging,
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_gate_is_exact_at_its_boundary() {
+        // 64 trees x 33_554_431 = 2_147_483_584 <= i32::MAX; one more row exceeds it.
+        assert!(ann_host_estimate(33_554_431, 1, 14).is_ok());
+        let message = overflow_message(33_554_432, 1, 14);
+        for part in [
+            "forest membership",
+            "2147483648",
+            "2147483647",
+            "n=33554432",
+        ] {
+            assert!(message.contains(part), "{part} missing: {message}");
+        }
+    }
+
+    #[test]
+    fn addressing_gate_is_exact_at_its_boundary() {
+        // 1_500_000 x 2_863 = 4_294_500_000 <= u32::MAX; x 2_864 = 4_296_000_000.
+        assert!(ann_host_estimate(1_500_000, 2_863, 14).is_ok());
+        let message = overflow_message(1_500_000, 2_864, 14);
+        for part in ["input copy", "4296000000", "4294967295", "features=2864"] {
+            assert!(message.contains(part), "{part} missing: {message}");
+        }
+    }
+
+    #[test]
+    fn host_plan_row_count_and_reverse_messages_name_values_and_limits() {
+        let message = overflow_message(i32::MAX as usize + 1, 1, 1);
+        assert!(message.contains("row count 2147483648"), "{message}");
+        assert!(message.contains("2147483647"), "{message}");
+        assert!(message.contains("features=1, k=1"), "{message}");
+        // 65536 x width 65535 = 4_294_901_760 > i32::MAX; the single leaf's
+        // 65536*65535/2 pairs stay within the per-leaf gate.
+        let message = overflow_message(65_536, 1, 65_535);
+        for part in ["reverse prefix", "4294901760", "2147483647", "width=65535"] {
+            assert!(message.contains(part), "{part} missing: {message}");
+        }
+    }
+
+    fn assert_preflight_accepts_former_ceiling(device: &burn::tensor::Device) {
+        for k in [14, 29] {
+            let plan = ann_preflight(device, 1_500_000, 256, k).unwrap();
+            assert_eq!(plan.host, host_plan(1_500_000, 256, k).unwrap());
+        }
+    }
+
+    #[test]
+    fn preflight_accepts_former_join_ceiling_shape_on_cpu() {
+        let device = crate::construct_cpu_device(burn::tensor::Device::cpu).unwrap();
+        assert_preflight_accepts_former_ceiling(&device);
+    }
+
+    #[test]
+    fn preflight_accepts_former_join_ceiling_shape_on_cuda() {
+        let Some(device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+            );
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        };
+        assert_preflight_accepts_former_ceiling(&device);
+    }
+
+    #[test]
+    fn workspace_capacity_error_names_stage_quantity_value_and_limit() {
+        let error = workspace_error(
+            "workspace plan",
+            WorkspaceError::Capacity {
+                quantity: "forest membership length (trees x rows)",
+                value: 4_294_967_294,
+                limit: i32::MAX as usize,
+            },
+        );
+        let AnnError::Overflow(message) = error else {
+            panic!("expected overflow");
+        };
+        assert_eq!(
+            message,
+            "ANN workspace plan: forest membership length (trees x rows) 4294967294 exceeds 2147483647"
+        );
     }
 
     #[test]
@@ -672,14 +862,17 @@ mod tests {
         assert_eq!(estimate.directed_edges, 33);
         let [input, forest_init, refinement, output] = estimate.phases;
         assert_eq!(input.runtime_bytes, 88);
-        // Forest: 55 i32 membership (220 B) + (5 leaves + terminal) i32 pairs (48 B),
-        // plus 12*n*H heap seeds (924 B) and the input tensor.
-        assert_eq!(forest_init.runtime_bytes, 88 + 268 + 924);
-        // Refinement adds 11*n*H heap buffers, 4-byte scratch, and pair/endpoint staging.
-        assert_eq!(refinement.runtime_bytes, 57_048);
-        // Output adds 8*n*k bytes of I32/F32 output tensors.
-        assert_eq!(output.runtime_bytes, 57_312);
-        assert_eq!(estimate.runtime_peak_bytes, 57_312);
+        // Forest: 55 i32 membership (220 B) + 6 i32 leaf rows (24 B) + 6 i64 pair
+        // prefix entries (48 B) = 292 B, plus 12*n*H heap seeds (924 B) and the input.
+        assert_eq!(forest_init.runtime_bytes, 88 + 292 + 924);
+        // Refinement: input 88 + forest 292 + heap 44*11*7 = 3388 + staging
+        // 16*1595 + 8*3190 = 51_040 + scratch. I32 scratch: 6*11 + 2*12 + 4*11*10
+        // + 1 chunk + 1 = 532 words (2128 B); I64 scratch: 11 + 12 + 1 + 1 = 25
+        // words (200 B). Total 88 + 292 + 3388 + 2328 + 51_040 = 57_136.
+        assert_eq!(refinement.runtime_bytes, 57_136);
+        // Output adds 8*n*k = 264 bytes of I32/F32 output tensors.
+        assert_eq!(output.runtime_bytes, 57_400);
+        assert_eq!(estimate.runtime_peak_bytes, 57_400);
         let cpu = estimate
             .phases
             .iter()

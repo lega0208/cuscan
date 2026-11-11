@@ -6,3 +6,11 @@ rustflags = [
   "-Zshare-generics=y",
   "-Zthreads=8",
 ]
+
+# Resolve dependency features once for the whole workspace so `-p <crate>` builds share
+# compiled dependencies instead of rebuilding them per package selection.
+[unstable]
+feature-unification = true
+
+[resolver]
+feature-unification = "workspace"

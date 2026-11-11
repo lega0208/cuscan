@@ -50,6 +50,12 @@ pub(super) struct WorkspacePlan {
 pub(super) enum WorkspaceError {
     InvalidDimensions,
     ArithmeticOverflow,
+    /// A valid shape exceeds a documented implementation limit.
+    Capacity {
+        quantity: &'static str,
+        value: usize,
+        limit: usize,
+    },
 }
 
 /// Plan `n_trees = min(64, 5 + round(sqrt(n)/20))`.
@@ -255,9 +261,12 @@ pub(super) fn plan_workspace(
         .checked_mul(heap_width)
         .and_then(|v| v.checked_mul(32))
         .and_then(|v| v.checked_add(n.checked_mul(c)?.checked_mul(16)?))
-        .and_then(|v| v.checked_add(n.checked_add(1)?.checked_mul(32)?))
+        // Per-row scratch: eight I32 words (counts, cursors, pool sizes, two offset
+        // arrays) plus two I64 words (join pair counts and center offsets) per row.
+        .and_then(|v| v.checked_add(n.checked_add(1)?.checked_mul(48)?))
         .and_then(|v| v.checked_add(WORKSPACE_FIXED_BYTES))
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
+    // The formula's 16nH + 16nC slack covers the 16(n+1) I64 scratch bytes.
     // Host forest, downloaded data, and seed heaps are released before pair
     // staging allocation; the device persistent buffers remain for the join.
     debug_assert!(actual_persistent <= formula_persistent);
@@ -317,8 +326,8 @@ struct ForestTotals {
 /// `split_node`: a node of size `m <= L` is one leaf contributing
 /// `m*(m-1)/2` pairs; otherwise it splits into `floor(m/2)` and `ceil(m/2)`.
 /// Every tree has identical totals, so trees contribute `trees * per_tree`.
-/// All tree totals and the i32-typed membership/offset/pair-prefix values are
-/// checked here, before any forest allocation.
+/// All tree totals, the i32-typed membership/offset values and the per-leaf pair
+/// count are checked here, before any forest allocation.
 fn forest_totals(
     n: usize,
     leaf_limit: usize,
@@ -338,10 +347,32 @@ fn forest_totals(
     let pair_count = pairs
         .checked_mul(trees)
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    // i32 storage: membership ids and leaf offsets are bounded by membership_len;
-    // pair prefixes are bounded by the total pair count.
-    if membership_len > i32::MAX as usize || pair_count > i32::MAX as usize {
-        return Err(WorkspaceError::ArithmeticOverflow);
+    // I32 storage: membership ids and leaf row offsets are bounded by membership_len.
+    if membership_len > i32::MAX as usize {
+        return Err(WorkspaceError::Capacity {
+            quantity: "forest membership length (trees x rows)",
+            value: membership_len,
+            limit: i32::MAX as usize,
+        });
+    }
+    // The forest pair prefix is I64, so the total is bounded only by the checked
+    // usize arithmetic above. Within a leaf the kernel narrows the local pair to u32
+    // and walks it in O(L), so one leaf's pairs must stay within i32. For every shape
+    // `host_plan` accepts this is implied by its reverse gate (n * width <= i32::MAX):
+    // L = 2w <= n gives L(L-1)/2 < 2w^2 <= n*w; L = n gives w >= n/2 and
+    // L(L-1)/2 < n^2/2 <= n*w; L = 10 is trivially small. It is kept here because this
+    // function takes an arbitrary leaf limit.
+    let max_leaf = leaf_limit.min(n);
+    let leaf_pairs = max_leaf
+        .checked_mul(max_leaf - 1)
+        .ok_or(WorkspaceError::ArithmeticOverflow)?
+        / 2;
+    if leaf_pairs > i32::MAX as usize {
+        return Err(WorkspaceError::Capacity {
+            quantity: "per-leaf pair count (L(L-1)/2)",
+            value: leaf_pairs,
+            limit: i32::MAX as usize,
+        });
     }
     Ok(ForestTotals {
         leaf_limit,
@@ -401,6 +432,14 @@ fn next_unit(state: &mut u64) -> f32 {
 mod tests {
     use super::*;
 
+    fn membership(value: usize) -> WorkspaceError {
+        WorkspaceError::Capacity {
+            quantity: "forest membership length (trees x rows)",
+            value,
+            limit: i32::MAX as usize,
+        }
+    }
+
     /// A memo is only valid for one leaf limit, so each call gets a fresh one.
     fn totals(m: usize, leaf_limit: usize) -> (usize, usize) {
         let mut memo = std::collections::BTreeMap::new();
@@ -432,17 +471,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_workspace_rejects_forest_prefix_that_pair_slot_check_accepts() {
-        // Host pair-slot check passes: 390000 * (C(C-1)/2 + C^2) with C=60.
-        assert!(390_000usize * 5370 <= i32::MAX as usize);
+    fn plan_workspace_accepts_forest_prefix_above_i32() {
         assert_eq!(tree_count(390_000).unwrap(), 36);
-        // Leaf limit min(max(10, 2*260), n) = 520 gives 1024 leaves of 380/381
-        // rows per tree: 320*72390 + 704*71010 = 73_155_840 pairs per tree.
-        // Times 36 trees exceeds i32::MAX (2_147_483_647).
-        assert_eq!(
-            plan_workspace(390_000, 260, MAX_CANDIDATES, 2, 36),
-            Err(WorkspaceError::ArithmeticOverflow)
-        );
+        // Leaf limit min(max(10, 2*260), n) = 520 gives 1024 leaves per tree:
+        // 390000 = 1024*380 + 880, so 880 leaves of 381 rows and 144 of 380:
+        // 880*72390 + 144*72010 = 74_072_640 pairs per tree; x36 = 2_666_615_040,
+        // above i32::MAX and carried by the I64 forest pair prefix.
+        let plan = plan_workspace(390_000, 260, MAX_CANDIDATES, 2, 36).unwrap();
+        assert_eq!(plan.forest_pair_count, 2_666_615_040);
     }
 
     #[test]
@@ -456,13 +492,13 @@ mod tests {
         );
         assert_eq!(
             forest_totals(i32::MAX as usize + 1, 1, 1),
-            Err(WorkspaceError::ArithmeticOverflow)
+            Err(membership(i32::MAX as usize + 1))
         );
         assert_eq!(
             forest_totals(i32::MAX as usize, 1, 2),
-            Err(WorkspaceError::ArithmeticOverflow)
+            Err(membership(2 * i32::MAX as usize))
         );
-        // Pairs = trees * m(m-1)/2 for a single leaf (limit = n).
+        // Per-leaf pairs m(m-1)/2 for a single leaf (limit = n):
         // 65536*65535/2 = 2_147_450_880 accepted; 65537*65536/2 = 2_147_516_416 rejected.
         assert_eq!(
             forest_totals(65_536, 65_536, 1).unwrap().pair_count,
@@ -470,12 +506,16 @@ mod tests {
         );
         assert_eq!(
             forest_totals(65_537, 65_537, 1),
-            Err(WorkspaceError::ArithmeticOverflow)
+            Err(WorkspaceError::Capacity {
+                quantity: "per-leaf pair count (L(L-1)/2)",
+                value: 2_147_516_416,
+                limit: i32::MAX as usize,
+            })
         );
-        // Two trees double the pair prefix past i32 even though one tree fits.
+        // Two trees put the pair total above i32; the I64 prefix accepts it.
         assert_eq!(
-            forest_totals(65_536, 65_536, 2),
-            Err(WorkspaceError::ArithmeticOverflow)
+            forest_totals(65_536, 65_536, 2).unwrap().pair_count,
+            4_294_901_760
         );
     }
 
