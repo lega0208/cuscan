@@ -35,7 +35,7 @@ burn = { version = "0.22.1", default-features = false, features = [
   "fusion",
 ] }
 burn-cubecl = { version = "0.22.1", default-features = false, features = ["cpu", "cuda"] }
-cubecl = { version = "0.11.1", default-features = false, features = ["cpu", "cuda", "persistence"] }
+cubecl = { version = "0.11.1", default-features = false, features = ["cpu", "cuda", "persistence", "stdlib"] }
 cubecl-cpu = { version = "0.11.1", default-features = false }
 cudarc = { version = "0.19.10", features = [
   "std",

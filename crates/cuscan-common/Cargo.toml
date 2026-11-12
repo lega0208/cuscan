@@ -15,6 +15,14 @@ cubecl-cpu = { workspace = true }
 cudarc = { workspace = true }
 rayon = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = []
+test-support = []
 tracing = ["burn/tracing", "burn-cubecl/tracing", "cubecl/tracing"]
+
+[[example]]
+name = "ann_tile_probe"
+required-features = ["test-support"]

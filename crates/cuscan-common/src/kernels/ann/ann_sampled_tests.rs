@@ -32,6 +32,272 @@ fn f32_tensor(device: &CubeDevice, shape: &[usize], values: Vec<f32>) -> CubeTen
     raw_tensor(device, shape, values, DType::F32)
 }
 
+#[test]
+fn memory_failure_preserves_fresh_availability_and_server_error() {
+    for stage in ["allocation", "input buffer synchronization"] {
+        let error = memory_failure(stage, "synthetic server error", 500, 400, Ok(123));
+        match error {
+            AnnError::Memory {
+                required_bytes,
+                available_bytes,
+                message,
+            } => {
+                assert_eq!(required_bytes, 500);
+                assert_eq!(available_bytes, 123);
+                assert!(message.contains(stage));
+                assert!(message.contains("synthetic server error"));
+                assert!(message.contains("fresh free 123 bytes"));
+                assert!(message.contains("planned usable 400 bytes"));
+            }
+            other => panic!("expected memory error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn memory_failure_preserves_query_failure_as_unknown_availability() {
+    for stage in ["allocation", "input buffer synchronization"] {
+        let error = memory_failure(
+            stage,
+            "synthetic server error",
+            500,
+            400,
+            Err("synthetic query error".into()),
+        );
+        match error {
+            AnnError::Memory {
+                required_bytes,
+                available_bytes,
+                message,
+            } => {
+                assert_eq!(required_bytes, 500);
+                assert_eq!(available_bytes, 0);
+                assert!(message.contains(stage));
+                assert!(message.contains("synthetic server error"));
+                assert!(message.contains("synthetic query error"));
+                assert!(message.contains("unknown"));
+                assert!(message.contains("planned usable 400 bytes"));
+            }
+            other => panic!("expected memory error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cpu_combined_budget_rejects_before_forest_readback() {
+    let (n, features, k) = (64, 1024, 8);
+    let device = crate::construct_cpu_device(burn::tensor::Device::cpu).unwrap();
+    let burn::backend::DispatchDevice::Cube(cube) = device.as_dispatch();
+    let client = cube.client();
+    let alignment = usize::try_from(client.properties().memory.alignment).unwrap();
+    let ample = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let plan = super::super::orchestration::ann_preflight(&device, n, features, k, &ample).unwrap();
+    let slots = (n * plan.host.workspace.pair_slots_per_center)
+        .max(plan.host.workspace.forest_pair_count)
+        .min(1 << 20);
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        plan.host.width,
+        plan.host.capacity,
+        &plan.host.workspace,
+        slots,
+    )
+    .unwrap();
+    let mut fixed = [0u64; 4];
+    let mut staging = 0u64;
+    for entry in table
+        .iter()
+        .filter(|entry| entry.route == BufferRoute::Both)
+    {
+        let bytes = (entry.bytes().unwrap().div_ceil(alignment) * alignment) as u64;
+        if entry.staging {
+            staging += bytes;
+        } else {
+            for (phase, total) in fixed.iter_mut().enumerate() {
+                if entry.phases & (1 << phase) != 0 {
+                    *total += bytes;
+                }
+            }
+        }
+    }
+    let runtime_min = *fixed.iter().max().unwrap() + staging;
+    fixed[1] += plan.host.workspace.host_peak_bytes as u64;
+    let cpu_min = *fixed.iter().max().unwrap() + staging;
+    assert!(cpu_min > runtime_min);
+    let usable = runtime_min + (cpu_min - runtime_min) / 2;
+    let budget = crate::memory::MemoryBudget {
+        limit_bytes: Some(usable + crate::memory::MEMORY_RESERVE_BYTES),
+        ..ample
+    };
+    assert_eq!(budget.usable_bytes(0), usable);
+
+    // The logical shape is valid, but forest_seed rejects this short readback.
+    let data = CubeTensor::new_contiguous(
+        client.clone(),
+        cube.clone(),
+        Shape::new([n, features]),
+        client.empty(4),
+        DType::F32,
+    );
+    ALLOCATION_LOG.with(|log| log.borrow_mut().clear());
+    let result = super::super::orchestration::ann_preflight(&device, n, features, k, &budget)
+        .and_then(|plan| {
+            super::super::orchestration::approximate_neighbors_planned(data, &plan, 42, 1, false)
+        });
+    match result {
+        Err(AnnError::Memory {
+            required_bytes,
+            available_bytes,
+            ..
+        }) => {
+            assert_eq!(required_bytes, cpu_min);
+            assert_eq!(available_bytes, usable);
+            assert!(runtime_min <= available_bytes && available_bytes < required_bytes);
+        }
+        other => panic!("expected combined CPU memory rejection, got {other:?}"),
+    }
+    ALLOCATION_LOG.with(|log| assert!(log.borrow().is_empty()));
+}
+
+fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
+    use std::collections::HashMap;
+
+    let n = 16;
+    let features = 3;
+    let k = 3;
+    let values: Vec<f32> = (0..n * features)
+        .map(|i| ((i * 17 + i * i * 3) % 101) as f32 / 13.0)
+        .collect();
+    let contiguous = f32_tensor(&device, &[n, features], values.clone());
+    let strided = if pitched {
+        let data = burn::tensor::TensorData::new(values.clone(), Shape::new([n, features]));
+        let (bytes, shape, dtype) = data.into_parts();
+        let client = device.client();
+        let allocation = client.create_tensor(bytes, shape, dtype.size());
+        let mut tensor = contiguous.clone();
+        tensor.handle = allocation.memory;
+        tensor.meta.strides = allocation.strides;
+        tensor
+    } else {
+        let transposed: Vec<f32> = (0..features)
+            .flat_map(|column| {
+                (0..n).map({
+                    let values = &values;
+                    move |row| values[row * features + column]
+                })
+            })
+            .collect();
+        let mut tensor = f32_tensor(&device, &[features, n], transposed);
+        tensor.meta.shape.swap(0, 1);
+        tensor.meta.strides.swap(0, 1);
+        tensor
+    };
+    assert!(contiguous.is_contiguous());
+    assert!(
+        !strided.is_contiguous(),
+        "fixture must exercise input copying"
+    );
+    let device = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let plan =
+        super::super::orchestration::ann_preflight(&device, n, features, k, &budget).unwrap();
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        plan.host.width,
+        plan.host.capacity,
+        &plan.host.workspace,
+        plan.tile_slots,
+    )
+    .unwrap();
+    let mut outputs = Vec::new();
+    for (input, copied) in [(contiguous, false), (strided, true)] {
+        ALLOCATION_LOG.with(|log| log.borrow_mut().clear());
+        let (ids, distances) = approximate_neighbors(input, k, 42, 2, false, plan).unwrap();
+        let log = ALLOCATION_LOG.with(|log| log.borrow().clone());
+        let mut counts = HashMap::new();
+        for key in &log {
+            *counts.entry(*key).or_insert(0usize) += 1;
+        }
+        let survival = cfg!(feature = "test-support")
+            && std::env::var_os("CUSCAN_ANN_PROFILE").is_some()
+            && std::env::var_os("CUSCAN_ANN_SURVIVAL_PROFILE").is_some();
+        for entry in &table {
+            let expected = match entry.buffer {
+                Buffer::Input => 0,
+                Buffer::InputCopy => usize::from(copied),
+                Buffer::SurvivalCounts => usize::from(survival),
+                _ => 1,
+            };
+            assert_eq!(
+                counts.remove(&entry.buffer).unwrap_or(0),
+                expected,
+                "allocation {:?}",
+                entry.buffer
+            );
+        }
+        assert!(
+            counts.is_empty(),
+            "allocations absent from table: {counts:?}"
+        );
+        let forest = [
+            Buffer::ForestRows,
+            Buffer::ForestLeafRows,
+            Buffer::ForestPairPrefix,
+            Buffer::HeapIds,
+            Buffer::HeapDistances,
+            Buffer::Flags,
+        ];
+        let start = usize::from(copied);
+        assert_eq!(&log[start..start + forest.len()], &forest);
+        outputs.push((
+            ids.client.read_one_unchecked(ids.handle.clone()).to_vec(),
+            distances
+                .client
+                .read_one_unchecked(distances.handle.clone())
+                .to_vec(),
+        ));
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "input layout changed ANN output bits"
+    );
+}
+
+#[test]
+fn driver_allocation_log_and_strided_input_cpu() {
+    driver_allocation_fixture(CubeDevice::Cpu(Default::default()), false);
+}
+
+#[test]
+fn driver_allocation_log_and_pitched_input_cuda() {
+    let count = crate::cuda_backend::try_device_count()
+        .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+    if count == 0 {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+        );
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    driver_allocation_fixture(
+        CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }),
+        true,
+    );
+}
+
 fn read_i32(tensor: &CubeTensor) -> Vec<i32> {
     tensor
         .client
@@ -56,6 +322,90 @@ fn read_f32(tensor: &CubeTensor) -> Vec<f32> {
 
 fn launch_units(client: &cubecl::client::Client, units: usize) -> (CubeCount, CubeDim) {
     ann_independent_launch(client, u32::try_from(units).unwrap()).unwrap()
+}
+
+#[cfg(feature = "test-support")]
+fn survival_fixture(device: CubeDevice) {
+    let client = device.client();
+    let counts = i32_tensor(&device, &[2], vec![123, 456]);
+    let heap_ids = i32_tensor(&device, &[4, 2], vec![1, 2, 0, 2, 0, 4, 0, 1]);
+    let heap_distances = f32_tensor(
+        &device,
+        &[4, 2],
+        vec![1.0, 5.0, 1.0, 5.0, 1.0, f32::INFINITY, 1.0, 5.0],
+    );
+    // The diagnostic tests only the tile-start worst-entry predicate, not the
+    // merge's separate nonnegative/finite validity rules or batch tightening.
+    let cases = [
+        (0, 1, 5.0, 1, 2, 2),      // lower IDs win both exact ties
+        (0, 3, 5.0, 1, 2, 1),      // higher ID loses at row 0
+        (0, 2, f32::NAN, 1, 2, 1), // NaN fails full row, passes non-full row
+        (0, 1, -1.0, 1, 2, 2),     // negative passes the threshold predicate
+        (0, 1, f32::NEG_INFINITY, 1, 2, 2),
+        (0, 2, f32::INFINITY, 1, 2, 1),
+        (99, 99, 0.0, 0, 0, 0), // invalid slot must not access either row
+    ];
+    for (left_id, right_id, distance, is_valid, produced, predicted) in cases {
+        let left = i32_tensor(&device, &[1], vec![left_id]);
+        let right = i32_tensor(&device, &[1], vec![right_id]);
+        let distances = f32_tensor(&device, &[1], vec![distance]);
+        let valid = i32_tensor(&device, &[1], vec![is_valid]);
+        let inputs = [
+            &left,
+            &right,
+            &distances,
+            &valid,
+            &heap_ids,
+            &heap_distances,
+        ];
+        let before: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|tensor| client.read_one_unchecked(tensor.handle.clone()).to_vec())
+            .collect();
+        let actual = profile_tile_survival(
+            &client,
+            &counts,
+            &left,
+            &right,
+            &distances,
+            &valid,
+            &heap_ids,
+            &heap_distances,
+            4,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            (produced, predicted),
+            "left={left_id} right={right_id} distance={distance:?} valid={is_valid}"
+        );
+        let after: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|tensor| client.read_one_unchecked(tensor.handle.clone()).to_vec())
+            .collect();
+        assert_eq!(before, after, "diagnostic mutated an input");
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn survival_profile_fixture_cpu() {
+    survival_fixture(CubeDevice::Cpu(Default::default()));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn survival_profile_fixture_cuda() {
+    let count = crate::cuda_backend::try_device_count()
+        .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+    assert!(
+        count > 0,
+        "survival profile CUDA fixture requires a usable CUDA device"
+    );
+    survival_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
 }
 
 fn merge_fixture(device: CubeDevice) {

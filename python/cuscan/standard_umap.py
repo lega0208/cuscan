@@ -16,6 +16,9 @@ class UMAP:
     ``2 * n_components`` components and some component's centroid affinity to all others
     underflows to zero (umap-learn only warns there); use ``init="random"``, a larger
     ``n_neighbors``, or scaled features instead.
+
+    ``memory_limit_bytes`` limits the estimated ANN working set including the input.
+    It is not a reservation or a budget for the entire fit; exact search is unaffected.
     """
 
     def __init__(
@@ -38,6 +41,7 @@ class UMAP:
         device_index: int = 0,
         neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
         unique: bool = False,
+        memory_limit_bytes: int | None = None,
     ) -> None:
         self.n_components = n_components
         self.n_neighbors = n_neighbors
@@ -57,6 +61,7 @@ class UMAP:
         self.device_index = device_index
         self.neighbor_search = neighbor_search
         self.unique = unique
+        self.memory_limit_bytes = memory_limit_bytes
 
     @staticmethod
     def _input_array(X: ArrayLike) -> NDArray[np.float32]:
@@ -80,6 +85,12 @@ class UMAP:
             not isinstance(self.n_epochs, (int, np.integer)) or self.n_epochs <= 0
         ):
             raise ValueError("n_epochs must be a positive integer or None")
+        if self.memory_limit_bytes is not None and (
+            isinstance(self.memory_limit_bytes, (bool, np.bool_))
+            or not isinstance(self.memory_limit_bytes, (int, np.integer))
+            or not 0 < int(self.memory_limit_bytes) <= 2**64 - 1
+        ):
+            raise ValueError("memory_limit_bytes must be a positive uint64 integer or None")
         model = _cuscan.fit_umap(
             x,
             n_components=self.n_components,
@@ -100,6 +111,9 @@ class UMAP:
             device_index=self.device_index,
             neighbor_search=self.neighbor_search,
             unique=self.unique,
+            memory_limit_bytes=(
+                None if self.memory_limit_bytes is None else int(self.memory_limit_bytes)
+            ),
         )
         snapshot = {
             name: getattr(self, name)
@@ -120,6 +134,7 @@ class UMAP:
                 "transform_queue_size",
                 "neighbor_search",
                 "unique",
+                "memory_limit_bytes",
             )
         }
         self.embedding_ = model.embedding

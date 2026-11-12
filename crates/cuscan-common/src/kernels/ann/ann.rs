@@ -5,10 +5,107 @@ use super::ann_forest::{
 };
 use super::ann_sampled;
 use crate::error::AnnError;
+use burn::backend::TensorMetadata;
 use burn::{backend::DispatchDevice, cubecl::prelude::*, tensor::DType};
 use burn_cubecl::tensor::CubeTensor;
 
 const ANN_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
+const BUDGET_TILE_CEILING_SLOTS: usize = 1 << 24;
+
+/// Bounds used by the budgeted tile planner, independent of runtime handles.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TileCaps {
+    pub max_slots: usize,
+    pub budget_ceiling_slots: usize,
+    pub max_page: usize,
+    pub alignment: usize,
+    pub units_per_cube: u32,
+    pub max_cubes: u32,
+    pub cpu_merge: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TileRequest {
+    Default,
+    Exact(usize),
+    Budget { usable_bytes: u64, fixed_bytes: u64 },
+}
+
+/// Sum the actual six staging allocations after individual alignment.
+fn tile_staging_bytes(slots: usize, alignment: usize) -> Result<u64, AnnError> {
+    staging_entries(slots)
+        .ok_or_else(|| AnnError::Overflow("ANN staging shape overflows usize".into()))?
+        .iter()
+        .try_fold(0u64, |sum, entry| {
+            let bytes = entry
+                .bytes()
+                .ok_or_else(|| AnnError::Overflow("ANN staging bytes overflow usize".into()))?;
+            sum.checked_add(aligned_bytes(bytes, alignment)?)
+                .ok_or_else(|| AnnError::Overflow("ANN staging total overflows u64".into()))
+        })
+}
+
+fn plan_tiles(caps: TileCaps, request: TileRequest) -> Result<usize, AnnError> {
+    if caps.max_slots == 0 || caps.max_page == 0 || caps.alignment == 0 || caps.units_per_cube == 0
+    {
+        return Err(AnnError::Capability(
+            "ANN tile limits must be nonzero".into(),
+        ));
+    }
+    let minimum = caps.max_slots.min(1 << 20);
+    let aligned_page = caps.max_page / caps.alignment * caps.alignment;
+    let launch_cap = u64::from(caps.max_cubes) * u64::from(caps.units_per_cube);
+    let upper = caps
+        .max_slots
+        .min(i32::MAX as usize / 2)
+        .min(aligned_page / 8)
+        .min(usize::try_from(launch_cap).unwrap_or(usize::MAX))
+        .min(if caps.cpu_merge { 1 << 26 } else { usize::MAX });
+    if upper < minimum {
+        return Err(AnnError::Capability(format!(
+            "ANN minimum tile {minimum} exceeds device tile cap {upper}"
+        )));
+    }
+    match request {
+        TileRequest::Default => Ok(upper.min(1 << 22)),
+        TileRequest::Exact(slots) => {
+            if slots < minimum || slots > upper {
+                Err(AnnError::InvalidInput(format!(
+                    "ANN tile {slots} outside {minimum}..={upper}"
+                )))
+            } else {
+                Ok(slots)
+            }
+        }
+        TileRequest::Budget {
+            usable_bytes,
+            fixed_bytes,
+        } => {
+            let minimum_bytes = tile_staging_bytes(minimum, caps.alignment)?;
+            let required = fixed_bytes
+                .checked_add(minimum_bytes)
+                .ok_or_else(|| AnnError::Overflow("ANN minimum memory exceeds u64".into()))?;
+            if usable_bytes < required {
+                return Err(AnnError::Memory {
+                    required_bytes: required,
+                    available_bytes: usable_bytes,
+                    message: format!("ANN needs {required} bytes but {usable_bytes} are available"),
+                });
+            }
+            let elastic = usable_bytes - fixed_bytes;
+            let (mut low, mut high) = (minimum, upper.min(caps.budget_ceiling_slots));
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if tile_staging_bytes(mid, caps.alignment)? <= elastic {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            Ok(low)
+        }
+    }
+}
 
 // The k-only graph lost exact neighbors on the small nonlinear regression
 // (213/240 hits). A four-edge margin preserves alternative paths for refinement.
@@ -46,12 +143,24 @@ impl LaunchShape {
     }
 }
 
-/// Checked plan for one approximate-neighbor launch. `ann_preflight` and the
-/// op both derive it through `plan_for_client`.
+/// Checked shape, launch geometry and immutable memory admission for one ANN call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnPlan {
     pub(super) host: HostPlan,
     merge: LaunchShape,
+    pub n: usize,
+    pub features: usize,
+    pub k: usize,
+    pub tile_slots: usize,
+    pub memory: PlannedMemory,
+}
+
+/// Immutable admission numbers; executable validation does not query availability again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedMemory {
+    pub fixed_peak_bytes: u64,
+    pub staging_bytes: u64,
+    pub usable_bytes: u64,
 }
 
 impl AnnPlan {
@@ -113,41 +222,168 @@ pub(super) fn check_page_limit(
     Ok(())
 }
 
-/// Number of distinct ANN device buffers described by `ann_buffer_table`.
-const ANN_BUFFERS: usize = 15;
+/// Each variant names one allocation. Input is caller-owned and credited as live;
+/// InputCopy conservatively reserves row-major materialization on every route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Buffer {
+    Input,
+    InputCopy,
+    ForestRows,
+    ForestLeafRows,
+    ForestPairPrefix,
+    HeapIds,
+    HeapDistances,
+    Flags,
+    PairLeft,
+    PairRight,
+    PairDistances,
+    PairValid,
+    EndpointCounts,
+    EndpointOffsets,
+    EndpointCursors,
+    ReverseCounts,
+    ReverseOffsets,
+    ReverseCursors,
+    ReverseSources,
+    EndpointIds,
+    EndpointDistances,
+    SampledIds,
+    SampledPriorities,
+    DestinationAIds,
+    DestinationADistances,
+    DestinationBIds,
+    DestinationBDistances,
+    MergeWorkspaceIds,
+    MergeWorkspaceDistances,
+    NextFlags,
+    NewCount,
+    PoolSizes,
+    PairCounts,
+    CenterOffsets,
+    ChunkSums,
+    JoinChunkSums,
+    JoinCursorPlaceholder,
+    OutputIds,
+    OutputDistances,
+    SurvivalCounts,
+}
 
-/// One entry per distinct ANN device allocation, mirroring the buffers created in
-/// `ann_sampled::approximate_neighbors` and `forest_seed`: `(stage, elements,
-/// element bytes)`. Shared by the addressing gate, the page checks and the estimate.
-/// Takes raw inputs so `host_plan` can call it before a `HostPlan` exists.
-fn ann_buffer_table(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BufferRoute {
+    Both,
+    SurvivalProfile,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BufferEntry {
+    pub buffer: Buffer,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+    /// Bit mask for Input, ForestInit, Refinement and Output respectively.
+    pub phases: u8,
+    pub route: BufferRoute,
+    pub staging: bool,
+}
+
+impl BufferEntry {
+    pub(super) fn elements(&self) -> Option<usize> {
+        self.shape.iter().try_fold(1usize, |a, &b| a.checked_mul(b))
+    }
+
+    pub(super) fn bytes(&self) -> Option<usize> {
+        self.elements()?.checked_mul(self.dtype.size())
+    }
+}
+
+fn staging_entries(slots: usize) -> Option<[BufferEntry; 6]> {
+    use Buffer::*;
+    let endpoints = slots.checked_mul(2)?;
+    Some(
+        [
+            (PairLeft, DType::I32, slots),
+            (PairRight, DType::I32, slots),
+            (PairDistances, DType::F32, slots),
+            (PairValid, DType::I32, slots),
+            (EndpointIds, DType::I32, endpoints),
+            (EndpointDistances, DType::F32, endpoints),
+        ]
+        .map(|(buffer, dtype, count)| BufferEntry {
+            buffer,
+            shape: vec![count],
+            dtype,
+            phases: 12,
+            route: BufferRoute::Both,
+            staging: true,
+        }),
+    )
+}
+
+/// The current driver's allocations, including buffers retained through output.
+pub(super) fn ann_buffer_table(
     n: usize,
     features: usize,
     k: usize,
     width: usize,
     capacity: usize,
     ws: &WorkspacePlan,
-) -> Option<[(&'static str, usize, usize); ANN_BUFFERS]> {
+    tile_slots: usize,
+) -> Option<Vec<BufferEntry>> {
+    use Buffer::*;
     let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
     let leaf_entries = ws.forest_leaf_count.checked_add(1)?;
     let row_entries = n.checked_add(1)?;
-    Some([
-        ("input copy", n.checked_mul(features)?, 4),
-        ("forest membership", ws.forest_membership_len, 4),
-        ("forest leaf rows", leaf_entries, 4),
-        ("forest pair prefix", leaf_entries, 8),
-        ("heap and merge", n.checked_mul(width)?, 4),
-        ("pair staging", ws.max_pair_slots_per_tile, 4),
-        ("endpoint staging", ws.max_endpoint_records, 4),
-        ("sampled pools", n.checked_mul(capacity.checked_mul(2)?)?, 4),
-        ("pool sizes", n.checked_mul(2)?, 4),
-        ("pair counts", n, 8),
-        ("center offsets", row_entries, 8),
-        ("row offsets", row_entries, 4),
-        ("chunk sums", chunks, 4),
-        ("join chunk sums", chunks, 8),
-        ("output", n.checked_mul(k)?, 4),
-    ])
+    let pool_width = capacity.checked_mul(2)?;
+    let pool_sizes = n.checked_mul(2)?;
+    let mut entries = Vec::new();
+    macro_rules! entry {
+        ($name:ident, $dtype:ident, $phases:expr, $staging:expr, $($dim:expr),+) => {
+            entries.push(BufferEntry { buffer: $name, shape: vec![$($dim),+], dtype: DType::$dtype,
+                phases: $phases, route: BufferRoute::Both, staging: $staging });
+        };
+    }
+    entry!(Input, F32, 15, false, n, features);
+    entry!(InputCopy, F32, 15, false, n, features);
+    entry!(ForestRows, I32, 14, false, ws.forest_membership_len);
+    entry!(ForestLeafRows, I32, 14, false, leaf_entries);
+    entry!(ForestPairPrefix, I64, 14, false, leaf_entries);
+    entry!(HeapIds, I32, 14, false, n, width);
+    entry!(HeapDistances, F32, 14, false, n, width);
+    entry!(Flags, I32, 14, false, n, width);
+    entries.extend(staging_entries(tile_slots)?);
+    entry!(EndpointCounts, I32, 12, false, n);
+    entry!(EndpointOffsets, I32, 12, false, row_entries);
+    entry!(EndpointCursors, I32, 12, false, n);
+    entry!(ReverseCounts, I32, 12, false, n);
+    entry!(ReverseOffsets, I32, 12, false, row_entries);
+    entry!(ReverseCursors, I32, 12, false, n);
+    entry!(ReverseSources, I32, 12, false, n.checked_mul(width)?);
+    entry!(SampledIds, I32, 12, false, n, pool_width);
+    entry!(SampledPriorities, I32, 12, false, n, pool_width);
+    entry!(DestinationAIds, I32, 12, false, n, width);
+    entry!(DestinationADistances, F32, 12, false, n, width);
+    entry!(DestinationBIds, I32, 12, false, n, width);
+    entry!(DestinationBDistances, F32, 12, false, n, width);
+    entry!(MergeWorkspaceIds, I32, 12, false, n, width);
+    entry!(MergeWorkspaceDistances, F32, 12, false, n, width);
+    entry!(NextFlags, I32, 12, false, n, width);
+    entry!(NewCount, I32, 12, false, 1);
+    entry!(PoolSizes, I32, 12, false, pool_sizes);
+    entry!(PairCounts, I64, 12, false, n);
+    entry!(CenterOffsets, I64, 12, false, row_entries);
+    entry!(ChunkSums, I32, 12, false, chunks);
+    entry!(JoinChunkSums, I64, 12, false, chunks);
+    entry!(JoinCursorPlaceholder, I64, 12, false, 1);
+    entry!(OutputIds, I32, 8, false, n, k);
+    entry!(OutputDistances, F32, 8, false, n, k);
+    entries.push(BufferEntry {
+        buffer: SurvivalCounts,
+        shape: vec![2],
+        dtype: DType::I32,
+        phases: 12,
+        route: BufferRoute::SurvivalProfile,
+        staging: false,
+    });
+    Some(entries)
 }
 
 /// Byte size of each distinct ANN device allocation for this shape. Every entry
@@ -157,22 +393,32 @@ fn ann_allocation_bytes(
     features: usize,
     k: usize,
     host: &HostPlan,
-) -> Result<[(&'static str, usize); ANN_BUFFERS], AnnError> {
+    tile_slots: usize,
+) -> Result<Vec<(String, usize)>, AnnError> {
     let overflow = || {
         AnnError::Overflow(format!(
             "ANN allocation size overflows usize (n={n}, features={features}, k={k})"
         ))
     };
-    let table = ann_buffer_table(n, features, k, host.width, host.capacity, &host.workspace)
-        .ok_or_else(overflow)?;
-    let mut bytes = [("", 0usize); ANN_BUFFERS];
-    for (entry, (stage, elements, element_bytes)) in bytes.iter_mut().zip(table) {
-        *entry = (
-            stage,
-            elements.checked_mul(element_bytes).ok_or_else(overflow)?,
-        );
-    }
-    Ok(bytes)
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        host.width,
+        host.capacity,
+        &host.workspace,
+        tile_slots,
+    )
+    .ok_or_else(overflow)?;
+    table
+        .into_iter()
+        .map(|entry| {
+            Ok((
+                format!("{:?}", entry.buffer),
+                entry.bytes().ok_or_else(overflow)?,
+            ))
+        })
+        .collect()
 }
 
 /// Pure shape and workspace checks. No client access.
@@ -221,15 +467,21 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
     // Kernels address buffers with 32-bit `usize` (CubeCL's default U32 address
     // type), so every buffer must stay within u32::MAX elements. Only the input copy
     // is independently reachable; the other entries are implied by the gates above.
-    let table = ann_buffer_table(n, features, k, width, capacity, &workspace).ok_or_else(|| {
-        AnnError::Overflow(format!(
-            "ANN buffer element count overflows usize ({shape})"
-        ))
-    })?;
-    for (stage, elements, _) in table {
+    let tile_slots = default_tile_slots(n, &workspace)?;
+    let table = ann_buffer_table(n, features, k, width, capacity, &workspace, tile_slots)
+        .ok_or_else(|| {
+            AnnError::Overflow(format!(
+                "ANN buffer element count overflows usize ({shape})"
+            ))
+        })?;
+    for entry in table {
+        let elements = entry
+            .elements()
+            .ok_or_else(|| AnnError::Overflow(format!("ANN buffer size overflows ({shape})")))?;
         if elements > u32::MAX as usize {
             return Err(AnnError::Overflow(format!(
-                "ANN {stage} buffer elements {elements} exceeds u32 addressing maximum {} ({shape})",
+                "ANN {:?} buffer elements {elements} exceeds u32 addressing maximum {} ({shape})",
+                entry.buffer,
                 u32::MAX
             )));
         }
@@ -380,27 +632,26 @@ fn ann_independent_cube_count(
     Ok(count)
 }
 
-/// Checked plan from the client's hardware and the problem shape. Both
-/// `ann_preflight` and the op call this function.
-pub(super) fn plan_for_client(
+fn plan_with_host(
     client: &cubecl::client::Client,
     n: usize,
     features: usize,
     k: usize,
+    host: HostPlan,
+    tile_slots: usize,
 ) -> Result<AnnPlan, AnnError> {
-    let host = host_plan(n, features, k)?;
     let memory = &client.properties().memory;
     let max_page = usize::try_from(memory.max_page_size)
         .map_err(|_| AnnError::Capability("device max page size exceeds usize".into()))?;
     let alignment = usize::try_from(memory.alignment)
         .map_err(|_| AnnError::Capability("device alignment exceeds usize".into()))?;
-    for (stage, bytes) in ann_allocation_bytes(n, features, k, &host)? {
-        check_page_limit(stage, bytes, max_page, alignment)?;
+    for (stage, bytes) in ann_allocation_bytes(n, features, k, &host, tile_slots)? {
+        check_page_limit(&stage, bytes, max_page, alignment)?;
     }
     let n_u32 = u32::try_from(n).expect("ANN row count validated by host_plan");
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
     // Largest independent launch is bounded by rows and by one pair tile.
-    let independent_units = n.max(host.workspace.max_pair_slots_per_tile);
+    let independent_units = n.max(tile_slots);
     let independent_units = u32::try_from(independent_units).map_err(|_| {
         AnnError::Overflow(format!(
             "ANN independent launch units {independent_units} exceeds u32 maximum {}",
@@ -413,7 +664,173 @@ pub(super) fn plan_for_client(
         units_per_cube,
         client.properties().hardware.max_cube_count.0,
     )?;
-    Ok(AnnPlan { host, merge })
+    let (fixed_peak_bytes, _) = fixed_memory(n, features, k, &host, alignment, merge.cpu_merge)?;
+    let staging_bytes = tile_staging_bytes(tile_slots, alignment)?;
+    Ok(AnnPlan {
+        host,
+        merge,
+        n,
+        features,
+        k,
+        tile_slots,
+        memory: PlannedMemory {
+            fixed_peak_bytes,
+            staging_bytes,
+            usable_bytes: fixed_peak_bytes
+                .checked_add(staging_bytes)
+                .ok_or_else(|| AnnError::Overflow("ANN planned memory overflows u64".into()))?,
+        },
+    })
+}
+
+fn aligned_bytes(bytes: usize, alignment: usize) -> Result<u64, AnnError> {
+    if alignment == 0 {
+        return Err(AnnError::Capability(
+            "device reports zero allocation alignment".into(),
+        ));
+    }
+    bytes
+        .checked_add(alignment - 1)
+        .and_then(|value| (value / alignment).checked_mul(alignment))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| AnnError::Overflow("ANN aligned allocation exceeds address space".into()))
+}
+
+fn fixed_memory(
+    n: usize,
+    features: usize,
+    k: usize,
+    host: &HostPlan,
+    alignment: usize,
+    cpu: bool,
+) -> Result<(u64, Vec<(String, u64)>), AnnError> {
+    let overflow = || AnnError::Overflow("ANN fixed memory overflows address space".into());
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        host.width,
+        host.capacity,
+        &host.workspace,
+        0,
+    )
+    .ok_or_else(overflow)?;
+    let mut phases = [0u64; 4];
+    let mut contributors = Vec::new();
+    for entry in table {
+        if entry.staging || entry.route != BufferRoute::Both {
+            continue;
+        }
+        let bytes = aligned_bytes(entry.bytes().ok_or_else(overflow)?, alignment)?;
+        contributors.push((format!("{:?}", entry.buffer), bytes));
+        for (phase, total) in phases.iter_mut().enumerate() {
+            if entry.phases & (1 << phase) != 0 {
+                *total = total.checked_add(bytes).ok_or_else(overflow)?;
+            }
+        }
+    }
+    if cpu {
+        phases[1] = phases[1]
+            .checked_add(u64::try_from(host.workspace.host_peak_bytes).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        contributors.push((
+            "host forest/readback/scratch".into(),
+            host.workspace.host_peak_bytes as u64,
+        ));
+    }
+    contributors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok((
+        *phases.iter().max().expect("four allocation phases"),
+        contributors,
+    ))
+}
+
+fn tile_caps(
+    client: &cubecl::client::Client,
+    n: usize,
+    host: &HostPlan,
+) -> Result<TileCaps, AnnError> {
+    let memory = &client.properties().memory;
+    let max_slots = n
+        .checked_mul(host.workspace.pair_slots_per_center)
+        .ok_or_else(|| AnnError::Overflow("ANN total pair slots overflow usize".into()))?
+        .max(host.workspace.forest_pair_count);
+    let cpu_merge = client.name() == "cpu";
+    Ok(TileCaps {
+        max_slots,
+        budget_ceiling_slots: BUDGET_TILE_CEILING_SLOTS,
+        max_page: usize::try_from(memory.max_page_size)
+            .map_err(|_| AnnError::Capability("device max page exceeds usize".into()))?,
+        alignment: usize::try_from(memory.alignment)
+            .map_err(|_| AnnError::Capability("device alignment exceeds usize".into()))?,
+        units_per_cube: crate::legal_cube_dim(client, CubeDim::new_1d(ANN_CUBE_DIM.x)).x,
+        max_cubes: client.properties().hardware.max_cube_count.0,
+        cpu_merge,
+    })
+}
+
+fn default_tile_slots(n: usize, workspace: &WorkspacePlan) -> Result<usize, AnnError> {
+    let max_slots = n
+        .checked_mul(workspace.pair_slots_per_center)
+        .ok_or_else(|| AnnError::Overflow("ANN total pair slots overflow usize".into()))?
+        .max(workspace.forest_pair_count);
+    plan_tiles(
+        TileCaps {
+            max_slots,
+            budget_ceiling_slots: usize::MAX,
+            max_page: usize::MAX,
+            alignment: 1,
+            units_per_cube: 32,
+            max_cubes: u32::MAX,
+            cpu_merge: false,
+        },
+        TileRequest::Default,
+    )
+}
+
+/// Run the existing ANN driver with an explicitly sized pair tile for experiments.
+///
+/// This support-only entry point accepts an F32 rank-two CubeTensor and returns
+/// raw I32 neighbor IDs and F32 distances. The tile is used in both forest and
+/// refinement phases; it is validated against device allocation and launch limits.
+#[cfg(feature = "test-support")]
+pub fn approximate_neighbors_with_tile_slots(
+    data: CubeTensor,
+    k: usize,
+    seed: u64,
+    max_iterations: u32,
+    squared: bool,
+    tile_slots: usize,
+) -> Result<(CubeTensor, CubeTensor), AnnError> {
+    if data.dtype != DType::F32 || data.rank() != 2 {
+        return Err(AnnError::InvalidInput(
+            "ANN input must be a rank-two F32 tensor".into(),
+        ));
+    }
+    let [n, features] = data.shape().dims::<2>();
+    let host = host_plan(n, features, k)?;
+    plan_tiles(
+        tile_caps(&data.client, n, &host)?,
+        TileRequest::Exact(tile_slots),
+    )?;
+    let plan = plan_with_host(&data.client, n, features, k, host, tile_slots)?;
+    ann_sampled::approximate_neighbors(data, k, seed, max_iterations, squared, plan)
+}
+
+/// Shape/capability-only exact tile plan for bitwise invariance tests.
+#[cfg(feature = "test-support")]
+pub fn ann_preflight_with_tile_slots(
+    device: &burn::tensor::Device,
+    n: usize,
+    features: usize,
+    k: usize,
+    slots: usize,
+) -> Result<AnnPlan, AnnError> {
+    let DispatchDevice::Cube(device) = device.as_dispatch();
+    let client = device.client();
+    let host = host_plan(n, features, k)?;
+    plan_tiles(tile_caps(&client, n, &host)?, TileRequest::Exact(slots))?;
+    plan_with_host(&client, n, features, k, host, slots)
 }
 
 /// Public launch preflight. Returns typed errors for invalid shapes and
@@ -423,9 +840,34 @@ pub fn ann_preflight(
     n: usize,
     features: usize,
     k: usize,
+    budget: &crate::memory::MemoryBudget,
 ) -> Result<AnnPlan, AnnError> {
     let DispatchDevice::Cube(cube_device) = device.as_dispatch();
-    plan_for_client(&cube_device.client(), n, features, k)
+    let client = cube_device.client();
+    let host = host_plan(n, features, k)?;
+    let caps = tile_caps(&client, n, &host)?;
+    let (fixed, contributors) =
+        fixed_memory(n, features, k, &host, caps.alignment, caps.cpu_merge)?;
+    let live = n
+        .checked_mul(features)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| AnnError::Overflow("ANN live input size overflows usize".into()))?;
+    let usable = budget.usable_bytes(aligned_bytes(live, caps.alignment)?);
+    let slots = plan_tiles(caps, TileRequest::Budget { usable_bytes: usable, fixed_bytes: fixed })
+        .map_err(|error| match error {
+            AnnError::Memory { required_bytes, available_bytes, .. } => {
+                let largest = contributors.iter().take(3)
+                    .map(|(name, bytes)| format!("{name} {bytes}"))
+                    .collect::<Vec<_>>().join(", ");
+                let limit = budget.limit_bytes.map_or_else(|| "none".into(), |v| v.to_string());
+                AnnError::Memory { required_bytes, available_bytes,
+                    message: format!("ANN needs {required_bytes} bytes of device memory but {available_bytes} are available (free {}, total {}, limit {limit}); largest buffers: {largest}; (n={n}, features={features}, k={k})", budget.free_bytes, budget.total_bytes) }
+            }
+            other => other,
+        })?;
+    let mut plan = plan_with_host(&client, n, features, k, host, slots)?;
+    plan.memory.usable_bytes = usable;
+    Ok(plan)
 }
 
 /// Allocation phase of one ANN call, in execution order.
@@ -470,6 +912,12 @@ pub struct AnnEstimate {
     pub runtime_peak_bytes: usize,
     /// Maximum over phases of `host + runtime`, for CPU where both are host RAM.
     pub cpu_combined_peak_bytes: usize,
+    /// Peak runtime bytes excluding pair and endpoint staging.
+    pub fixed_runtime_peak_bytes: usize,
+    /// Unaligned runtime bytes per pair slot across six staging buffers.
+    pub staging_bytes_per_slot: usize,
+    /// Fixed runtime peak plus the minimum tile, without alignment rounding.
+    pub min_runtime_bytes: usize,
 }
 
 /// Pure, checked allocation estimate for `ann_preflight` shapes. Uses the same
@@ -495,63 +943,50 @@ fn estimate_from_plan(
     let ws = host.workspace;
     let w = host.width;
     let c = host.capacity;
-    // Element types are 4-byte I32/F32 except the 64-bit join and forest pair
-    // prefixes (pair counts, center offsets, join chunk sums, the join cursor
-    // placeholder and the forest pair prefix), which are 8-byte I64.
-    let input = mul(mul(n, features)?, 4)?;
-    // Eleven n x H buffers: heap ids/dists/flags, merge destinations A/B,
-    // merge workspace, next flags, and reverse sources (n x H elements).
-    let heap = mul(mul(n, w)?, 44)?;
-    // Heap ids/dists/flags created by forest initialization.
-    let init_heap = mul(mul(n, w)?, 12)?;
-    // Forest: i32 membership, plus i32 leaf row offsets and i64 pair prefix that
-    // each include the terminal entry: 4*membership + 4*(L+1) + 8*(L+1).
-    let leaf_entries = add(ws.forest_leaf_count, 1)?;
-    let forest = add(
-        mul(ws.forest_membership_len, 4)?,
-        add(mul(leaf_entries, 4)?, mul(leaf_entries, 8)?)?,
-    )?;
-    // I32 scratch: 6n endpoint/reverse counts and cursors plus pool sizes, two
-    // (n+1) reverse/endpoint offsets, 4nC sampled ids/priorities, chunk sums,
-    // and new_count.
-    let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
-    let scratch_i32 = add(
-        add(mul(n, 6)?, mul(add(n, 1)?, 2)?)?,
-        add(mul(mul(n, c)?, 4)?, add(chunks, 1)?)?,
-    )?;
-    // I64 scratch: n pair counts, n+1 center offsets, join chunk sums and the
-    // one-element join cursor placeholder.
-    let scratch_i64 = add(add(n, add(n, 1)?)?, add(chunks, 1)?)?;
-    let scratch = add(mul(scratch_i32, 4)?, mul(scratch_i64, 8)?)?;
-    // Pair staging: four 4-byte pair arrays. Endpoint staging: id and distance.
-    let staging = add(
-        mul(ws.max_pair_slots_per_tile, 16)?,
-        mul(ws.max_endpoint_records, 8)?,
-    )?;
-    let output = mul(mul(n, k)?, 8)?;
+    let slots = default_tile_slots(n, &ws)?;
+    let table = ann_buffer_table(n, features, k, w, c, &ws, slots).ok_or_else(overflow)?;
+    let mut runtime = [0usize; 4];
+    let mut fixed = [0usize; 4];
+    for entry in &table {
+        if entry.route != BufferRoute::Both {
+            continue;
+        }
+        let bytes = entry.bytes().ok_or_else(overflow)?;
+        for phase in 0..4 {
+            if entry.phases & (1 << phase) != 0 {
+                runtime[phase] = add(runtime[phase], bytes)?;
+                if !entry.staging {
+                    fixed[phase] = add(fixed[phase], bytes)?;
+                }
+            }
+        }
+    }
+    let input = table
+        .iter()
+        .find(|entry| entry.buffer == Buffer::Input)
+        .and_then(BufferEntry::bytes)
+        .ok_or_else(overflow)?;
     let trees = tree_count(n).map_err(|error| workspace_error("tree count", error))?;
-
-    let refinement_runtime = add(add(add(input, forest)?, add(heap, scratch)?)?, staging)?;
     let phases = [
         AnnPhaseBytes {
             phase: AnnPhase::Input,
             host_bytes: mul(input, 2)?,
-            runtime_bytes: input,
+            runtime_bytes: runtime[0],
         },
         AnnPhaseBytes {
             phase: AnnPhase::ForestInit,
             host_bytes: ws.host_peak_bytes,
-            runtime_bytes: add(add(input, forest)?, init_heap)?,
+            runtime_bytes: runtime[1],
         },
         AnnPhaseBytes {
             phase: AnnPhase::Refinement,
             host_bytes: 0,
-            runtime_bytes: refinement_runtime,
+            runtime_bytes: runtime[2],
         },
         AnnPhaseBytes {
             phase: AnnPhase::Output,
             host_bytes: 0,
-            runtime_bytes: add(refinement_runtime, output)?,
+            runtime_bytes: runtime[3],
         },
     ];
     let host_peak_bytes = phases.iter().map(|p| p.host_bytes).max().unwrap_or(0);
@@ -568,6 +1003,20 @@ fn estimate_from_plan(
         host_peak_bytes,
         runtime_peak_bytes,
         cpu_combined_peak_bytes,
+        fixed_runtime_peak_bytes: *fixed.iter().max().unwrap(),
+        staging_bytes_per_slot: usize::try_from(tile_staging_bytes(1, 1)?)
+            .map_err(|_| overflow())?,
+        min_runtime_bytes: add(
+            *fixed.iter().max().unwrap(),
+            usize::try_from(tile_staging_bytes(
+                n.checked_mul(ws.pair_slots_per_center)
+                    .ok_or_else(overflow)?
+                    .max(ws.forest_pair_count)
+                    .min(1 << 20),
+                1,
+            )?)
+            .map_err(|_| overflow())?,
+        )?,
     })
 }
 
@@ -694,26 +1143,263 @@ pub(super) fn ann_output<F: Float, I: Int>(
     }
 }
 
-/// Bounded sampled NN-descent. `squared` skips the output square root.
-///
-/// The trait returns a tensor pair, so an invalid launch is reported by
-/// panicking. The estimator must call `ann_preflight` before dispatch to
-/// surface `AnnError` as a typed error.
-pub(crate) fn approximate_neighbors(
+/// Execute a checked plan on its original shape and device capabilities.
+pub fn approximate_neighbors_planned(
     data: CubeTensor,
-    k: u32,
+    plan: &AnnPlan,
     seed: u64,
     max_iterations: u32,
     squared: bool,
-) -> (CubeTensor, CubeTensor) {
-    let k = usize::try_from(k).expect("ANN width exceeds usize");
-    ann_sampled::approximate_neighbors(data, k, seed, max_iterations, squared)
-        .unwrap_or_else(|error| panic!("ANN launch rejected after preflight: {error}"))
+) -> Result<(CubeTensor, CubeTensor), AnnError> {
+    if data.dtype != DType::F32
+        || data.rank() != 2
+        || data.shape().dims::<2>() != [plan.n, plan.features]
+    {
+        return Err(AnnError::InvalidInput(
+            "ANN plan does not match input shape or dtype".into(),
+        ));
+    }
+    let host = host_plan(plan.n, plan.features, plan.k)?;
+    plan_tiles(
+        tile_caps(&data.client, plan.n, &host)?,
+        TileRequest::Exact(plan.tile_slots),
+    )?;
+    let mut checked = plan_with_host(
+        &data.client,
+        plan.n,
+        plan.features,
+        plan.k,
+        host,
+        plan.tile_slots,
+    )?;
+    checked.memory = plan.memory;
+    if checked != *plan {
+        return Err(AnnError::InvalidInput(
+            "ANN plan does not match executable device fields".into(),
+        ));
+    }
+    ann_sampled::approximate_neighbors(data, plan.k, seed, max_iterations, squared, *plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ample_budget() -> crate::memory::MemoryBudget {
+        crate::memory::MemoryBudget {
+            total_bytes: u64::MAX,
+            free_bytes: u64::MAX,
+            limit_bytes: None,
+        }
+    }
+
+    #[test]
+    fn cpu_combined_forest_peak_rejects_runtime_only_budget() {
+        let (n, features, k) = (64, 1024, 8);
+        let host = host_plan(n, features, k).unwrap();
+        let caps = TileCaps {
+            max_slots: (n * host.workspace.pair_slots_per_center)
+                .max(host.workspace.forest_pair_count),
+            budget_ceiling_slots: BUDGET_TILE_CEILING_SLOTS,
+            max_page: usize::MAX,
+            alignment: 1,
+            units_per_cube: 32,
+            max_cubes: u32::MAX,
+            cpu_merge: true,
+        };
+        let runtime_fixed = fixed_memory(n, features, k, &host, caps.alignment, false)
+            .unwrap()
+            .0;
+        let cpu_fixed = fixed_memory(n, features, k, &host, caps.alignment, true)
+            .unwrap()
+            .0;
+        let staging = tile_staging_bytes(caps.max_slots.min(1 << 20), caps.alignment).unwrap();
+        let runtime_min = runtime_fixed + staging;
+        let cpu_min = cpu_fixed + staging;
+        assert!(cpu_min > runtime_min);
+        let usable = runtime_min + (cpu_min - runtime_min) / 2;
+        assert!(
+            plan_tiles(
+                caps,
+                TileRequest::Budget {
+                    usable_bytes: usable,
+                    fixed_bytes: runtime_fixed,
+                }
+            )
+            .is_ok()
+        );
+        match plan_tiles(
+            caps,
+            TileRequest::Budget {
+                usable_bytes: usable,
+                fixed_bytes: cpu_fixed,
+            },
+        ) {
+            Err(AnnError::Memory {
+                required_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!(required_bytes, cpu_min);
+                assert_eq!(available_bytes, usable);
+                assert!(runtime_min <= available_bytes && available_bytes < required_bytes);
+            }
+            other => panic!("expected combined CPU memory rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_tile_alignment_minimum_and_caps() {
+        let caps = TileCaps {
+            max_slots: 8_000_000,
+            budget_ceiling_slots: BUDGET_TILE_CEILING_SLOTS,
+            max_page: usize::MAX,
+            alignment: 512,
+            units_per_cube: 32,
+            max_cubes: u32::MAX,
+            cpu_merge: false,
+        };
+        let minimum = 1 << 20;
+        let fixed_bytes = 123;
+        let minimum_bytes = tile_staging_bytes(minimum, caps.alignment).unwrap();
+        assert!(matches!(
+            plan_tiles(
+                caps,
+                TileRequest::Budget {
+                    usable_bytes: fixed_bytes + minimum_bytes - 1,
+                    fixed_bytes,
+                }
+            ),
+            Err(AnnError::Memory { .. })
+        ));
+        assert_eq!(
+            plan_tiles(
+                caps,
+                TileRequest::Budget {
+                    usable_bytes: fixed_bytes + minimum_bytes,
+                    fixed_bytes,
+                }
+            )
+            .unwrap(),
+            minimum
+        );
+        let q = minimum + 129;
+        let bytes = tile_staging_bytes(q, caps.alignment).unwrap();
+        assert!(
+            plan_tiles(
+                caps,
+                TileRequest::Budget {
+                    usable_bytes: fixed_bytes + bytes - 1,
+                    fixed_bytes
+                }
+            )
+            .unwrap()
+                < q
+        );
+        assert!(
+            plan_tiles(
+                caps,
+                TileRequest::Budget {
+                    usable_bytes: fixed_bytes + bytes,
+                    fixed_bytes
+                }
+            )
+            .unwrap()
+                >= q
+        );
+        assert_eq!(plan_tiles(caps, TileRequest::Default).unwrap(), 1 << 22);
+        assert!(plan_tiles(caps, TileRequest::Exact(minimum - 1)).is_err());
+        let limited = TileCaps {
+            max_cubes: minimum as u32 / 32,
+            ..caps
+        };
+        assert_eq!(
+            plan_tiles(limited, TileRequest::Exact(minimum)).unwrap(),
+            minimum
+        );
+        assert!(plan_tiles(limited, TileRequest::Exact(minimum + 1)).is_err());
+    }
+
+    #[test]
+    fn budget_ceiling_is_separate_from_validity_limits() {
+        let cuda = TileCaps {
+            max_slots: 1 << 27,
+            budget_ceiling_slots: BUDGET_TILE_CEILING_SLOTS,
+            max_page: usize::MAX,
+            alignment: 1,
+            units_per_cube: 32,
+            max_cubes: u32::MAX,
+            cpu_merge: false,
+        };
+        let ample = TileRequest::Budget {
+            usable_bytes: u64::MAX,
+            fixed_bytes: 123,
+        };
+        assert_eq!(plan_tiles(cuda, ample).unwrap(), BUDGET_TILE_CEILING_SLOTS);
+
+        let q = (1 << 22) + 129;
+        let bytes = tile_staging_bytes(q, cuda.alignment).unwrap();
+        assert!(tile_staging_bytes(q + 1, cuda.alignment).unwrap() > bytes);
+        assert_eq!(
+            plan_tiles(
+                cuda,
+                TileRequest::Budget {
+                    usable_bytes: 123 + bytes,
+                    fixed_bytes: 123,
+                }
+            )
+            .unwrap(),
+            q
+        );
+
+        let cpu = TileCaps {
+            cpu_merge: true,
+            ..cuda
+        };
+        assert_eq!(plan_tiles(cpu, ample).unwrap(), BUDGET_TILE_CEILING_SLOTS);
+        assert_eq!(
+            plan_tiles(cpu, TileRequest::Exact(1 << 26)).unwrap(),
+            1 << 26
+        );
+        assert!(plan_tiles(cpu, TileRequest::Exact((1 << 26) + 1)).is_err());
+        assert_eq!(plan_tiles(cpu, TileRequest::Default).unwrap(), 1 << 22);
+        assert_eq!(
+            plan_tiles(cuda, TileRequest::Exact(1 << 26)).unwrap(),
+            1 << 26
+        );
+        assert!(plan_tiles(cuda, TileRequest::Exact((1 << 27) + 1)).is_err());
+        assert_eq!(plan_tiles(cuda, TileRequest::Default).unwrap(), 1 << 22);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn forced_tile_checks_endpoint_limits_and_allocation_sizes() {
+        let host = host_plan(40_000, 32, 14).unwrap();
+        let caps = TileCaps {
+            max_slots: 2_000_000_000,
+            budget_ceiling_slots: BUDGET_TILE_CEILING_SLOTS,
+            max_page: usize::MAX,
+            alignment: 1,
+            units_per_cube: 32,
+            max_cubes: u32::MAX,
+            cpu_merge: false,
+        };
+        assert!(plan_tiles(caps, TileRequest::Exact(0)).is_err());
+        assert!(plan_tiles(caps, TileRequest::Exact(usize::MAX)).is_err());
+        assert!(plan_tiles(caps, TileRequest::Exact(i32::MAX as usize / 2 + 1)).is_err());
+        assert_eq!(
+            plan_tiles(caps, TileRequest::Exact(1 << 24)).unwrap(),
+            1 << 24
+        );
+        let allocations = ann_allocation_bytes(40_000, 32, 14, &host, 1 << 24).unwrap();
+        let (_, endpoint_bytes) = allocations
+            .iter()
+            .find(|(name, _)| *name == "EndpointIds")
+            .unwrap();
+        assert_eq!(*endpoint_bytes, 1 << 27);
+        assert!(check_page_limit("endpoint staging", *endpoint_bytes, (1 << 27) - 1, 1).is_err());
+        assert!(ann_independent_cube_count(1 << 24, 32, (1 << 19) - 1).is_err());
+    }
 
     fn full_limits() -> CooperativeLimits {
         CooperativeLimits {
@@ -759,10 +1445,10 @@ mod tests {
                 4 * (6 * n + 2 * (n + 1) + 4 * n * c + chunks + 1) + 8 * (n + (n + 1) + chunks + 1);
             let input = 4 * n * 256;
             let heap = 44 * n * host.width;
-            let staging = 16 * ws.max_pair_slots_per_tile + 8 * ws.max_endpoint_records;
+            let staging = 32 * default_tile_slots(n, &ws).unwrap();
             assert_eq!(
                 estimate.phases[2].runtime_bytes,
-                input + forest + heap + scratch + staging,
+                2 * input + forest + heap + scratch + staging,
                 "k={k}"
             );
         }
@@ -788,7 +1474,7 @@ mod tests {
         // 1_500_000 x 2_863 = 4_294_500_000 <= u32::MAX; x 2_864 = 4_296_000_000.
         assert!(ann_host_estimate(1_500_000, 2_863, 14).is_ok());
         let message = overflow_message(1_500_000, 2_864, 14);
-        for part in ["input copy", "4296000000", "4294967295", "features=2864"] {
+        for part in ["Input", "4296000000", "4294967295", "features=2864"] {
             assert!(message.contains(part), "{part} missing: {message}");
         }
     }
@@ -809,8 +1495,17 @@ mod tests {
 
     fn assert_preflight_accepts_former_ceiling(device: &burn::tensor::Device) {
         for k in [14, 29] {
-            let plan = ann_preflight(device, 1_500_000, 256, k).unwrap();
-            assert_eq!(plan.host, host_plan(1_500_000, 256, k).unwrap());
+            let plan = ann_preflight(device, 1_500_000, 256, k, &ample_budget()).unwrap();
+            let shape = host_plan(1_500_000, 256, k).unwrap();
+            assert_eq!(
+                (plan.host.width, plan.host.capacity),
+                (shape.width, shape.capacity)
+            );
+            assert!(plan.tile_slots >= 1 << 20);
+            assert_eq!(
+                plan.host.workspace.forest_pair_count,
+                shape.workspace.forest_pair_count
+            );
         }
     }
 
@@ -861,18 +1556,19 @@ mod tests {
         assert_eq!(estimate.trees, 5);
         assert_eq!(estimate.directed_edges, 33);
         let [input, forest_init, refinement, output] = estimate.phases;
-        assert_eq!(input.runtime_bytes, 88);
+        // Original input plus the conservatively reserved contiguous copy: 2*11*2*4.
+        assert_eq!(input.runtime_bytes, 176);
         // Forest: 55 i32 membership (220 B) + 6 i32 leaf rows (24 B) + 6 i64 pair
         // prefix entries (48 B) = 292 B, plus 12*n*H heap seeds (924 B) and the input.
-        assert_eq!(forest_init.runtime_bytes, 88 + 292 + 924);
-        // Refinement: input 88 + forest 292 + heap 44*11*7 = 3388 + staging
+        assert_eq!(forest_init.runtime_bytes, 176 + 292 + 924);
+        // Refinement: input and copy 176 + forest 292 + heap 44*11*7 = 3388 + staging
         // 16*1595 + 8*3190 = 51_040 + scratch. I32 scratch: 6*11 + 2*12 + 4*11*10
         // + 1 chunk + 1 = 532 words (2128 B); I64 scratch: 11 + 12 + 1 + 1 = 25
-        // words (200 B). Total 88 + 292 + 3388 + 2328 + 51_040 = 57_136.
-        assert_eq!(refinement.runtime_bytes, 57_136);
+        // words (200 B). Total 176 + 292 + 3388 + 2328 + 51_040 = 57_224.
+        assert_eq!(refinement.runtime_bytes, 57_224);
         // Output adds 8*n*k = 264 bytes of I32/F32 output tensors.
-        assert_eq!(output.runtime_bytes, 57_400);
-        assert_eq!(estimate.runtime_peak_bytes, 57_400);
+        assert_eq!(output.runtime_bytes, 57_488);
+        assert_eq!(estimate.runtime_peak_bytes, 57_488);
         let cpu = estimate
             .phases
             .iter()
@@ -917,21 +1613,49 @@ mod tests {
         // Endpoint staging is 2 * (11 * 145) = 3190 i32/f32 elements = 12760 bytes,
         // the largest entry (pair staging 6380, membership 220, output 132).
         let host = host_plan(11, 2, 3).unwrap();
-        let entries = ann_allocation_bytes(11, 2, 3, &host).unwrap();
+        let entries = ann_allocation_bytes(11, 2, 3, &host, 1_595).unwrap();
         let largest = entries.iter().map(|(_, bytes)| *bytes).max().unwrap();
         assert_eq!(largest, 12_760);
         assert!(
             entries
                 .iter()
-                .any(|(stage, bytes)| { *stage == "forest membership" && *bytes == 220 })
+                .any(|(stage, bytes)| { *stage == "ForestRows" && *bytes == 220 })
         );
         assert!(
             entries
                 .iter()
-                .any(|(stage, bytes)| *stage == "output" && *bytes == 132)
+                .any(|(stage, bytes)| *stage == "OutputIds" && *bytes == 132)
         );
         // A page limit one byte below the largest entry rejects the whole plan.
         assert!(check_page_limit("endpoint staging", largest, largest - 1, 4).is_err());
+    }
+
+    #[test]
+    fn allocation_table_is_unique_and_matches_estimate_phases() {
+        let host = host_plan(11, 2, 3).unwrap();
+        let table =
+            ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
+        assert_eq!(table.len(), 40);
+        let mut seen = std::collections::HashSet::new();
+        for entry in &table {
+            assert!(seen.insert(entry.buffer));
+            assert!(entry.bytes().is_some());
+        }
+        assert_eq!(table.iter().filter(|entry| entry.staging).count(), 6);
+        let estimate = estimate_from_plan(11, 2, 3, &host).unwrap();
+        for (index, phase) in estimate.phases.iter().enumerate() {
+            let expected: usize = table
+                .iter()
+                .filter(|entry| {
+                    entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                })
+                .map(|entry| entry.bytes().unwrap())
+                .sum();
+            assert_eq!(phase.runtime_bytes, expected);
+        }
+        assert_eq!(estimate.phases[0].runtime_bytes, 176);
+        assert_eq!(estimate.phases[1].runtime_bytes, 1392);
+        assert_eq!(estimate.staging_bytes_per_slot, 32);
     }
 
     #[test]
@@ -1046,9 +1770,28 @@ mod tests {
         let DispatchDevice::Cube(cube_device) = device.as_dispatch();
         let client = cube_device.client();
         for (n, features, k) in [(67, 3, 5), (200, 8, 10)] {
-            let preflight = ann_preflight(&device, n, features, k).unwrap();
-            let in_op = plan_for_client(&client, n, features, k).unwrap();
+            let preflight = ann_preflight(&device, n, features, k, &ample_budget()).unwrap();
+            let host = host_plan(n, features, k).unwrap();
+            plan_tiles(
+                tile_caps(&client, n, &host).unwrap(),
+                TileRequest::Exact(preflight.tile_slots),
+            )
+            .unwrap();
+            let mut in_op =
+                plan_with_host(&client, n, features, k, host, preflight.tile_slots).unwrap();
+            in_op.memory = preflight.memory;
             assert_eq!(preflight, in_op);
+            let capped = crate::memory::MemoryBudget {
+                limit_bytes: Some(512 << 20),
+                ..ample_budget()
+            };
+            let mut other = ann_preflight(&device, n, features, k, &capped).unwrap();
+            assert_ne!(preflight.memory.usable_bytes, other.memory.usable_bytes);
+            other.memory = preflight.memory;
+            assert_eq!(
+                preflight, other,
+                "reporting-only budgets must not change capped execution"
+            );
         }
     }
 
@@ -1056,12 +1799,43 @@ mod tests {
     fn preflight_rejects_tiny_n_and_invalid_k_through_device() {
         let device = crate::construct_cpu_device(burn::tensor::Device::cpu).unwrap();
         assert!(matches!(
-            ann_preflight(&device, 1, 3, 1),
+            ann_preflight(&device, 1, 3, 1, &ample_budget()),
             Err(AnnError::InvalidInput(_))
         ));
         assert!(matches!(
-            ann_preflight(&device, 5, 3, 5),
+            ann_preflight(&device, 5, 3, 5, &ample_budget()),
             Err(AnnError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn planned_execution_rejects_shape_tile_and_launch_mismatches() {
+        let device = crate::construct_cpu_device(burn::tensor::Device::cpu).unwrap();
+        let DispatchDevice::Cube(cube) = device.as_dispatch();
+        let client = cube.client();
+        // Deliberately undersized backing: reaching forest readback would produce
+        // a workspace/read error, not the required pre-execution InvalidInput.
+        let data = CubeTensor::new_contiguous(
+            client.clone(),
+            cube.clone(),
+            burn::tensor::Shape::new([64, 8]),
+            client.empty(4),
+            DType::F32,
+        );
+        let plan = ann_preflight(&device, 64, 8, 8, &ample_budget()).unwrap();
+        let mut bad_shape = plan;
+        bad_shape.n += 1;
+        let mut bad_tile = plan;
+        bad_tile.tile_slots = 0;
+        let mut bad_launch = plan;
+        bad_launch.merge.cubes += 1;
+        let mut bad_width = plan;
+        bad_width.host.width += 1;
+        for bad in [bad_shape, bad_tile, bad_launch, bad_width] {
+            assert!(matches!(
+                approximate_neighbors_planned(data.clone(), &bad, 42, 1, false),
+                Err(AnnError::InvalidInput(_))
+            ));
+        }
     }
 }

@@ -28,6 +28,19 @@ pub fn device(index: usize) -> Option<burn::tensor::Device> {
     (index < device_count()).then(|| burn::tensor::Device::cuda(index))
 }
 
+/// Query free CUDA memory on the device's primary context.
+pub(crate) fn free_memory(index: usize) -> Result<u64, String> {
+    if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        return Err("CUDA driver library is unavailable".into());
+    }
+    let context = cudarc::driver::CudaContext::new(index)
+        .map_err(|error| format!("CUDA context for device {index}: {error}"))?;
+    let (free, _) = context
+        .mem_get_info()
+        .map_err(|error| format!("CUDA memory query for device {index}: {error}"))?;
+    u64::try_from(free).map_err(|_| "CUDA free memory exceeds u64".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

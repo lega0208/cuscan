@@ -5,8 +5,7 @@ use burn::{
     tensor::{Device, Int, Tensor, TensorData, Transaction},
 };
 use cuscan_common::{
-    AnnError, BackendChoice, ann_preflight, backend::NeighborOps, neighbors as common_neighbors,
-    selected_device,
+    AnnError, BackendChoice, ann_preflight, neighbors as common_neighbors, selected_device,
 };
 use hdbscan_core::{
     HdbscanConfig, HdbscanError, HostClustering, MstGraph,
@@ -103,6 +102,7 @@ pub(crate) fn map_ann_error(error: AnnError) -> HdbscanError {
         AnnError::Capability(message) => HdbscanError::BackendUnavailable(message),
         AnnError::Workspace(message) => HdbscanError::Numerical(message),
         AnnError::Overflow(message) => HdbscanError::Capacity(message),
+        AnnError::Memory { message, .. } => HdbscanError::Memory(message),
     }
 }
 
@@ -808,6 +808,7 @@ fn knn_spanning_tree(
     min_samples: usize,
     k: usize,
     approximate: bool,
+    memory_limit_bytes: Option<u64>,
 ) -> Result<(hdbscan_core::knn_kruskal::KnnMst, KnnDiagnostics)> {
     let n = data.dims()[0];
     let slots = n
@@ -843,19 +844,18 @@ fn knn_spanning_tree(
     }
     checked_allocation_bytes(allocation_bytes, 1, None, "kNN graph live allocation bytes")?;
     let (mut ids, distances_sq) = if approximate {
-        ann_preflight(&data.device(), n, data.dims()[1], k).map_err(map_ann_error)?;
-        let width = u32::try_from(k).map_err(|_| HdbscanError::Overflow("ANN neighbor width"))?;
+        let budget =
+            cuscan_common::memory::resolve_memory_budget(&data.device(), memory_limit_bytes)
+                .map_err(map_backend_error)?;
+        let plan =
+            ann_preflight(&data.device(), n, data.dims()[1], k, &budget).map_err(map_ann_error)?;
         let iterations = (n as f64).log2().round().max(5.0) as u32;
-        let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
-            data.clone().into_dispatch(),
-            width,
-            42,
-            iterations,
-            true,
-        );
+        let (ids, distances) =
+            common_neighbors::approximate_neighbors(data.clone(), &plan, 42, iterations, true)
+                .map_err(map_ann_error)?;
         let [id_data, distance_data] = Transaction::default()
-            .register(Tensor::<2, Int>::from_dispatch(ids))
-            .register(Tensor::<2>::from_dispatch(distances))
+            .register(ids)
+            .register(distances)
             .try_execute()
             .map_err(|error| HdbscanError::Numerical(error.to_string()))?
             .try_into()
@@ -1046,8 +1046,13 @@ impl HDBSCAN {
                     )?;
                 }
                 let data = tensor_f32(finite_values, [n, features], &device);
-                let (graph_mst, diagnostics) =
-                    knn_spanning_tree(&data, min_samples, neighbor_width, plan.approximate)?;
+                let (graph_mst, diagnostics) = knn_spanning_tree(
+                    &data,
+                    min_samples,
+                    neighbor_width,
+                    plan.approximate,
+                    self.config.memory_limit_bytes,
+                )?;
                 neighbors =
                     public_neighbors(&diagnostics.neighbors, n, diagnostics.k, min_samples)?;
                 core_values = graph_mst.core.iter().map(|&value| value as f32).collect();

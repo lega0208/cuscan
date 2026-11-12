@@ -2,7 +2,9 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Tensor, TensorData},
 };
-use cuscan_common::{ann_preflight, backend::NeighborOps};
+use cuscan_common::{
+    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
+};
 use umap::backend::StandardUmapOps;
 
 fn points(rows: usize, features: usize, salt: usize) -> Vec<f32> {
@@ -41,23 +43,12 @@ fn approximate(
     iterations: u32,
 ) -> (Vec<i32>, Vec<f32>) {
     let data = Tensor::<2>::from_data(TensorData::new(values, [n, features]), device);
-    ann_preflight(device, n, features, k).unwrap();
-    let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
-        data.into_dispatch(),
-        k as u32,
-        seed,
-        iterations,
-        false,
-    );
+    let budget = resolve_memory_budget(device, None).unwrap();
+    let plan = ann_preflight(device, n, features, k, &budget).unwrap();
+    let (ids, distances) = approximate_neighbors(data, &plan, seed, iterations, false).unwrap();
     (
-        Tensor::<2, burn::tensor::Int>::from_dispatch(ids)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap(),
-        Tensor::<2>::from_dispatch(distances)
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap(),
+        ids.to_data().try_to_vec::<i32>().unwrap(),
+        distances.to_data().try_to_vec::<f32>().unwrap(),
     )
 }
 
@@ -441,9 +432,10 @@ fn cpu_ann_resolves_equal_distances_by_neighbor_id() {
 #[test]
 fn ann_rejects_invalid_tiny_width_and_singleton_input() {
     let device = Device::cpu();
+    let budget = resolve_memory_budget(&device, None).unwrap();
     for (n, features, k) in [(2, 1, 0), (1, 1, 1), (2, 1, 2), (2, 0, 1)] {
         assert!(matches!(
-            ann_preflight(&device, n, features, k),
+            ann_preflight(&device, n, features, k, &budget),
             Err(cuscan_common::AnnError::InvalidInput(_))
         ));
     }

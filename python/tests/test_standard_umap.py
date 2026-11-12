@@ -266,7 +266,8 @@ def test_cuda_backend() -> None:
 def test_cuda_transform_releases_gil_for_at_least_half_second() -> None:
     x, _ = blobs(12)
     model = estimator(backend="cuda", init="random", neighbor_search="exact", n_epochs=200).fit(x)
-    query = np.random.default_rng(23).normal(size=(8192, x.shape[1])).astype(np.float32)
+    # Keep native work above half a second even when kernels are already compiled.
+    query = np.random.default_rng(23).normal(size=(131_072, x.shape[1])).astype(np.float32)
 
     stop = threading.Event()
     started = threading.Event()

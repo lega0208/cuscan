@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::backend::StandardUmapOps;
-use cuscan_common::{AnnError, ann_preflight, backend::NeighborOps};
+use cuscan_common::{AnnError, ann_preflight};
 
 use super::{
     Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
@@ -181,19 +181,22 @@ impl UMAP {
                 (neighbors.indices, neighbors.distances)
             }
             NeighborSearch::Approximate => {
-                ann_preflight(&device, n, features, widths.nonself).map_err(map_ann_error)?;
+                let budget = cuscan_common::memory::resolve_memory_budget(
+                    &device,
+                    self.config.memory_limit_bytes,
+                )
+                .map_err(|error| UmapError::BackendUnavailable(error.to_string()))?;
+                let plan = ann_preflight(&device, n, features, widths.nonself, &budget)
+                    .map_err(map_ann_error)?;
                 let iters = (n as f64).log2().round().max(5.0) as u32;
-                let (indices, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
-                    training_data.clone().into_dispatch(),
-                    widths.nonself as u32,
+                cuscan_common::neighbors::approximate_neighbors(
+                    training_data.clone(),
+                    &plan,
                     seed,
                     iters,
                     false,
-                );
-                (
-                    Tensor::from_dispatch(indices),
-                    Tensor::from_dispatch(distances),
                 )
+                .map_err(map_ann_error)?
             }
             NeighborSearch::Auto => unreachable!("search is resolved before dispatch"),
         };
@@ -1619,6 +1622,7 @@ fn map_ann_error(error: AnnError) -> UmapError {
         AnnError::Capability(message) => UmapError::BackendUnavailable(message),
         AnnError::Workspace(message) => UmapError::Numerical(message),
         AnnError::Overflow(message) => UmapError::Capacity(message),
+        AnnError::Memory { message, .. } => UmapError::Memory(message),
     }
 }
 

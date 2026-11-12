@@ -17,6 +17,8 @@ pub struct UMAPConfig {
     pub random_state: Option<u64>,
     pub transform_seed: u64,
     pub transform_queue_size: f64,
+    /// Optional upper bound on ANN memory usage in bytes; must be positive.
+    pub memory_limit_bytes: Option<u64>,
     /// Fit on exact distinct rows and return embeddings in original row order.
     /// Positive and negative zero are considered equal. Defaults to false.
     pub unique: bool,
@@ -39,6 +41,7 @@ impl Default for UMAPConfig {
             random_state: None,
             transform_seed: 42,
             transform_queue_size: 4.0,
+            memory_limit_bytes: None,
             unique: false,
         }
     }
@@ -47,6 +50,11 @@ impl Default for UMAPConfig {
 impl UMAPConfig {
     /// Validate controls that do not depend on a particular input matrix.
     pub fn validate(&self) -> Result<()> {
+        if self.memory_limit_bytes == Some(0) {
+            return Err(UmapError::InvalidInput(
+                "memory_limit_bytes must be greater than zero".into(),
+            ));
+        }
         if self.n_components == 0 {
             return Err(UmapError::InvalidConfig(
                 "n_components must be greater than zero".into(),
@@ -450,4 +458,25 @@ fn validate_queue_size(queue_size: f64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_limit_tests {
+    use super::*;
+
+    #[test]
+    fn validates_memory_limit() {
+        let mut config = UMAPConfig::default();
+        assert_eq!(config.memory_limit_bytes, None);
+        assert!(config.validate().is_ok());
+        config.memory_limit_bytes = Some(1);
+        assert!(config.validate().is_ok());
+        config.memory_limit_bytes = Some(0);
+        assert_eq!(
+            config.validate(),
+            Err(UmapError::InvalidInput(
+                "memory_limit_bytes must be greater than zero".into()
+            ))
+        );
+    }
 }

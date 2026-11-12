@@ -39,6 +39,8 @@ pub struct HdbscanConfig {
     pub knn_k: Option<usize>,
     /// Use independent bounds on the complete-graph KD route.
     pub reproducible: bool,
+    /// Optional upper bound on ANN memory usage in bytes; must be positive.
+    pub memory_limit_bytes: Option<u64>,
 }
 
 impl Default for HdbscanConfig {
@@ -54,6 +56,7 @@ impl Default for HdbscanConfig {
             mst_graph: MstGraph::Auto,
             knn_k: None,
             reproducible: false,
+            memory_limit_bytes: None,
         }
     }
 }
@@ -61,6 +64,11 @@ impl Default for HdbscanConfig {
 impl HdbscanConfig {
     /// Reject non-positive sizes and non-finite or negative selection thresholds.
     pub fn validate(&self) -> Result<()> {
+        if self.memory_limit_bytes == Some(0) {
+            return Err(HdbscanError::InvalidInput(
+                "memory_limit_bytes must be greater than zero".into(),
+            ));
+        }
         if self.min_cluster_size == 0 {
             return Err(HdbscanError::InvalidConfig(
                 "min_cluster_size must be positive".into(),
@@ -93,5 +101,26 @@ impl HdbscanConfig {
     /// `min_samples`, defaulting to `min_cluster_size`.
     pub fn resolved_min_samples(&self) -> usize {
         self.min_samples.unwrap_or(self.min_cluster_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_memory_limit() {
+        let mut config = HdbscanConfig::default();
+        assert_eq!(config.memory_limit_bytes, None);
+        assert!(config.validate().is_ok());
+        config.memory_limit_bytes = Some(1);
+        assert!(config.validate().is_ok());
+        config.memory_limit_bytes = Some(0);
+        assert_eq!(
+            config.validate(),
+            Err(HdbscanError::InvalidInput(
+                "memory_limit_bytes must be greater than zero".into()
+            ))
+        );
     }
 }

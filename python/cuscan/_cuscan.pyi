@@ -95,11 +95,15 @@ class HDBSCANPredictor:
 
 def fit_hdbscan(
     x: NDArray[np.float32],
+    *,
+    memory_limit_bytes: int | None = None,
     **kwargs: object,
 ) -> FittedHDBSCAN: ...
 def estimate_hdbscan_resources(
     n_finite: int,
     features: int,
+    *,
+    memory_limit_bytes: int | None = None,
     **kwargs: object,
 ) -> dict[str, object]: ...
 def hdbscan_cuda_available() -> bool: ...
@@ -124,6 +128,7 @@ def fit_umap(
     device_index: int = 0,
     neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
     unique: bool = False,
+    memory_limit_bytes: int | None = None,
 ) -> FittedUMAP: ...
 def load(
     arrays: dict[str, NDArray[np.generic] | None],

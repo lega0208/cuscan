@@ -4,11 +4,10 @@
 //! `ann_construction_worker INPUT.f32le ROWS FEATURES [DEVICE_INDEX]`; it reads
 //! one JSON command per stdin line and emits one JSON response per command.
 
-use burn::{
-    backend::Dispatch,
-    tensor::{Int, Tensor, TensorData},
+use burn::tensor::{Tensor, TensorData};
+use cuscan_common::{
+    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
 };
-use cuscan_common::{ann_preflight, backend::NeighborOps};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -92,20 +91,11 @@ fn perform(
         TensorData::new(host_features.to_vec(), [rows, features]),
         device,
     );
-    ann_preflight(device, rows, features, k as usize)?;
-    let (indices, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
-        input.into_dispatch(),
-        k,
-        seed,
-        cap,
-        false,
-    );
-    let ids = Tensor::<2, Int>::from_dispatch(indices)
-        .to_data()
-        .try_to_vec::<i32>()?;
-    let distances = Tensor::<2>::from_dispatch(distances)
-        .to_data()
-        .try_to_vec::<f32>()?;
+    let budget = resolve_memory_budget(device, None)?;
+    let plan = ann_preflight(device, rows, features, k as usize, &budget)?;
+    let (indices, distances) = approximate_neighbors(input, &plan, seed, cap, false)?;
+    let ids = indices.to_data().try_to_vec::<i32>()?;
+    let distances = distances.to_data().try_to_vec::<f32>()?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     if ids.len() != rows * k as usize || distances.len() != ids.len() {
         return Err(format!(

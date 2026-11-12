@@ -90,6 +90,7 @@ def _validate_config(config: Any, precision: Any, curve: Any) -> None:
         "transform_seed",
         "n_epochs_value",
         "random_state_value",
+        "memory_limit_bytes_value",
         "training_rows",
         "n_features",
         "query_graph_width",
@@ -99,7 +100,12 @@ def _validate_config(config: Any, precision: Any, curve: Any) -> None:
         _check_scalar(config, name, "<f4")
         _check_scalar(precision, name, "<f8")
     _check_scalar(config, "transform_queue_size", "<f8")
-    for name in ("unique", "n_epochs_is_auto", "random_state_is_none"):
+    for name in (
+        "unique",
+        "n_epochs_is_auto",
+        "random_state_is_none",
+        "memory_limit_bytes_is_none",
+    ):
         _check_scalar(config, name, "|b1")
     for name in ("init", "requested_search", "resolved_search"):
         text = _check_text(config, name)
@@ -154,6 +160,14 @@ def save_model(
         config.attrs["random_state_value"] = np.uint64(
             0 if metadata["random_state"] is None else metadata["random_state"]
         )
+        if metadata["memory_limit_bytes"] != precision["memory_limit_bytes"]:
+            raise ValueError("Python memory limit disagrees with native config")
+        config.attrs["memory_limit_bytes_is_none"] = np.bool_(
+            metadata["memory_limit_bytes"] is None
+        )
+        config.attrs["memory_limit_bytes_value"] = np.uint64(
+            0 if metadata["memory_limit_bytes"] is None else metadata["memory_limit_bytes"]
+        )
         py_config = file.create_group("python_precision")
         for key in _FLOATS:
             py_config.attrs[key] = np.asarray(precision[key], dtype="<f8")
@@ -204,6 +218,8 @@ def load_model(
             "n_epochs_value",
             "random_state_is_none",
             "random_state_value",
+            "memory_limit_bytes_is_none",
+            "memory_limit_bytes_value",
         }
         if (
             set(config.attrs) != expected_config
@@ -224,6 +240,11 @@ def load_model(
             _attr(config, "random_state_is_none") and _attr(config, "random_state_value") != 0
         ):
             raise ValueError("noncanonical optional-value payload")
+        memory_is_none = _attr(config, "memory_limit_bytes_is_none")
+        memory_value = int(_attr(config, "memory_limit_bytes_value"))
+        if (memory_is_none and memory_value != 0) or (not memory_is_none and memory_value == 0):
+            raise ValueError("noncanonical memory_limit_bytes payload")
+        metadata["memory_limit_bytes"] = None if memory_is_none else memory_value
         for key in ("a", "b"):
             metadata[key] = _attr(curve, key)
         precision_values = {key: float(_attr(precision, key)) for key in _FLOATS}
@@ -306,11 +327,18 @@ def load_model(
     constructor = {key: metadata[key] for key in _CONSTRUCTOR if key not in _FLOATS}
     constructor.update(precision_values)
     constructor.update(
-        backend=backend, device_index=device_index, neighbor_search=metadata["requested_search"]
+        backend=backend,
+        device_index=device_index,
+        neighbor_search=metadata["requested_search"],
+        memory_limit_bytes=None if memory_is_none else memory_value,
     )
     model = cls(**constructor)
     model._model = native
     model.embedding_ = native.embedding
     model.n_features_in_ = d
-    model._fit_config = {**metadata, **precision_values}
+    model._fit_config = {
+        **metadata,
+        **precision_values,
+        "memory_limit_bytes": model.memory_limit_bytes,
+    }
     return model

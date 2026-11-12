@@ -165,7 +165,10 @@ def test_bridge_accepts_ann_shape_above_former_join_ceiling() -> None:
 
 def test_bridge_ann_addressing_gate_reports_precise_capacity_error() -> None:
     # 1.5M x 2864 input elements exceed the 32-bit kernel addressing limit.
-    with pytest.raises(OverflowError, match=r"input copy.*4294967295"):
+    with pytest.raises(
+        OverflowError,
+        match=r"ANN Input buffer elements 4296000000 exceeds u32 addressing maximum 4294967295",
+    ):
         _cuscan.estimate_hdbscan_resources(1_500_000, 2_864, backend="cpu", min_samples=5)
 
 

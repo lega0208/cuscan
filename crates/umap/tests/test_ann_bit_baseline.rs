@@ -16,18 +16,21 @@
 //!   features=8, k=14, seed 42, iterations `round(log2 n)` = 15. Both forest seeding and
 //!   refinement span more than one 4,194,304-slot staging tile, so the tile loop and nonzero
 //!   slot offsets are covered bit-exactly. Files `{label}-multitile-{ids,distance-bits}.bin`.
+//! - Ties, Wide, Hub: n=512, k=14, 9 iterations, seed 42. Ties contains repeated
+//!   binary vectors and exact equidistant neighbors; Wide uses 256-feature blobs; Hub
+//!   has an origin row nearest to 511 distinct signed unit vectors in 256 dimensions.
+//!   Files use `{label}-{ties,wide,hub}-{ids,distance-bits}.bin` respectively.
 //!
 //! Capture refuses to overwrite existing files; delete a file deliberately to recapture it.
 //! Compare fails on a missing or changed file and prints the capture command.
 //! The estimator baseline must be captured from the pristine HEAD worktree
 //! (`target/m2-ann-baseline`). Its copy of this file calls `StandardUmapOps`, so the baseline
-//! is not produced by relocated code. This live file calls `NeighborOps` (the post-move path).
+//! is not produced by relocated code. This live file uses the current ANN entry point.
 
-use burn::{
-    backend::Dispatch,
-    tensor::{Device, Int, Tensor, TensorData},
+use burn::tensor::{Device, Tensor, TensorData};
+use cuscan_common::{
+    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
 };
-use cuscan_common::backend::NeighborOps;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -72,13 +75,16 @@ enum Family {
     B0,
     Estimator,
     MultiTile,
+    Ties,
+    Wide,
+    Hub,
 }
 
 impl Family {
     fn k(self) -> usize {
         match self {
             Family::B0 => B0_K,
-            Family::Estimator => ESTIMATOR_K,
+            Family::Estimator | Family::Ties | Family::Wide | Family::Hub => ESTIMATOR_K,
             Family::MultiTile => MULTITILE_K,
         }
     }
@@ -86,15 +92,22 @@ impl Family {
     fn iterations(self) -> u32 {
         match self {
             Family::B0 => B0_ITERATIONS,
-            Family::Estimator => ESTIMATOR_ITERATIONS,
+            Family::Estimator | Family::Ties | Family::Wide | Family::Hub => ESTIMATOR_ITERATIONS,
             Family::MultiTile => MULTITILE_ITERATIONS,
         }
     }
 
     fn rows(self) -> usize {
         match self {
-            Family::B0 | Family::Estimator => ROWS,
+            Family::B0 | Family::Estimator | Family::Ties | Family::Wide | Family::Hub => ROWS,
             Family::MultiTile => MULTITILE_ROWS,
+        }
+    }
+
+    fn features(self) -> usize {
+        match self {
+            Family::Wide | Family::Hub => 256,
+            _ => FEATURES,
         }
     }
 
@@ -105,6 +118,9 @@ impl Family {
             Family::B0 => "",
             Family::Estimator => "estimator-",
             Family::MultiTile => "multitile-",
+            Family::Ties => "ties-",
+            Family::Wide => "wide-",
+            Family::Hub => "hub-",
         }
     }
 
@@ -114,6 +130,9 @@ impl Family {
             Family::B0 => "",
             Family::Estimator => "estimator_",
             Family::MultiTile => "multitile_",
+            Family::Ties => "ties_",
+            Family::Wide => "wide_",
+            Family::Hub => "hub_",
         }
     }
 }
@@ -139,10 +158,10 @@ impl SplitMix64 {
 
 /// Seed-42 blob dataset: `BLOBS` centers in [-10, 10)^FEATURES, rows assigned round-robin,
 /// each coordinate jittered by a uniform offset in [-0.25, 0.25).
-fn blob_rows(n_rows: usize) -> Vec<Vec<f32>> {
+fn blob_rows(n_rows: usize, features: usize) -> Vec<Vec<f32>> {
     let mut random = SplitMix64(SEED);
     let centers: Vec<Vec<f32>> = (0..BLOBS)
-        .map(|_| (0..FEATURES).map(|_| random.unit() * 20.0 - 10.0).collect())
+        .map(|_| (0..features).map(|_| random.unit() * 20.0 - 10.0).collect())
         .collect();
     (0..n_rows)
         .map(|row| {
@@ -153,6 +172,30 @@ fn blob_rows(n_rows: usize) -> Vec<Vec<f32>> {
                 .collect()
         })
         .collect()
+}
+
+fn fixture_rows(family: Family) -> Vec<Vec<f32>> {
+    match family {
+        Family::Ties => (0..ROWS)
+            .map(|row| {
+                let pattern = row / 4;
+                (0..FEATURES)
+                    .map(|bit| ((pattern >> bit) & 1) as f32)
+                    .collect()
+            })
+            .collect(),
+        Family::Hub => (0..ROWS)
+            .map(|row| {
+                let mut values = vec![0.0; family.features()];
+                if row != 0 {
+                    let point = row - 1;
+                    values[point / 2] = if point % 2 == 0 { 1.0 } else { -1.0 };
+                }
+                values
+            })
+            .collect(),
+        _ => blob_rows(family.rows(), family.features()),
+    }
 }
 
 fn target_device(target: Target) -> Option<(Device, BackendChoice)> {
@@ -173,28 +216,22 @@ fn target_device(target: Target) -> Option<(Device, BackendChoice)> {
     }
 }
 
-/// The only ANN call site in this file. Uses `NeighborOps` with `squared = false`, the
+/// The only ANN call site in this file. Uses `squared = false`, the
 /// estimator's distance mode. Returns `(ids, distance bits)` for the `[n_rows, k]` table.
 fn ann_neighbors(
     device: &Device,
     values: &[f32],
     n_rows: usize,
+    features: usize,
     k: usize,
     iterations: u32,
 ) -> (Vec<i32>, Vec<u32>) {
-    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n_rows, FEATURES]), device);
-    let (ids, distances) = <Dispatch as NeighborOps>::approximate_neighbors(
-        data.into_dispatch(),
-        k as u32,
-        SEED,
-        iterations,
-        false,
-    );
-    let ids = Tensor::<2, Int>::from_dispatch(ids)
-        .to_data()
-        .try_to_vec::<i32>()
-        .unwrap();
-    let distance_bits = Tensor::<2>::from_dispatch(distances)
+    let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n_rows, features]), device);
+    let budget = resolve_memory_budget(device, None).unwrap();
+    let plan = ann_preflight(device, n_rows, features, k, &budget).unwrap();
+    let (ids, distances) = approximate_neighbors(data, &plan, SEED, iterations, false).unwrap();
+    let ids = ids.to_data().try_to_vec::<i32>().unwrap();
+    let distance_bits = distances
         .to_data()
         .try_to_vec::<f32>()
         .unwrap()
@@ -334,13 +371,14 @@ fn run(target: Target, family: Family, mode: Mode) {
         (MULTITILE_ROWS as f64).log2().round() as u32,
         "multitile iteration count drifted from round(log2 n)"
     );
-    let rows = blob_rows(family.rows());
+    let rows = fixture_rows(family);
     let values: Vec<f32> = rows.iter().flatten().copied().collect();
 
     let (ids, distance_bits) = ann_neighbors(
         &device,
         &values,
         family.rows(),
+        family.features(),
         family.k(),
         family.iterations(),
     );
@@ -456,4 +494,76 @@ fn compare_multitile_cpu() {
 #[ignore = "compares CUDA multi-tile ANN ids and distance bits against the pristine baseline"]
 fn compare_multitile_cuda() {
     run(Target::Cuda, Family::MultiTile, Mode::Compare);
+}
+
+#[test]
+#[ignore = "captures the duplicate and exact-tie CPU ANN baseline"]
+fn capture_ties_cpu() {
+    run(Target::Cpu, Family::Ties, Mode::Capture);
+}
+
+#[test]
+#[ignore = "captures the duplicate and exact-tie CUDA ANN baseline"]
+fn capture_ties_cuda() {
+    run(Target::Cuda, Family::Ties, Mode::Capture);
+}
+
+#[test]
+#[ignore = "compares CPU ANN ids and distance bits against the tie baseline"]
+fn compare_ties_cpu() {
+    run(Target::Cpu, Family::Ties, Mode::Compare);
+}
+
+#[test]
+#[ignore = "compares CUDA ANN ids and distance bits against the tie baseline"]
+fn compare_ties_cuda() {
+    run(Target::Cuda, Family::Ties, Mode::Compare);
+}
+
+#[test]
+#[ignore = "captures the 256-feature CPU ANN baseline"]
+fn capture_wide_cpu() {
+    run(Target::Cpu, Family::Wide, Mode::Capture);
+}
+
+#[test]
+#[ignore = "captures the 256-feature CUDA ANN baseline"]
+fn capture_wide_cuda() {
+    run(Target::Cuda, Family::Wide, Mode::Capture);
+}
+
+#[test]
+#[ignore = "compares CPU ANN ids and distance bits against the 256-feature baseline"]
+fn compare_wide_cpu() {
+    run(Target::Cpu, Family::Wide, Mode::Compare);
+}
+
+#[test]
+#[ignore = "compares CUDA ANN ids and distance bits against the 256-feature baseline"]
+fn compare_wide_cuda() {
+    run(Target::Cuda, Family::Wide, Mode::Compare);
+}
+
+#[test]
+#[ignore = "captures the hub-row CPU ANN baseline"]
+fn capture_hub_cpu() {
+    run(Target::Cpu, Family::Hub, Mode::Capture);
+}
+
+#[test]
+#[ignore = "captures the hub-row CUDA ANN baseline"]
+fn capture_hub_cuda() {
+    run(Target::Cuda, Family::Hub, Mode::Capture);
+}
+
+#[test]
+#[ignore = "compares CPU ANN ids and distance bits against the hub-row baseline"]
+fn compare_hub_cpu() {
+    run(Target::Cpu, Family::Hub, Mode::Compare);
+}
+
+#[test]
+#[ignore = "compares CUDA ANN ids and distance bits against the hub-row baseline"]
+fn compare_hub_cuda() {
+    run(Target::Cuda, Family::Hub, Mode::Compare);
 }

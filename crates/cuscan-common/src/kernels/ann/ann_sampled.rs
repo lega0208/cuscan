@@ -15,15 +15,15 @@ use super::ann_forest::{
     WorkspaceError, build_forest, forest_leaf_limit, plan_workspace, tree_count,
 };
 use super::orchestration::{
-    AnnPlan, ann_independent_launch, ann_output, ann_should_stop, plan_for_client, reverse_count,
-    reverse_scatter, reverse_zero, workspace_error,
+    AnnPlan, Buffer, BufferEntry, BufferRoute, ann_buffer_table, ann_independent_launch,
+    ann_output, ann_should_stop, reverse_count, reverse_scatter, reverse_zero, workspace_error,
 };
 use crate::error::AnnError;
 use burn::{
     backend::{TensorMetadata, cubecl::dtype_to_storage_type},
     tensor::{DType, Shape},
 };
-use burn_cubecl::{kernel::into_contiguous, tensor::CubeTensor};
+use burn_cubecl::tensor::CubeTensor;
 use cubecl::prelude::*;
 
 #[cfg(test)]
@@ -48,16 +48,26 @@ pub(super) struct ForestSeed {
 
 pub(super) fn forest_seed(
     data: &CubeTensor,
+    allocator: &mut AnnAllocator,
     n: usize,
     features: usize,
     heap_width: usize,
     max_candidates: usize,
     seed: u64,
+    profile: bool,
 ) -> Result<ForestSeed, WorkspaceError> {
     let trees = tree_count(n)?;
     let leaf_size = forest_leaf_limit(n, heap_width);
     let workspace = plan_workspace(n, heap_width, max_candidates, features, trees)?;
+    let readback_start = profile.then(std::time::Instant::now);
     let input_bytes = data.client.read_one_unchecked(data.handle.clone());
+    if let Some(start) = readback_start {
+        eprintln!(
+            "ANN_PROFILE forest_readback_ms={:.3} bytes={}",
+            start.elapsed().as_secs_f64() * 1000.0,
+            input_bytes.len()
+        );
+    }
     let expected_bytes = n
         .checked_mul(features)
         .and_then(|v| v.checked_mul(DType::F32.size()))
@@ -72,7 +82,14 @@ pub(super) fn forest_seed(
         .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect::<Vec<_>>();
     drop(input_bytes);
+    let build_start = profile.then(std::time::Instant::now);
     let forest = build_forest(&features_host, n, features, seed, trees, leaf_size)?;
+    if let Some(start) = build_start {
+        eprintln!(
+            "ANN_PROFILE forest_build_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let forest_pair_slots = forest
         .leaf_offsets
         .windows(2)
@@ -85,9 +102,9 @@ pub(super) fn forest_seed(
         })?;
     // The plan and the built forest must agree exactly; both come from the
     // same midpoint recurrence, so any mismatch is a planner defect.
-    debug_assert_eq!(forest.row_ids.len(), workspace.forest_membership_len);
-    debug_assert_eq!(forest.leaf_offsets.len() - 1, workspace.forest_leaf_count);
-    debug_assert_eq!(forest_pair_slots, workspace.forest_pair_count);
+    assert_eq!(forest.row_ids.len(), workspace.forest_membership_len);
+    assert_eq!(forest.leaf_offsets.len() - 1, workspace.forest_leaf_count);
+    assert_eq!(forest_pair_slots, workspace.forest_pair_count);
     let heap_len = n
         .checked_mul(heap_width)
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
@@ -121,48 +138,38 @@ pub(super) fn forest_seed(
                 .ok_or(WorkspaceError::ArithmeticOverflow)?;
         }
     }
-    let rows_tensor = cube_tensor_from_vec(
-        data.client.clone(),
-        data.device.clone(),
+    let upload_start = profile.then(std::time::Instant::now);
+    let rows_tensor = allocator.upload(
+        Buffer::ForestRows,
         Shape::new([membership.len()]),
         DType::I32,
         membership,
     );
     debug_assert_eq!(leaf_rows.len(), leaf_pair_prefix.len());
-    let leaf_rows_tensor = cube_tensor_from_vec(
-        data.client.clone(),
-        data.device.clone(),
+    let leaf_rows_tensor = allocator.upload(
+        Buffer::ForestLeafRows,
         Shape::new([leaf_rows.len()]),
         DType::I32,
         leaf_rows,
     );
-    let pair_prefix_tensor = cube_tensor_from_vec(
-        data.client.clone(),
-        data.device.clone(),
+    let pair_prefix_tensor = allocator.upload(
+        Buffer::ForestPairPrefix,
         Shape::new([leaf_pair_prefix.len()]),
         DType::I64,
         leaf_pair_prefix,
     );
     drop(forest);
     drop(features_host);
-    let client = data.client.clone();
-    let device = data.device.clone();
     let shape = Shape::new([n, heap_width]);
-    let ids = cube_tensor_from_vec(
-        client.clone(),
-        device.clone(),
-        shape.clone(),
-        DType::I32,
-        ids,
-    );
-    let distances = cube_tensor_from_vec(
-        client.clone(),
-        device.clone(),
-        shape.clone(),
-        DType::F32,
-        distances,
-    );
-    let flags = cube_tensor_from_vec(client, device, shape, DType::I32, flags);
+    let ids = allocator.upload(Buffer::HeapIds, shape.clone(), DType::I32, ids);
+    let distances = allocator.upload(Buffer::HeapDistances, shape.clone(), DType::F32, distances);
+    let flags = allocator.upload(Buffer::Flags, shape, DType::I32, flags);
+    if let Some(start) = upload_start {
+        eprintln!(
+            "ANN_PROFILE forest_upload_enqueue_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(ForestSeed {
         ids,
         distances,
@@ -174,31 +181,160 @@ pub(super) fn forest_seed(
     })
 }
 
-fn cube_tensor_from_vec<T: burn::tensor::Element>(
+pub(super) struct AnnAllocator {
+    table: Vec<BufferEntry>,
+    allocated: Vec<(Buffer, CubeTensor)>,
     client: cubecl::client::Client,
     device: burn_cubecl::CubeDevice,
-    shape: Shape,
-    dtype: DType,
-    values: Vec<T>,
-) -> CubeTensor {
-    let tensor_data = burn::tensor::TensorData::new(values, shape.clone());
-    assert_eq!(tensor_data.dtype(), dtype);
-    let (bytes, _, _) = tensor_data.into_parts();
-    CubeTensor::new_contiguous(client.clone(), device, shape, client.create(bytes), dtype)
+    plan: AnnPlan,
 }
 
-fn empty_tensor(data: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
-    let bytes = shape
-        .num_elements()
-        .checked_mul(dtype.size())
-        .expect("ANN scratch tensor size overflows usize");
-    CubeTensor::new_contiguous(
-        data.client.clone(),
-        data.device.clone(),
-        shape,
-        data.client.empty(bytes),
-        dtype,
-    )
+#[cfg(test)]
+thread_local! {
+    static ALLOCATION_LOG: std::cell::RefCell<Vec<Buffer>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn memory_failure(
+    stage: &str,
+    error: &str,
+    required_bytes: u64,
+    usable_bytes: u64,
+    fresh_free: Result<u64, String>,
+) -> AnnError {
+    let (available_bytes, availability) = match fresh_free {
+        Ok(bytes) => (bytes, format!("fresh free {bytes} bytes")),
+        Err(error) => (
+            0,
+            format!(
+                "fresh free memory unknown (availability query failed: {error}); available_bytes=0 denotes unknown"
+            ),
+        ),
+    };
+    AnnError::Memory {
+        required_bytes,
+        available_bytes,
+        message: format!(
+            "ANN {stage} failed: {error}; planned {required_bytes} bytes, {availability}, planned usable {usable_bytes} bytes"
+        ),
+    }
+}
+
+impl AnnAllocator {
+    fn memory_error(&self, stage: &str, error: impl std::fmt::Debug) -> AnnError {
+        let device =
+            burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(self.device.clone()));
+        let fresh_free = crate::resolve_memory_budget(&device, None)
+            .map(|budget| budget.free_bytes)
+            .map_err(|error| error.to_string());
+        let required_bytes = self
+            .plan
+            .memory
+            .fixed_peak_bytes
+            .saturating_add(self.plan.memory.staging_bytes);
+        memory_failure(
+            stage,
+            &format!("{error:?}"),
+            required_bytes,
+            self.plan.memory.usable_bytes,
+            fresh_free,
+        )
+    }
+
+    fn entry(&self, key: Buffer, shape: &Shape, dtype: DType) -> &BufferEntry {
+        assert_ne!(key, Buffer::Input, "ANN input is externally owned");
+        assert!(
+            !self.allocated.iter().any(|(buffer, _)| *buffer == key),
+            "duplicate ANN allocation {key:?}"
+        );
+        let mut matches = self.table.iter().filter(|entry| entry.buffer == key);
+        let entry = matches.next().expect("missing ANN allocation table entry");
+        assert!(
+            matches.next().is_none(),
+            "duplicate ANN table entry {key:?}"
+        );
+        assert_eq!(
+            Shape::from(entry.shape.clone()),
+            *shape,
+            "ANN allocation shape {key:?}"
+        );
+        assert_eq!(entry.dtype, dtype, "ANN allocation dtype {key:?}");
+        assert_eq!(entry.elements(), Some(shape.num_elements()));
+        entry
+    }
+
+    fn empty(&mut self, key: Buffer, shape: Shape, dtype: DType) -> CubeTensor {
+        let bytes = self
+            .entry(key, &shape, dtype)
+            .bytes()
+            .expect("ANN allocation size overflow");
+        let handle = self
+            .client
+            .memory_dedicated_allocation((), |_| self.client.empty(bytes));
+        #[cfg(test)]
+        ALLOCATION_LOG.with(|log| log.borrow_mut().push(key));
+        let tensor = CubeTensor::new_contiguous(
+            self.client.clone(),
+            self.device.clone(),
+            shape,
+            handle,
+            dtype,
+        );
+        self.allocated.push((key, tensor.clone()));
+        tensor
+    }
+
+    fn upload<T: burn::tensor::Element>(
+        &mut self,
+        key: Buffer,
+        shape: Shape,
+        dtype: DType,
+        values: Vec<T>,
+    ) -> CubeTensor {
+        self.entry(key, &shape, dtype);
+        assert_eq!(
+            values.len(),
+            shape.num_elements(),
+            "ANN upload element count {key:?}"
+        );
+        let tensor_data = burn::tensor::TensorData::new(values, shape.clone());
+        assert_eq!(tensor_data.dtype(), dtype);
+        let (bytes, _, _) = tensor_data.into_parts();
+        let handle = self
+            .client
+            .memory_dedicated_allocation((), |_| self.client.create(bytes));
+        #[cfg(test)]
+        ALLOCATION_LOG.with(|log| log.borrow_mut().push(key));
+        let tensor = CubeTensor::new_contiguous(
+            self.client.clone(),
+            self.device.clone(),
+            shape,
+            handle,
+            dtype,
+        );
+        self.allocated.push((key, tensor.clone()));
+        tensor
+    }
+
+    fn check(&self, phase: u8) -> Result<(), AnnError> {
+        for entry in &self.table {
+            if entry.buffer != Buffer::Input
+                && entry.buffer != Buffer::InputCopy
+                && entry.route == BufferRoute::Both
+                && entry.phases & phase != 0
+            {
+                assert!(
+                    self.allocated.iter().any(|(key, _)| *key == entry.buffer),
+                    "missing ANN allocation {:?}",
+                    entry.buffer
+                );
+            }
+        }
+        let handles = self.allocated.iter().map(|(_, tensor)| &tensor.handle);
+        if let Err(error) = cubecl::future::block_on(self.client.sync_buffers(handles)) {
+            return Err(self.memory_error("allocation", error));
+        }
+        Ok(())
+    }
 }
 
 /// Production shared sampled NN-descent orchestration. Source heaps and flags
@@ -210,23 +346,54 @@ pub(super) fn approximate_neighbors(
     seed: u64,
     max_iterations: u32,
     squared: bool,
+    plan: AnnPlan,
 ) -> Result<(CubeTensor, CubeTensor), AnnError> {
     let profile = std::env::var_os("CUSCAN_ANN_PROFILE").is_some();
     let init_start = std::time::Instant::now();
-    let data = into_contiguous(data);
+    if data.meta.is_tiled() {
+        return Err(AnnError::InvalidInput(
+            "ANN requires untiled input; untile it first".into(),
+        ));
+    }
     let [n, features] = data.shape().dims::<2>();
     assert_eq!(data.dtype, DType::F32);
     let client = data.client.clone();
-    let plan: AnnPlan = plan_for_client(&client, n, features, k)?;
     let width = plan.host.width;
     let capacity = plan.host.capacity;
     let workspace = plan.host.workspace;
+    let table = ann_buffer_table(n, features, k, width, capacity, &workspace, plan.tile_slots)
+        .ok_or_else(|| AnnError::Overflow("ANN allocation table overflow".into()))?;
+    let mut allocator = AnnAllocator {
+        table,
+        allocated: Vec::new(),
+        client: client.clone(),
+        device: data.device.clone(),
+        plan,
+    };
+    cubecl::future::block_on(client.sync_buffers([&data.handle]))
+        .map_err(|error| allocator.memory_error("input buffer synchronization", error))?;
+    let data = if data.is_contiguous() {
+        data
+    } else {
+        let copy = allocator.empty(Buffer::InputCopy, Shape::new([n, features]), DType::F32);
+        allocator.check(1)?;
+        cubecl::std::tensor::copy_into(
+            &client,
+            data.binding(),
+            copy.clone().binding(),
+            dtype_to_storage_type(DType::F32),
+        );
+        allocator.check(1)?;
+        copy
+    };
     let n_u32 = u32::try_from(n).expect("ANN row count validated by plan");
     let width_u32 = u32::try_from(width).expect("ANN width validated by plan");
     let cap_u32 = u32::try_from(capacity).expect("ANN sample capacity validated by plan");
-    let pair_slots = workspace.max_pair_slots_per_tile;
+    let pair_slots = plan.tile_slots;
     let pair_elements = pair_slots;
-    let endpoint_elements = workspace.max_endpoint_records;
+    let endpoint_elements = pair_slots
+        .checked_mul(2)
+        .expect("ANN endpoint tile validated by plan");
     let max_total_slots = n
         .checked_mul(workspace.pair_slots_per_center)
         .expect("ANN pair slot count overflows usize");
@@ -238,42 +405,95 @@ pub(super) fn approximate_neighbors(
         leaf_rows: forest_leaf_rows,
         pair_prefix: forest_pair_prefix,
         pair_count: forest_pairs,
-    } = forest_seed(&data, n, features, width, capacity, seed)
-        .map_err(|error| workspace_error("RP forest initialization", error))?;
-    let pair_left = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
-    let pair_right = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
-    let pair_distances = empty_tensor(&data, Shape::new([pair_elements]), DType::F32);
-    let pair_valid = empty_tensor(&data, Shape::new([pair_elements]), DType::I32);
-    let endpoint_counts = empty_tensor(&data, Shape::new([n]), DType::I32);
-    let endpoint_offsets = empty_tensor(&data, Shape::new([n + 1]), DType::I32);
-    let endpoint_cursors = empty_tensor(&data, Shape::new([n]), DType::I32);
-    let reverse_counts = empty_tensor(&data, Shape::new([n]), DType::I32);
-    let reverse_offsets = empty_tensor(&data, Shape::new([n + 1]), DType::I32);
-    let reverse_cursors = empty_tensor(&data, Shape::new([n]), DType::I32);
+    } = forest_seed(
+        &data,
+        &mut allocator,
+        n,
+        features,
+        width,
+        capacity,
+        seed,
+        profile,
+    )
+    .map_err(|error| workspace_error("RP forest initialization", error))?;
+    let pair_left = allocator.empty(Buffer::PairLeft, Shape::new([pair_elements]), DType::I32);
+    let pair_right = allocator.empty(Buffer::PairRight, Shape::new([pair_elements]), DType::I32);
+    let pair_distances = allocator.empty(
+        Buffer::PairDistances,
+        Shape::new([pair_elements]),
+        DType::F32,
+    );
+    let pair_valid = allocator.empty(Buffer::PairValid, Shape::new([pair_elements]), DType::I32);
+    let endpoint_counts = allocator.empty(Buffer::EndpointCounts, Shape::new([n]), DType::I32);
+    let endpoint_offsets =
+        allocator.empty(Buffer::EndpointOffsets, Shape::new([n + 1]), DType::I32);
+    let endpoint_cursors = allocator.empty(Buffer::EndpointCursors, Shape::new([n]), DType::I32);
+    let reverse_counts = allocator.empty(Buffer::ReverseCounts, Shape::new([n]), DType::I32);
+    let reverse_offsets = allocator.empty(Buffer::ReverseOffsets, Shape::new([n + 1]), DType::I32);
+    let reverse_cursors = allocator.empty(Buffer::ReverseCursors, Shape::new([n]), DType::I32);
     let reverse_elements = n.checked_mul(width).expect("ANN reverse size overflow");
-    let reverse_sources = empty_tensor(&data, Shape::new([reverse_elements]), DType::I32);
-    let endpoint_ids = empty_tensor(&data, Shape::new([endpoint_elements]), DType::I32);
-    let endpoint_distances = empty_tensor(&data, Shape::new([endpoint_elements]), DType::F32);
-    let sampled_ids = empty_tensor(&data, Shape::new([n, capacity * 2]), DType::I32);
-    let sampled_priorities = empty_tensor(&data, Shape::new([n, capacity * 2]), DType::I32);
-    let mut destination_a_ids = empty_tensor(&data, Shape::new([n, width]), DType::I32);
-    let mut destination_a_distances = empty_tensor(&data, Shape::new([n, width]), DType::F32);
-    let mut destination_b_ids = empty_tensor(&data, Shape::new([n, width]), DType::I32);
-    let mut destination_b_distances = empty_tensor(&data, Shape::new([n, width]), DType::F32);
-    let merge_workspace_ids = empty_tensor(&data, Shape::new([n, width]), DType::I32);
-    let merge_workspace_distances = empty_tensor(&data, Shape::new([n, width]), DType::F32);
-    let mut next_flags = empty_tensor(&data, Shape::new([n, width]), DType::I32);
-    let new_count = empty_tensor(&data, Shape::new([1]), DType::I32);
-    let pool_sizes = empty_tensor(&data, Shape::new([n * 2]), DType::I32);
+    let reverse_sources = allocator.empty(
+        Buffer::ReverseSources,
+        Shape::new([reverse_elements]),
+        DType::I32,
+    );
+    let endpoint_ids = allocator.empty(
+        Buffer::EndpointIds,
+        Shape::new([endpoint_elements]),
+        DType::I32,
+    );
+    let endpoint_distances = allocator.empty(
+        Buffer::EndpointDistances,
+        Shape::new([endpoint_elements]),
+        DType::F32,
+    );
+    let sampled_ids = allocator.empty(
+        Buffer::SampledIds,
+        Shape::new([n, capacity * 2]),
+        DType::I32,
+    );
+    let sampled_priorities = allocator.empty(
+        Buffer::SampledPriorities,
+        Shape::new([n, capacity * 2]),
+        DType::I32,
+    );
+    let mut destination_a_ids =
+        allocator.empty(Buffer::DestinationAIds, Shape::new([n, width]), DType::I32);
+    let mut destination_a_distances = allocator.empty(
+        Buffer::DestinationADistances,
+        Shape::new([n, width]),
+        DType::F32,
+    );
+    let mut destination_b_ids =
+        allocator.empty(Buffer::DestinationBIds, Shape::new([n, width]), DType::I32);
+    let mut destination_b_distances = allocator.empty(
+        Buffer::DestinationBDistances,
+        Shape::new([n, width]),
+        DType::F32,
+    );
+    let merge_workspace_ids = allocator.empty(
+        Buffer::MergeWorkspaceIds,
+        Shape::new([n, width]),
+        DType::I32,
+    );
+    let merge_workspace_distances = allocator.empty(
+        Buffer::MergeWorkspaceDistances,
+        Shape::new([n, width]),
+        DType::F32,
+    );
+    let mut next_flags = allocator.empty(Buffer::NextFlags, Shape::new([n, width]), DType::I32);
+    let new_count = allocator.empty(Buffer::NewCount, Shape::new([1]), DType::I32);
+    let pool_sizes = allocator.empty(Buffer::PoolSizes, Shape::new([n * 2]), DType::I32);
     // The join pair prefix is 64-bit; reverse and endpoint prefixes stay I32.
-    let pair_counts = empty_tensor(&data, Shape::new([n]), DType::I64);
-    let center_offsets = empty_tensor(&data, Shape::new([n + 1]), DType::I64);
+    let pair_counts = allocator.empty(Buffer::PairCounts, Shape::new([n]), DType::I64);
+    let center_offsets = allocator.empty(Buffer::CenterOffsets, Shape::new([n + 1]), DType::I64);
     let chunks = n.div_ceil(PREFIX_CHUNK);
-    let chunk_sums = empty_tensor(&data, Shape::new([chunks]), DType::I32);
-    let join_chunk_sums = empty_tensor(&data, Shape::new([chunks]), DType::I64);
+    let chunk_sums = allocator.empty(Buffer::ChunkSums, Shape::new([chunks]), DType::I32);
+    let join_chunk_sums = allocator.empty(Buffer::JoinChunkSums, Shape::new([chunks]), DType::I64);
     // Fixed launch signature placeholder for the join prefix, which never seeds cursors.
     // Passing `center_offsets` twice would alias two mutable bindings.
-    let join_cursor_placeholder = empty_tensor(&data, Shape::new([1]), DType::I64);
+    let join_cursor_placeholder =
+        allocator.empty(Buffer::JoinCursorPlaceholder, Shape::new([1]), DType::I64);
     let prefix_i32 = |values: &CubeTensor, offsets: &CubeTensor, cursors: &CubeTensor| {
         exclusive_prefix(
             &client,
@@ -298,7 +518,17 @@ pub(super) fn approximate_neighbors(
     };
     let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32)?;
     let (row_count, row_dim) = ann_independent_launch(&client, n_u32)?;
+    // Per-tile readbacks and atomics perturb timings: these are diagnostic runs,
+    // not representative ANN performance measurements.
+    #[cfg(feature = "test-support")]
+    let survival_counts = (profile && std::env::var_os("CUSCAN_ANN_SURVIVAL_PROFILE").is_some())
+        .then(|| allocator.empty(Buffer::SurvivalCounts, Shape::new([2]), DType::I32));
+    #[cfg(feature = "test-support")]
+    let mut forest_survival = (0u64, 0u64);
+    #[cfg(feature = "test-support")]
+    let mut join_survival = (0u64, 0u64);
     let mut forest_offset = 0usize;
+    allocator.check(4)?;
     let mut forest_destination_a = false;
     let mut forest_current_ids = candidates.clone();
     let mut forest_current_distances = distances.clone();
@@ -326,6 +556,24 @@ pub(super) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I64),
             ],
         );
+        #[cfg(feature = "test-support")]
+        if let Some(counts) = &survival_counts {
+            let (produced, predicted) = profile_tile_survival(
+                &client,
+                counts,
+                &pair_left,
+                &pair_right,
+                &pair_distances,
+                &pair_valid,
+                &forest_current_ids,
+                &forest_current_distances,
+                n_u32,
+                width_u32,
+                slots_u32,
+            )?;
+            forest_survival.0 += produced;
+            forest_survival.1 += predicted;
+        }
         endpoint_count_zero::launch(
             &client,
             row_count.clone(),
@@ -414,6 +662,13 @@ pub(super) fn approximate_neighbors(
         forest_destination_a = target_is_a;
         forest_offset += slots;
     }
+    #[cfg(feature = "test-support")]
+    if survival_counts.is_some() {
+        eprintln!(
+            "ANN_PROFILE survival phase=forest produced={} predicted_surviving={} (tile-start predicate; timing-sensitive)",
+            forest_survival.0, forest_survival.1
+        );
+    }
     if forest_pairs > 0 {
         if forest_destination_a {
             std::mem::swap(&mut candidates, &mut destination_a_ids);
@@ -442,13 +697,16 @@ pub(super) fn approximate_neighbors(
     if profile {
         let _ = client.read_one_unchecked(candidates.handle.clone());
         eprintln!(
-            "ANN_PROFILE init_ms={:.3} forest_pairs={forest_pairs} H={width} C={capacity} workspace_bytes={} W={} staging_bytes={}",
+            "ANN_PROFILE init_ms={:.3} forest_pairs={forest_pairs} forest_tiles={} H={width} C={capacity} tile_slots={} fixed_peak_bytes={} staging_bytes={} usable_bytes={}",
             init_start.elapsed().as_secs_f64() * 1000.0,
-            workspace.workspace_bytes,
-            workspace.formula_workspace_bytes,
-            workspace.staging_bytes
+            forest_pairs.div_ceil(pair_slots),
+            plan.tile_slots,
+            plan.memory.fixed_peak_bytes,
+            plan.memory.staging_bytes,
+            plan.memory.usable_bytes
         );
     }
+    allocator.check(4)?;
     let mut stop_reason = "max_iterations";
     let mut iterations_run = 0u32;
     let mut last_new_count: Option<i32> = None;
@@ -572,6 +830,24 @@ pub(super) fn approximate_neighbors(
                     dtype_to_storage_type(DType::I64),
                 ],
             );
+            #[cfg(feature = "test-support")]
+            if let Some(counts) = &survival_counts {
+                let (produced, predicted) = profile_tile_survival(
+                    &client,
+                    counts,
+                    &pair_left,
+                    &pair_right,
+                    &pair_distances,
+                    &pair_valid,
+                    &current_ids,
+                    &current_distances,
+                    n_u32,
+                    width_u32,
+                    slots_u32,
+                )?;
+                join_survival.0 += produced;
+                join_survival.1 += predicted;
+            }
             endpoint_count_zero::launch(
                 &client,
                 row_count.clone(),
@@ -664,8 +940,9 @@ pub(super) fn approximate_neighbors(
         if profile {
             let _ = client.read_one_unchecked(current_ids.handle.clone());
             eprintln!(
-                "ANN_PROFILE iteration={iteration} pair_merge_ms={:.3} pair_slots={total_slots}",
-                join_start.elapsed().as_secs_f64() * 1000.0
+                "ANN_PROFILE iteration={iteration} pair_merge_ms={:.3} pair_slots={total_slots} pair_tiles={}",
+                join_start.elapsed().as_secs_f64() * 1000.0,
+                total_slots.div_ceil(pair_slots)
             );
         }
         // Return the old source allocation to the destination pool. Assigning
@@ -712,13 +989,21 @@ pub(super) fn approximate_neighbors(
             }
         }
     }
+    #[cfg(feature = "test-support")]
+    if survival_counts.is_some() {
+        eprintln!(
+            "ANN_PROFILE survival phase=join produced={} predicted_surviving={} (tile-start predicate; timing-sensitive)",
+            join_survival.0, join_survival.1
+        );
+    }
     if profile {
         eprintln!(
             "ANN_PROFILE stop reason={stop_reason} iterations={iterations_run} max_iterations={max_iterations} final_new_count={last_new_count:?} capacity={capacity} width={width}"
         );
     }
-    let output_indices = empty_tensor(&data, Shape::new([n, k]), DType::I32);
-    let output_distances = empty_tensor(&data, Shape::new([n, k]), DType::F32);
+    let output_indices = allocator.empty(Buffer::OutputIds, Shape::new([n, k]), DType::I32);
+    let output_distances = allocator.empty(Buffer::OutputDistances, Shape::new([n, k]), DType::F32);
+    allocator.check(8)?;
     ann_output::launch(
         &client,
         helper_count,
@@ -1431,6 +1716,103 @@ pub(super) fn endpoint_count_kernel<I: Int>(
         endpoint_counts[left].fetch_add(I::cast_from(1i32));
         endpoint_counts[right].fetch_add(I::cast_from(1i32));
     }
+}
+
+// This probe observes the heap before the tile merges, not the progressively
+// tightened heap within the merge. Passing the predicate is not insertion.
+#[cfg(feature = "test-support")]
+#[cube(launch)]
+fn survival_zero<I: Int>(counts: &mut Tensor<I>, #[define(I)] _dtype: ElemType) {
+    counts[0] = I::cast_from(0i32);
+    counts[1] = I::cast_from(0i32);
+}
+
+#[cfg(feature = "test-support")]
+#[cube(launch)]
+fn survival_probe<F: Float, I: Int>(
+    left: &Tensor<I>,
+    right: &Tensor<I>,
+    distances: &Tensor<F>,
+    valid: &Tensor<I>,
+    heap_ids: &Tensor<I>,
+    heap_distances: &Tensor<F>,
+    counts: &mut Tensor<Atomic<I>>,
+    n: u32,
+    width: u32,
+    slots: u32,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let slot = ABSOLUTE_POS_X as usize;
+    if slot < slots as usize && valid[slot] != I::cast_from(0i32) {
+        let l = u32::cast_from(left[slot]) as usize;
+        let r = u32::cast_from(right[slot]) as usize;
+        let d = distances[slot];
+        let l_worst = l * width as usize + width as usize - 1;
+        let r_worst = r * width as usize + width as usize - 1;
+        let l_id = u32::cast_from(heap_ids[l_worst]) as usize;
+        let r_id = u32::cast_from(heap_ids[r_worst]) as usize;
+        let l_distance = heap_distances[l_worst];
+        let r_distance = heap_distances[r_worst];
+        let l_pass = l_id >= n as usize || d < l_distance || (d == l_distance && r < l_id);
+        let r_pass = r_id >= n as usize || d < r_distance || (d == r_distance && l < r_id);
+        counts[0].fetch_add(I::cast_from(2i32));
+        if l_pass {
+            counts[1].fetch_add(I::cast_from(1i32));
+        }
+        if r_pass {
+            counts[1].fetch_add(I::cast_from(1i32));
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn profile_tile_survival(
+    client: &cubecl::client::Client,
+    counts: &CubeTensor,
+    left: &CubeTensor,
+    right: &CubeTensor,
+    distances: &CubeTensor,
+    valid: &CubeTensor,
+    heap_ids: &CubeTensor,
+    heap_distances: &CubeTensor,
+    n: u32,
+    width: u32,
+    slots: u32,
+) -> Result<(u64, u64), AnnError> {
+    survival_zero::launch(
+        client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        counts.clone().into_tensor_arg(),
+        dtype_to_storage_type(DType::I32),
+    );
+    let (count, dim) = ann_independent_launch(client, slots)?;
+    survival_probe::launch(
+        client,
+        count,
+        dim,
+        left.clone().into_tensor_arg(),
+        right.clone().into_tensor_arg(),
+        distances.clone().into_tensor_arg(),
+        valid.clone().into_tensor_arg(),
+        heap_ids.clone().into_tensor_arg(),
+        heap_distances.clone().into_tensor_arg(),
+        counts.clone().into_tensor_arg(),
+        n,
+        width,
+        slots,
+        [
+            dtype_to_storage_type(DType::F32),
+            dtype_to_storage_type(DType::I32),
+        ],
+    );
+    let bytes = client.read_one_unchecked(counts.handle.clone());
+    let produced = i32::from_ne_bytes(bytes[..4].try_into().expect("survival count is i32"));
+    let predicted = i32::from_ne_bytes(bytes[4..8].try_into().expect("survival count is i32"));
+    Ok((
+        u64::try_from(produced).expect("negative survival count"),
+        u64::try_from(predicted).expect("negative survival count"),
+    ))
 }
 
 #[cube(launch)]

@@ -4,7 +4,7 @@ rustflags = [
   "-C",
   "link-arg=-fuse-ld=mold",
   "-Zshare-generics=y",
-  "-Zthreads=8",
+  "-Zthreads=7",
 ]
 
 # Resolve dependency features once for the whole workspace so `-p <crate>` builds share

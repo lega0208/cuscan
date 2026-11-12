@@ -7,7 +7,9 @@ use numpy::ndarray::Array2;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
-use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
+use pyo3::exceptions::{
+    PyMemoryError, PyOverflowError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyTuple};
 
@@ -734,6 +736,7 @@ fn parse_hdbscan_kwargs(
         "device_index",
         "reproducible",
         "knn_k",
+        "memory_limit_bytes",
     ];
     for (key, _) in kwargs.iter() {
         let key = key.extract::<String>()?;
@@ -798,6 +801,11 @@ fn parse_hdbscan_kwargs(
         .map(|value| optional_positive_integer(&value, "knn_k"))
         .transpose()?
         .unwrap_or(None);
+    let memory_limit_bytes = kwargs
+        .get_item("memory_limit_bytes")?
+        .map(|value| crate::optional_memory_limit(&value))
+        .transpose()?
+        .unwrap_or(None);
     let backend = match backend {
         ref backend if backend == "auto" => BackendChoice::Auto,
         ref backend if backend == "cpu" => BackendChoice::Cpu,
@@ -827,6 +835,7 @@ fn parse_hdbscan_kwargs(
         cluster_selection_persistence,
         knn_k,
         reproducible,
+        memory_limit_bytes,
         ..Default::default()
     };
     Ok((config, backend))
@@ -954,6 +963,7 @@ fn map_hdbscan_error(error: HdbscanError) -> PyErr {
             PyRuntimeError::new_err(message)
         }
         HdbscanError::Overflow(_) | HdbscanError::Capacity(_) => PyOverflowError::new_err(message),
+        HdbscanError::Memory(_) => PyMemoryError::new_err(message),
     }
 }
 
@@ -989,6 +999,10 @@ mod tests {
                 map_hdbscan_error(HdbscanError::Capacity("limit".into()))
                     .is_instance_of::<PyOverflowError>(py)
             );
+            let message = "memory limit exceeded";
+            let error = map_hdbscan_error(HdbscanError::Memory(message.into()));
+            assert!(error.is_instance_of::<PyMemoryError>(py));
+            assert_eq!(error.value(py).to_string(), message);
         });
     }
 }

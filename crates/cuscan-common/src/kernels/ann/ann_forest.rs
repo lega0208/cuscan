@@ -7,8 +7,6 @@ use rayon::prelude::*;
 
 pub(super) const MAX_TREES: usize = 64;
 pub(super) const MAX_CANDIDATES: usize = 60;
-pub(super) const STAGING_LIMIT_BYTES: usize = 256 * 1024 * 1024;
-const WORKSPACE_FIXED_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ForestLeaves {
@@ -24,18 +22,8 @@ pub(super) struct ForestLeaves {
 pub(super) struct WorkspacePlan {
     pub(super) max_candidates_per_class: usize,
     pub(super) pair_slots_per_center: usize,
-    pub(super) max_pair_slots_per_tile: usize,
-    pub(super) centers_per_tile: usize,
-    pub(super) max_pairs_per_tile: usize,
-    pub(super) max_endpoint_records: usize,
-    /// Actual peak auxiliary allocation estimate, including the host forest.
-    pub(super) workspace_bytes: usize,
-    /// Approved W expression for this tile, including its one-MiB reserve.
-    pub(super) formula_workspace_bytes: usize,
     /// Peak host-only phase: feature copy plus forest and recursion scratch.
     pub(super) host_peak_bytes: usize,
-    /// Pair and endpoint staging allocation charged to the 256-MiB cap.
-    pub(super) staging_bytes: usize,
     /// Leaf size limit used by the forest builder (`min(max(10, 2H), n)`).
     pub(super) forest_leaf_limit: usize,
     /// Total membership entries across all trees (`trees * n`).
@@ -181,17 +169,185 @@ fn split_node(
     split_node(data, features, right, leaf_size, path_right, out);
 }
 
-/// Return the largest center tile satisfying the staging cap.
+// Phase 0 prototype only. Keep the production builder above unchanged so it is
+// also the oracle for both variants.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn probe_forest(
+    data: &[f32],
+    n: usize,
+    features: usize,
+    seed: u64,
+    trees: usize,
+    leaf_size: usize,
+    join_threshold: Option<usize>,
+) -> Result<ForestLeaves, WorkspaceError> {
+    if n == 0 || features == 0 || leaf_size == 0 || trees == 0 || trees > MAX_TREES {
+        return Err(WorkspaceError::InvalidDimensions);
+    }
+    let expected = n
+        .checked_mul(features)
+        .ok_or(WorkspaceError::ArithmeticOverflow)?;
+    if data.len() != expected {
+        return Err(WorkspaceError::InvalidDimensions);
+    }
+    let membership_len = n
+        .checked_mul(trees)
+        .ok_or(WorkspaceError::ArithmeticOverflow)?;
+    let per_tree: Vec<_> = (0..trees)
+        .into_par_iter()
+        .map(|tree| {
+            let mut rows = (0..n).collect::<Vec<_>>();
+            let mut out = ForestLeaves {
+                row_ids: Vec::with_capacity(n),
+                leaf_offsets: vec![0],
+                tree_leaf_offsets: Vec::new(),
+            };
+            probe_split(
+                data,
+                features,
+                &mut rows,
+                leaf_size.min(n),
+                seed_for(seed, tree as u64, 1),
+                join_threshold,
+                &mut out,
+            );
+            out
+        })
+        .collect();
+    let mut result = ForestLeaves {
+        row_ids: Vec::with_capacity(membership_len),
+        leaf_offsets: vec![0],
+        tree_leaf_offsets: Vec::with_capacity(trees + 1),
+    };
+    for tree in per_tree {
+        result.tree_leaf_offsets.push(result.leaf_offsets.len() - 1);
+        let row_offset = result.row_ids.len();
+        result.row_ids.extend(tree.row_ids);
+        result.leaf_offsets.extend(
+            tree.leaf_offsets
+                .into_iter()
+                .skip(1)
+                .map(|offset| row_offset + offset),
+        );
+    }
+    result.tree_leaf_offsets.push(result.leaf_offsets.len() - 1);
+    Ok(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn probe_split(
+    data: &[f32],
+    features: usize,
+    rows: &mut [usize],
+    leaf_size: usize,
+    node_seed: u64,
+    join_threshold: Option<usize>,
+    out: &mut ForestLeaves,
+) {
+    if rows.len() <= leaf_size {
+        out.row_ids.extend_from_slice(rows);
+        out.leaf_offsets.push(out.row_ids.len());
+        return;
+    }
+    let mut state = node_seed;
+    let normal: Vec<_> = (0..features)
+        .map(|_| next_unit(&mut state) * 2.0 - 1.0)
+        .collect();
+    let mut projected = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(8) {
+        // `Iterator::sum::<f64>()` starts from negative zero.
+        let mut sums = [-0.0f64; 8];
+        for feature in 0..features {
+            for (lane, &row) in chunk.iter().enumerate() {
+                sums[lane] +=
+                    f64::from(data[row * features + feature]) * f64::from(normal[feature]);
+            }
+        }
+        for (lane, &row) in chunk.iter().enumerate() {
+            projected.push((row, sums[lane], mix64(node_seed ^ row as u64)));
+        }
+    }
+    let compare = |a: &(usize, f64, u64), b: &(usize, f64, u64)| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    let midpoint = projected.len() / 2;
+    projected.select_nth_unstable_by(midpoint, compare);
+    for (row, item) in rows.iter_mut().zip(projected.iter()) {
+        *row = item.0;
+    }
+    drop(projected);
+    drop(normal);
+    let join = join_threshold.is_some_and(|threshold| rows.len() >= threshold);
+    let (left, right) = rows.split_at_mut(midpoint);
+    let left_seed = seed_for(node_seed, 0, 0);
+    let right_seed = seed_for(node_seed, 1, 0);
+    if join {
+        let mut right_out = ForestLeaves {
+            row_ids: Vec::with_capacity(right.len()),
+            leaf_offsets: vec![0],
+            tree_leaf_offsets: Vec::new(),
+        };
+        rayon::join(
+            || {
+                probe_split(
+                    data,
+                    features,
+                    left,
+                    leaf_size,
+                    left_seed,
+                    join_threshold,
+                    out,
+                )
+            },
+            || {
+                probe_split(
+                    data,
+                    features,
+                    right,
+                    leaf_size,
+                    right_seed,
+                    join_threshold,
+                    &mut right_out,
+                )
+            },
+        );
+        let offset = out.row_ids.len();
+        out.row_ids.extend(right_out.row_ids);
+        out.leaf_offsets.extend(
+            right_out
+                .leaf_offsets
+                .into_iter()
+                .skip(1)
+                .map(|value| offset + value),
+        );
+    } else {
+        probe_split(
+            data,
+            features,
+            left,
+            leaf_size,
+            left_seed,
+            join_threshold,
+            out,
+        );
+        probe_split(
+            data,
+            features,
+            right,
+            leaf_size,
+            right_seed,
+            join_threshold,
+            out,
+        );
+    }
+}
+
+/// Plan forest and join shape, independent of the memory budget and tile size.
 ///
 /// For `C=min(max_candidates,n-1)`, one center has
-/// `P=C*(C-1)/2+C*C` fixed pair slots. A tile may end mid-center; for `Q`
-/// flattened slots and `R=2*Q` endpoint records, the conservative workspace is
-/// exactly
-/// `W=48*n*H + 32*n*C + 32*(n+1) + 32*R + 1MiB`; staging is charged as
-/// `32*R` and capped at 256 MiB. The persistent and host terms are linear in
-/// `n` and cannot be tiled, so they are not capped here; device allocation
-/// failures surface from the runtime. All terms and conversions are checked.
-/// No whole-leaf pair array is planned or allocated.
+/// `P=C*(C-1)/2+C*C` fixed pair slots.
 pub(super) fn plan_workspace(
     n: usize,
     heap_width: usize,
@@ -214,13 +370,6 @@ pub(super) fn plan_workspace(
         .checked_mul(c.checked_sub(1).ok_or(WorkspaceError::InvalidDimensions)?)
         .and_then(|v| v.checked_div(2))
         .and_then(|v| v.checked_add(c.checked_mul(c)?))
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let formula_persistent = n
-        .checked_mul(heap_width)
-        .and_then(|v| v.checked_mul(48))
-        .and_then(|v| v.checked_add(n.checked_mul(c)?.checked_mul(32)?))
-        .and_then(|v| v.checked_add(n.checked_add(1)?.checked_mul(32)?))
-        .and_then(|v| v.checked_add(WORKSPACE_FIXED_BYTES))
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
     // Peak host memory includes the downloaded byte buffer and decoded f32
     // feature copy simultaneously (8*n*d bytes), temporary per-tree results
@@ -254,54 +403,12 @@ pub(super) fn plan_workspace(
         .and_then(|v| v.checked_add(recursion_scratch_bytes))
         .and_then(|v| v.checked_add(host_graph_bytes))
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    // Conservative estimate of allocated persistent buffers, kept separate
-    // from W's reserve so the forest is charged against the reserve rather
-    // than added on top of W.
-    let actual_persistent = n
-        .checked_mul(heap_width)
-        .and_then(|v| v.checked_mul(32))
-        .and_then(|v| v.checked_add(n.checked_mul(c)?.checked_mul(16)?))
-        // Per-row scratch: eight I32 words (counts, cursors, pool sizes, two offset
-        // arrays) plus two I64 words (join pair counts and center offsets) per row.
-        .and_then(|v| v.checked_add(n.checked_add(1)?.checked_mul(48)?))
-        .and_then(|v| v.checked_add(WORKSPACE_FIXED_BYTES))
+    n.checked_mul(pairs_per_center)
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    // The formula's 16nH + 16nC slack covers the 16(n+1) I64 scratch bytes.
-    // Host forest, downloaded data, and seed heaps are released before pair
-    // staging allocation; the device persistent buffers remain for the join.
-    debug_assert!(actual_persistent <= formula_persistent);
-    let total_pair_slots = n
-        .checked_mul(pairs_per_center)
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let staging_bytes_per_pair_slot = 64usize; // R=2Q records at 32 bytes each.
-    let max_slots_by_staging = STAGING_LIMIT_BYTES / staging_bytes_per_pair_slot;
-    let max_pair_slots_per_tile = total_pair_slots.min(max_slots_by_staging);
-    let centers_per_tile = max_pair_slots_per_tile.div_ceil(pairs_per_center);
-    let max_pairs_per_tile = max_pair_slots_per_tile;
-    let max_endpoint_records = max_pairs_per_tile
-        .checked_mul(2)
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let staging_bytes = max_endpoint_records
-        .checked_mul(32)
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let formula_workspace_bytes = formula_persistent
-        .checked_add(staging_bytes)
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let stage_peak_bytes = actual_persistent
-        .checked_add(staging_bytes)
-        .ok_or(WorkspaceError::ArithmeticOverflow)?;
-    let workspace_bytes = host_peak_bytes.max(stage_peak_bytes);
     Ok(WorkspacePlan {
         max_candidates_per_class: c,
         pair_slots_per_center: pairs_per_center,
-        max_pair_slots_per_tile,
-        centers_per_tile,
-        max_pairs_per_tile,
-        max_endpoint_records,
-        workspace_bytes,
-        formula_workspace_bytes,
         host_peak_bytes,
-        staging_bytes,
         forest_leaf_limit: forest.leaf_limit,
         forest_membership_len: forest.membership_len,
         forest_leaf_count: forest.leaf_count,
@@ -432,6 +539,46 @@ fn next_unit(state: &mut u64) -> f32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn probe_variants_match_production_forest_across_thread_counts() {
+        let n = 37;
+        let features = 9;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|row| {
+                (0..features).map(move |feature| {
+                    if feature == 0 {
+                        3.0
+                    } else {
+                        ((row / 3 * (feature + 1)) % 17) as f32 / 4.0
+                    }
+                })
+            })
+            .collect();
+        let identical = vec![2.0; n * features];
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for points in [&data, &identical] {
+                    for leaf_size in [4, n, n + 1] {
+                        let expected = build_forest(points, n, features, 42, 3, leaf_size).unwrap();
+                        for threshold in [None, Some(8)] {
+                            let actual =
+                                probe_forest(points, n, features, 42, 3, leaf_size, threshold)
+                                    .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "threads={threads}, leaf_size={leaf_size}, threshold={threshold:?}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     fn membership(value: usize) -> WorkspaceError {
         WorkspaceError::Capacity {
             quantity: "forest membership length (trees x rows)",
@@ -555,30 +702,32 @@ mod tests {
     }
 
     #[test]
-    fn workspace_plan_respects_both_caps_and_uses_pair_slot_formula() {
+    fn workspace_plan_reports_shape_and_host_peak() {
         let plan = plan_workspace(50_000, 14, MAX_CANDIDATES, 32, 16).unwrap();
-        let c = 60usize;
-        let per_center = c * (c - 1) / 2 + c * c;
-        assert_eq!(plan.max_candidates_per_class, c);
-        assert_eq!(plan.max_pairs_per_tile, plan.max_pair_slots_per_tile);
-        assert_eq!(plan.pair_slots_per_center, per_center);
-        assert!(plan.max_pair_slots_per_tile > 0);
+        assert_eq!(plan.max_candidates_per_class, 60);
+        assert_eq!(plan.pair_slots_per_center, 5_370);
+        assert_eq!(plan.host_peak_bytes, 96_402_184);
         assert_eq!(
-            plan.centers_per_tile,
-            plan.max_pair_slots_per_tile.div_ceil(per_center)
+            plan_workspace(50_000, 14, MAX_CANDIDATES, 32, 16).unwrap(),
+            plan
         );
-        assert_eq!(plan.max_endpoint_records, 2 * plan.max_pairs_per_tile);
-        assert_eq!(plan.staging_bytes, 32 * plan.max_endpoint_records);
-        assert!(plan.workspace_bytes <= plan.formula_workspace_bytes);
-        assert!(plan.host_peak_bytes <= plan.workspace_bytes);
-        assert!(plan.staging_bytes <= STAGING_LIMIT_BYTES);
-        assert!(plan.host_peak_bytes >= 4 * 50_000 * 32);
-        let larger = plan_workspace(50_000, 14, MAX_CANDIDATES, 32, 16).unwrap();
-        assert_eq!(plan, larger);
     }
 
     #[test]
-    fn workspace_plan_rejects_persistent_overflow() {
+    fn workspace_plan_preserves_forest_shape_across_candidate_widths() {
+        let join = plan_workspace(11, 4, 10, 2, 3).unwrap();
+        assert_eq!(join.pair_slots_per_center, 145);
+        let forest = plan_workspace(11, 4, 1, 2, 3).unwrap();
+        assert_eq!(forest.max_candidates_per_class, 1);
+        assert_eq!(forest.pair_slots_per_center, 1);
+        assert_eq!(forest.forest_pair_count, 75);
+        assert_eq!(forest.forest_pair_count, join.forest_pair_count);
+        assert_eq!(forest.forest_leaf_count, join.forest_leaf_count);
+        assert_eq!(forest.host_peak_bytes, join.host_peak_bytes);
+    }
+
+    #[test]
+    fn workspace_plan_rejects_shape_overflow() {
         assert_eq!(
             plan_workspace(usize::MAX, 1, 1, 1, 1),
             Err(WorkspaceError::ArithmeticOverflow)
@@ -590,9 +739,8 @@ mod tests {
         for n in [250_000usize, 1_000_000] {
             let trees = tree_count(n).unwrap();
             let plan = plan_workspace(n, 19, MAX_CANDIDATES, 784, trees).unwrap();
-            assert!(plan.max_pair_slots_per_tile > 0);
-            assert!(plan.staging_bytes <= STAGING_LIMIT_BYTES);
-            assert!(plan.workspace_bytes > 512 * 1024 * 1024);
+            assert_eq!(plan.pair_slots_per_center, 5_370);
+            assert!(plan.host_peak_bytes > 512 * 1024 * 1024);
         }
     }
 

@@ -2,7 +2,9 @@ use burn::{
     backend::Dispatch,
     tensor::{Device, Int, Tensor, TensorData},
 };
-use cuscan_common::{ann_preflight, backend::NeighborOps};
+use cuscan_common::{
+    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
+};
 use serde_json::Value;
 use std::{collections::HashSet, fs::File, io::Read};
 use umap::{
@@ -440,18 +442,17 @@ fn assert_approximate_fit_quality(
             TensorData::new(train.values.clone(), [train.rows, train.cols]),
             device,
         );
-        ann_preflight(device, train.rows, train.cols, k).unwrap();
-        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
-            train_tensor.clone().into_dispatch(),
-            k as u32,
+        let budget = resolve_memory_budget(device, None).unwrap();
+        let plan = ann_preflight(device, train.rows, train.cols, k, &budget).unwrap();
+        let (ids, _) = approximate_neighbors(
+            train_tensor.clone(),
+            &plan,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
             false,
-        );
-        let ids = Tensor::<2, Int>::from_dispatch(ids)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap();
+        )
+        .unwrap();
+        let ids = ids.to_data().try_to_vec::<i32>().unwrap();
         assert_eq!(ids.len(), train.rows * k, "{name} seed {seed}: ANN shape");
         assert!(
             ids.iter().all(|&id| id >= 0 && (id as usize) < train.rows),
@@ -715,16 +716,17 @@ fn run_recall(device: Device) {
         );
         let fit_k = 14usize;
         let seed = 47u64;
-        ann_preflight(&device, train.rows, train.cols, fit_k).unwrap();
-        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
-            train_tensor.clone().into_dispatch(),
-            fit_k as u32,
+        let memory_budget = resolve_memory_budget(&device, None).unwrap();
+        let plan = ann_preflight(&device, train.rows, train.cols, fit_k, &memory_budget).unwrap();
+        let (graph, _) = approximate_neighbors(
+            train_tensor.clone(),
+            &plan,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
             false,
-        );
-        let graph = Tensor::<2, Int>::from_dispatch(ids);
-        let approximate_fit = graph.to_data().try_to_vec::<i32>().unwrap();
+        )
+        .unwrap();
+        let approximate_fit = graph.clone().to_data().try_to_vec::<i32>().unwrap();
         let fit_recall = tie_aware_recall(&approximate_fit, train, train, fit_k, true);
         fit_weighted_hits += (fit_recall * (train.rows * fit_k) as f64).round() as usize;
         fit_weighted_rows += train.rows * fit_k;
@@ -1009,18 +1011,17 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
             TensorData::new(train.values.clone(), [train.rows, train.cols]),
             device,
         );
-        ann_preflight(device, train.rows, train.cols, 14).unwrap();
-        let (ids, _) = <Dispatch as NeighborOps>::approximate_neighbors(
-            data.into_dispatch(),
-            14,
+        let budget = resolve_memory_budget(device, None).unwrap();
+        let plan = ann_preflight(device, train.rows, train.cols, 14, &budget).unwrap();
+        let (ids, _) = approximate_neighbors(
+            data,
+            &plan,
             seed,
             (train.rows as f64).log2().round().max(5.0) as u32,
             false,
-        );
-        let ids = Tensor::<2, Int>::from_dispatch(ids)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap();
+        )
+        .unwrap();
+        let ids = ids.to_data().try_to_vec::<i32>().unwrap();
         let nonself = tie_aware_recall(&ids, &train, &train, 14, true);
         let self_inclusive = (1.0 + 14.0 * nonself) / 15.0;
         eprintln!("PHASE2_CAMPAIGN_RECALL seed={seed} self_inclusive_at15={self_inclusive:.9}");

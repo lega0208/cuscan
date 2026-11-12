@@ -1,6 +1,61 @@
 use crate::backend::NeighborOps;
-use burn::backend::Dispatch;
+use burn::backend::fusion::custom::{OperationIr, OperationOutput, StreamId};
+use burn::backend::fusion::{Client, FusionTensor, NoOp};
+use burn::backend::ir::{BackendIr, InitOperationIr};
+use burn::backend::{Dispatch, TensorMetadata};
 use burn::tensor::{Int, Tensor};
+use burn_cubecl::{Cube, CubeBackend, fusion::FusionCubeRuntime, tensor::CubeTensor};
+
+fn register_ann_output(
+    client: &Client<FusionCubeRuntime>,
+    tensor: CubeTensor,
+    integer: bool,
+) -> FusionTensor<FusionCubeRuntime> {
+    let (shape, dtype) = (tensor.shape(), tensor.dtype);
+    let handle = if integer {
+        CubeBackend::int_tensor_handle(tensor)
+    } else {
+        CubeBackend::float_tensor_handle(tensor)
+    };
+    let init = InitOperationIr::create(shape, dtype, || client.register_tensor_handle(handle));
+    client
+        .register(
+            StreamId::current(),
+            OperationIr::Init(init),
+            NoOp::<CubeBackend>::new(),
+        )
+        .output()
+}
+
+/// Execute ANN with the previously admitted plan, without querying a new budget.
+///
+/// Materialization drains pending input fusion operations. The raw driver validates
+/// executable shape, tile and launch decisions before reading features or building
+/// the forest; reporting-only memory fields do not choose a new execution route.
+pub fn approximate_neighbors(
+    data: Tensor<2>,
+    plan: &crate::AnnPlan,
+    seed: u64,
+    max_iterations: u32,
+    squared: bool,
+) -> Result<(Tensor<2, Int>, Tensor<2>), crate::AnnError> {
+    let fused = data.try_into_primitive::<Cube>().map_err(|error| {
+        crate::AnnError::InvalidInput(format!("ANN requires a CubeCL tensor: {error:?}"))
+    })?;
+    let client = fused.client.clone();
+    let raw = client.resolve_tensor_float::<CubeBackend>(fused);
+    let (ids, distances) = crate::kernels::ann::approximate_neighbors_planned(
+        raw,
+        plan,
+        seed,
+        max_iterations,
+        squared,
+    )?;
+    Ok((
+        Tensor::from_primitive::<Cube>(register_ann_output(&client, ids, true)),
+        Tensor::from_primitive::<Cube>(register_ann_output(&client, distances, false)),
+    ))
+}
 
 /// Client-independent checked ANN allocation estimate; see `ann_host_estimate`.
 pub use crate::kernels::ann::{AnnEstimate, AnnPhase, AnnPhaseBytes, ann_host_estimate};
@@ -121,6 +176,185 @@ pub fn squared_euclidean_distance_block(query: Tensor<2>, reference: Tensor<2>) 
 mod tests {
     use super::*;
     use burn::tensor::{Device, TensorData};
+
+    #[cfg(feature = "test-support")]
+    mod fusion_roundtrip {
+        use super::*;
+
+        fn roundtrip(device: Device) {
+            let (n, features, k, seed, iterations) = (64usize, 8usize, 8u32, 7u64, 4u32);
+            let values: Vec<f32> = (0..n * features)
+                .map(|i| ((i * 2654435761usize) % 1009) as f32 / 1009.0)
+                .collect();
+            for squared in [false, true] {
+                let data =
+                    Tensor::<2>::from_data(TensorData::new(values.clone(), [n, features]), &device);
+                let budget = crate::memory::resolve_memory_budget(&device, None).unwrap();
+                let plan = crate::ann_preflight(&device, n, features, k as usize, &budget).unwrap();
+                let (expected_ids, expected_distances) =
+                    approximate_neighbors(data.clone(), &plan, seed, iterations, squared).unwrap();
+
+                // Materialize a pending fusion operation before entering the raw driver.
+                let fused = (data * 1.0).try_into_primitive::<Cube>().unwrap();
+                let client = fused.client.clone();
+                let raw = client.resolve_tensor_float::<CubeBackend>(fused);
+                // This equals the default shape-only tile for n=64, capacity=60.
+                let (ids, distances) = crate::approximate_neighbors_with_tile_slots(
+                    raw,
+                    k as usize,
+                    seed,
+                    iterations,
+                    squared,
+                    64 * (60 * 59 / 2 + 60 * 60),
+                )
+                .unwrap();
+
+                let wrap_int = |tensor: CubeTensor| {
+                    Tensor::<2, Int>::from_primitive::<Cube>(register_ann_output(
+                        &client, tensor, true,
+                    ))
+                };
+                let wrap_float = |tensor: CubeTensor| {
+                    Tensor::<2>::from_primitive::<Cube>(register_ann_output(&client, tensor, false))
+                };
+                let ids = wrap_int(ids);
+                let distances = wrap_float(distances);
+                let expected_ids = expected_ids.into_data().try_to_vec::<i32>().unwrap();
+                let expected_bits: Vec<u32> = expected_distances
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect();
+                assert_eq!(
+                    (ids.clone() + 0).into_data().try_to_vec::<i32>().unwrap(),
+                    expected_ids
+                );
+                assert_eq!(ids.into_data().try_to_vec::<i32>().unwrap(), expected_ids);
+                let actual_bits: Vec<u32> = distances
+                    .clone()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect();
+                assert_eq!(actual_bits, expected_bits);
+                let downstream_bits: Vec<u32> = (distances + 0.0)
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect();
+                assert_eq!(downstream_bits, expected_bits);
+            }
+        }
+
+        #[test]
+        fn p0_3b_fusion_roundtrip_cpu() {
+            roundtrip(Device::cpu());
+        }
+
+        fn strided_input_roundtrip(device: Device) {
+            for features in [3, 100] {
+                let n = 64;
+                let values: Vec<f32> = (0..n * features)
+                    .map(|i| ((i * 73 + i / features * 19) % 1009) as f32 / 1009.0)
+                    .collect();
+                let transposed: Vec<_> = (0..features)
+                    .flat_map(|column| (0..n).map(move |row| (row, column)))
+                    .map(|(row, column)| values[row * features + column])
+                    .collect();
+                let source =
+                    Tensor::<2>::from_data(TensorData::new(transposed, [features, n]), &device)
+                        .swap_dims(0, 1);
+                let fused = source.try_into_primitive::<Cube>().unwrap();
+                let client = fused.client.clone();
+                let raw = client.resolve_tensor_float::<CubeBackend>(fused);
+                assert!(
+                    !raw.is_contiguous(),
+                    "fixture must retain its strided layout"
+                );
+                let (bytes, _, _) = TensorData::new(values.clone(), [n, features]).into_parts();
+                let contiguous = CubeTensor::new_contiguous(
+                    raw.client.clone(),
+                    raw.device.clone(),
+                    burn::tensor::Shape::new([n, features]),
+                    raw.client.create(bytes),
+                    burn::tensor::DType::F32,
+                );
+                assert!(contiguous.is_contiguous());
+                let wrap = |raw| {
+                    Tensor::<2>::from_primitive::<Cube>(register_ann_output(&client, raw, false))
+                };
+                let budget = crate::resolve_memory_budget(&device, None).unwrap();
+                let plan = crate::ann_preflight(&device, n, features, 8, &budget).unwrap();
+                let (expected_ids, expected_distances) =
+                    approximate_neighbors(wrap(contiguous), &plan, 7, 4, false).unwrap();
+                let expected_ids = expected_ids.into_data().try_to_vec::<i32>().unwrap();
+                let bits = |tensor: Tensor<2>| {
+                    tensor
+                        .into_data()
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>()
+                };
+                let expected_bits = bits(expected_distances);
+                let pitched =
+                    Tensor::<2>::from_data(TensorData::new(values, [n, features]), &device);
+                let fused = pitched.try_into_primitive::<Cube>().unwrap();
+                let pitched_raw = client.resolve_tensor_float::<CubeBackend>(fused);
+                let burn::backend::DispatchDevice::Cube(cube) = device.as_dispatch();
+                if matches!(cube, cubecl::Device::Cuda(_)) {
+                    assert!(
+                        !pitched_raw.is_contiguous(),
+                        "CUDA fixture must exercise row pitch"
+                    );
+                }
+                for input in [wrap(raw), wrap(pitched_raw)] {
+                    let (ids, distances) =
+                        approximate_neighbors(input, &plan, 7, 4, false).unwrap();
+                    assert_eq!(ids.into_data().try_to_vec::<i32>().unwrap(), expected_ids);
+                    assert_eq!(bits(distances), expected_bits);
+                }
+            }
+        }
+
+        #[test]
+        fn planned_ann_strided_input_cpu() {
+            strided_input_roundtrip(Device::cpu());
+        }
+
+        #[test]
+        fn planned_ann_strided_input_cuda() {
+            if crate::cuda_backend::try_device_count().expect("CUDA discovery failed") == 0 {
+                assert!(
+                    std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                    "CUDA is required"
+                );
+                return;
+            }
+            strided_input_roundtrip(Device::cuda(0));
+        }
+
+        #[test]
+        fn p0_3b_fusion_roundtrip_cuda() {
+            let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
+            if count == 0 {
+                assert!(
+                    std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                    "required CUDA execution has no usable device"
+                );
+                eprintln!("P0-3b CUDA roundtrip not run: no usable CUDA device");
+                return;
+            }
+            roundtrip(Device::cuda(0));
+        }
+    }
 
     fn devices() -> Vec<Device> {
         let mut devices = vec![Device::cpu()];

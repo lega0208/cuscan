@@ -2349,6 +2349,7 @@ dependencies = [
  "cubecl-cpu",
  "cudarc",
  "rayon",
+ "tempfile",
 ]
 
 [[package]]

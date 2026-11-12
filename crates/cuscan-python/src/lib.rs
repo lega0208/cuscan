@@ -1,8 +1,8 @@
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyModule};
 use umap::{
     BackendChoice, FittedUMAP as RustFittedUMAP, Init, NeighborSearch, UMAP, UMAPConfig, UmapError,
 };
@@ -78,6 +78,7 @@ impl FittedUMAP {
         metadata.set_item("transform_seed", c.transform_seed)?;
         metadata.set_item("transform_queue_size", c.transform_queue_size)?;
         metadata.set_item("unique", c.unique)?;
+        metadata.set_item("memory_limit_bytes", c.memory_limit_bytes)?;
         metadata.set_item("requested_search", search_name(state.requested_search))?;
         metadata.set_item("resolved_search", search_name(state.resolved_search))?;
         metadata.set_item("a", state.a)?;
@@ -204,6 +205,7 @@ fn map_umap_error(error: UmapError) -> PyErr {
     let message = error.to_string();
     match error {
         UmapError::InvalidConfig(_) | UmapError::InvalidInput(_) => PyValueError::new_err(message),
+        UmapError::Memory(_) => PyMemoryError::new_err(message),
         UmapError::BackendUnavailable(_)
         | UmapError::Numerical(_)
         | UmapError::SpectralConvergence(_)
@@ -296,6 +298,7 @@ fn load(
         transform_seed: get!("transform_seed").extract()?,
         transform_queue_size: get!("transform_queue_size").extract()?,
         unique: get!("unique").extract()?,
+        memory_limit_bytes: optional_memory_limit(&get!("memory_limit_bytes"))?,
     };
     let fshape = training_features.shape();
     let eshape = embedding.shape();
@@ -362,7 +365,7 @@ fn load(
   learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0,
   init="spectral", random_state=None, transform_seed=42,
   transform_queue_size=4.0, backend="auto", device_index=0,
-  neighbor_search="auto", unique=false))]
+  neighbor_search="auto", unique=false, memory_limit_bytes=None))]
 #[allow(clippy::too_many_arguments)]
 fn fit_umap(
     py: Python<'_>,
@@ -385,7 +388,12 @@ fn fit_umap(
     device_index: usize,
     neighbor_search: &str,
     unique: bool,
+    memory_limit_bytes: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<FittedUMAP> {
+    let memory_limit_bytes = memory_limit_bytes
+        .map(optional_memory_limit)
+        .transpose()?
+        .flatten();
     let init = match init {
         "spectral" => Init::Spectral,
         "random" => Init::Random,
@@ -427,6 +435,7 @@ fn fit_umap(
         transform_seed,
         transform_queue_size,
         unique,
+        memory_limit_bytes,
     };
     let data: Vec<Vec<f32>> = x
         .as_array()
@@ -437,6 +446,21 @@ fn fit_umap(
     py.detach(|| UMAP::new(config, backend, search).fit(&data))
         .map(|inner| FittedUMAP { inner })
         .map_err(map_umap_error)
+}
+
+pub(crate) fn optional_memory_limit(value: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let rejected =
+        || PyValueError::new_err("memory_limit_bytes must be a positive integer or None");
+    if value.is_instance_of::<PyBool>() || value.is_instance_of::<PyFloat>() {
+        return Err(rejected());
+    }
+    match value.extract::<u64>() {
+        Ok(parsed) if parsed > 0 => Ok(Some(parsed)),
+        _ => Err(rejected()),
+    }
 }
 
 #[pymodule]
@@ -469,6 +493,44 @@ mod umap_error_tests {
             let error = map_umap_error(UmapError::Capacity(message.into()));
             assert!(error.is_instance_of::<PyRuntimeError>(py));
             assert_eq!(error.value(py).to_string(), message);
+        });
+    }
+
+    #[test]
+    fn umap_memory_maps_to_memory_error_with_unchanged_message() {
+        Python::initialize();
+        Python::attach(|py| {
+            let message = "memory limit exceeded";
+            let error = map_umap_error(UmapError::Memory(message.into()));
+            assert!(error.is_instance_of::<PyMemoryError>(py));
+            assert_eq!(error.value(py).to_string(), message);
+        });
+    }
+
+    #[test]
+    fn memory_limit_requires_a_positive_integer_or_none() {
+        Python::initialize();
+        Python::attach(|py| {
+            let values = PyDict::new(py);
+            values.set_item("none", py.None()).unwrap();
+            values.set_item("positive", u64::MAX).unwrap();
+            values.set_item("zero", 0).unwrap();
+            values.set_item("negative", -1).unwrap();
+            values.set_item("bool", true).unwrap();
+            values.set_item("float", 1.0).unwrap();
+            assert_eq!(
+                optional_memory_limit(&values.get_item("none").unwrap().unwrap()).unwrap(),
+                None
+            );
+            assert_eq!(
+                optional_memory_limit(&values.get_item("positive").unwrap().unwrap()).unwrap(),
+                Some(u64::MAX)
+            );
+            for key in ["zero", "negative", "bool", "float"] {
+                let error =
+                    optional_memory_limit(&values.get_item(key).unwrap().unwrap()).unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py));
+            }
         });
     }
 }

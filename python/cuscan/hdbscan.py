@@ -160,6 +160,9 @@ class HDBSCAN:
     safety boundary: fitting continues with the same settings, and warning filters can suppress
     or escalate it. The estimate is conditional on the backend (``Auto`` reports both CPU and
     CUDA scenarios) and does not measure available memory. Complete-graph fits emit no advisory.
+
+    ``memory_limit_bytes`` limits the estimated ANN working set including the input.
+    It is not a reservation or a budget for the entire fit; complete-graph fits are unaffected.
     """
 
     _fitted_state: _FittedState
@@ -245,6 +248,7 @@ class HDBSCAN:
         validate_cannot_link: bool = True,
         cannot_link_groups: object | None = None,
         metric_kwds: object | None = None,
+        memory_limit_bytes: int | None = None,
     ) -> None:
         self.min_cluster_size = min_cluster_size
         self.min_samples = min_samples
@@ -265,6 +269,7 @@ class HDBSCAN:
         self.validate_cannot_link = validate_cannot_link
         self.cannot_link_groups = cannot_link_groups
         self.metric_kwds = metric_kwds
+        self.memory_limit_bytes = memory_limit_bytes
 
     @staticmethod
     def _input_array(X: ArrayLike) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
@@ -330,6 +335,12 @@ class HDBSCAN:
         if not isinstance(self.reproducible, (bool, np.bool_)):
             raise ValueError("reproducible must be a boolean")
         self._positive_integer("knn_k", self.knn_k, allow_none=True)
+        if self.memory_limit_bytes is not None and (
+            isinstance(self.memory_limit_bytes, (bool, np.bool_))
+            or not isinstance(self.memory_limit_bytes, (int, np.integer))
+            or not 0 < int(self.memory_limit_bytes) <= 2**64 - 1
+        ):
+            raise ValueError("memory_limit_bytes must be a positive uint64 integer or None")
 
         unsupported = (
             ("semi_supervised", self.semi_supervised, False),
@@ -380,13 +391,17 @@ class HDBSCAN:
             raise ValueError("X must contain at least one fully finite row")
 
         native_kwargs = self._native_kwargs()
+        memory_limit_bytes = (
+            None if self.memory_limit_bytes is None else int(self.memory_limit_bytes)
+        )
         estimate = _cuscan.estimate_hdbscan_resources(
             int(np.count_nonzero(finite_rows)),
             int(x.shape[1]),
+            memory_limit_bytes=memory_limit_bytes,
             **native_kwargs,
         )
         self._warn_resource_advisory(estimate)
-        fitted = _cuscan.fit_hdbscan(x, **native_kwargs)
+        fitted = _cuscan.fit_hdbscan(x, memory_limit_bytes=memory_limit_bytes, **native_kwargs)
 
         labels = np.array(fitted.labels, dtype=np.intp, copy=True)
         probabilities_raw = np.array(fitted.probabilities, dtype=np.float32, copy=True)
