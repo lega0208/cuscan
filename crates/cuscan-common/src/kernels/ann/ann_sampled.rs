@@ -249,6 +249,10 @@ impl AnnAllocator {
         let mut matches = self.table.iter().filter(|entry| entry.buffer == key);
         let entry = matches.next().expect("missing ANN allocation table entry");
         assert!(
+            entry.route != BufferRoute::Cuda || !self.plan.merge_geometry().0,
+            "CUDA-only ANN allocation on CPU route: {key:?}"
+        );
+        assert!(
             matches.next().is_none(),
             "duplicate ANN table entry {key:?}"
         );
@@ -316,10 +320,13 @@ impl AnnAllocator {
     }
 
     fn check(&self, phase: u8) -> Result<(), AnnError> {
+        #[cfg(debug_assertions)]
+        self.assert_live_phase(phase);
         for entry in &self.table {
             if entry.buffer != Buffer::Input
                 && entry.buffer != Buffer::InputCopy
-                && entry.route == BufferRoute::Both
+                && (entry.route == BufferRoute::Both
+                    || (entry.route == BufferRoute::Cuda && !self.plan.merge_geometry().0))
                 && entry.phases & phase != 0
             {
                 assert!(
@@ -335,11 +342,123 @@ impl AnnAllocator {
         }
         Ok(())
     }
+
+    #[cfg(debug_assertions)]
+    fn assert_live_phase(&self, phase: u8) {
+        for (key, _) in &self.allocated {
+            debug_assert!(
+                self.table
+                    .iter()
+                    .any(|entry| entry.buffer == *key && entry.phases & phase != 0),
+                "ANN allocation {key:?} retained outside phase {phase}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_heap_identity(&self, candidates: &CubeTensor) {
+        let retained = self
+            .allocated
+            .iter()
+            .find(|(key, _)| *key == Buffer::HeapIds)
+            .expect("retained ANN heap IDs");
+        debug_assert_eq!(
+            retained.1.handle.memory.clone().binding().id(),
+            candidates.handle.memory.clone().binding().id()
+        );
+        debug_assert_eq!(retained.1.handle.service, candidates.handle.service);
+        debug_assert_eq!(
+            retained.1.handle.offset_start,
+            candidates.handle.offset_start
+        );
+        debug_assert_eq!(retained.1.handle.offset_end, candidates.handle.offset_end);
+    }
+
+    fn release_except(&mut self, phase: u8) {
+        self.allocated.retain(|(key, _)| {
+            self.table
+                .iter()
+                .any(|entry| entry.buffer == *key && entry.phases & phase != 0)
+        });
+    }
+
+    fn swap_keys(&mut self, left: Buffer, right: Buffer) {
+        for (key, _) in &mut self.allocated {
+            if *key == left {
+                *key = right;
+            } else if *key == right {
+                *key = left;
+            }
+        }
+    }
 }
 
-/// Production shared sampled NN-descent orchestration. Source heaps and flags
-/// are frozen for the entire iteration; endpoint merge tiles accumulate into
-/// alternating destination buffers before flags/convergence are finalized.
+fn launch_endpoint_merge(
+    client: &cubecl::client::Client,
+    plan: &AnnPlan,
+    offsets: &CubeTensor,
+    endpoint_ids: &CubeTensor,
+    endpoint_distances: &CubeTensor,
+    ids: &CubeTensor,
+    distances: &CubeTensor,
+    workspace: &Option<(CubeTensor, CubeTensor)>,
+    width: u32,
+) {
+    let (cpu, count, dim) = plan.merge_geometry();
+    let dtypes = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+    ];
+    if cpu {
+        endpoint_merge_cpu::launch(
+            client,
+            count,
+            dim,
+            offsets.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            width,
+            dtypes,
+        );
+    } else {
+        let (workspace_ids, workspace_distances) =
+            workspace.as_ref().expect("CUDA merge workspace");
+        endpoint_merge_cuda::launch(
+            client,
+            count,
+            dim,
+            offsets.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            workspace_ids.clone().into_tensor_arg(),
+            workspace_distances.clone().into_tensor_arg(),
+            width,
+            dtypes,
+        );
+    }
+}
+
+#[cube(launch)]
+fn heap_copy_kernel<I: Int>(
+    source: &Tensor<I>,
+    destination: &mut Tensor<I>,
+    #[define(I)] _dtype: ElemType,
+) {
+    let index = ABSOLUTE_POS_X as usize;
+    if index < source.shape(0) * source.shape(1) {
+        destination[index] = source[index];
+    }
+}
+
+/// Production sampled NN-descent orchestration. Source IDs and flags stay frozen
+/// for each iteration; merge tiles update a working ID heap and one distance heap.
+/// Heap-distance launches are forest/refinement merge, random fill, and output.
+/// The optional survival diagnostic additionally reads the current heap before a
+/// tile; neither sampled-pool construction nor flag finalization reads distances.
 pub(super) fn approximate_neighbors(
     data: CubeTensor,
     k: usize,
@@ -399,7 +518,7 @@ pub(super) fn approximate_neighbors(
         .expect("ANN pair slot count overflows usize");
     let ForestSeed {
         ids: mut candidates,
-        mut distances,
+        distances,
         mut flags,
         rows: forest_rows,
         leaf_rows: forest_leaf_rows,
@@ -428,15 +547,6 @@ pub(super) fn approximate_neighbors(
     let endpoint_offsets =
         allocator.empty(Buffer::EndpointOffsets, Shape::new([n + 1]), DType::I32);
     let endpoint_cursors = allocator.empty(Buffer::EndpointCursors, Shape::new([n]), DType::I32);
-    let reverse_counts = allocator.empty(Buffer::ReverseCounts, Shape::new([n]), DType::I32);
-    let reverse_offsets = allocator.empty(Buffer::ReverseOffsets, Shape::new([n + 1]), DType::I32);
-    let reverse_cursors = allocator.empty(Buffer::ReverseCursors, Shape::new([n]), DType::I32);
-    let reverse_elements = n.checked_mul(width).expect("ANN reverse size overflow");
-    let reverse_sources = allocator.empty(
-        Buffer::ReverseSources,
-        Shape::new([reverse_elements]),
-        DType::I32,
-    );
     let endpoint_ids = allocator.empty(
         Buffer::EndpointIds,
         Shape::new([endpoint_elements]),
@@ -447,53 +557,24 @@ pub(super) fn approximate_neighbors(
         Shape::new([endpoint_elements]),
         DType::F32,
     );
-    let sampled_ids = allocator.empty(
-        Buffer::SampledIds,
-        Shape::new([n, capacity * 2]),
-        DType::I32,
-    );
-    let sampled_priorities = allocator.empty(
-        Buffer::SampledPriorities,
-        Shape::new([n, capacity * 2]),
-        DType::I32,
-    );
-    let mut destination_a_ids =
-        allocator.empty(Buffer::DestinationAIds, Shape::new([n, width]), DType::I32);
-    let mut destination_a_distances = allocator.empty(
-        Buffer::DestinationADistances,
-        Shape::new([n, width]),
-        DType::F32,
-    );
-    let mut destination_b_ids =
-        allocator.empty(Buffer::DestinationBIds, Shape::new([n, width]), DType::I32);
-    let mut destination_b_distances = allocator.empty(
-        Buffer::DestinationBDistances,
-        Shape::new([n, width]),
-        DType::F32,
-    );
-    let merge_workspace_ids = allocator.empty(
-        Buffer::MergeWorkspaceIds,
-        Shape::new([n, width]),
-        DType::I32,
-    );
-    let merge_workspace_distances = allocator.empty(
-        Buffer::MergeWorkspaceDistances,
-        Shape::new([n, width]),
-        DType::F32,
-    );
-    let mut next_flags = allocator.empty(Buffer::NextFlags, Shape::new([n, width]), DType::I32);
-    let new_count = allocator.empty(Buffer::NewCount, Shape::new([1]), DType::I32);
-    let pool_sizes = allocator.empty(Buffer::PoolSizes, Shape::new([n * 2]), DType::I32);
-    // The join pair prefix is 64-bit; reverse and endpoint prefixes stay I32.
-    let pair_counts = allocator.empty(Buffer::PairCounts, Shape::new([n]), DType::I64);
-    let center_offsets = allocator.empty(Buffer::CenterOffsets, Shape::new([n + 1]), DType::I64);
+    let merge_workspace = if plan.merge_geometry().0 {
+        None
+    } else {
+        Some((
+            allocator.empty(
+                Buffer::MergeWorkspaceIds,
+                Shape::new([n, width]),
+                DType::I32,
+            ),
+            allocator.empty(
+                Buffer::MergeWorkspaceDistances,
+                Shape::new([n, width]),
+                DType::F32,
+            ),
+        ))
+    };
     let chunks = n.div_ceil(PREFIX_CHUNK);
     let chunk_sums = allocator.empty(Buffer::ChunkSums, Shape::new([chunks]), DType::I32);
-    let join_chunk_sums = allocator.empty(Buffer::JoinChunkSums, Shape::new([chunks]), DType::I64);
-    // Fixed launch signature placeholder for the join prefix, which never seeds cursors.
-    // Passing `center_offsets` twice would alias two mutable bindings.
-    let join_cursor_placeholder =
-        allocator.empty(Buffer::JoinCursorPlaceholder, Shape::new([1]), DType::I64);
     let prefix_i32 = |values: &CubeTensor, offsets: &CubeTensor, cursors: &CubeTensor| {
         exclusive_prefix(
             &client,
@@ -503,17 +584,6 @@ pub(super) fn approximate_neighbors(
             &chunk_sums,
             DType::I32,
             true,
-        )
-    };
-    let join_prefix = || {
-        exclusive_prefix(
-            &client,
-            &pair_counts,
-            &center_offsets,
-            &join_cursor_placeholder,
-            &join_chunk_sums,
-            DType::I64,
-            false,
         )
     };
     let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32)?;
@@ -528,10 +598,7 @@ pub(super) fn approximate_neighbors(
     #[cfg(feature = "test-support")]
     let mut join_survival = (0u64, 0u64);
     let mut forest_offset = 0usize;
-    allocator.check(4)?;
-    let mut forest_destination_a = false;
-    let mut forest_current_ids = candidates.clone();
-    let mut forest_current_distances = distances.clone();
+    allocator.check(2)?;
     while forest_offset < forest_pairs {
         let slots = (forest_pairs - forest_offset).min(pair_slots);
         let slots_u32 = u32::try_from(slots).expect("ANN forest tile exceeds CubeCL range");
@@ -565,8 +632,8 @@ pub(super) fn approximate_neighbors(
                 &pair_right,
                 &pair_distances,
                 &pair_valid,
-                &forest_current_ids,
-                &forest_current_distances,
+                &candidates,
+                &distances,
                 n_u32,
                 width_u32,
                 slots_u32,
@@ -610,56 +677,17 @@ pub(super) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             ],
         );
-        let (cpu_merge, merge_count, merge_dim) = plan.merge_geometry();
-        let target_is_a = !forest_destination_a;
-        if target_is_a {
-            endpoint_merge_kernel::launch(
-                &client,
-                merge_count,
-                merge_dim,
-                forest_current_ids.clone().into_tensor_arg(),
-                forest_current_distances.clone().into_tensor_arg(),
-                endpoint_offsets.clone().into_tensor_arg(),
-                endpoint_ids.clone().into_tensor_arg(),
-                endpoint_distances.clone().into_tensor_arg(),
-                destination_a_ids.clone().into_tensor_arg(),
-                destination_a_distances.clone().into_tensor_arg(),
-                merge_workspace_ids.clone().into_tensor_arg(),
-                merge_workspace_distances.clone().into_tensor_arg(),
-                width_u32,
-                cpu_merge,
-                [
-                    dtype_to_storage_type(DType::F32),
-                    dtype_to_storage_type(DType::I32),
-                ],
-            );
-            forest_current_ids = destination_a_ids.clone();
-            forest_current_distances = destination_a_distances.clone();
-        } else {
-            endpoint_merge_kernel::launch(
-                &client,
-                merge_count,
-                merge_dim,
-                forest_current_ids.clone().into_tensor_arg(),
-                forest_current_distances.clone().into_tensor_arg(),
-                endpoint_offsets.clone().into_tensor_arg(),
-                endpoint_ids.clone().into_tensor_arg(),
-                endpoint_distances.clone().into_tensor_arg(),
-                destination_b_ids.clone().into_tensor_arg(),
-                destination_b_distances.clone().into_tensor_arg(),
-                merge_workspace_ids.clone().into_tensor_arg(),
-                merge_workspace_distances.clone().into_tensor_arg(),
-                width_u32,
-                cpu_merge,
-                [
-                    dtype_to_storage_type(DType::F32),
-                    dtype_to_storage_type(DType::I32),
-                ],
-            );
-            forest_current_ids = destination_b_ids.clone();
-            forest_current_distances = destination_b_distances.clone();
-        }
-        forest_destination_a = target_is_a;
+        launch_endpoint_merge(
+            &client,
+            &plan,
+            &endpoint_offsets,
+            &endpoint_ids,
+            &endpoint_distances,
+            &candidates,
+            &distances,
+            &merge_workspace,
+            width_u32,
+        );
         forest_offset += slots;
     }
     #[cfg(feature = "test-support")]
@@ -669,15 +697,10 @@ pub(super) fn approximate_neighbors(
             forest_survival.0, forest_survival.1
         );
     }
-    if forest_pairs > 0 {
-        if forest_destination_a {
-            std::mem::swap(&mut candidates, &mut destination_a_ids);
-            std::mem::swap(&mut distances, &mut destination_a_distances);
-        } else {
-            std::mem::swap(&mut candidates, &mut destination_b_ids);
-            std::mem::swap(&mut distances, &mut destination_b_distances);
-        }
-    }
+    drop(forest_rows);
+    drop(forest_leaf_rows);
+    drop(forest_pair_prefix);
+    allocator.release_except(4);
     random_fill_kernel::launch(
         &client,
         row_count.clone(),
@@ -706,6 +729,41 @@ pub(super) fn approximate_neighbors(
             plan.memory.usable_bytes
         );
     }
+    let reverse_counts = allocator.empty(Buffer::ReverseCounts, Shape::new([n]), DType::I32);
+    let reverse_offsets = allocator.empty(Buffer::ReverseOffsets, Shape::new([n + 1]), DType::I32);
+    let reverse_cursors = allocator.empty(Buffer::ReverseCursors, Shape::new([n]), DType::I32);
+    let reverse_sources =
+        allocator.empty(Buffer::ReverseSources, Shape::new([n * width]), DType::I32);
+    let sampled_ids = allocator.empty(
+        Buffer::SampledIds,
+        Shape::new([n, capacity * 2]),
+        DType::I32,
+    );
+    let sampled_priorities = allocator.empty(
+        Buffer::SampledPriorities,
+        Shape::new([n, capacity * 2]),
+        DType::I32,
+    );
+    let mut working_ids = allocator.empty(Buffer::WorkingIds, Shape::new([n, width]), DType::I32);
+    let mut next_flags = allocator.empty(Buffer::NextFlags, Shape::new([n, width]), DType::I32);
+    let new_count = allocator.empty(Buffer::NewCount, Shape::new([1]), DType::I32);
+    let pool_sizes = allocator.empty(Buffer::PoolSizes, Shape::new([n * 2]), DType::I32);
+    let pair_counts = allocator.empty(Buffer::PairCounts, Shape::new([n]), DType::I64);
+    let center_offsets = allocator.empty(Buffer::CenterOffsets, Shape::new([n + 1]), DType::I64);
+    let join_chunk_sums = allocator.empty(Buffer::JoinChunkSums, Shape::new([chunks]), DType::I64);
+    let join_cursor_placeholder =
+        allocator.empty(Buffer::JoinCursorPlaceholder, Shape::new([1]), DType::I64);
+    let join_prefix = || {
+        exclusive_prefix(
+            &client,
+            &pair_counts,
+            &center_offsets,
+            &join_cursor_placeholder,
+            &join_chunk_sums,
+            DType::I64,
+            false,
+        )
+    };
     allocator.check(4)?;
     let mut stop_reason = "max_iterations";
     let mut iterations_run = 0u32;
@@ -713,7 +771,6 @@ pub(super) fn approximate_neighbors(
     for iteration in 0..max_iterations {
         let pool_start = std::time::Instant::now();
         let source_ids = candidates.clone();
-        let source_distances = distances.clone();
         let source_flags = flags.clone();
         let (reverse_count_units, reverse_dim) = ann_independent_launch(&client, n_u32)?;
         reverse_zero::launch(
@@ -801,10 +858,18 @@ pub(super) fn approximate_neighbors(
         }
         let join_start = std::time::Instant::now();
         let mut slot_offset = 0usize;
-        let mut has_destination = false;
-        let mut destination_is_a = false;
-        let mut current_ids = source_ids.clone();
-        let mut current_distances = source_distances.clone();
+        if total_slots > 0 {
+            let elements = u32::try_from(n * width).expect("ANN heap size validated by plan");
+            let (copy_count, copy_dim) = ann_independent_launch(&client, elements)?;
+            heap_copy_kernel::launch(
+                &client,
+                copy_count,
+                copy_dim,
+                source_ids.clone().into_tensor_arg(),
+                working_ids.clone().into_tensor_arg(),
+                dtype_to_storage_type(DType::I32),
+            );
+        }
         while slot_offset < total_slots {
             let slots = (total_slots - slot_offset).min(pair_slots);
             let slots_u32 = u32::try_from(slots).expect("ANN pair tile exceeds CubeCL range");
@@ -839,8 +904,8 @@ pub(super) fn approximate_neighbors(
                     &pair_right,
                     &pair_distances,
                     &pair_valid,
-                    &current_ids,
-                    &current_distances,
+                    &working_ids,
+                    &distances,
                     n_u32,
                     width_u32,
                     slots_u32,
@@ -884,76 +949,34 @@ pub(super) fn approximate_neighbors(
                     dtype_to_storage_type(DType::I32),
                 ],
             );
-            let (cpu_merge, merge_count, merge_dim) = plan.merge_geometry();
-            let target_is_a = !has_destination || !destination_is_a;
-            if target_is_a {
-                endpoint_merge_kernel::launch(
-                    &client,
-                    merge_count,
-                    merge_dim,
-                    current_ids.clone().into_tensor_arg(),
-                    current_distances.clone().into_tensor_arg(),
-                    endpoint_offsets.clone().into_tensor_arg(),
-                    endpoint_ids.clone().into_tensor_arg(),
-                    endpoint_distances.clone().into_tensor_arg(),
-                    destination_a_ids.clone().into_tensor_arg(),
-                    destination_a_distances.clone().into_tensor_arg(),
-                    merge_workspace_ids.clone().into_tensor_arg(),
-                    merge_workspace_distances.clone().into_tensor_arg(),
-                    width_u32,
-                    cpu_merge,
-                    [
-                        dtype_to_storage_type(DType::F32),
-                        dtype_to_storage_type(DType::I32),
-                    ],
-                );
-                current_ids = destination_a_ids.clone();
-                current_distances = destination_a_distances.clone();
-            } else {
-                endpoint_merge_kernel::launch(
-                    &client,
-                    merge_count,
-                    merge_dim,
-                    current_ids.clone().into_tensor_arg(),
-                    current_distances.clone().into_tensor_arg(),
-                    endpoint_offsets.clone().into_tensor_arg(),
-                    endpoint_ids.clone().into_tensor_arg(),
-                    endpoint_distances.clone().into_tensor_arg(),
-                    destination_b_ids.clone().into_tensor_arg(),
-                    destination_b_distances.clone().into_tensor_arg(),
-                    merge_workspace_ids.clone().into_tensor_arg(),
-                    merge_workspace_distances.clone().into_tensor_arg(),
-                    width_u32,
-                    cpu_merge,
-                    [
-                        dtype_to_storage_type(DType::F32),
-                        dtype_to_storage_type(DType::I32),
-                    ],
-                );
-                current_ids = destination_b_ids.clone();
-                current_distances = destination_b_distances.clone();
-            }
-            destination_is_a = target_is_a;
-            has_destination = true;
+            launch_endpoint_merge(
+                &client,
+                &plan,
+                &endpoint_offsets,
+                &endpoint_ids,
+                &endpoint_distances,
+                &working_ids,
+                &distances,
+                &merge_workspace,
+                width_u32,
+            );
             slot_offset += slots;
         }
         if profile {
-            let _ = client.read_one_unchecked(current_ids.handle.clone());
+            let _ = client.read_one_unchecked(if total_slots > 0 {
+                working_ids.handle.clone()
+            } else {
+                candidates.handle.clone()
+            });
             eprintln!(
                 "ANN_PROFILE iteration={iteration} pair_merge_ms={:.3} pair_slots={total_slots} pair_tiles={}",
                 join_start.elapsed().as_secs_f64() * 1000.0,
                 total_slots.div_ceil(pair_slots)
             );
         }
-        // Return the old source allocation to the destination pool. Assigning
-        // a cloned destination here would alias next iteration's frozen source.
-        // With zero compact pairs no merge ran and the source heap stands.
-        if has_destination && destination_is_a {
-            std::mem::swap(&mut candidates, &mut destination_a_ids);
-            std::mem::swap(&mut distances, &mut destination_a_distances);
-        } else if has_destination {
-            std::mem::swap(&mut candidates, &mut destination_b_ids);
-            std::mem::swap(&mut distances, &mut destination_b_distances);
+        if total_slots > 0 {
+            std::mem::swap(&mut candidates, &mut working_ids);
+            allocator.swap_keys(Buffer::HeapIds, Buffer::WorkingIds);
         }
         convergence_zero::launch(
             &client,
@@ -1001,6 +1024,37 @@ pub(super) fn approximate_neighbors(
             "ANN_PROFILE stop reason={stop_reason} iterations={iterations_run} max_iterations={max_iterations} final_new_count={last_new_count:?} capacity={capacity} width={width}"
         );
     }
+    drop(pair_left);
+    drop(pair_right);
+    drop(pair_distances);
+    drop(pair_valid);
+    drop(endpoint_counts);
+    drop(endpoint_offsets);
+    drop(endpoint_cursors);
+    drop(endpoint_ids);
+    drop(endpoint_distances);
+    drop(merge_workspace);
+    drop(reverse_counts);
+    drop(reverse_offsets);
+    drop(reverse_cursors);
+    drop(reverse_sources);
+    drop(sampled_ids);
+    drop(sampled_priorities);
+    drop(working_ids);
+    drop(flags);
+    drop(next_flags);
+    drop(new_count);
+    drop(pool_sizes);
+    drop(pair_counts);
+    drop(center_offsets);
+    drop(chunk_sums);
+    drop(join_chunk_sums);
+    drop(join_cursor_placeholder);
+    #[cfg(feature = "test-support")]
+    drop(survival_counts);
+    allocator.release_except(8);
+    #[cfg(debug_assertions)]
+    allocator.assert_heap_identity(&candidates);
     let output_indices = allocator.empty(Buffer::OutputIds, Shape::new([n, k]), DType::I32);
     let output_distances = allocator.empty(Buffer::OutputDistances, Shape::new([n, k]), DType::F32);
     allocator.check(8)?;
@@ -2073,14 +2127,41 @@ fn cooperative_endpoint_insert<F: Float, I: Int>(
     }
 }
 
-/// Merge endpoint CSR records with frozen source heaps. Candidate ordering is
-/// total `(distance,id)`; duplicate ids retain their minimum proposal distance.
-/// CPU owns a row sequentially, while CUDA lanes distribute candidate slots
-/// and write their unique rank in the sorted output.
+/// CPU owns each row and updates its heap directly.
 #[cube(launch)]
-pub(super) fn endpoint_merge_kernel<F: Float, I: Int>(
-    source_ids: &Tensor<I>,
-    source_distances: &Tensor<F>,
+pub(super) fn endpoint_merge_cpu<F: Float, I: Int>(
+    endpoint_offsets: &Tensor<I>,
+    endpoint_ids: &Tensor<I>,
+    endpoint_distances: &Tensor<F>,
+    output_ids: &mut Tensor<I>,
+    output_distances: &mut Tensor<F>,
+    width: u32,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let row = (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize;
+    let n = output_ids.shape(0);
+    let width = width as usize;
+    if row < n {
+        let start = u32::cast_from(endpoint_offsets[row]) as usize;
+        let end = u32::cast_from(endpoint_offsets[row + 1]) as usize;
+        for position in start..end {
+            serial_endpoint_insert::<F, I>(
+                n,
+                width,
+                row,
+                endpoint_ids[position],
+                endpoint_distances[position],
+                output_ids,
+                output_distances,
+                row * width,
+            );
+        }
+    }
+}
+
+/// CUDA uses the heap as toggle state zero and a separate workspace as state one.
+#[cube(launch)]
+pub(super) fn endpoint_merge_cuda<F: Float, I: Int>(
     endpoint_offsets: &Tensor<I>,
     endpoint_ids: &Tensor<I>,
     endpoint_distances: &Tensor<F>,
@@ -2089,46 +2170,17 @@ pub(super) fn endpoint_merge_kernel<F: Float, I: Int>(
     workspace_ids: &mut Tensor<I>,
     workspace_distances: &mut Tensor<F>,
     width: u32,
-    #[comptime] cpu_merge: bool,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let lane = UNIT_POS_X as usize;
-    let row = if comptime![cpu_merge] {
-        (CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X) as usize
-    } else {
-        CUBE_POS_X as usize
-    };
-    let n = source_ids.shape(0);
+    let row = CUBE_POS_X as usize;
+    let n = output_ids.shape(0);
     let width = width as usize;
     if row < n {
         let start = u32::cast_from(endpoint_offsets[row]) as usize;
         let end = u32::cast_from(endpoint_offsets[row + 1]) as usize;
         let row_base = row * width;
-        if comptime![cpu_merge] {
-            for slot in 0..width {
-                output_ids[row_base + slot] = source_ids[row_base + slot];
-                output_distances[row_base + slot] = source_distances[row_base + slot];
-            }
-            for position in start..end {
-                serial_endpoint_insert::<F, I>(
-                    n,
-                    width,
-                    row,
-                    endpoint_ids[position],
-                    endpoint_distances[position],
-                    output_ids,
-                    output_distances,
-                    row_base,
-                );
-            }
-        } else {
-            let mut slot = lane;
-            while slot < width {
-                output_ids[row_base + slot] = source_ids[row_base + slot];
-                output_distances[row_base + slot] = source_distances[row_base + slot];
-                slot += 32;
-            }
-            sync_cube();
+        if start < end {
             let mut duplicate_slots = Shared::<[I]>::new_slice(32usize);
             let mut rank_counts = Shared::<[I]>::new_slice(32usize);
             let mut metadata = Shared::<[I]>::new_slice(3usize);
@@ -2194,7 +2246,7 @@ pub(super) fn endpoint_merge_kernel<F: Float, I: Int>(
                 batch += 32;
             }
             if toggle != 0 {
-                slot = lane;
+                let mut slot = lane;
                 while slot < width {
                     output_ids[row_base + slot] = workspace_ids[row_base + slot];
                     output_distances[row_base + slot] = workspace_distances[row_base + slot];

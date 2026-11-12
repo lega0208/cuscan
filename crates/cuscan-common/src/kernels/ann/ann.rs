@@ -249,10 +249,7 @@ pub(super) enum Buffer {
     EndpointDistances,
     SampledIds,
     SampledPriorities,
-    DestinationAIds,
-    DestinationADistances,
-    DestinationBIds,
-    DestinationBDistances,
+    WorkingIds,
     MergeWorkspaceIds,
     MergeWorkspaceDistances,
     NextFlags,
@@ -271,6 +268,7 @@ pub(super) enum Buffer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BufferRoute {
     Both,
+    Cuda,
     SurvivalProfile,
 }
 
@@ -311,14 +309,14 @@ fn staging_entries(slots: usize) -> Option<[BufferEntry; 6]> {
             buffer,
             shape: vec![count],
             dtype,
-            phases: 12,
+            phases: 6,
             route: BufferRoute::Both,
             staging: true,
         }),
     )
 }
 
-/// The current driver's allocations, including buffers retained through output.
+/// The driver's allocations and their live phases, including caller-owned input.
 pub(super) fn ann_buffer_table(
     n: usize,
     features: usize,
@@ -343,43 +341,42 @@ pub(super) fn ann_buffer_table(
     }
     entry!(Input, F32, 15, false, n, features);
     entry!(InputCopy, F32, 15, false, n, features);
-    entry!(ForestRows, I32, 14, false, ws.forest_membership_len);
-    entry!(ForestLeafRows, I32, 14, false, leaf_entries);
-    entry!(ForestPairPrefix, I64, 14, false, leaf_entries);
+    entry!(ForestRows, I32, 2, false, ws.forest_membership_len);
+    entry!(ForestLeafRows, I32, 2, false, leaf_entries);
+    entry!(ForestPairPrefix, I64, 2, false, leaf_entries);
     entry!(HeapIds, I32, 14, false, n, width);
     entry!(HeapDistances, F32, 14, false, n, width);
-    entry!(Flags, I32, 14, false, n, width);
+    entry!(Flags, I32, 6, false, n, width);
     entries.extend(staging_entries(tile_slots)?);
-    entry!(EndpointCounts, I32, 12, false, n);
-    entry!(EndpointOffsets, I32, 12, false, row_entries);
-    entry!(EndpointCursors, I32, 12, false, n);
-    entry!(ReverseCounts, I32, 12, false, n);
-    entry!(ReverseOffsets, I32, 12, false, row_entries);
-    entry!(ReverseCursors, I32, 12, false, n);
-    entry!(ReverseSources, I32, 12, false, n.checked_mul(width)?);
-    entry!(SampledIds, I32, 12, false, n, pool_width);
-    entry!(SampledPriorities, I32, 12, false, n, pool_width);
-    entry!(DestinationAIds, I32, 12, false, n, width);
-    entry!(DestinationADistances, F32, 12, false, n, width);
-    entry!(DestinationBIds, I32, 12, false, n, width);
-    entry!(DestinationBDistances, F32, 12, false, n, width);
-    entry!(MergeWorkspaceIds, I32, 12, false, n, width);
-    entry!(MergeWorkspaceDistances, F32, 12, false, n, width);
-    entry!(NextFlags, I32, 12, false, n, width);
-    entry!(NewCount, I32, 12, false, 1);
-    entry!(PoolSizes, I32, 12, false, pool_sizes);
-    entry!(PairCounts, I64, 12, false, n);
-    entry!(CenterOffsets, I64, 12, false, row_entries);
-    entry!(ChunkSums, I32, 12, false, chunks);
-    entry!(JoinChunkSums, I64, 12, false, chunks);
-    entry!(JoinCursorPlaceholder, I64, 12, false, 1);
+    entry!(EndpointCounts, I32, 6, false, n);
+    entry!(EndpointOffsets, I32, 6, false, row_entries);
+    entry!(EndpointCursors, I32, 6, false, n);
+    entry!(ReverseCounts, I32, 4, false, n);
+    entry!(ReverseOffsets, I32, 4, false, row_entries);
+    entry!(ReverseCursors, I32, 4, false, n);
+    entry!(ReverseSources, I32, 4, false, n.checked_mul(width)?);
+    entry!(SampledIds, I32, 4, false, n, pool_width);
+    entry!(SampledPriorities, I32, 4, false, n, pool_width);
+    entry!(WorkingIds, I32, 4, false, n, width);
+    entry!(MergeWorkspaceIds, I32, 6, false, n, width);
+    entries.last_mut()?.route = BufferRoute::Cuda;
+    entry!(MergeWorkspaceDistances, F32, 6, false, n, width);
+    entries.last_mut()?.route = BufferRoute::Cuda;
+    entry!(NextFlags, I32, 4, false, n, width);
+    entry!(NewCount, I32, 4, false, 1);
+    entry!(PoolSizes, I32, 4, false, pool_sizes);
+    entry!(PairCounts, I64, 4, false, n);
+    entry!(CenterOffsets, I64, 4, false, row_entries);
+    entry!(ChunkSums, I32, 6, false, chunks);
+    entry!(JoinChunkSums, I64, 4, false, chunks);
+    entry!(JoinCursorPlaceholder, I64, 4, false, 1);
     entry!(OutputIds, I32, 8, false, n, k);
     entry!(OutputDistances, F32, 8, false, n, k);
     entries.push(BufferEntry {
         buffer: SurvivalCounts,
         shape: vec![2],
         dtype: DType::I32,
-        phases: 12,
+        phases: 6,
         route: BufferRoute::SurvivalProfile,
         staging: false,
     });
@@ -394,6 +391,7 @@ fn ann_allocation_bytes(
     k: usize,
     host: &HostPlan,
     tile_slots: usize,
+    cpu: bool,
 ) -> Result<Vec<(String, usize)>, AnnError> {
     let overflow = || {
         AnnError::Overflow(format!(
@@ -412,6 +410,7 @@ fn ann_allocation_bytes(
     .ok_or_else(overflow)?;
     table
         .into_iter()
+        .filter(|entry| entry.route != BufferRoute::Cuda || !cpu)
         .map(|entry| {
             Ok((
                 format!("{:?}", entry.buffer),
@@ -645,13 +644,14 @@ fn plan_with_host(
         .map_err(|_| AnnError::Capability("device max page size exceeds usize".into()))?;
     let alignment = usize::try_from(memory.alignment)
         .map_err(|_| AnnError::Capability("device alignment exceeds usize".into()))?;
-    for (stage, bytes) in ann_allocation_bytes(n, features, k, &host, tile_slots)? {
-        check_page_limit(&stage, bytes, max_page, alignment)?;
-    }
     let n_u32 = u32::try_from(n).expect("ANN row count validated by host_plan");
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
-    // Largest independent launch is bounded by rows and by one pair tile.
-    let independent_units = n.max(tile_slots);
+    for (stage, bytes) in ann_allocation_bytes(n, features, k, &host, tile_slots, merge.cpu_merge)?
+    {
+        check_page_limit(&stage, bytes, max_page, alignment)?;
+    }
+    // The ID copy covers n * width elements; pair launches cover one tile.
+    let independent_units = (n * host.width).max(tile_slots);
     let independent_units = u32::try_from(independent_units).map_err(|_| {
         AnnError::Overflow(format!(
             "ANN independent launch units {independent_units} exceeds u32 maximum {}",
@@ -718,7 +718,10 @@ fn fixed_memory(
     let mut phases = [0u64; 4];
     let mut contributors = Vec::new();
     for entry in table {
-        if entry.staging || entry.route != BufferRoute::Both {
+        if entry.staging
+            || entry.route == BufferRoute::SurvivalProfile
+            || (cpu && entry.route == BufferRoute::Cuda)
+        {
             continue;
         }
         let bytes = aligned_bytes(entry.bytes().ok_or_else(overflow)?, alignment)?;
@@ -886,8 +889,8 @@ pub struct AnnPhaseBytes {
     pub phase: AnnPhase,
     /// Host RAM allocated by ANN itself during this phase.
     pub host_bytes: usize,
-    /// ANN-owned runtime buffers (device on CUDA, host RAM on CPU), including
-    /// the input tensor and forest tensors, which persist through refinement.
+    /// CUDA-conservative runtime phase estimate, including the input tensor.
+    /// CPU uses the same phase layout but does not allocate CUDA merge workspaces.
     pub runtime_bytes: usize,
 }
 
@@ -910,13 +913,13 @@ pub struct AnnEstimate {
     pub host_peak_bytes: usize,
     /// Maximum runtime bytes across phases.
     pub runtime_peak_bytes: usize,
-    /// Maximum over phases of `host + runtime`, for CPU where both are host RAM.
+    /// Maximum over phases of host plus CPU-route runtime, excluding CUDA workspaces.
     pub cpu_combined_peak_bytes: usize,
-    /// Peak runtime bytes excluding pair and endpoint staging.
+    /// CUDA-conservative peak runtime bytes excluding pair and endpoint staging.
     pub fixed_runtime_peak_bytes: usize,
     /// Unaligned runtime bytes per pair slot across six staging buffers.
     pub staging_bytes_per_slot: usize,
-    /// Fixed runtime peak plus the minimum tile, without alignment rounding.
+    /// CUDA-conservative fixed runtime peak plus the minimum tile, without alignment rounding.
     pub min_runtime_bytes: usize,
 }
 
@@ -946,15 +949,19 @@ fn estimate_from_plan(
     let slots = default_tile_slots(n, &ws)?;
     let table = ann_buffer_table(n, features, k, w, c, &ws, slots).ok_or_else(overflow)?;
     let mut runtime = [0usize; 4];
+    let mut cpu_runtime = [0usize; 4];
     let mut fixed = [0usize; 4];
     for entry in &table {
-        if entry.route != BufferRoute::Both {
+        if entry.route == BufferRoute::SurvivalProfile {
             continue;
         }
         let bytes = entry.bytes().ok_or_else(overflow)?;
         for phase in 0..4 {
             if entry.phases & (1 << phase) != 0 {
                 runtime[phase] = add(runtime[phase], bytes)?;
+                if entry.route != BufferRoute::Cuda {
+                    cpu_runtime[phase] = add(cpu_runtime[phase], bytes)?;
+                }
                 if !entry.staging {
                     fixed[phase] = add(fixed[phase], bytes)?;
                 }
@@ -991,8 +998,8 @@ fn estimate_from_plan(
     ];
     let host_peak_bytes = phases.iter().map(|p| p.host_bytes).max().unwrap_or(0);
     let runtime_peak_bytes = phases.iter().map(|p| p.runtime_bytes).max().unwrap_or(0);
-    let cpu_combined_peak_bytes = phases.iter().try_fold(0usize, |peak, p| {
-        add(p.host_bytes, p.runtime_bytes).map(|v| peak.max(v))
+    let cpu_combined_peak_bytes = phases.iter().enumerate().try_fold(0usize, |peak, (i, p)| {
+        add(p.host_bytes, cpu_runtime[i]).map(|v| peak.max(v))
     })?;
     Ok(AnnEstimate {
         retained_width: w,
@@ -1391,7 +1398,7 @@ mod tests {
             plan_tiles(caps, TileRequest::Exact(1 << 24)).unwrap(),
             1 << 24
         );
-        let allocations = ann_allocation_bytes(40_000, 32, 14, &host, 1 << 24).unwrap();
+        let allocations = ann_allocation_bytes(40_000, 32, 14, &host, 1 << 24, false).unwrap();
         let (_, endpoint_bytes) = allocations
             .iter()
             .find(|(name, _)| *name == "EndpointIds")
@@ -1435,21 +1442,22 @@ mod tests {
             let estimate = ann_host_estimate(1_500_000, 256, k).unwrap();
             assert_eq!(estimate.trees, 64);
             let host = host_plan(1_500_000, 256, k).unwrap();
-            let ws = host.workspace;
             let n = 1_500_000usize;
+            let width = k + 4;
             let c = 60usize;
-            let leaf_entries = ws.forest_leaf_count + 1;
-            let forest = 4 * ws.forest_membership_len + 4 * leaf_entries + 8 * leaf_entries;
             let chunks = n.div_ceil(128);
+            let input = 2 * 4 * n * 256;
+            let staging = 32 * (1 << 22);
+            // IDs, distances, two flag buffers, working IDs, reverse sources,
+            // and two CUDA workspaces; forest membership is already released.
+            let heap = 32 * n * width;
             let scratch =
                 4 * (6 * n + 2 * (n + 1) + 4 * n * c + chunks + 1) + 8 * (n + (n + 1) + chunks + 1);
-            let input = 4 * n * 256;
-            let heap = 44 * n * host.width;
-            let staging = 32 * default_tile_slots(n, &ws).unwrap();
+            assert_eq!(estimate.retained_width, width);
+            assert_eq!(host.width, width);
             assert_eq!(
                 estimate.phases[2].runtime_bytes,
-                2 * input + forest + heap + scratch + staging,
-                "k={k}"
+                input + heap + scratch + staging
             );
         }
     }
@@ -1558,23 +1566,29 @@ mod tests {
         let [input, forest_init, refinement, output] = estimate.phases;
         // Original input plus the conservatively reserved contiguous copy: 2*11*2*4.
         assert_eq!(input.runtime_bytes, 176);
-        // Forest: 55 i32 membership (220 B) + 6 i32 leaf rows (24 B) + 6 i64 pair
-        // prefix entries (48 B) = 292 B, plus 12*n*H heap seeds (924 B) and the input.
-        assert_eq!(forest_init.runtime_bytes, 176 + 292 + 924);
-        // Refinement: input and copy 176 + forest 292 + heap 44*11*7 = 3388 + staging
-        // 16*1595 + 8*3190 = 51_040 + scratch. I32 scratch: 6*11 + 2*12 + 4*11*10
-        // + 1 chunk + 1 = 532 words (2128 B); I64 scratch: 11 + 12 + 1 + 1 = 25
-        // words (200 B). Total 176 + 292 + 3388 + 2328 + 51_040 = 57_224.
-        assert_eq!(refinement.runtime_bytes, 57_224);
-        // Output adds 8*n*k = 264 bytes of I32/F32 output tensors.
-        assert_eq!(output.runtime_bytes, 57_488);
-        assert_eq!(estimate.runtime_peak_bytes, 57_488);
-        let cpu = estimate
-            .phases
-            .iter()
-            .map(|phase| phase.host_bytes + phase.runtime_bytes)
-            .max();
-        assert_eq!(Some(estimate.cpu_combined_peak_bytes), cpu);
+        assert_eq!(forest_init.runtime_bytes, 53_188);
+        assert_eq!(refinement.runtime_bytes, 56_008);
+        assert_eq!(output.runtime_bytes, 1_056);
+        let host = host_plan(11, 2, 3).unwrap();
+        let table =
+            ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
+        for (phase, expected) in [(2, 52_572), (4, 55_392)] {
+            let cpu: usize = table
+                .iter()
+                .filter(|entry| entry.route == BufferRoute::Both && entry.phases & phase != 0)
+                .map(|entry| entry.bytes().unwrap())
+                .sum();
+            assert_eq!(cpu, expected);
+        }
+        assert!(
+            estimate.cpu_combined_peak_bytes
+                <= estimate
+                    .phases
+                    .iter()
+                    .map(|phase| phase.host_bytes + phase.runtime_bytes)
+                    .max()
+                    .unwrap()
+        );
     }
 
     #[test]
@@ -1613,7 +1627,7 @@ mod tests {
         // Endpoint staging is 2 * (11 * 145) = 3190 i32/f32 elements = 12760 bytes,
         // the largest entry (pair staging 6380, membership 220, output 132).
         let host = host_plan(11, 2, 3).unwrap();
-        let entries = ann_allocation_bytes(11, 2, 3, &host, 1_595).unwrap();
+        let entries = ann_allocation_bytes(11, 2, 3, &host, 1_595, false).unwrap();
         let largest = entries.iter().map(|(_, bytes)| *bytes).max().unwrap();
         assert_eq!(largest, 12_760);
         assert!(
@@ -1635,11 +1649,24 @@ mod tests {
         let host = host_plan(11, 2, 3).unwrap();
         let table =
             ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
-        assert_eq!(table.len(), 40);
+        assert_eq!(table.len(), 37);
         let mut seen = std::collections::HashSet::new();
         for entry in &table {
             assert!(seen.insert(entry.buffer));
             assert!(entry.bytes().is_some());
+            if matches!(
+                entry.buffer,
+                Buffer::ForestRows | Buffer::ForestLeafRows | Buffer::ForestPairPrefix
+            ) {
+                assert_eq!(entry.phases, 2);
+            }
+            if matches!(
+                entry.buffer,
+                Buffer::MergeWorkspaceIds | Buffer::MergeWorkspaceDistances
+            ) {
+                assert_eq!(entry.route, BufferRoute::Cuda);
+                assert_eq!(entry.phases, 6);
+            }
         }
         assert_eq!(table.iter().filter(|entry| entry.staging).count(), 6);
         let estimate = estimate_from_plan(11, 2, 3, &host).unwrap();
@@ -1647,14 +1674,38 @@ mod tests {
             let expected: usize = table
                 .iter()
                 .filter(|entry| {
-                    entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                    entry.route != BufferRoute::SurvivalProfile && entry.phases & (1 << index) != 0
                 })
                 .map(|entry| entry.bytes().unwrap())
                 .sum();
             assert_eq!(phase.runtime_bytes, expected);
+            let cpu: usize = table
+                .iter()
+                .filter(|entry| {
+                    entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                })
+                .map(|entry| entry.bytes().unwrap())
+                .sum();
+            assert!(phase.runtime_bytes >= cpu);
         }
         assert_eq!(estimate.phases[0].runtime_bytes, 176);
-        assert_eq!(estimate.phases[1].runtime_bytes, 1392);
+        let cpu_peak = estimate
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                phase.host_bytes
+                    + table
+                        .iter()
+                        .filter(|entry| {
+                            entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                        })
+                        .map(|entry| entry.bytes().unwrap())
+                        .sum::<usize>()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(estimate.cpu_combined_peak_bytes, cpu_peak);
         assert_eq!(estimate.staging_bytes_per_slot, 32);
     }
 

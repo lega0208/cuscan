@@ -32,6 +32,86 @@ fn f32_tensor(device: &CubeDevice, shape: &[usize], values: Vec<f32>) -> CubeTen
     raw_tensor(device, shape, values, DType::F32)
 }
 
+#[cfg(debug_assertions)]
+fn lifetime_allocator() -> AnnAllocator {
+    let device = CubeDevice::Cpu(Default::default());
+    let dispatch = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device.clone()));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let plan = super::super::orchestration::ann_preflight(&dispatch, 11, 2, 3, &budget).unwrap();
+    let table = ann_buffer_table(
+        11,
+        2,
+        3,
+        plan.host.width,
+        plan.host.capacity,
+        &plan.host.workspace,
+        plan.tile_slots,
+    )
+    .unwrap();
+    AnnAllocator {
+        table,
+        allocated: Vec::new(),
+        client: device.client(),
+        device,
+        plan,
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "retained outside phase")]
+fn allocator_rejects_wrong_phase_retained_handle() {
+    let mut allocator = lifetime_allocator();
+    let rows = allocator
+        .table
+        .iter()
+        .find(|entry| entry.buffer == Buffer::ForestRows)
+        .unwrap()
+        .shape[0];
+    let _rows = allocator.empty(Buffer::ForestRows, Shape::new([rows]), DType::I32);
+    allocator.assert_live_phase(4);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn allocator_release_tracks_swapped_heap_identity() {
+    let mut allocator = lifetime_allocator();
+    let width = allocator.plan.host.width;
+    let mut candidates = allocator.empty(Buffer::HeapIds, Shape::new([11, width]), DType::I32);
+    let mut working = allocator.empty(Buffer::WorkingIds, Shape::new([11, width]), DType::I32);
+    let rows = allocator
+        .table
+        .iter()
+        .find(|entry| entry.buffer == Buffer::ForestRows)
+        .unwrap()
+        .shape[0];
+    let forest = allocator.empty(Buffer::ForestRows, Shape::new([rows]), DType::I32);
+    drop(forest);
+    allocator.release_except(4);
+    assert!(
+        !allocator
+            .allocated
+            .iter()
+            .any(|(key, _)| *key == Buffer::ForestRows)
+    );
+    allocator.assert_live_phase(4);
+    std::mem::swap(&mut candidates, &mut working);
+    allocator.swap_keys(Buffer::HeapIds, Buffer::WorkingIds);
+    assert_ne!(
+        candidates.handle.memory.clone().binding().id(),
+        working.handle.memory.clone().binding().id()
+    );
+    drop(working);
+    allocator.release_except(8);
+    allocator.assert_live_phase(8);
+    allocator.assert_heap_identity(&candidates);
+    assert_eq!(allocator.allocated.len(), 1);
+}
+
 #[test]
 fn memory_failure_preserves_fresh_availability_and_server_error() {
     for stage in ["allocation", "input buffer synchronization"] {
@@ -238,6 +318,7 @@ fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
                 Buffer::Input => 0,
                 Buffer::InputCopy => usize::from(copied),
                 Buffer::SurvivalCounts => usize::from(survival),
+                _ if entry.route == BufferRoute::Cuda && plan.merge_geometry().0 => 0,
                 _ => 1,
             };
             assert_eq!(
@@ -408,46 +489,86 @@ fn survival_profile_fixture_cuda() {
     survival_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
 }
 
+fn fixture_merge(
+    device: &CubeDevice,
+    offsets: &CubeTensor,
+    endpoint_ids: &CubeTensor,
+    endpoint_distances: &CubeTensor,
+    ids: &CubeTensor,
+    distances: &CubeTensor,
+    workspace_ids: &CubeTensor,
+    workspace_distances: &CubeTensor,
+    n: usize,
+    width: usize,
+) {
+    let client = device.client();
+    let (cpu, count, dim) =
+        super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
+            .unwrap()
+            .geometry();
+    let dtype = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+    ];
+    if cpu {
+        endpoint_merge_cpu::launch(
+            &client,
+            count,
+            dim,
+            offsets.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            width as u32,
+            dtype,
+        );
+    } else {
+        endpoint_merge_cuda::launch(
+            &client,
+            count,
+            dim,
+            offsets.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            workspace_ids.clone().into_tensor_arg(),
+            workspace_distances.clone().into_tensor_arg(),
+            width as u32,
+            dtype,
+        );
+    }
+}
+
 fn merge_fixture(device: CubeDevice) {
     let client = device.client();
     let n = 3usize;
     let width = 1usize;
     let source_ids = i32_tensor(&device, &[n, width], vec![1, 0, 1]);
-    let source_distances = f32_tensor(&device, &[n, width], vec![10.0, 10.0, 9.0]);
     // Inject proposals for pair 0-2 at 5, then pair 0-1 at 1.
     let offsets = i32_tensor(&device, &[n + 1], vec![0, 2, 3, 4]);
     let endpoint_ids = i32_tensor(&device, &[4], vec![2, 1, 0, 0]);
     let endpoint_distances = f32_tensor(&device, &[4], vec![5.0, 1.0, 1.0, 5.0]);
-    let output_ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
-    let output_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
+    let output_ids = i32_tensor(&device, &[n, width], vec![1, 0, 1]);
+    let output_distances = f32_tensor(&device, &[n, width], vec![10.0, 10.0, 9.0]);
     let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
-    let (cpu_merge, count, dim) =
-        super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
-            .unwrap()
-            .geometry();
-    endpoint_merge_kernel::launch(
-        &client,
-        count,
-        dim,
-        source_ids.clone().into_tensor_arg(),
-        source_distances.clone().into_tensor_arg(),
-        offsets.into_tensor_arg(),
-        endpoint_ids.into_tensor_arg(),
-        endpoint_distances.into_tensor_arg(),
-        output_ids.clone().into_tensor_arg(),
-        output_distances.clone().into_tensor_arg(),
-        workspace_ids.into_tensor_arg(),
-        workspace_distances.into_tensor_arg(),
-        width as u32,
-        cpu_merge,
-        [
-            dtype_to_storage_type(DType::F32),
-            dtype_to_storage_type(DType::I32),
-        ],
+    fixture_merge(
+        &device,
+        &offsets,
+        &endpoint_ids,
+        &endpoint_distances,
+        &output_ids,
+        &output_distances,
+        &workspace_ids,
+        &workspace_distances,
+        n,
+        width,
     );
     assert_eq!(read_i32(&output_ids), [1, 0, 0]);
     assert_eq!(read_f32(&output_distances), [1.0, 1.0, 5.0]);
+    assert_eq!(read_i32(&source_ids), [1, 0, 1]);
 
     let source_flags = i32_tensor(&device, &[n, width], vec![1; n * width]);
     let sampled = i32_tensor(&device, &[n, 2], vec![3; n * 2]);
@@ -474,11 +595,8 @@ fn merge_fixture(device: CubeDevice) {
 }
 
 fn duplicate_merge_fixture(device: CubeDevice) {
-    let client = device.client();
     let n = 3usize;
     let width = 2usize;
-    let source_ids = i32_tensor(&device, &[n, width], vec![3; n * width]);
-    let source_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
     // The same pair arrives twice in one merge batch; each endpoint retains one id at min distance.
     let offsets = i32_tensor(&device, &[n + 1], vec![0, 2, 2, 4]);
     let endpoint_ids = i32_tensor(&device, &[4], vec![2, 2, 0, 0]);
@@ -487,35 +605,113 @@ fn duplicate_merge_fixture(device: CubeDevice) {
     let output_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
     let workspace_ids = i32_tensor(&device, &[n, width], vec![3; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
-    let (cpu_merge, count, dim) =
-        super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
-            .unwrap()
-            .geometry();
-    endpoint_merge_kernel::launch(
-        &client,
-        count,
-        dim,
-        source_ids.into_tensor_arg(),
-        source_distances.into_tensor_arg(),
-        offsets.into_tensor_arg(),
-        endpoint_ids.into_tensor_arg(),
-        endpoint_distances.into_tensor_arg(),
-        output_ids.clone().into_tensor_arg(),
-        output_distances.clone().into_tensor_arg(),
-        workspace_ids.into_tensor_arg(),
-        workspace_distances.into_tensor_arg(),
-        width as u32,
-        cpu_merge,
-        [
-            dtype_to_storage_type(DType::F32),
-            dtype_to_storage_type(DType::I32),
-        ],
+    fixture_merge(
+        &device,
+        &offsets,
+        &endpoint_ids,
+        &endpoint_distances,
+        &output_ids,
+        &output_distances,
+        &workspace_ids,
+        &workspace_distances,
+        n,
+        width,
     );
     assert_eq!(read_i32(&output_ids), [2, 3, 3, 3, 0, 3]);
     assert_eq!(
         read_f32(&output_distances),
         [4.0, f32::MAX, f32::MAX, f32::MAX, 4.0, f32::MAX]
     );
+}
+
+fn untouched_merge_rows_fixture(device: CubeDevice) {
+    let n = 4usize;
+    let width = 1usize;
+    // Row 0 has no records; row 1 receives only a worse proposal. Row 2 has
+    // one accepted proposal and row 3 has two, exercising both CUDA toggles.
+    let offsets = i32_tensor(&device, &[n + 1], vec![0, 0, 1, 2, 4]);
+    let endpoint_ids = i32_tensor(&device, &[4], vec![2, 1, 1, 2]);
+    let endpoint_distances = f32_tensor(&device, &[4], vec![2.0, 0.5, 0.75, 0.25]);
+    let output_ids = i32_tensor(&device, &[n, width], vec![1, 0, 0, 0]);
+    let output_distances = f32_tensor(&device, &[n, width], vec![1.0, 1.0, 1.0, 1.0]);
+    let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n]);
+    let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n]);
+    fixture_merge(
+        &device,
+        &offsets,
+        &endpoint_ids,
+        &endpoint_distances,
+        &output_ids,
+        &output_distances,
+        &workspace_ids,
+        &workspace_distances,
+        n,
+        width,
+    );
+    assert_eq!(read_i32(&output_ids), [1, 0, 1, 2]);
+    assert_eq!(read_f32(&output_distances), [1.0, 1.0, 0.5, 0.25]);
+}
+
+fn tiled_and_zero_slot_iteration_fixture(device: CubeDevice) {
+    let dispatch = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device.clone()));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    for (n, k, iterations) in [(2usize, 1usize, 3u32), (8, 2, 3)] {
+        let values: Vec<f32> = (0..n).map(|i| (i * i + 3 * i) as f32).collect();
+        let plan = super::super::orchestration::ann_preflight(&dispatch, n, 1, k, &budget).unwrap();
+        let mut tiled = plan;
+        tiled.tile_slots = 1;
+        let (expected_ids, expected_distances) = approximate_neighbors(
+            f32_tensor(&device, &[n, 1], values.clone()),
+            k,
+            42,
+            iterations,
+            true,
+            plan,
+        )
+        .unwrap();
+        let (actual_ids, actual_distances) = approximate_neighbors(
+            f32_tensor(&device, &[n, 1], values.clone()),
+            k,
+            42,
+            iterations,
+            true,
+            tiled,
+        )
+        .unwrap();
+        assert_eq!(read_i32(&actual_ids), read_i32(&expected_ids));
+        assert_eq!(
+            read_f32(&actual_distances)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            read_f32(&expected_distances)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        // Each row has only one possible neighbor, so its disjoint new/old
+        // pools cannot contain a pair; every refinement iteration has zero slots.
+        if n == 2 {
+            let (initial_ids, initial_distances) =
+                approximate_neighbors(f32_tensor(&device, &[n, 1], values), k, 42, 0, true, plan)
+                    .unwrap();
+            assert_eq!(read_i32(&actual_ids), read_i32(&initial_ids));
+            assert_eq!(
+                read_f32(&actual_distances)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                read_f32(&initial_distances)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 fn sampled_pair_slots_fixture(device: CubeDevice) {
@@ -1364,6 +1560,8 @@ fn run_kernel_fixtures(device: CubeDevice) {
     squared_output_fixture(device.clone());
     merge_fixture(device.clone());
     duplicate_merge_fixture(device.clone());
+    untouched_merge_rows_fixture(device.clone());
+    tiled_and_zero_slot_iteration_fixture(device.clone());
     sampled_pair_slots_fixture(device.clone());
     forest_pair_slots_tiled_fixture(device.clone());
     sampled_pair_slots_large_offset_fixture(device.clone());

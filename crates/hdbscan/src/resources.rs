@@ -4,6 +4,10 @@
 //! never sums across phases. CPU reports one overlapped host+runtime peak. CUDA reports
 //! host and device peaks separately. Exact and ANN graph routes are modeled as they
 //! execute, not as a flat `n * width` allocation.
+//! ANN runtime phases use the common CUDA-conservative estimate on both backends:
+//! CPU advisories retain the CUDA merge-workspace allowance even though CPU execution
+//! does not allocate it. Admission uses the separate route-specific checked ANN plan,
+//! not this advisory estimate.
 //!
 //! Retained fitted state is modeled: the model-owned compact finite geometry clone
 //! (`n * features * 4`, taken before upload and live for the whole fit, so the Input
@@ -355,6 +359,8 @@ fn scenario(
     match ann {
         Some(ann) => {
             for phase in ann.phases {
+                // Keep the common CUDA-conservative runtime allowance on CPU as well;
+                // this advisory must not stand in for route-specific ANN admission.
                 // ANN host bytes are passed through for every phase. The facade `Input` phase
                 // counts the finite copy, and ANN's `Input` host term (decode plus read-back of
                 // the same data) is a separate lifetime that is still live during ANN input.
