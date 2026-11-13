@@ -19,7 +19,7 @@ license = "MIT"
 repository = "https://github.com/lega0208/cuscan"
 
 [workspace.dependencies]
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 umap-core = { path = "crates/umap-core", default-features = false }
 cuscan-common = { path = "crates/cuscan-common", default-features = false }
 hdbscan-core = { path = "crates/hdbscan-core", default-features = false }
@@ -60,11 +60,11 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = "0.7"
-cubecl-environment = { version = "=0.11.1", default-features = false, features = [
+cubecl-environment = { version = "=0.11.3", default-features = false, features = [
   "std",
   "persistence",
 ] }
-cubecl-server = { version = "=0.11.1", default-features = false, features = [
+cubecl-server = { version = "=0.11.3", default-features = false, features = [
   "std",
   "persistence",
 ] }
