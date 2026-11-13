@@ -81,7 +81,9 @@ def main():
                     break
                 try:
                     status = Path(f"/proc/{process.pid}/status").read_text()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
+                    # The process can die between poll() and the read; a stale
+                    # cached dentry fails the read itself with ESRCH.
                     status = ""
                 for line in status.splitlines():
                     if line.startswith("VmHWM:"):

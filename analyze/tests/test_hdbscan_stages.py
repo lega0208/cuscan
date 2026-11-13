@@ -1441,15 +1441,24 @@ def test_run_command_rejects_invalid_executable_and_timeout(tmp_path: Path) -> N
 def process_exited(proc_stat: Path) -> bool:
     try:
         return proc_stat.read_text(encoding="utf-8").split()[2] == "Z"
-    except FileNotFoundError:
-        # Reaping can remove the entry at any point, including during the read.
+    except (FileNotFoundError, ProcessLookupError):
+        # Reaping can remove the entry at any point: lookup fails with ENOENT,
+        # and a stale cached entry can fail the read itself with ESRCH.
         return True
 
 
-@pytest.mark.parametrize("state", ["missing", "Z", "S"])
-def test_process_exited_handles_reaping(tmp_path: Path, state: str) -> None:
+@pytest.mark.parametrize("state", ["missing", "Z", "S", "esrch"])
+def test_process_exited_handles_reaping(
+    tmp_path: Path, state: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     proc_stat = tmp_path / "stat"
-    if state != "missing":
+    if state == "esrch":
+
+        def raise_esrch(self: Path, *_args: object, **_kwargs: object) -> str:
+            raise ProcessLookupError(3, "No such process")
+
+        monkeypatch.setattr(Path, "read_text", raise_esrch)
+    elif state != "missing":
         proc_stat.write_text(f"123 (python) {state} 0", encoding="utf-8")
     assert process_exited(proc_stat) is (state != "S")
 
