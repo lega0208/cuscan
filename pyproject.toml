@@ -22,7 +22,7 @@ serialization = ["h5py>=3.11", "hdf5plugin>=5.0"]
 
 [dependency-groups]
 dev = [
-    "fast-hdbscan==0.3.2",
+    "fast-hdbscan==0.3.4",
     "hdbscan>=0.8.44",
     "maturin",
     "plotly>=7.1.0",
