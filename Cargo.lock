@@ -2345,6 +2345,7 @@ version = "0.1.1"
 dependencies = [
  "burn",
  "burn-cubecl",
+ "bytemuck",
  "cubecl",
  "cubecl-cpu",
  "cudarc",

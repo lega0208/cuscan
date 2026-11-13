@@ -1,4 +1,6 @@
-//! Phase 0 host forest probe. Includes the same source without exporting probe APIs.
+//! Host forest probe: times the production builder against the frozen serial
+//! reference and checks bit equality. Includes the same source without
+//! exporting forest APIs.
 #[cfg(feature = "test-support")]
 #[allow(dead_code)]
 #[path = "../src/kernels/ann/ann_forest.rs"]
@@ -10,16 +12,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<_> = std::env::args().collect();
     if !(4..=6).contains(&args.len()) {
         return Err(
-            "usage: ann_forest_probe ROWS FEATURES THREADS [REPEATS] [JOIN_THRESHOLD]".into(),
+            "usage: ann_forest_probe ROWS FEATURES THREADS [REPEATS] [VARIANTS=reference,production]"
+                .into(),
         );
     }
     let rows: usize = args[1].parse()?;
     let features: usize = args[2].parse()?;
     let threads: usize = args[3].parse()?;
-    let repeats: usize = args.get(4).map_or(Ok(3), |s| s.parse())?;
-    let threshold: usize = args.get(5).map_or(Ok(8192), |s| s.parse())?;
-    if rows == 0 || features == 0 || threads == 0 || repeats == 0 || threshold == 0 {
-        return Err("all arguments must be positive".into());
+    let repeats: usize = args.get(4).map_or(Ok(1), |s| s.parse())?;
+    let variants: Vec<&str> = args
+        .get(5)
+        .map_or("reference,production", String::as_str)
+        .split(',')
+        .collect();
+    if rows < 2 || features == 0 || threads == 0 || repeats == 0 {
+        return Err("rows must be at least 2 and other arguments positive".into());
+    }
+    if let Some(bad) = variants
+        .iter()
+        .find(|v| !matches!(**v, "reference" | "production"))
+    {
+        return Err(format!("unknown variant {bad}").into());
     }
     let len = rows.checked_mul(features).ok_or("input size overflow")?;
     let mut state = 42u64;
@@ -40,27 +53,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .num_threads(threads)
         .build()?;
     pool.install(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut expected = None;
         for repeat in 0..repeats {
-            let mut expected = None;
-            // Rotate order to reduce systematic warm-cache/order bias.
-            for offset in 0..3 {
-                let variant = (repeat + offset) % 3;
+            for &variant in &variants {
                 let started = Instant::now();
                 let result = match variant {
-                    0 => ann_forest::build_forest(&data, rows, features, 42, trees, leaf_size),
-                    1 => ann_forest::probe_forest(&data, rows, features, 42, trees, leaf_size, None),
-                    _ => ann_forest::probe_forest(&data, rows, features, 42, trees, leaf_size, Some(threshold)),
-                }.map_err(|e| format!("forest: {e:?}"))?;
-                let elapsed = started.elapsed();
-                if let Some(ref baseline) = expected {
-                    if baseline != &result {
-                        return Err(format!("forest mismatch repeat={repeat} variant={variant}").into());
-                    }
-                } else {
-                    expected = Some(result);
+                    "reference" => ann_forest::reference_build_forest(
+                        &data, rows, features, 42, trees, leaf_size,
+                    ),
+                    _ => ann_forest::build_forest(&data, rows, features, 42, trees, leaf_size),
                 }
-                let name = ["current", "lanes", "lanes-joins"][variant];
-                println!("variant={name} rows={rows} features={features} threads={threads} trees={trees} leaf_size={leaf_size} join_threshold={threshold} repeat={repeat} elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
+                .map_err(|e| format!("forest: {e:?}"))?;
+                let elapsed = started.elapsed();
+                let equal = match &expected {
+                    Some(baseline) => baseline == &result,
+                    None => {
+                        expected = Some(result);
+                        true
+                    }
+                };
+                println!(
+                    "variant={variant} rows={rows} features={features} threads={threads} trees={trees} leaf_size={leaf_size} repeat={repeat} elapsed_ms={:.3} equal={equal}",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                if !equal {
+                    return Err(format!("forest mismatch repeat={repeat} variant={variant}").into());
+                }
             }
         }
         Ok(())

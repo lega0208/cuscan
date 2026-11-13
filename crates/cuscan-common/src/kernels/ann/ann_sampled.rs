@@ -12,7 +12,7 @@ mod injected_kernel_tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ann_forest::{
-    WorkspaceError, build_forest, forest_leaf_limit, plan_workspace, tree_count,
+    ForestLeaves, WorkspaceError, build_forest, forest_leaf_limit, plan_workspace, tree_count,
 };
 use super::orchestration::{
     AnnPlan, Buffer, BufferEntry, BufferRoute, ann_buffer_table, ann_independent_launch,
@@ -75,15 +75,37 @@ pub(super) fn forest_seed(
     if input_bytes.len() != expected_bytes {
         return Err(WorkspaceError::InvalidDimensions);
     }
-    let features_host = input_bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_ne_bytes(*chunk))
-        .collect::<Vec<_>>();
-    drop(input_bytes);
+    // View the downloaded bytes as f32 when they are 4-byte aligned; otherwise
+    // decode a copy (the planner charges the copy).
+    enum FeatureSource<B> {
+        Downloaded(B),
+        Decoded(Vec<f32>),
+    }
+    let source = if bytemuck::try_cast_slice::<u8, f32>(&input_bytes).is_ok() {
+        FeatureSource::Downloaded(input_bytes)
+    } else {
+        FeatureSource::Decoded(
+            input_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_ne_bytes(*chunk))
+                .collect(),
+        )
+    };
+    let features_host: &[f32] = match &source {
+        FeatureSource::Downloaded(bytes) => bytemuck::cast_slice(&bytes[..]),
+        FeatureSource::Decoded(values) => values,
+    };
+    if profile {
+        eprintln!(
+            "ANN_PROFILE forest_feature_copy_decoded={}",
+            matches!(source, FeatureSource::Decoded(_))
+        );
+    }
     let build_start = profile.then(std::time::Instant::now);
-    let forest = build_forest(&features_host, n, features, seed, trees, leaf_size)?;
+    let forest = build_forest(features_host, n, features, seed, trees, leaf_size)?;
+    drop(source);
     if let Some(start) = build_start {
         eprintln!(
             "ANN_PROFILE forest_build_ms={:.3}",
@@ -113,10 +135,6 @@ pub(super) fn forest_seed(
     // Empty slots carry the same (n, +inf) missing-neighbor contract as exact search.
     let distances = vec![f32::INFINITY; heap_len];
     let flags = vec![0i32; heap_len];
-    let mut membership = Vec::with_capacity(forest.row_ids.len());
-    for &id in &forest.row_ids {
-        membership.push(i32::try_from(id).map_err(|_| WorkspaceError::InvalidDimensions)?);
-    }
     // Membership offsets stay I32 (bounded by trees * n <= i32::MAX); the pair
     // prefix is I64 so the forest pair total is not limited to i32.
     let mut leaf_rows = Vec::with_capacity(forest.leaf_offsets.len());
@@ -138,6 +156,12 @@ pub(super) fn forest_seed(
                 .ok_or(WorkspaceError::ArithmeticOverflow)?;
         }
     }
+    let ForestLeaves {
+        row_ids: membership,
+        leaf_offsets,
+        tree_leaf_offsets: _,
+    } = forest;
+    drop(leaf_offsets);
     let upload_start = profile.then(std::time::Instant::now);
     let rows_tensor = allocator.upload(
         Buffer::ForestRows,
@@ -158,8 +182,6 @@ pub(super) fn forest_seed(
         DType::I64,
         leaf_pair_prefix,
     );
-    drop(forest);
-    drop(features_host);
     let shape = Shape::new([n, heap_width]);
     let ids = allocator.upload(Buffer::HeapIds, shape.clone(), DType::I32, ids);
     let distances = allocator.upload(Buffer::HeapDistances, shape.clone(), DType::F32, distances);
