@@ -506,6 +506,7 @@ const UNTOUCHED_WORST_DISTANCE: f32 = -7.5;
 
 /// Run the backend's merge and return the row-worst arrays it leaves, starting
 /// from the untouched sentinels.
+#[allow(clippy::too_many_arguments)]
 fn fixture_merge(
     device: &CubeDevice,
     offsets: &CubeTensor,
@@ -537,6 +538,7 @@ fn fixture_merge(
 }
 
 /// Run the backend's merge with caller-owned row-worst arrays.
+#[allow(clippy::too_many_arguments)]
 fn fixture_merge_into(
     device: &CubeDevice,
     offsets: &CubeTensor,

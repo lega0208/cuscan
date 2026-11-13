@@ -202,10 +202,11 @@ fn cgroup_headroom(cgroup: &Path, mountinfo: &Path) -> Result<Option<u64>, Backe
         else {
             return Err(invalid(cgroup, "malformed cgroup membership"));
         };
-        if id == "0" && controllers.is_empty() {
-            if process.replace(absolute_path(path, cgroup)?).is_some() {
-                return Err(invalid(cgroup, "duplicate unified cgroup membership"));
-            }
+        if id == "0"
+            && controllers.is_empty()
+            && process.replace(absolute_path(path, cgroup)?).is_some()
+        {
+            return Err(invalid(cgroup, "duplicate unified cgroup membership"));
         }
     }
     let Some(process) = process else {

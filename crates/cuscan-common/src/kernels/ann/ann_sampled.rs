@@ -48,6 +48,7 @@ pub(super) struct ForestSeed {
     pub(super) pair_count: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn forest_seed(
     data: &CubeTensor,
     allocator: &mut AnnAllocator,
@@ -417,6 +418,7 @@ impl AnnAllocator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_endpoint_merge(
     client: &cubecl::client::Client,
     plan: &AnnPlan,
