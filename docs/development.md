@@ -373,8 +373,8 @@ projected = model.transform(X_new)
   `transform_queue_size` (default 4.0) controls approximate transform effort and
   is rejected for exact search.
 - **ANN capacity limits:** approximate fit neighbors (UMAP fit and the HDBSCAN
-  ANN branch) are checked by `ann_preflight` and `ann_host_estimate` before any
-  allocation; the checks depend only on the shape. The join and forest pair
+  ANN branch) use shape and device checks in `ann_preflight`; the separate
+  `ann_host_estimate` provides shape-only advisory estimates. The join and forest pair
   prefixes are 64-bit, so the total number of candidate pairs is not limited to
   i32. The remaining limits come from 32-bit ids, offsets and kernel addressing:
   - rows `n <= i32::MAX`;
@@ -389,14 +389,62 @@ projected = model.transform(X_new)
     limit.
 
   A rejected shape returns `UmapError::Capacity` or `HdbscanError::Capacity`. The
-  message names the quantity, its value, the limit and the shape. Previously,
-  shapes above about 400,000 rows (the old i32 join prefix, 399,903 rows at the
-  fixed 60 sampled candidates) were rejected. Their wall time and memory are not
-  measured beyond a 420,000 x 8 end-to-end test; at 1,500,000 x 256 the estimate
-  reports several GB of runtime and host memory. Performance at these sizes is a
-  separate follow-up. Inputs wider than the addressing limit (for example
-  `n x features > u32::MAX` below 400,000 rows) used to be accepted and indexed
-  out of range; they are now rejected.
+  message names the quantity, its value, the limit and the shape.
+
+  **Memory admission and tiles:** each approximate fit resolves available memory
+  once, after the input is live, and passes a checked `AnnPlan` to ANN. Usable
+  bytes are `min(floor(0.9 * free) + aligned_live_input, limit, total) - 64 MiB`,
+  saturating at zero; an absent limit is unbounded in that minimum. The live
+  input is included in both the budget and estimated working set. The planner
+  chooses the largest pair-staging tile fitting the aligned fixed peak and six
+  staging allocations, subject to shape, page and launch limits and a budgeted
+  ceiling of 2^24 pair slots. The CPU hardware cap is 2^26 slots. The minimum is
+  the lesser of the total pair slots and 2^20. Tile sizes preserve ANN neighbor
+  IDs and distance bits. Exact tile overrides exist only in the common crate's
+  `test-support` APIs, not the estimator APIs.
+
+  `UMAPConfig::memory_limit_bytes` and `HdbscanConfig::memory_limit_bytes`, and
+  the Python `memory_limit_bytes` argument, accept an optional positive byte
+  limit. It caps the estimated ANN working set including the input, before the
+  reserve is subtracted; it cannot increase available memory. If fixed buffers
+  plus the minimum tile do not fit, `AnnError::Memory` maps to
+  `UmapError::Memory` or `HdbscanError::Memory` and Python raises `MemoryError`.
+  This is admission, not a reservation or execution fallback: concurrent
+  allocations can overcommit after the check, and WSL2 can permit overcommit.
+  Fuzzy graph and layout, exact search, and transform are not budgeted by it.
+
+  **Estimates:** `ann_host_estimate` returns `AnnEstimate`: `retained_width`
+  is `min(k + 4, n - 1)`, `sample_capacity` is `min(60, n - 1)` per new/old
+  class, `trees` is the forest tree count, and `directed_edges` is `n * k`.
+  `phases` contains `phase`, `host_bytes` and CUDA-conservative `runtime_bytes`
+  including input for Input, ForestInit, Refinement and Output. `host_peak_bytes`
+  and `runtime_peak_bytes` are their respective maxima; `cpu_combined_peak_bytes`
+  is the maximum per-phase host plus CPU-route runtime. `fixed_runtime_peak_bytes`
+  excludes staging, `staging_bytes_per_slot` is the unaligned six-buffer cost,
+  and `min_runtime_bytes` adds the minimum tile without alignment. Estimates are
+  advisory, not reservations or total process memory.
+
+  **Profiling:** setting `CUSCAN_ANN_PROFILE=1` emits `ANN_PROFILE` lines to
+  stderr: `forest_readback_ms`/`bytes`, `forest_feature_copy_decoded`,
+  `forest_build_ms`, `forest_upload_enqueue_ms`; `init_ms`, `forest_pairs`,
+  `forest_tiles`, `H`, `C`, `tile_slots`, `fixed_peak_bytes`, `staging_bytes`,
+  `usable_bytes`; per-`iteration` `pools_ms` and `pair_merge_ms` with
+  `pair_slots`/`pair_tiles`; `records phase=forest|join produced kept`; and
+  `stop reason iterations max_iterations final_new_count capacity width`.
+  With `test-support` and `CUSCAN_ANN_SURVIVAL_PROFILE` also set, `survival`
+  lines report `phase`, `produced` and `predicted_surviving`; these are
+  timing-sensitive tile-start predictions, not insertion counts. Profiling
+  performs readbacks and is not representative of normal execution timing.
+- **CPU free memory:** ANN memory admission on the CPU backend reads available
+  host memory once per fit (`cuscan_common::memory`). Linux uses `MemAvailable`
+  from `/proc/meminfo`, capped by the cgroup v2 headroom of the current process.
+  Other targets use `sysinfo` available memory: on macOS active, inactive and free
+  pages (XNU non-compressed available memory, which can overstate free memory),
+  on Windows `ullAvailPhys`. Those readings do not include job-object or
+  container limits; set `memory_limit_bytes` there. On those targets a zero
+  reading is a backend-unavailable error, never total memory; on Linux an
+  unreadable source is that error and a zero reading is admitted as zero free
+  memory. Only Linux is tested.
 - **Errors:** invalid input or configuration returns `UmapError`; Python raises
   `ValueError` (input/config) or `RuntimeError` (backend/numerical). Valid
   input that exceeds a documented implementation limit (see ANN capacity limits)

@@ -12,11 +12,13 @@ mod injected_kernel_tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ann_forest::{
-    ForestLeaves, WorkspaceError, build_forest, forest_leaf_limit, plan_workspace, tree_count,
+    ForestLeaves, MAX_CANDIDATES, WorkspaceError, build_forest, forest_leaf_limit, plan_workspace,
+    tree_count,
 };
 use super::orchestration::{
-    AnnPlan, Buffer, BufferEntry, BufferRoute, ann_buffer_table, ann_independent_launch,
-    ann_output, ann_should_stop, reverse_count, reverse_scatter, reverse_zero, workspace_error,
+    AnnPlan, Buffer, BufferEntry, BufferRoute, REVERSE_NEW_BIT, ann_buffer_table,
+    ann_independent_launch, ann_output, ann_should_stop, reverse_count, reverse_scatter,
+    reverse_zero, workspace_error,
 };
 use crate::error::AnnError;
 use burn::{
@@ -423,6 +425,8 @@ fn launch_endpoint_merge(
     endpoint_distances: &CubeTensor,
     ids: &CubeTensor,
     distances: &CubeTensor,
+    row_worst_ids: &CubeTensor,
+    row_worst_distances: &CubeTensor,
     workspace: &Option<(CubeTensor, CubeTensor)>,
     width: u32,
 ) {
@@ -441,6 +445,8 @@ fn launch_endpoint_merge(
             endpoint_distances.clone().into_tensor_arg(),
             ids.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
             width,
             dtypes,
         );
@@ -458,6 +464,8 @@ fn launch_endpoint_merge(
             distances.clone().into_tensor_arg(),
             workspace_ids.clone().into_tensor_arg(),
             workspace_distances.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
             width,
             dtypes,
         );
@@ -478,7 +486,10 @@ fn heap_copy_kernel<I: Int>(
 
 /// Production sampled NN-descent orchestration. Source IDs and flags stay frozen
 /// for each iteration; merge tiles update a working ID heap and one distance heap.
-/// Heap-distance launches are forest/refinement merge, random fill, and output.
+/// Heap-distance launches are forest/refinement merge, random fill, the row-worst
+/// refresh and output. Pair kernels read only the row-worst thresholds, which the
+/// merge rewrites for every row it touches and the refresh rebuilds after the
+/// initial upload and after random fill (the only heap writers outside the merge).
 /// The optional survival diagnostic additionally reads the current heap before a
 /// tile; neither sampled-pool construction nor flag finalization reads distances.
 pub(super) fn approximate_neighbors(
@@ -501,6 +512,11 @@ pub(super) fn approximate_neighbors(
     let client = data.client.clone();
     let width = plan.host.width;
     let capacity = plan.host.capacity;
+    // `sampled_pool_kernel` sizes its local priority array for this bound.
+    assert!(
+        capacity <= MAX_CANDIDATES,
+        "ANN sample capacity exceeds MAX_CANDIDATES"
+    );
     let workspace = plan.host.workspace;
     let table = ann_buffer_table(n, features, k, width, capacity, &workspace, plan.tile_slots)
         .ok_or_else(|| AnnError::Overflow("ANN allocation table overflow".into()))?;
@@ -565,6 +581,9 @@ pub(super) fn approximate_neighbors(
         DType::F32,
     );
     let pair_valid = allocator.empty(Buffer::PairValid, Shape::new([pair_elements]), DType::I32);
+    let row_worst_ids = allocator.empty(Buffer::RowWorstIds, Shape::new([n]), DType::I32);
+    let row_worst_distances =
+        allocator.empty(Buffer::RowWorstDistances, Shape::new([n]), DType::F32);
     let endpoint_counts = allocator.empty(Buffer::EndpointCounts, Shape::new([n]), DType::I32);
     let endpoint_offsets =
         allocator.empty(Buffer::EndpointOffsets, Shape::new([n + 1]), DType::I32);
@@ -610,6 +629,26 @@ pub(super) fn approximate_neighbors(
     };
     let (helper_count, helper_dim) = ann_independent_launch(&client, n_u32)?;
     let (row_count, row_dim) = ann_independent_launch(&client, n_u32)?;
+    let refresh_row_worst = |ids: &CubeTensor| {
+        row_worst_refresh_kernel::launch(
+            &client,
+            row_count.clone(),
+            row_dim,
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
+            width_u32,
+            [
+                dtype_to_storage_type(DType::F32),
+                dtype_to_storage_type(DType::I32),
+            ],
+        );
+    };
+    let profile_counts =
+        profile.then(|| allocator.empty(Buffer::ProfileCounts, Shape::new([1]), DType::I32));
+    let mut forest_records = (0u64, 0u64);
+    let mut join_records = (0u64, 0u64);
     // Per-tile readbacks and atomics perturb timings: these are diagnostic runs,
     // not representative ANN performance measurements.
     #[cfg(feature = "test-support")]
@@ -621,6 +660,8 @@ pub(super) fn approximate_neighbors(
     let mut join_survival = (0u64, 0u64);
     let mut forest_offset = 0usize;
     allocator.check(2)?;
+    // The heap holds the initial `(n, +inf)` rows: every row starts not full.
+    refresh_row_worst(&candidates);
     while forest_offset < forest_pairs {
         let slots = (forest_pairs - forest_offset).min(pair_slots);
         let slots_u32 = u32::try_from(slots).expect("ANN forest tile exceeds CubeCL range");
@@ -633,6 +674,8 @@ pub(super) fn approximate_neighbors(
             forest_rows.clone().into_tensor_arg(),
             forest_leaf_rows.clone().into_tensor_arg(),
             forest_pair_prefix.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
             pair_left.clone().into_tensor_arg(),
             pair_right.clone().into_tensor_arg(),
             pair_distances.clone().into_tensor_arg(),
@@ -682,6 +725,18 @@ pub(super) fn approximate_neighbors(
             dtype_to_storage_type(DType::I32),
         );
         prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+        if let Some(counts) = &profile_counts {
+            let (produced, kept) = profile_tile_records(
+                &client,
+                counts,
+                &pair_valid,
+                &endpoint_offsets,
+                n,
+                slots_u32,
+            )?;
+            forest_records.0 += produced;
+            forest_records.1 += kept;
+        }
         endpoint_scatter_kernel::launch(
             &client,
             pair_count.clone(),
@@ -707,6 +762,8 @@ pub(super) fn approximate_neighbors(
             &endpoint_distances,
             &candidates,
             &distances,
+            &row_worst_ids,
+            &row_worst_distances,
             &merge_workspace,
             width_u32,
         );
@@ -717,6 +774,12 @@ pub(super) fn approximate_neighbors(
         eprintln!(
             "ANN_PROFILE survival phase=forest produced={} predicted_surviving={} (tile-start predicate; timing-sensitive)",
             forest_survival.0, forest_survival.1
+        );
+    }
+    if profile {
+        eprintln!(
+            "ANN_PROFILE records phase=forest produced={} kept={}",
+            forest_records.0, forest_records.1
         );
     }
     drop(forest_rows);
@@ -739,6 +802,8 @@ pub(super) fn approximate_neighbors(
             dtype_to_storage_type(DType::I32),
         ],
     );
+    // Random fill is the only heap writer outside the merge.
+    refresh_row_worst(&candidates);
     if profile {
         let _ = client.read_one_unchecked(candidates.handle.clone());
         eprintln!(
@@ -758,11 +823,6 @@ pub(super) fn approximate_neighbors(
         allocator.empty(Buffer::ReverseSources, Shape::new([n * width]), DType::I32);
     let sampled_ids = allocator.empty(
         Buffer::SampledIds,
-        Shape::new([n, capacity * 2]),
-        DType::I32,
-    );
-    let sampled_priorities = allocator.empty(
-        Buffer::SampledPriorities,
         Shape::new([n, capacity * 2]),
         DType::I32,
     );
@@ -818,6 +878,7 @@ pub(super) fn approximate_neighbors(
             reverse_count_units,
             reverse_dim,
             source_ids.clone().into_tensor_arg(),
+            source_flags.clone().into_tensor_arg(),
             reverse_cursors.clone().into_tensor_arg(),
             reverse_sources.clone().into_tensor_arg(),
             n_u32,
@@ -833,7 +894,6 @@ pub(super) fn approximate_neighbors(
             reverse_offsets.clone().into_tensor_arg(),
             reverse_sources.clone().into_tensor_arg(),
             sampled_ids.clone().into_tensor_arg(),
-            sampled_priorities.clone().into_tensor_arg(),
             n_u32,
             width_u32,
             cap_u32,
@@ -904,6 +964,8 @@ pub(super) fn approximate_neighbors(
                 sampled_ids.clone().into_tensor_arg(),
                 pool_sizes.clone().into_tensor_arg(),
                 center_offsets.clone().into_tensor_arg(),
+                row_worst_ids.clone().into_tensor_arg(),
+                row_worst_distances.clone().into_tensor_arg(),
                 pair_left.clone().into_tensor_arg(),
                 pair_right.clone().into_tensor_arg(),
                 pair_distances.clone().into_tensor_arg(),
@@ -954,6 +1016,18 @@ pub(super) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             );
             prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+            if let Some(counts) = &profile_counts {
+                let (produced, kept) = profile_tile_records(
+                    &client,
+                    counts,
+                    &pair_valid,
+                    &endpoint_offsets,
+                    n,
+                    slots_u32,
+                )?;
+                join_records.0 += produced;
+                join_records.1 += kept;
+            }
             endpoint_scatter_kernel::launch(
                 &client,
                 pair_count.clone(),
@@ -979,6 +1053,8 @@ pub(super) fn approximate_neighbors(
                 &endpoint_distances,
                 &working_ids,
                 &distances,
+                &row_worst_ids,
+                &row_worst_distances,
                 &merge_workspace,
                 width_u32,
             );
@@ -1043,6 +1119,10 @@ pub(super) fn approximate_neighbors(
     }
     if profile {
         eprintln!(
+            "ANN_PROFILE records phase=join produced={} kept={}",
+            join_records.0, join_records.1
+        );
+        eprintln!(
             "ANN_PROFILE stop reason={stop_reason} iterations={iterations_run} max_iterations={max_iterations} final_new_count={last_new_count:?} capacity={capacity} width={width}"
         );
     }
@@ -1050,6 +1130,9 @@ pub(super) fn approximate_neighbors(
     drop(pair_right);
     drop(pair_distances);
     drop(pair_valid);
+    drop(row_worst_ids);
+    drop(row_worst_distances);
+    drop(profile_counts);
     drop(endpoint_counts);
     drop(endpoint_offsets);
     drop(endpoint_cursors);
@@ -1061,7 +1144,6 @@ pub(super) fn approximate_neighbors(
     drop(reverse_cursors);
     drop(reverse_sources);
     drop(sampled_ids);
-    drop(sampled_priorities);
     drop(working_ids);
     drop(flags);
     drop(next_flags);
@@ -1234,13 +1316,35 @@ fn candidate_priority<I: Int>(
     park_miller::<I>(add_mod::<I>(state, class_mod, modulus))
 }
 
-/// Insert into a priority-sorted pool holding `len` valid members and return
-/// the new length. The pool keeps the `capacity` lowest `(priority, id)`
-/// members; duplicates (which always carry the same priority) are ignored.
+/// Whether `id` is among the `len` valid members of pool `list`. Read-only; the
+/// pools are mutable only because the kernel holds them that way.
+#[cube]
+fn pool_contains<I: Int>(
+    ids: &mut Tensor<I>,
+    row_base: usize,
+    capacity: usize,
+    list: usize,
+    id: I,
+    len: usize,
+) -> bool {
+    let base = row_base + list * capacity;
+    let mut found = false;
+    for slot in 0..len {
+        if ids[base + slot] == id {
+            found = true;
+        }
+    }
+    found
+}
+
+/// Insert an id absent from a priority-sorted pool holding `len` valid members
+/// and return the new length. The pool keeps the `capacity` lowest
+/// `(priority, id)` members; `priorities` is the kernel-local mirror of both
+/// pools (`list * capacity + slot`), not device memory.
 #[cube]
 fn sampled_insert<I: Int>(
     ids: &mut Tensor<I>,
-    priorities: &mut Tensor<I>,
+    priorities: &mut Array<I>,
     row_base: usize,
     capacity: usize,
     list: usize,
@@ -1249,16 +1353,12 @@ fn sampled_insert<I: Int>(
     len: usize,
 ) -> usize {
     let base = row_base + list * capacity;
-    let mut duplicate = false;
-    for slot in 0..len {
-        if ids[base + slot] == id {
-            duplicate = true;
-        }
-    }
-    let mut accepted = !duplicate;
-    if accepted && len == capacity {
-        let last = base + capacity - 1;
-        accepted = priority < priorities[last] || (priority == priorities[last] && id < ids[last]);
+    let local = list * capacity;
+    let mut accepted = true;
+    if len == capacity {
+        let last = capacity - 1;
+        let last_priority = priorities[local + last];
+        accepted = priority < last_priority || (priority == last_priority && id < ids[base + last]);
     }
     let mut result = len;
     if accepted {
@@ -1267,12 +1367,14 @@ fn sampled_insert<I: Int>(
         let mut placed = false;
         for step in 0..start {
             if !placed {
-                let previous = base + start - step - 1;
-                if priority < priorities[previous]
-                    || (priority == priorities[previous] && id < ids[previous])
+                let previous = start - step - 1;
+                let previous_id = ids[base + previous];
+                let previous_priority = priorities[local + previous];
+                if priority < previous_priority
+                    || (priority == previous_priority && id < previous_id)
                 {
-                    ids[previous + 1] = ids[previous];
-                    priorities[previous + 1] = priorities[previous];
+                    ids[base + previous + 1] = previous_id;
+                    priorities[local + previous + 1] = previous_priority;
                 } else {
                     insert_at = start - step;
                     placed = true;
@@ -1280,7 +1382,7 @@ fn sampled_insert<I: Int>(
             }
         }
         ids[base + insert_at] = id;
-        priorities[base + insert_at] = priority;
+        priorities[local + insert_at] = priority;
         if len < capacity {
             result = len + 1;
         }
@@ -1371,6 +1473,14 @@ pub(super) fn random_fill_kernel<F: Float, I: Int>(
 /// Build bounded priority-sampled new and old pools from frozen forward and
 /// reverse adjacency. New-class membership takes precedence across both
 /// directions; reverse CSR order does not influence the retained sample.
+///
+/// `reverse_sources` entries carry the source id with [`REVERSE_NEW_BIT`] set when
+/// the source's edge to this row is new (a source row holds each valid target at
+/// most once, so one entry describes the whole edge). While no distinct new id has
+/// been offered to a full new pool, that pool holds the complete new set and
+/// answers old-class exclusion; after an overflow the exact scan is used.
+/// Pool priorities live in a kernel-local array sized for `capacity <=
+/// MAX_CANDIDATES`.
 #[cube(launch)]
 pub(super) fn sampled_pool_kernel<I: Int>(
     candidates: &Tensor<I>,
@@ -1378,7 +1488,6 @@ pub(super) fn sampled_pool_kernel<I: Int>(
     reverse_offsets: &Tensor<I>,
     reverse_sources: &Tensor<I>,
     sampled_ids: &mut Tensor<I>,
-    sampled_priorities: &mut Tensor<I>,
     n: u32,
     width: u32,
     capacity: u32,
@@ -1393,29 +1502,41 @@ pub(super) fn sampled_pool_kernel<I: Int>(
     if row < n && capacity > 0 {
         let output_base = row * capacity * 2;
         let sentinel_id = I::cast_from(n as i32);
-        let sentinel_priority = I::cast_from(2_147_483_647i32);
         for slot in 0..(capacity * 2) {
             sampled_ids[output_base + slot] = sentinel_id;
-            sampled_priorities[output_base + slot] = sentinel_priority;
         }
+        let mut priorities = Array::<I>::new(2 * MAX_CANDIDATES);
         let input_base = row * width;
         let mut new_len = 0usize;
         let mut old_len = 0usize;
+        let mut overflow = false;
         // New forward edges.
         for slot in 0..width {
             if retained[input_base + slot] == I::cast_from(0i32) {
                 let candidate = u32::cast_from(candidates[input_base + slot]) as usize;
                 if candidate < n && candidate != row {
-                    new_len = sampled_insert(
-                        sampled_ids,
-                        sampled_priorities,
-                        output_base,
-                        capacity,
-                        0,
-                        I::cast_from(candidate as i32),
-                        candidate_priority::<I>(row, candidate, seed, iteration, 1),
-                        new_len,
-                    );
+                    let id = I::cast_from(candidate as i32);
+                    if !pool_contains(sampled_ids, output_base, capacity, 0, id, new_len) {
+                        if new_len == capacity {
+                            overflow = true;
+                        }
+                        new_len = sampled_insert(
+                            sampled_ids,
+                            &mut priorities,
+                            output_base,
+                            capacity,
+                            0,
+                            id,
+                            candidate_priority::<I>(
+                                row,
+                                u32::cast_from(id) as usize,
+                                seed,
+                                iteration,
+                                1,
+                            ),
+                            new_len,
+                        );
+                    }
                 }
             }
         }
@@ -1423,24 +1544,29 @@ pub(super) fn sampled_pool_kernel<I: Int>(
         let reverse_start = u32::cast_from(reverse_offsets[row]) as usize;
         let reverse_end = u32::cast_from(reverse_offsets[row + 1]) as usize;
         for position in reverse_start..reverse_end {
-            let source = u32::cast_from(reverse_sources[position]) as usize;
-            if source < n {
-                let source_base = source * width;
-                for slot in 0..width {
-                    if candidates[source_base + slot] == I::cast_from(row as i32)
-                        && retained[source_base + slot] == I::cast_from(0i32)
-                    {
-                        new_len = sampled_insert(
-                            sampled_ids,
-                            sampled_priorities,
-                            output_base,
-                            capacity,
-                            0,
-                            I::cast_from(source as i32),
-                            candidate_priority::<I>(row, source, seed, iteration, 1),
-                            new_len,
-                        );
+            let entry = u32::cast_from(reverse_sources[position]);
+            if entry & REVERSE_NEW_BIT != 0 {
+                let id = I::cast_from((entry & (REVERSE_NEW_BIT - 1)) as i32);
+                if !pool_contains(sampled_ids, output_base, capacity, 0, id, new_len) {
+                    if new_len == capacity {
+                        overflow = true;
                     }
+                    new_len = sampled_insert(
+                        sampled_ids,
+                        &mut priorities,
+                        output_base,
+                        capacity,
+                        0,
+                        id,
+                        candidate_priority::<I>(
+                            row,
+                            u32::cast_from(id) as usize,
+                            seed,
+                            iteration,
+                            1,
+                        ),
+                        new_len,
+                    );
                 }
             }
         }
@@ -1448,61 +1574,162 @@ pub(super) fn sampled_pool_kernel<I: Int>(
         for slot in 0..width {
             if retained[input_base + slot] != I::cast_from(0i32) {
                 let candidate = u32::cast_from(candidates[input_base + slot]) as usize;
-                if candidate < n
-                    && candidate != row
-                    && !has_new_candidate(
-                        candidates,
-                        retained,
-                        row,
-                        I::cast_from(candidate as i32),
-                        n,
-                        width,
-                    )
-                {
-                    old_len = sampled_insert(
-                        sampled_ids,
-                        sampled_priorities,
-                        output_base,
-                        capacity,
-                        1,
-                        I::cast_from(candidate as i32),
-                        candidate_priority::<I>(row, candidate, seed, iteration, 2),
-                        old_len,
-                    );
-                }
-            }
-        }
-        // Old reverse edges.
-        for position in reverse_start..reverse_end {
-            let source = u32::cast_from(reverse_sources[position]) as usize;
-            if source < n {
-                let source_base = source * width;
-                for slot in 0..width {
-                    if candidates[source_base + slot] == I::cast_from(row as i32)
-                        && retained[source_base + slot] != I::cast_from(0i32)
-                        && !has_new_candidate(
-                            candidates,
-                            retained,
-                            row,
-                            I::cast_from(source as i32),
-                            n,
-                            width,
-                        )
+                if candidate < n && candidate != row {
+                    let id = I::cast_from(candidate as i32);
+                    let is_new = if overflow {
+                        has_new_candidate(candidates, retained, row, id, n, width)
+                    } else {
+                        pool_contains(sampled_ids, output_base, capacity, 0, id, new_len)
+                    };
+                    if !is_new && !pool_contains(sampled_ids, output_base, capacity, 1, id, old_len)
                     {
                         old_len = sampled_insert(
                             sampled_ids,
-                            sampled_priorities,
+                            &mut priorities,
                             output_base,
                             capacity,
                             1,
-                            I::cast_from(source as i32),
-                            candidate_priority::<I>(row, source, seed, iteration, 2),
+                            id,
+                            candidate_priority::<I>(
+                                row,
+                                u32::cast_from(id) as usize,
+                                seed,
+                                iteration,
+                                2,
+                            ),
                             old_len,
                         );
                     }
                 }
             }
         }
+        // Old reverse edges.
+        for position in reverse_start..reverse_end {
+            let entry = u32::cast_from(reverse_sources[position]);
+            if entry & REVERSE_NEW_BIT == 0 {
+                let id = I::cast_from(entry as i32);
+                let is_new = if overflow {
+                    has_new_candidate(candidates, retained, row, id, n, width)
+                } else {
+                    pool_contains(sampled_ids, output_base, capacity, 0, id, new_len)
+                };
+                if !is_new && !pool_contains(sampled_ids, output_base, capacity, 1, id, old_len) {
+                    old_len = sampled_insert(
+                        sampled_ids,
+                        &mut priorities,
+                        output_base,
+                        capacity,
+                        1,
+                        id,
+                        candidate_priority::<I>(
+                            row,
+                            u32::cast_from(id) as usize,
+                            seed,
+                            iteration,
+                            2,
+                        ),
+                        old_len,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch)]
+pub(super) fn row_worst_refresh_kernel<F: Float, I: Int>(
+    ids: &Tensor<I>,
+    distances: &Tensor<F>,
+    row_worst_ids: &mut Tensor<I>,
+    row_worst_distances: &mut Tensor<F>,
+    width: u32,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let row = ABSOLUTE_POS_X as usize;
+    if row < ids.shape(0) {
+        let worst = row * width as usize + width as usize - 1;
+        row_worst_ids[row] = ids[worst];
+        row_worst_distances[row] = distances[worst];
+    }
+}
+
+/// `pair_valid` bit: the record for `left` (`candidate = right`) is kept.
+pub(super) const KEEP_LEFT: i32 = 1;
+/// `pair_valid` bit: the record for `right` (`candidate = left`) is kept.
+pub(super) const KEEP_RIGHT: i32 = 2;
+/// `pair_valid` bit: the pair produced two records (a valid pair with a
+/// non-negative, non-NaN distance), whether or not either endpoint is kept.
+/// Count and scatter ignore it; profiling counters and the survival probe read it.
+pub(super) const PRODUCED: i32 = 4;
+
+/// Whether `row` keeps the record `(distance, candidate)` against its tile-start
+/// threshold. A non-full row (worst id `>= n`) keeps every record; otherwise the
+/// record must be lexicographically below `(worst distance, worst id)`, the same
+/// predicate as the merge's own filter. Thresholds only tighten, so a rejected
+/// record would also be rejected by the merge.
+#[cube]
+fn endpoint_passes<F: Float, I: Int>(
+    row: usize,
+    candidate: usize,
+    distance: F,
+    n: usize,
+    row_worst_ids: &Tensor<I>,
+    row_worst_distances: &Tensor<F>,
+) -> bool {
+    let worst_id = u32::cast_from(row_worst_ids[row]) as usize;
+    let worst_distance = row_worst_distances[row];
+    worst_id >= n
+        || distance < worst_distance
+        || (distance == worst_distance && candidate < worst_id)
+}
+
+/// The 2-bit endpoint mask plus [`PRODUCED`] for a pair. Invalid, self and
+/// negative/NaN-distance pairs produce no records (mask 0), as the merge rejects
+/// them; +inf and signed zero go through the ordinary comparisons.
+#[cube]
+fn endpoint_mask<F: Float, I: Int>(
+    left: usize,
+    right: usize,
+    distance: F,
+    n: usize,
+    row_worst_ids: &Tensor<I>,
+    row_worst_distances: &Tensor<F>,
+) -> i32 {
+    let mut mask = 0i32;
+    if left < n && right < n && left != right && distance >= F::new(0.0f32) {
+        mask = PRODUCED;
+        if endpoint_passes::<F, I>(left, right, distance, n, row_worst_ids, row_worst_distances) {
+            mask += KEEP_LEFT;
+        }
+        if endpoint_passes::<F, I>(right, left, distance, n, row_worst_ids, row_worst_distances) {
+            mask += KEEP_RIGHT;
+        }
+    }
+    mask
+}
+
+/// Test access to [`endpoint_mask`] with arbitrary pair distances.
+#[cfg(test)]
+#[cube(launch)]
+pub(super) fn endpoint_mask_probe<F: Float, I: Int>(
+    left: &Tensor<I>,
+    right: &Tensor<I>,
+    distances: &Tensor<F>,
+    row_worst_ids: &Tensor<I>,
+    row_worst_distances: &Tensor<F>,
+    masks: &mut Tensor<I>,
+    #[define(F, I)] _dtypes: [ElemType; 2],
+) {
+    let slot = ABSOLUTE_POS_X as usize;
+    if slot < masks.shape(0) {
+        masks[slot] = I::cast_from(endpoint_mask::<F, I>(
+            u32::cast_from(left[slot]) as usize,
+            u32::cast_from(right[slot]) as usize,
+            distances[slot],
+            row_worst_ids.shape(0),
+            row_worst_ids,
+            row_worst_distances,
+        ));
     }
 }
 
@@ -1518,6 +1745,8 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
     forest_rows: &Tensor<I>,
     leaf_rows: &Tensor<I>,
     pair_prefix: &Tensor<P>,
+    row_worst_ids: &Tensor<I>,
+    row_worst_distances: &Tensor<F>,
     pair_left: &mut Tensor<I>,
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
@@ -1560,11 +1789,18 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
                 let difference = data[left * features + feature] - data[right * features + feature];
                 squared += difference * difference;
             }
-            let valid = squared >= F::new(0.0f32);
+            let mask = endpoint_mask::<F, I>(
+                left,
+                right,
+                squared,
+                data.shape(0),
+                row_worst_ids,
+                row_worst_distances,
+            );
             pair_left[slot] = I::cast_from(left as i32);
             pair_right[slot] = I::cast_from(right as i32);
             pair_distances[slot] = squared;
-            pair_valid[slot] = I::cast_from(if valid { 1i32 } else { 0i32 });
+            pair_valid[slot] = I::cast_from(mask);
         }
         if !found {
             pair_left[slot] = I::cast_from(0i32);
@@ -1691,6 +1927,8 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
     sampled_ids: &Tensor<I>,
     pool_sizes: &Tensor<I>,
     center_offsets: &Tensor<P>,
+    row_worst_ids: &Tensor<I>,
+    row_worst_distances: &Tensor<F>,
     pair_left: &mut Tensor<I>,
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
@@ -1759,8 +1997,15 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
                 squared += difference * difference;
             }
         }
-        let distance_valid = valid && squared >= F::new(0.0f32);
-        pair_valid[slot] = I::cast_from(if distance_valid { 1i32 } else { 0i32 });
+        let mask = endpoint_mask::<F, I>(
+            left_id,
+            right_id,
+            squared,
+            n,
+            row_worst_ids,
+            row_worst_distances,
+        );
+        pair_valid[slot] = I::cast_from(mask);
         pair_distances[slot] = squared;
     }
 }
@@ -1786,11 +2031,16 @@ pub(super) fn endpoint_count_kernel<I: Int>(
     #[define(I)] _dtype: ElemType,
 ) {
     let slot = ABSOLUTE_POS_X as usize;
-    if slot < slots as usize && pair_valid[slot] != I::cast_from(0i32) {
-        let left = u32::cast_from(pair_left[slot]) as usize;
-        let right = u32::cast_from(pair_right[slot]) as usize;
-        endpoint_counts[left].fetch_add(I::cast_from(1i32));
-        endpoint_counts[right].fetch_add(I::cast_from(1i32));
+    if slot < slots as usize {
+        let mask = i32::cast_from(pair_valid[slot]);
+        if mask & KEEP_LEFT != 0 {
+            let left = u32::cast_from(pair_left[slot]) as usize;
+            endpoint_counts[left].fetch_add(I::cast_from(1i32));
+        }
+        if mask & KEEP_RIGHT != 0 {
+            let right = u32::cast_from(pair_right[slot]) as usize;
+            endpoint_counts[right].fetch_add(I::cast_from(1i32));
+        }
     }
 }
 
@@ -1819,7 +2069,7 @@ fn survival_probe<F: Float, I: Int>(
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let slot = ABSOLUTE_POS_X as usize;
-    if slot < slots as usize && valid[slot] != I::cast_from(0i32) {
+    if slot < slots as usize && i32::cast_from(valid[slot]) & PRODUCED != 0 {
         let l = u32::cast_from(left[slot]) as usize;
         let r = u32::cast_from(right[slot]) as usize;
         let d = distances[slot];
@@ -1891,6 +2141,88 @@ fn profile_tile_survival(
     ))
 }
 
+/// Profiling workers for [`produced_pair_count`]; each strides over the tile and
+/// adds once, so the counter takes at most this many atomics per tile.
+const PROFILE_WORKERS: u32 = 4096;
+
+/// Count the tile's pairs with [`PRODUCED`] set into `count[0]`.
+#[cube(launch)]
+fn produced_pair_count<I: Int>(
+    pair_valid: &Tensor<I>,
+    count: &mut Tensor<Atomic<I>>,
+    slots: u32,
+    workers: u32,
+    #[define(I)] _dtype: ElemType,
+) {
+    let worker = ABSOLUTE_POS_X;
+    if worker < workers {
+        let mut produced = 0i32;
+        let mut slot = worker;
+        while slot < slots {
+            if i32::cast_from(pair_valid[slot as usize]) & PRODUCED != 0 {
+                produced += 1;
+            }
+            slot += workers;
+        }
+        if produced != 0 {
+            count[0].fetch_add(I::cast_from(produced));
+        }
+    }
+}
+
+/// Actual record counts of one staged tile, for `CUSCAN_ANN_PROFILE`: records
+/// produced (two per produced pair) and records kept by the endpoint filter (the
+/// endpoint prefix total, already computed for scatter). Reads back and so
+/// synchronizes; only profiled runs call it.
+fn profile_tile_records(
+    client: &cubecl::client::Client,
+    count: &CubeTensor,
+    pair_valid: &CubeTensor,
+    endpoint_offsets: &CubeTensor,
+    n: usize,
+    slots: u32,
+) -> Result<(u64, u64), AnnError> {
+    count_zero::launch(
+        client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(1),
+        count.clone().into_tensor_arg(),
+        dtype_to_storage_type(DType::I32),
+    );
+    let workers = slots.min(PROFILE_WORKERS);
+    if workers > 0 {
+        let (units, dim) = ann_independent_launch(client, workers)?;
+        produced_pair_count::launch(
+            client,
+            units,
+            dim,
+            pair_valid.clone().into_tensor_arg(),
+            count.clone().into_tensor_arg(),
+            slots,
+            workers,
+            dtype_to_storage_type(DType::I32),
+        );
+    }
+    let pairs = client.read_one_unchecked(count.handle.clone());
+    let pairs = i32::from_ne_bytes(pairs[..4].try_into().expect("profile count is i32"));
+    let kept = client.read_one_unchecked(
+        endpoint_offsets
+            .handle
+            .clone()
+            .offset_start((n * DType::I32.size()) as u64),
+    );
+    let kept = i32::from_ne_bytes(kept[..4].try_into().expect("endpoint total is i32"));
+    Ok((
+        2 * u64::try_from(pairs).expect("negative produced pair count"),
+        u64::try_from(kept).expect("negative endpoint total"),
+    ))
+}
+
+#[cube(launch)]
+fn count_zero<I: Int>(count: &mut Tensor<I>, #[define(I)] _dtype: ElemType) {
+    count[0] = I::cast_from(0i32);
+}
+
 #[cube(launch)]
 pub(super) fn endpoint_scatter_kernel<F: Float, I: Int>(
     pair_left: &Tensor<I>,
@@ -1904,25 +2236,31 @@ pub(super) fn endpoint_scatter_kernel<F: Float, I: Int>(
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let slot = ABSOLUTE_POS_X as usize;
-    if slot < slots as usize && pair_valid[slot] != I::cast_from(0i32) {
+    if slot < slots as usize {
+        let mask = i32::cast_from(pair_valid[slot]);
         let left = u32::cast_from(pair_left[slot]) as usize;
         let right = u32::cast_from(pair_right[slot]) as usize;
-        let left_position =
-            u32::cast_from(endpoint_cursors[left].fetch_add(I::cast_from(1i32))) as usize;
-        let right_position =
-            u32::cast_from(endpoint_cursors[right].fetch_add(I::cast_from(1i32))) as usize;
-        endpoint_neighbor_ids[left_position] = I::cast_from(right as i32);
-        endpoint_distances[left_position] = pair_distances[slot];
-        endpoint_neighbor_ids[right_position] = I::cast_from(left as i32);
-        endpoint_distances[right_position] = pair_distances[slot];
+        if mask & KEEP_LEFT != 0 {
+            let position =
+                u32::cast_from(endpoint_cursors[left].fetch_add(I::cast_from(1i32))) as usize;
+            endpoint_neighbor_ids[position] = I::cast_from(right as i32);
+            endpoint_distances[position] = pair_distances[slot];
+        }
+        if mask & KEEP_RIGHT != 0 {
+            let position =
+                u32::cast_from(endpoint_cursors[right].fetch_add(I::cast_from(1i32))) as usize;
+            endpoint_neighbor_ids[position] = I::cast_from(left as i32);
+            endpoint_distances[position] = pair_distances[slot];
+        }
     }
 }
 
+/// Insert a record that passed the caller's worst-entry filter and validity
+/// checks into a sorted heap row, keeping each id once at its minimum distance.
 #[cube]
 fn serial_endpoint_insert<F: Float, I: Int>(
     n: usize,
     width: usize,
-    row: usize,
     id: I,
     proposal_distance: F,
     ids: &mut Tensor<I>,
@@ -1930,61 +2268,53 @@ fn serial_endpoint_insert<F: Float, I: Int>(
     base: usize,
 ) {
     let id_value = u32::cast_from(id) as usize;
-    let worst_index = u32::cast_from(ids[base + width - 1]) as usize;
-    let worst_distance = distances[base + width - 1];
-    // A full heap cannot change for a record not better than its worst entry.
-    let improves = worst_index >= n
-        || proposal_distance < worst_distance
-        || (proposal_distance == worst_distance && id_value < worst_index);
-    if improves && id_value < n && id_value != row && proposal_distance >= F::new(0.0f32) {
-        let mut duplicate = width;
-        for slot in 0..width {
-            if ids[base + slot] == id {
-                duplicate = slot;
-            }
+    let mut duplicate = width;
+    for slot in 0..width {
+        if ids[base + slot] == id {
+            duplicate = slot;
         }
-        let distance = if duplicate < width {
-            let old_distance = distances[base + duplicate];
-            if proposal_distance < old_distance {
-                proposal_distance
-            } else {
-                old_distance
-            }
-        } else {
+    }
+    let distance = if duplicate < width {
+        let old_distance = distances[base + duplicate];
+        if proposal_distance < old_distance {
             proposal_distance
-        };
-        if duplicate < width {
-            let mut slot = duplicate;
-            while slot + 1 < width {
-                ids[base + slot] = ids[base + slot + 1];
-                distances[base + slot] = distances[base + slot + 1];
-                slot += 1;
-            }
-            ids[base + width - 1] = I::cast_from(n as i32);
-            distances[base + width - 1] = F::new(f32::INFINITY);
+        } else {
+            old_distance
         }
-        let mut rank = 0usize;
-        while rank < width {
-            let old_id = ids[base + rank];
-            let old_index = u32::cast_from(old_id) as usize;
-            if old_index >= n
-                || distance < distances[base + rank]
-                || (distance == distances[base + rank] && id_value < old_index)
-            {
-                break;
-            }
-            rank += 1;
+    } else {
+        proposal_distance
+    };
+    if duplicate < width {
+        let mut slot = duplicate;
+        while slot + 1 < width {
+            ids[base + slot] = ids[base + slot + 1];
+            distances[base + slot] = distances[base + slot + 1];
+            slot += 1;
         }
-        if rank < width {
-            let mut slot = width - 1;
-            while slot > rank {
-                ids[base + slot] = ids[base + slot - 1];
-                distances[base + slot] = distances[base + slot - 1];
-                slot -= 1;
-            }
-            ids[base + rank] = id;
-            distances[base + rank] = distance;
+        ids[base + width - 1] = I::cast_from(n as i32);
+        distances[base + width - 1] = F::new(f32::INFINITY);
+    }
+    let mut rank = 0usize;
+    while rank < width {
+        let old_id = ids[base + rank];
+        let old_index = u32::cast_from(old_id) as usize;
+        if old_index >= n
+            || distance < distances[base + rank]
+            || (distance == distances[base + rank] && id_value < old_index)
+        {
+            break;
         }
+        rank += 1;
+    }
+    if rank < width {
+        let mut slot = width - 1;
+        while slot > rank {
+            ids[base + slot] = ids[base + slot - 1];
+            distances[base + slot] = distances[base + slot - 1];
+            slot -= 1;
+        }
+        ids[base + rank] = id;
+        distances[base + rank] = distance;
     }
 }
 
@@ -2157,6 +2487,8 @@ pub(super) fn endpoint_merge_cpu<F: Float, I: Int>(
     endpoint_distances: &Tensor<F>,
     output_ids: &mut Tensor<I>,
     output_distances: &mut Tensor<F>,
+    row_worst_ids: &mut Tensor<I>,
+    row_worst_distances: &mut Tensor<F>,
     width: u32,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
@@ -2166,17 +2498,38 @@ pub(super) fn endpoint_merge_cpu<F: Float, I: Int>(
     if row < n {
         let start = u32::cast_from(endpoint_offsets[row]) as usize;
         let end = u32::cast_from(endpoint_offsets[row + 1]) as usize;
+        let base = row * width;
+        let last = base + width - 1;
+        // The worst entry stays in registers and is reloaded only after an
+        // insert, the only operation that can change it.
+        let mut worst_id = output_ids[last];
+        let mut worst_distance = output_distances[last];
         for position in start..end {
-            serial_endpoint_insert::<F, I>(
-                n,
-                width,
-                row,
-                endpoint_ids[position],
-                endpoint_distances[position],
-                output_ids,
-                output_distances,
-                row * width,
-            );
+            let id = endpoint_ids[position];
+            let distance = endpoint_distances[position];
+            let id_value = u32::cast_from(id) as usize;
+            let worst_index = u32::cast_from(worst_id) as usize;
+            // A full heap cannot change for a record not better than its worst entry.
+            let improves = worst_index >= n
+                || distance < worst_distance
+                || (distance == worst_distance && id_value < worst_index);
+            if improves && id_value < n && id_value != row && distance >= F::new(0.0f32) {
+                serial_endpoint_insert::<F, I>(
+                    n,
+                    width,
+                    id,
+                    distance,
+                    output_ids,
+                    output_distances,
+                    base,
+                );
+                worst_id = output_ids[last];
+                worst_distance = output_distances[last];
+            }
+        }
+        if start < end {
+            row_worst_ids[row] = worst_id;
+            row_worst_distances[row] = worst_distance;
         }
     }
 }
@@ -2191,6 +2544,8 @@ pub(super) fn endpoint_merge_cuda<F: Float, I: Int>(
     output_distances: &mut Tensor<F>,
     workspace_ids: &mut Tensor<I>,
     workspace_distances: &mut Tensor<F>,
+    row_worst_ids: &mut Tensor<I>,
+    row_worst_distances: &mut Tensor<F>,
     width: u32,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
@@ -2276,6 +2631,11 @@ pub(super) fn endpoint_merge_cuda<F: Float, I: Int>(
                 }
             }
             sync_cube();
+            if lane == 0 {
+                let worst = row_base + width - 1;
+                row_worst_ids[row] = output_ids[worst];
+                row_worst_distances[row] = output_distances[worst];
+            }
         }
     }
 }

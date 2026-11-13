@@ -1,6 +1,5 @@
 use super::*;
 
-use super::super::ann_forest::MAX_CANDIDATES;
 use burn_cubecl::CubeDevice;
 use std::collections::BTreeSet;
 
@@ -317,6 +316,9 @@ fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
             let expected = match entry.buffer {
                 Buffer::Input => 0,
                 Buffer::InputCopy => usize::from(copied),
+                Buffer::ProfileCounts => {
+                    usize::from(std::env::var_os("CUSCAN_ANN_PROFILE").is_some())
+                }
                 Buffer::SurvivalCounts => usize::from(survival),
                 _ if entry.route == BufferRoute::Cuda && plan.merge_geometry().0 => 0,
                 _ => 1,
@@ -430,7 +432,7 @@ fn survival_fixture(device: CubeDevice) {
         let left = i32_tensor(&device, &[1], vec![left_id]);
         let right = i32_tensor(&device, &[1], vec![right_id]);
         let distances = f32_tensor(&device, &[1], vec![distance]);
-        let valid = i32_tensor(&device, &[1], vec![is_valid]);
+        let valid = i32_tensor(&device, &[1], vec![is_valid * PRODUCED]);
         let inputs = [
             &left,
             &right,
@@ -489,6 +491,21 @@ fn survival_profile_fixture_cuda() {
     survival_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
 }
 
+/// Row-worst thresholds of `n` non-full rows: the initial `(n, +inf)`.
+fn open_worst_ids(device: &CubeDevice, n: usize) -> CubeTensor {
+    i32_tensor(device, &[n], vec![n as i32; n])
+}
+
+fn open_worst_distances(device: &CubeDevice, n: usize) -> CubeTensor {
+    f32_tensor(device, &[n], vec![f32::INFINITY; n])
+}
+
+/// Sentinel row-worst values that no merge writes; rows without records keep them.
+const UNTOUCHED_WORST_ID: i32 = -7;
+const UNTOUCHED_WORST_DISTANCE: f32 = -7.5;
+
+/// Run the backend's merge and return the row-worst arrays it leaves, starting
+/// from the untouched sentinels.
 fn fixture_merge(
     device: &CubeDevice,
     offsets: &CubeTensor,
@@ -500,8 +517,41 @@ fn fixture_merge(
     workspace_distances: &CubeTensor,
     n: usize,
     width: usize,
+) -> (Vec<i32>, Vec<f32>) {
+    let worst_ids = i32_tensor(device, &[n], vec![UNTOUCHED_WORST_ID; n]);
+    let worst_distances = f32_tensor(device, &[n], vec![UNTOUCHED_WORST_DISTANCE; n]);
+    fixture_merge_into(
+        device,
+        offsets,
+        endpoint_ids,
+        endpoint_distances,
+        ids,
+        distances,
+        workspace_ids,
+        workspace_distances,
+        &worst_ids,
+        &worst_distances,
+        width,
+    );
+    (read_i32(&worst_ids), read_f32(&worst_distances))
+}
+
+/// Run the backend's merge with caller-owned row-worst arrays.
+fn fixture_merge_into(
+    device: &CubeDevice,
+    offsets: &CubeTensor,
+    endpoint_ids: &CubeTensor,
+    endpoint_distances: &CubeTensor,
+    ids: &CubeTensor,
+    distances: &CubeTensor,
+    workspace_ids: &CubeTensor,
+    workspace_distances: &CubeTensor,
+    worst_ids: &CubeTensor,
+    worst_distances: &CubeTensor,
+    width: usize,
 ) {
     let client = device.client();
+    let n = ids.shape()[0];
     let (cpu, count, dim) =
         super::super::orchestration::ann_launch_shape(&client, DType::F32.size(), n as u32)
             .unwrap()
@@ -520,6 +570,8 @@ fn fixture_merge(
             endpoint_distances.clone().into_tensor_arg(),
             ids.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
+            worst_ids.clone().into_tensor_arg(),
+            worst_distances.clone().into_tensor_arg(),
             width as u32,
             dtype,
         );
@@ -535,8 +587,381 @@ fn fixture_merge(
             distances.clone().into_tensor_arg(),
             workspace_ids.clone().into_tensor_arg(),
             workspace_distances.clone().into_tensor_arg(),
+            worst_ids.clone().into_tensor_arg(),
+            worst_distances.clone().into_tensor_arg(),
             width as u32,
             dtype,
+        );
+    }
+}
+
+/// Scalar oracle of the endpoint filter: IEEE comparisons, so `-0.0 == 0.0`.
+fn endpoint_mask_oracle(left: usize, right: usize, distance: f32, worst: &[(i32, f32)]) -> i32 {
+    let n = worst.len();
+    if left >= n || right >= n || left == right || distance.is_nan() || distance < 0.0 {
+        return 0;
+    }
+    let passes = |row: usize, candidate: usize| {
+        let (id, threshold) = worst[row];
+        let id = id as usize;
+        id >= n || distance < threshold || (distance == threshold && candidate < id)
+    };
+    PRODUCED
+        | if passes(left, right) { KEEP_LEFT } else { 0 }
+        | if passes(right, left) { KEEP_RIGHT } else { 0 }
+}
+
+/// The endpoint predicate on exact edge values, then count and scatter honoring
+/// each mask bit independently, and the profiling record counters.
+fn endpoint_mask_fixture(device: CubeDevice) {
+    let client = device.client();
+    let n = 4usize;
+    // Row 0 full at (5, id 2); row 1 not full; row 2 full at (+inf, id 1);
+    // row 3 full at (0, id 2).
+    let worst = [(2, 5.0), (4, f32::INFINITY), (1, f32::INFINITY), (2, 0.0)];
+    let cases: [(i32, i32, f32, i32); 16] = [
+        (0, 1, 5.0, 7),           // tie, lower id kept at row 0; row 1 not full
+        (0, 3, 5.0, 4),           // tie, higher id rejected at 0; worse at 3
+        (0, 2, 5.0, 6),           // tie with the worst id itself is rejected
+        (0, 1, f32::NAN, 0),      // NaN produces nothing, even for a non-full row
+        (0, 1, -1.0, 0),          // negative produces nothing
+        (0, 1, -0.0, 7),          // signed zero is a valid distance
+        (3, 1, -0.0, 7),          // -0 ties +0 at row 3, lower id kept
+        (3, 2, 0.0, 6),           // +0 tie with the worst id rejected at row 3
+        (2, 0, f32::INFINITY, 5), // +inf tie at row 2 with lower id; worse at 0
+        (2, 3, f32::INFINITY, 4), // +inf tie with higher id rejected
+        (1, 2, f32::INFINITY, 5), // +inf kept by a non-full row; tie with worst id at 2
+        (0, 3, 4.0, 5),           // left only
+        (3, 0, 4.0, 6),           // right only
+        (1, 1, 1.0, 0),           // self pair
+        (4, 0, 1.0, 0),           // invalid id
+        (0, 4, 1.0, 0),           // invalid id
+    ];
+    for &(left, right, distance, expected) in &cases {
+        assert_eq!(
+            endpoint_mask_oracle(left as usize, right as usize, distance, &worst),
+            expected,
+            "oracle left={left} right={right} distance={distance:?}"
+        );
+    }
+    let slots = cases.len();
+    let left = i32_tensor(&device, &[slots], cases.iter().map(|c| c.0).collect());
+    let right = i32_tensor(&device, &[slots], cases.iter().map(|c| c.1).collect());
+    let distances = f32_tensor(&device, &[slots], cases.iter().map(|c| c.2).collect());
+    let worst_ids = i32_tensor(&device, &[n], worst.iter().map(|w| w.0).collect());
+    let worst_distances = f32_tensor(&device, &[n], worst.iter().map(|w| w.1).collect());
+    let masks = i32_tensor(&device, &[slots], vec![-1; slots]);
+    let (count, dim) = launch_units(&client, slots);
+    let dtypes = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+    ];
+    endpoint_mask_probe::launch(
+        &client,
+        count.clone(),
+        dim,
+        left.clone().into_tensor_arg(),
+        right.clone().into_tensor_arg(),
+        distances.clone().into_tensor_arg(),
+        worst_ids.into_tensor_arg(),
+        worst_distances.into_tensor_arg(),
+        masks.clone().into_tensor_arg(),
+        dtypes,
+    );
+    let expected: Vec<i32> = cases.iter().map(|c| c.3).collect();
+    assert_eq!(read_i32(&masks), expected);
+
+    let counts = i32_tensor(&device, &[n], vec![-1; n]);
+    let (row_count, row_dim) = launch_units(&client, n);
+    endpoint_count_zero::launch(
+        &client,
+        row_count,
+        row_dim,
+        counts.clone().into_tensor_arg(),
+        dtype_to_storage_type(DType::I32),
+    );
+    endpoint_count_kernel::launch(
+        &client,
+        count.clone(),
+        dim,
+        left.clone().into_tensor_arg(),
+        right.clone().into_tensor_arg(),
+        masks.clone().into_tensor_arg(),
+        counts.clone().into_tensor_arg(),
+        slots as u32,
+        dtype_to_storage_type(DType::I32),
+    );
+    let mut records: Vec<Vec<(i32, u32)>> = vec![Vec::new(); n];
+    for &(l, r, d, mask) in &cases {
+        if mask & KEEP_LEFT != 0 {
+            records[l as usize].push((r, d.to_bits()));
+        }
+        if mask & KEEP_RIGHT != 0 {
+            records[r as usize].push((l, d.to_bits()));
+        }
+    }
+    let expected_counts: Vec<i32> = records.iter().map(|row| row.len() as i32).collect();
+    assert_eq!(read_i32(&counts), expected_counts);
+    let offsets = i32_tensor(&device, &[n + 1], vec![-1; n + 1]);
+    let cursors = i32_tensor(&device, &[n], vec![-1; n]);
+    let sums = i32_tensor(&device, &[n.div_ceil(PREFIX_CHUNK)], vec![0]);
+    exclusive_prefix(
+        &client,
+        &counts,
+        &offsets,
+        &cursors,
+        &sums,
+        DType::I32,
+        true,
+    )
+    .unwrap();
+    let total: usize = records.iter().map(Vec::len).sum();
+    let endpoint_ids = i32_tensor(&device, &[total], vec![-1; total]);
+    let endpoint_distances = f32_tensor(&device, &[total], vec![-1.0; total]);
+    endpoint_scatter_kernel::launch(
+        &client,
+        count,
+        dim,
+        left.into_tensor_arg(),
+        right.into_tensor_arg(),
+        distances.into_tensor_arg(),
+        masks.clone().into_tensor_arg(),
+        cursors.into_tensor_arg(),
+        endpoint_ids.clone().into_tensor_arg(),
+        endpoint_distances.clone().into_tensor_arg(),
+        slots as u32,
+        dtypes,
+    );
+    let offsets_host = read_i32(&offsets);
+    let ids_host = read_i32(&endpoint_ids);
+    let distances_host = read_f32(&endpoint_distances);
+    for (row, expected_row) in records.iter_mut().enumerate() {
+        let range = offsets_host[row] as usize..offsets_host[row + 1] as usize;
+        let mut actual: Vec<(i32, u32)> = range
+            .map(|position| (ids_host[position], distances_host[position].to_bits()))
+            .collect();
+        actual.sort_unstable();
+        expected_row.sort_unstable();
+        assert_eq!(&actual, expected_row, "row {row}");
+    }
+    let profile = i32_tensor(&device, &[1], vec![-1]);
+    let produced = cases.iter().filter(|c| c.3 & PRODUCED != 0).count() as u64;
+    assert_eq!(
+        profile_tile_records(&client, &profile, &masks, &offsets, n, slots as u32).unwrap(),
+        (2 * produced, total as u64)
+    );
+}
+
+/// Forest pairs of one leaf holding every row, staged in tiles through the
+/// filtered pipeline with persistent thresholds, against the unfiltered scalar
+/// merge. Rows become full mid-phase, so later tiles see tightened (and, within
+/// a tile, stale) thresholds. A second pass of the same pairs is all duplicates
+/// and must leave the heap and thresholds unchanged.
+fn filtered_pipeline_fixture(device: CubeDevice) {
+    let client = device.client();
+    // Ties (3, 3 and equal spacing), zero distances, +inf from the extremes and
+    // a NaN row whose records are all rejected.
+    let values = [0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 6.0, 3.0e38, -3.0e38, f32::NAN];
+    let n = values.len();
+    let width = 3usize;
+    let pairs = n * (n - 1) / 2;
+    let mut proposals = Vec::new();
+    for left in 0..n {
+        for right in left + 1..n {
+            let difference = values[left] - values[right];
+            proposals.push((left, right, difference * difference));
+        }
+    }
+    let oracle = merge_proposals(
+        &vec![Vec::new(); n],
+        &proposals,
+        &vec![BTreeSet::new(); n],
+        width,
+    );
+    let data = f32_tensor(&device, &[n, 1], values.to_vec());
+    let forest_rows = i32_tensor(&device, &[n], (0..n as i32).collect());
+    let leaf_rows = i32_tensor(&device, &[2], vec![0, n as i32]);
+    let pair_prefix = i64_tensor(&device, &[2], vec![0, pairs as i64]);
+    let dtypes = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+    ];
+    for tile in [1usize, 4, 7, pairs] {
+        let ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
+        let distances = f32_tensor(&device, &[n, width], vec![f32::INFINITY; n * width]);
+        let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
+        let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
+        let worst_ids = i32_tensor(&device, &[n], vec![-1; n]);
+        let worst_distances = f32_tensor(&device, &[n], vec![-1.0; n]);
+        let (row_count, row_dim) = launch_units(&client, n);
+        row_worst_refresh_kernel::launch(
+            &client,
+            row_count.clone(),
+            row_dim,
+            ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            worst_ids.clone().into_tensor_arg(),
+            worst_distances.clone().into_tensor_arg(),
+            width as u32,
+            dtypes,
+        );
+        assert_eq!(read_i32(&worst_ids), vec![n as i32; n]);
+        let mut kept_per_pass = Vec::new();
+        let mut snapshots = Vec::new();
+        for _pass in 0..2 {
+            let mut kept = 0usize;
+            let mut offset = 0usize;
+            while offset < pairs {
+                let slots = tile.min(pairs - offset);
+                let left = i32_tensor(&device, &[slots], vec![-1; slots]);
+                let right = i32_tensor(&device, &[slots], vec![-1; slots]);
+                let pair_distances = f32_tensor(&device, &[slots], vec![-1.0; slots]);
+                let valid = i32_tensor(&device, &[slots], vec![-1; slots]);
+                let (count, dim) = launch_units(&client, slots);
+                forest_pair_slots_kernel::launch(
+                    &client,
+                    count.clone(),
+                    dim,
+                    data.clone().into_tensor_arg(),
+                    forest_rows.clone().into_tensor_arg(),
+                    leaf_rows.clone().into_tensor_arg(),
+                    pair_prefix.clone().into_tensor_arg(),
+                    worst_ids.clone().into_tensor_arg(),
+                    worst_distances.clone().into_tensor_arg(),
+                    left.clone().into_tensor_arg(),
+                    right.clone().into_tensor_arg(),
+                    pair_distances.clone().into_tensor_arg(),
+                    valid.clone().into_tensor_arg(),
+                    offset as u64,
+                    slots as u32,
+                    [
+                        dtype_to_storage_type(DType::F32),
+                        dtype_to_storage_type(DType::I32),
+                        dtype_to_storage_type(DType::I64),
+                    ],
+                );
+                let counts = i32_tensor(&device, &[n], vec![-1; n]);
+                endpoint_count_zero::launch(
+                    &client,
+                    row_count.clone(),
+                    row_dim,
+                    counts.clone().into_tensor_arg(),
+                    dtype_to_storage_type(DType::I32),
+                );
+                endpoint_count_kernel::launch(
+                    &client,
+                    count.clone(),
+                    dim,
+                    left.clone().into_tensor_arg(),
+                    right.clone().into_tensor_arg(),
+                    valid.clone().into_tensor_arg(),
+                    counts.clone().into_tensor_arg(),
+                    slots as u32,
+                    dtype_to_storage_type(DType::I32),
+                );
+                let offsets = i32_tensor(&device, &[n + 1], vec![-1; n + 1]);
+                let cursors = i32_tensor(&device, &[n], vec![-1; n]);
+                let sums = i32_tensor(&device, &[n.div_ceil(PREFIX_CHUNK)], vec![0]);
+                exclusive_prefix(
+                    &client,
+                    &counts,
+                    &offsets,
+                    &cursors,
+                    &sums,
+                    DType::I32,
+                    true,
+                )
+                .unwrap();
+                let total = read_i32(&offsets)[n] as usize;
+                kept += total;
+                let staged = (2 * slots).max(1);
+                let endpoint_ids = i32_tensor(&device, &[staged], vec![-1; staged]);
+                let endpoint_distances = f32_tensor(&device, &[staged], vec![-1.0; staged]);
+                endpoint_scatter_kernel::launch(
+                    &client,
+                    count,
+                    dim,
+                    left.into_tensor_arg(),
+                    right.into_tensor_arg(),
+                    pair_distances.into_tensor_arg(),
+                    valid.into_tensor_arg(),
+                    cursors.into_tensor_arg(),
+                    endpoint_ids.clone().into_tensor_arg(),
+                    endpoint_distances.clone().into_tensor_arg(),
+                    slots as u32,
+                    dtypes,
+                );
+                fixture_merge_into(
+                    &device,
+                    &offsets,
+                    &endpoint_ids,
+                    &endpoint_distances,
+                    &ids,
+                    &distances,
+                    &workspace_ids,
+                    &workspace_distances,
+                    &worst_ids,
+                    &worst_distances,
+                    width,
+                );
+                offset += slots;
+            }
+            kept_per_pass.push(kept);
+            snapshots.push((
+                read_i32(&ids),
+                read_f32(&distances)
+                    .iter()
+                    .map(|d| d.to_bits())
+                    .collect::<Vec<_>>(),
+                read_i32(&worst_ids),
+                read_f32(&worst_distances)
+                    .iter()
+                    .map(|d| d.to_bits())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let (heap_ids, heap_bits, worst_id_values, worst_bits) = &snapshots[0];
+        for row in 0..n {
+            let expected = &oracle.rows[row];
+            for slot in 0..width {
+                let index = row * width + slot;
+                let (id, bits) = expected
+                    .get(slot)
+                    .map_or((n as i32, f32::INFINITY.to_bits()), |neighbor| {
+                        (neighbor.id as i32, neighbor.distance.to_bits())
+                    });
+                assert_eq!(
+                    (heap_ids[index], heap_bits[index]),
+                    (id, bits),
+                    "tile={tile} row={row} slot={slot}"
+                );
+            }
+            // Every row's threshold is its heap's last entry (the NaN row
+            // keeps the refreshed not-full value).
+            let last = row * width + width - 1;
+            assert_eq!(
+                worst_id_values[row], heap_ids[last],
+                "tile={tile} row={row}"
+            );
+            assert_eq!(worst_bits[row], heap_bits[last], "tile={tile} row={row}");
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "tile={tile}: duplicates changed state"
+        );
+        // A single tile sees only the initial not-full thresholds and keeps all.
+        let produced = 2 * (pairs - (n - 1));
+        if tile == pairs {
+            assert_eq!(kept_per_pass[0], produced);
+        } else {
+            assert!(
+                kept_per_pass[0] < produced,
+                "tile={tile}: filter kept every produced record"
+            );
+        }
+        assert!(
+            kept_per_pass[1] < kept_per_pass[0],
+            "tile={tile}: duplicate pass was not filtered"
         );
     }
 }
@@ -554,7 +979,7 @@ fn merge_fixture(device: CubeDevice) {
     let output_distances = f32_tensor(&device, &[n, width], vec![10.0, 10.0, 9.0]);
     let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
-    fixture_merge(
+    let worst = fixture_merge(
         &device,
         &offsets,
         &endpoint_ids,
@@ -566,6 +991,7 @@ fn merge_fixture(device: CubeDevice) {
         n,
         width,
     );
+    assert_eq!(worst, (vec![1, 0, 0], vec![1.0, 1.0, 5.0]));
     assert_eq!(read_i32(&output_ids), [1, 0, 0]);
     assert_eq!(read_f32(&output_distances), [1.0, 1.0, 5.0]);
     assert_eq!(read_i32(&source_ids), [1, 0, 1]);
@@ -605,7 +1031,7 @@ fn duplicate_merge_fixture(device: CubeDevice) {
     let output_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
     let workspace_ids = i32_tensor(&device, &[n, width], vec![3; n * width]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
-    fixture_merge(
+    let worst = fixture_merge(
         &device,
         &offsets,
         &endpoint_ids,
@@ -617,10 +1043,73 @@ fn duplicate_merge_fixture(device: CubeDevice) {
         n,
         width,
     );
+    // Row 1 has no records and keeps its threshold.
+    assert_eq!(
+        worst,
+        (
+            vec![3, UNTOUCHED_WORST_ID, 3],
+            vec![f32::MAX, UNTOUCHED_WORST_DISTANCE, f32::MAX]
+        )
+    );
     assert_eq!(read_i32(&output_ids), [2, 3, 3, 3, 0, 3]);
     assert_eq!(
         read_f32(&output_distances),
         [4.0, f32::MAX, f32::MAX, f32::MAX, 4.0, f32::MAX]
+    );
+}
+
+/// A worse duplicate after an improving one keeps the improved distance, on a
+/// non-full row (0) and a full row (1), and the row thresholds follow the heap.
+fn worse_duplicate_merge_fixture(device: CubeDevice) {
+    let n = 3usize;
+    let width = 2usize;
+    let offsets = i32_tensor(&device, &[n + 1], vec![0, 2, 4, 4]);
+    let endpoint_ids = i32_tensor(&device, &[4], vec![2, 2, 2, 2]);
+    let endpoint_distances = f32_tensor(&device, &[4], vec![3.0, 8.0, 1.0, 6.0]);
+    let output_ids = i32_tensor(&device, &[n, width], vec![3, 3, 0, 2, 3, 3]);
+    let output_distances = f32_tensor(
+        &device,
+        &[n, width],
+        vec![
+            f32::INFINITY,
+            f32::INFINITY,
+            2.0,
+            5.0,
+            f32::INFINITY,
+            f32::INFINITY,
+        ],
+    );
+    let workspace_ids = i32_tensor(&device, &[n, width], vec![3; n * width]);
+    let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n * width]);
+    let worst = fixture_merge(
+        &device,
+        &offsets,
+        &endpoint_ids,
+        &endpoint_distances,
+        &output_ids,
+        &output_distances,
+        &workspace_ids,
+        &workspace_distances,
+        n,
+        width,
+    );
+    assert_eq!(read_i32(&output_ids), [2, 3, 2, 0, 3, 3]);
+    let bits = |values: Vec<f32>| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(read_f32(&output_distances)),
+        bits(vec![
+            3.0,
+            f32::INFINITY,
+            1.0,
+            2.0,
+            f32::INFINITY,
+            f32::INFINITY
+        ])
+    );
+    assert_eq!(worst.0, [3, 0, UNTOUCHED_WORST_ID]);
+    assert_eq!(
+        bits(worst.1),
+        bits(vec![f32::INFINITY, 2.0, UNTOUCHED_WORST_DISTANCE])
     );
 }
 
@@ -636,7 +1125,7 @@ fn untouched_merge_rows_fixture(device: CubeDevice) {
     let output_distances = f32_tensor(&device, &[n, width], vec![1.0, 1.0, 1.0, 1.0]);
     let workspace_ids = i32_tensor(&device, &[n, width], vec![n as i32; n]);
     let workspace_distances = f32_tensor(&device, &[n, width], vec![f32::MAX; n]);
-    fixture_merge(
+    let worst = fixture_merge(
         &device,
         &offsets,
         &endpoint_ids,
@@ -647,6 +1136,14 @@ fn untouched_merge_rows_fixture(device: CubeDevice) {
         &workspace_distances,
         n,
         width,
+    );
+    // Row 0 has no records; row 1's rejected record still rewrites its unchanged worst.
+    assert_eq!(
+        worst,
+        (
+            vec![UNTOUCHED_WORST_ID, 0, 1, 2],
+            vec![UNTOUCHED_WORST_DISTANCE, 1.0, 0.5, 0.25]
+        )
     );
     assert_eq!(read_i32(&output_ids), [1, 0, 1, 2]);
     assert_eq!(read_f32(&output_distances), [1.0, 1.0, 0.5, 0.25]);
@@ -735,6 +1232,8 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         sampled_ids.into_tensor_arg(),
         pool_sizes.into_tensor_arg(),
         center_offsets.into_tensor_arg(),
+        open_worst_ids(&device, 5).into_tensor_arg(),
+        open_worst_distances(&device, 5).into_tensor_arg(),
         left.clone().into_tensor_arg(),
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
@@ -750,7 +1249,7 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
     );
     assert_eq!(read_i32(&left), [1, 1, 1, 2, 2, 1, 1, 1, 2, 2]);
     assert_eq!(read_i32(&right), [2, 3, 4, 3, 4, 2, 3, 4, 3, 4]);
-    assert_eq!(read_i32(&valid), [1; 10]);
+    assert_eq!(read_i32(&valid), [PRODUCED | KEEP_LEFT | KEEP_RIGHT; 10]);
     assert_eq!(
         read_f32(&distances),
         [1.0, 4.0, 9.0, 1.0, 4.0, 1.0, 4.0, 9.0, 1.0, 4.0]
@@ -776,6 +1275,8 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         sampled_ids.into_tensor_arg(),
         pool_sizes.into_tensor_arg(),
         center_offsets.into_tensor_arg(),
+        open_worst_ids(&device, 5).into_tensor_arg(),
+        open_worst_distances(&device, 5).into_tensor_arg(),
         left.clone().into_tensor_arg(),
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
@@ -791,7 +1292,7 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
     );
     assert_eq!(read_i32(&left), [1, 1, 1, 2]);
     assert_eq!(read_i32(&right), [4, 2, 3, 3]);
-    assert_eq!(read_i32(&valid), [1; 4]);
+    assert_eq!(read_i32(&valid), [PRODUCED | KEEP_LEFT | KEEP_RIGHT; 4]);
     assert_eq!(read_f32(&distances), [9.0, 1.0, 4.0, 1.0]);
 }
 
@@ -817,6 +1318,8 @@ fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
         forest_rows.into_tensor_arg(),
         leaf_rows.into_tensor_arg(),
         pair_prefix.into_tensor_arg(),
+        open_worst_ids(&device, 4).into_tensor_arg(),
+        open_worst_distances(&device, 4).into_tensor_arg(),
         left.clone().into_tensor_arg(),
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
@@ -832,7 +1335,7 @@ fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
     assert_eq!(read_i32(&left), [0, 1]);
     assert_eq!(read_i32(&right), [2, 2]);
     assert_eq!(read_f32(&distances), [4.0, 1.0]);
-    assert_eq!(read_i32(&valid), [1, 1]);
+    assert_eq!(read_i32(&valid), [PRODUCED | KEEP_LEFT | KEEP_RIGHT; 2]);
 
     // The two staged pairs fan out symmetrically to their four endpoints.
     let cursors = i32_tensor(&device, &[4], vec![0, 1, 2, 4]);
@@ -921,6 +1424,8 @@ fn sampled_pair_slots_large_offset_fixture(device: CubeDevice) {
             sampled_ids.clone().into_tensor_arg(),
             pool_sizes.clone().into_tensor_arg(),
             center_offsets.clone().into_tensor_arg(),
+            open_worst_ids(&device, 5).into_tensor_arg(),
+            open_worst_distances(&device, 5).into_tensor_arg(),
             left.clone().into_tensor_arg(),
             right.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
@@ -942,7 +1447,11 @@ fn sampled_pair_slots_large_offset_fixture(device: CubeDevice) {
             .map(|(&l, &r)| (l as usize, r as usize))
             .collect();
         assert_eq!(got, expected, "start={start}");
-        assert_eq!(read_i32(&valid), [1; 10], "start={start}");
+        assert_eq!(
+            read_i32(&valid),
+            [PRODUCED | KEEP_LEFT | KEEP_RIGHT; 10],
+            "start={start}"
+        );
         let want: Vec<f32> = expected
             .iter()
             .map(|&(l, r)| ((r - l) * (r - l)) as f32)
@@ -986,6 +1495,8 @@ fn forest_pair_slots_large_offset_fixture(device: CubeDevice) {
             forest_rows.clone().into_tensor_arg(),
             leaf_rows.clone().into_tensor_arg(),
             pair_prefix.clone().into_tensor_arg(),
+            open_worst_ids(&device, 12).into_tensor_arg(),
+            open_worst_distances(&device, 12).into_tensor_arg(),
             left.clone().into_tensor_arg(),
             right.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
@@ -1003,189 +1514,129 @@ fn forest_pair_slots_large_offset_fixture(device: CubeDevice) {
         assert_eq!(read_i32(&left), [a, a, a + 1, b, b, b + 1], "start={start}");
         assert_eq!(read_i32(&right), [a + 1, a + 2, a + 2, b + 1, b + 2, b + 2]);
         assert_eq!(read_f32(&distances), [1.0, 4.0, 1.0, 1.0, 4.0, 1.0]);
-        assert_eq!(read_i32(&valid), [1; 6]);
+        assert_eq!(read_i32(&valid), [PRODUCED | KEEP_LEFT | KEEP_RIGHT; 6]);
     }
 }
 
-fn sampled_pool_fixture(device: CubeDevice) {
+/// Run the production reverse CSR (count, prefix, tagged scatter) and the pool
+/// kernel on a heap whose rows hold each valid id at most once, then compare
+/// every row with the scalar `sample_pools` oracle. The pool kernel is rerun on
+/// the reverse CSR with each target's entries reversed: scatter order must not
+/// change the pools.
+fn check_sampled_pools(
+    device: &CubeDevice,
+    n: usize,
+    width: usize,
+    capacity: usize,
+    candidate_values: &[i32],
+    flag_values: &[i32],
+    label: &str,
+) {
     let client = device.client();
-    let n = 4usize;
-    let width = 2usize;
-    let capacity = 2usize;
-    // Forward and reverse sources intentionally repeat ids and disagree on class.
-    let candidate_values = vec![1, 2, 0, 3, 0, 3, 0, 2];
-    let flag_values = vec![1, 0, 0, 1, 0, 1, 1, 0];
-    let candidates = i32_tensor(&device, &[n, width], candidate_values.clone());
-    let flags = i32_tensor(&device, &[n, width], flag_values.clone());
-    let reverse_offsets = i32_tensor(&device, &[n + 1], vec![0, 3, 4, 6, 8]);
-    let reverse_sources = i32_tensor(&device, &[8], vec![1, 2, 3, 0, 0, 3, 1, 2]);
-    let sampled_ids = i32_tensor(
-        &device,
-        &[n, capacity * 2],
-        vec![n as i32; n * capacity * 2],
+    for row in 0..n {
+        let ids = &candidate_values[row * width..(row + 1) * width];
+        let valid: BTreeSet<_> = ids.iter().filter(|&&id| (id as usize) < n).collect();
+        let valid_count = ids.iter().filter(|&&id| (id as usize) < n).count();
+        assert_eq!(valid.len(), valid_count, "{label}: row {row} repeats an id");
+    }
+    let candidates = i32_tensor(device, &[n, width], candidate_values.to_vec());
+    let flags = i32_tensor(device, &[n, width], flag_values.to_vec());
+    let counts = i32_tensor(device, &[n], vec![-1; n]);
+    let offsets = i32_tensor(device, &[n + 1], vec![-1; n + 1]);
+    let cursors = i32_tensor(device, &[n], vec![-1; n]);
+    let sums = i32_tensor(
+        device,
+        &[n.div_ceil(PREFIX_CHUNK)],
+        vec![0; n.div_ceil(PREFIX_CHUNK)],
     );
-    let sampled_priorities = i32_tensor(
-        &device,
-        &[n, capacity * 2],
-        vec![i32::MAX; n * capacity * 2],
-    );
+    let sources = i32_tensor(device, &[n * width], vec![-1; n * width]);
     let (count, dim) = launch_units(&client, n);
-    sampled_pool_kernel::launch(
+    reverse_zero::launch(
         &client,
-        count,
+        count.clone(),
+        dim,
+        counts.clone().into_tensor_arg(),
+        dtype_to_storage_type(DType::I32),
+    );
+    reverse_count::launch(
+        &client,
+        count.clone(),
+        dim,
+        candidates.clone().into_tensor_arg(),
+        counts.clone().into_tensor_arg(),
+        n as u32,
+        width as u32,
+        dtype_to_storage_type(DType::I32),
+    );
+    exclusive_prefix(
+        &client,
+        &counts,
+        &offsets,
+        &cursors,
+        &sums,
+        DType::I32,
+        true,
+    )
+    .unwrap();
+    reverse_scatter::launch(
+        &client,
+        count.clone(),
         dim,
         candidates.clone().into_tensor_arg(),
         flags.clone().into_tensor_arg(),
-        reverse_offsets.clone().into_tensor_arg(),
-        reverse_sources.clone().into_tensor_arg(),
-        sampled_ids.clone().into_tensor_arg(),
-        sampled_priorities.clone().into_tensor_arg(),
+        cursors.into_tensor_arg(),
+        sources.clone().into_tensor_arg(),
         n as u32,
         width as u32,
-        capacity as u32,
-        43,
-        7,
         dtype_to_storage_type(DType::I32),
     );
-    let actual_ids = read_i32(&sampled_ids);
-    let actual_priorities = read_i32(&sampled_priorities);
-
-    // Build the scalar expectation from explicitly enumerated forward/reverse entries.
-    for row in 0..n {
-        let forward = (0..width)
-            .map(|slot| Candidate {
-                id: candidate_values[row * width + slot] as usize,
-                is_new: flag_values[row * width + slot] == 0,
-            })
-            .collect::<Vec<_>>();
-        let mut reverse = Vec::new();
+    let offset_values = read_i32(&offsets);
+    let source_values = read_i32(&sources);
+    // Every reverse entry is a distinct source whose slot holds the target, tagged
+    // exactly when that slot is new.
+    let mut reverse = vec![Vec::new(); n];
+    for target in 0..n {
+        let range = offset_values[target] as usize..offset_values[target + 1] as usize;
+        let mut entries: Vec<u32> = source_values[range].iter().map(|&v| v as u32).collect();
+        entries.sort_unstable();
+        let mut expected = Vec::new();
         for source in 0..n {
             for slot in 0..width {
                 let index = source * width + slot;
-                if candidate_values[index] as usize == row {
-                    reverse.push(Candidate {
+                if candidate_values[index] as usize == target && source != target {
+                    let tag = if flag_values[index] == 0 {
+                        REVERSE_NEW_BIT
+                    } else {
+                        0
+                    };
+                    expected.push(source as u32 | tag);
+                    reverse[target].push(Candidate {
                         id: source,
                         is_new: flag_values[index] == 0,
                     });
                 }
             }
         }
-        let expected = sample_pools(row, n, &forward, &reverse, capacity, 43, 7);
-        let base = row * capacity * 2;
-        let mut expected_ids = vec![n as i32; capacity * 2];
-        let mut expected_priorities = vec![i32::MAX; capacity * 2];
-        for (class, pool) in [(0usize, &expected.new), (1, &expected.old)] {
-            for (slot, &id) in pool.iter().enumerate() {
-                expected_ids[class * capacity + slot] = id as i32;
-                expected_priorities[class * capacity + slot] =
-                    priority(43, 7, row, id, class == 0) as i32;
-            }
-        }
-        assert_eq!(
-            &actual_ids[base..base + capacity * 2],
-            expected_ids,
-            "sampled IDs row {row}"
-        );
-        assert_eq!(
-            &actual_priorities[base..base + capacity * 2],
-            expected_priorities,
-            "sampled priority row {row}"
-        );
+        expected.sort_unstable();
+        assert_eq!(entries, expected, "{label}: reverse entries of {target}");
     }
-
-    let reordered_sources = i32_tensor(&device, &[8], vec![3, 2, 1, 0, 3, 0, 2, 1]);
-    let reordered_ids = i32_tensor(
-        &device,
-        &[n, capacity * 2],
-        vec![n as i32; n * capacity * 2],
-    );
-    let reordered_priorities = i32_tensor(
-        &device,
-        &[n, capacity * 2],
-        vec![i32::MAX; n * capacity * 2],
-    );
-    let (count, dim) = launch_units(&client, n);
-    sampled_pool_kernel::launch(
-        &client,
-        count,
-        dim,
-        candidates.into_tensor_arg(),
-        flags.into_tensor_arg(),
-        reverse_offsets.into_tensor_arg(),
-        reordered_sources.into_tensor_arg(),
-        reordered_ids.clone().into_tensor_arg(),
-        reordered_priorities.clone().into_tensor_arg(),
-        n as u32,
-        width as u32,
-        capacity as u32,
-        43,
-        7,
-        dtype_to_storage_type(DType::I32),
-    );
-    assert_eq!(
-        read_i32(&reordered_ids),
-        actual_ids,
-        "reverse CSR scatter order must not bias pool selection"
-    );
-    assert_eq!(read_i32(&reordered_priorities), actual_priorities);
-}
-
-/// Sampled-pool scalar agreement at candidate widths straddling the sampling budget.
-/// Capacity is the production `MAX_CANDIDATES` budget; widths 59..65 and 120/256 exercise
-/// both pool-saturated and pool-sparse rows. Pools are compared against `sample_pools`.
-fn sampled_pool_width_edge_fixture(device: CubeDevice) {
-    let client = device.client();
-    let n = 200usize;
-    let capacity = MAX_CANDIDATES.min(n - 1);
-    for width in [59usize, 60, 61, 64, 65, 120, 256] {
-        let mut candidate_values = vec![0i32; n * width];
-        let mut flag_values = vec![0i32; n * width];
-        for row in 0..n {
-            for slot in 0..width {
-                let mut id = (row * 7 + slot * 13 + 1) % n;
-                if id == row {
-                    id = (id + 1) % n;
-                }
-                candidate_values[row * width + slot] = id as i32;
-                flag_values[row * width + slot] = i32::from((row + slot) % 3 == 0);
-            }
-        }
-        // Reverse CSR grouped by target, sources ascending, matching the scalar reference order.
-        let mut reverse_offsets = vec![0i32; n + 1];
-        let mut reverse_sources = Vec::with_capacity(n * width);
-        for target in 0..n {
-            for (index, &candidate) in candidate_values.iter().enumerate() {
-                if candidate as usize == target {
-                    reverse_sources.push((index / width) as i32);
-                }
-            }
-            reverse_offsets[target + 1] = reverse_sources.len() as i32;
-        }
-        let candidates = i32_tensor(&device, &[n, width], candidate_values.clone());
-        let flags = i32_tensor(&device, &[n, width], flag_values.clone());
-        let offsets = i32_tensor(&device, &[n + 1], reverse_offsets.clone());
-        let sources = i32_tensor(&device, &[reverse_sources.len()], reverse_sources.clone());
-        let sampled_ids = i32_tensor(
-            &device,
-            &[n, capacity * 2],
-            vec![n as i32; n * capacity * 2],
-        );
-        let sampled_priorities = i32_tensor(
-            &device,
-            &[n, capacity * 2],
-            vec![i32::MAX; n * capacity * 2],
-        );
-        let (count, dim) = launch_units(&client, n);
+    let mut reversed = source_values.clone();
+    for target in 0..n {
+        reversed[offset_values[target] as usize..offset_values[target + 1] as usize].reverse();
+    }
+    let mut runs = Vec::new();
+    for order in [source_values, reversed] {
+        let sources = i32_tensor(device, &[order.len()], order);
+        let sampled_ids = i32_tensor(device, &[n, capacity * 2], vec![-1; n * capacity * 2]);
         sampled_pool_kernel::launch(
             &client,
-            count,
+            count.clone(),
             dim,
-            candidates.into_tensor_arg(),
-            flags.into_tensor_arg(),
-            offsets.into_tensor_arg(),
+            candidates.clone().into_tensor_arg(),
+            flags.clone().into_tensor_arg(),
+            offsets.clone().into_tensor_arg(),
             sources.into_tensor_arg(),
             sampled_ids.clone().into_tensor_arg(),
-            sampled_priorities.clone().into_tensor_arg(),
             n as u32,
             width as u32,
             capacity as u32,
@@ -1193,51 +1644,171 @@ fn sampled_pool_width_edge_fixture(device: CubeDevice) {
             7,
             dtype_to_storage_type(DType::I32),
         );
-        let actual_ids = read_i32(&sampled_ids);
-        let actual_priorities = read_i32(&sampled_priorities);
-
-        for row in 0..n {
-            let forward = (0..width)
-                .map(|slot| Candidate {
-                    id: candidate_values[row * width + slot] as usize,
-                    is_new: flag_values[row * width + slot] == 0,
-                })
-                .collect::<Vec<_>>();
-            let mut reverse = Vec::new();
-            for source in 0..n {
-                for slot in 0..width {
-                    let index = source * width + slot;
-                    if candidate_values[index] as usize == row {
-                        reverse.push(Candidate {
-                            id: source,
-                            is_new: flag_values[index] == 0,
-                        });
-                    }
-                }
-            }
-            let expected = sample_pools(row, n, &forward, &reverse, capacity, 43, 7);
-            let base = row * capacity * 2;
-            let mut expected_ids = vec![n as i32; capacity * 2];
-            let mut expected_priorities = vec![i32::MAX; capacity * 2];
-            for (class, pool) in [(0usize, &expected.new), (1, &expected.old)] {
-                for (slot, &id) in pool.iter().enumerate() {
-                    expected_ids[class * capacity + slot] = id as i32;
-                    expected_priorities[class * capacity + slot] =
-                        priority(43, 7, row, id, class == 0) as i32;
-                }
-            }
-            assert_eq!(
-                &actual_ids[base..base + capacity * 2],
-                expected_ids,
-                "width {width} sampled IDs row {row}"
-            );
-            assert_eq!(
-                &actual_priorities[base..base + capacity * 2],
-                expected_priorities,
-                "width {width} sampled priority row {row}"
-            );
-        }
+        runs.push(read_i32(&sampled_ids));
     }
+    assert_eq!(runs[0], runs[1], "{label}: reverse order changed the pools");
+    for row in 0..n {
+        let forward = (0..width)
+            .map(|slot| Candidate {
+                id: candidate_values[row * width + slot] as usize,
+                is_new: flag_values[row * width + slot] == 0,
+            })
+            .collect::<Vec<_>>();
+        let expected = sample_pools(row, n, &forward, &reverse[row], capacity, 43, 7);
+        let mut expected_ids = vec![n as i32; capacity * 2];
+        for (class, pool) in [(0usize, &expected.new), (1, &expected.old)] {
+            for (slot, &id) in pool.iter().enumerate() {
+                expected_ids[class * capacity + slot] = id as i32;
+            }
+        }
+        let base = row * capacity * 2;
+        assert_eq!(
+            &runs[0][base..base + capacity * 2],
+            expected_ids,
+            "{label}: sampled IDs row {row}"
+        );
+    }
+}
+
+fn sampled_pool_fixture(device: CubeDevice) {
+    // Ids repeat across rows and disagree on class between directions.
+    check_sampled_pools(
+        &device,
+        4,
+        2,
+        2,
+        &[1, 2, 0, 3, 0, 3, 0, 2],
+        &[1, 0, 0, 1, 0, 1, 1, 0],
+        "small",
+    );
+}
+
+/// Sampled-pool scalar agreement at candidate widths straddling the sampling budget.
+/// Capacity is the production `MAX_CANDIDATES` budget; widths 59..65 and 120/256 exercise
+/// both pool-saturated and pool-sparse rows, with some padding ids.
+fn sampled_pool_width_edge_fixture(device: CubeDevice) {
+    let n = 300usize;
+    let capacity = MAX_CANDIDATES.min(n - 1);
+    for width in [59usize, 60, 61, 64, 65, 120, 256] {
+        let mut candidate_values = vec![0i32; n * width];
+        let mut flag_values = vec![0i32; n * width];
+        for row in 0..n {
+            for slot in 0..width {
+                // Offsets 1 + 7*slot mod 299 are distinct and never zero.
+                let id = if row % 5 == 0 && slot + 1 == width {
+                    n
+                } else {
+                    (row + 1 + (slot * 7) % (n - 1)) % n
+                };
+                candidate_values[row * width + slot] = id as i32;
+                flag_values[row * width + slot] = i32::from((row + slot) % 3 == 0);
+            }
+        }
+        check_sampled_pools(
+            &device,
+            n,
+            width,
+            capacity,
+            &candidate_values,
+            &flag_values,
+            &format!("width {width}"),
+        );
+    }
+}
+
+/// Hub row 0 with a new set larger than the pool. Its forward new ids are
+/// ordered by priority so that every overflowing offer is accepted with an
+/// eviction (`improving`) or rejected (`worsening`). Each forward id's own row
+/// holds 0 as old, so the old reverse loop offers every new id again and must
+/// exclude it even after eviction or rejection; the last forward slot is an old
+/// id whose row holds 0 as new. Row `n - 1` is the source of a tagged entry.
+fn hub_pool_fixture(device: CubeDevice) {
+    let n = 16usize;
+    let width = 7usize;
+    let capacity = 2usize;
+    let hub_new = 6usize;
+    let mut by_priority: Vec<usize> = (1..n).collect();
+    by_priority.sort_by_key(|&id| (priority(43, 7, 0, id, true), id));
+    for improving in [true, false] {
+        // The old id has the best priority, so its reverse new offer is accepted
+        // too in the evicting case.
+        let old_id = by_priority[0];
+        let mut chosen: Vec<usize> = by_priority[1..hub_new].to_vec();
+        if improving {
+            chosen.reverse();
+        }
+        let mut candidate_values = vec![n as i32; n * width];
+        let mut flag_values = vec![1i32; n * width];
+        for (slot, &id) in chosen.iter().enumerate() {
+            candidate_values[slot] = id as i32;
+            flag_values[slot] = 0;
+        }
+        candidate_values[width - 1] = old_id as i32;
+        flag_values[width - 1] = 1;
+        for row in 1..n {
+            let base = row * width;
+            let mut slot = 0usize;
+            if chosen.contains(&row) {
+                candidate_values[base] = 0;
+                flag_values[base] = 1;
+                slot = 1;
+            } else if row == old_id {
+                candidate_values[base] = 0;
+                flag_values[base] = 0;
+                slot = 1;
+            }
+            let mut id = 1usize;
+            while slot < width {
+                if id != row && !chosen.contains(&id) && id != old_id {
+                    candidate_values[base + slot] = id as i32;
+                    flag_values[base + slot] = i32::from((row + slot).is_multiple_of(2));
+                    slot += 1;
+                }
+                id += 1;
+            }
+        }
+        check_sampled_pools(
+            &device,
+            n,
+            width,
+            capacity,
+            &candidate_values,
+            &flag_values,
+            if improving {
+                "hub evicting"
+            } else {
+                "hub rejecting"
+            },
+        );
+    }
+    // A full new pool offered only duplicates: rows 1 and 2 hold 0 as new and
+    // row 0 holds them as new, so the reverse offers repeat pool members. Old id
+    // 3 is then answered from the complete pool; row 4 is all padding.
+    #[rustfmt::skip]
+    let candidate_values = [
+        1, 2, 3,
+        0, 3, 4,
+        0, 1, 4,
+        0, 4, 5,
+        5, 5, 5,
+    ];
+    #[rustfmt::skip]
+    let flag_values = [
+        0, 0, 1,
+        0, 1, 1,
+        0, 0, 1,
+        1, 1, 0,
+        1, 1, 1,
+    ];
+    check_sampled_pools(
+        &device,
+        5,
+        3,
+        2,
+        &candidate_values,
+        &flag_values,
+        "duplicates only",
+    );
 }
 
 fn flag_transition_fixture(device: CubeDevice) {
@@ -1561,6 +2132,9 @@ fn run_kernel_fixtures(device: CubeDevice) {
     merge_fixture(device.clone());
     duplicate_merge_fixture(device.clone());
     untouched_merge_rows_fixture(device.clone());
+    worse_duplicate_merge_fixture(device.clone());
+    endpoint_mask_fixture(device.clone());
+    filtered_pipeline_fixture(device.clone());
     tiled_and_zero_slot_iteration_fixture(device.clone());
     sampled_pair_slots_fixture(device.clone());
     forest_pair_slots_tiled_fixture(device.clone());
@@ -1568,6 +2142,7 @@ fn run_kernel_fixtures(device: CubeDevice) {
     forest_pair_slots_large_offset_fixture(device.clone());
     sampled_pool_fixture(device.clone());
     sampled_pool_width_edge_fixture(device.clone());
+    hub_pool_fixture(device.clone());
     flag_transition_fixture(device);
 }
 

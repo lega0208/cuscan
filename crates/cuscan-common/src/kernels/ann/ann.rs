@@ -233,6 +233,8 @@ pub(super) enum Buffer {
     ForestPairPrefix,
     HeapIds,
     HeapDistances,
+    RowWorstIds,
+    RowWorstDistances,
     Flags,
     PairLeft,
     PairRight,
@@ -248,7 +250,6 @@ pub(super) enum Buffer {
     EndpointIds,
     EndpointDistances,
     SampledIds,
-    SampledPriorities,
     WorkingIds,
     MergeWorkspaceIds,
     MergeWorkspaceDistances,
@@ -262,6 +263,7 @@ pub(super) enum Buffer {
     JoinCursorPlaceholder,
     OutputIds,
     OutputDistances,
+    ProfileCounts,
     SurvivalCounts,
 }
 
@@ -269,7 +271,8 @@ pub(super) enum Buffer {
 pub(super) enum BufferRoute {
     Both,
     Cuda,
-    SurvivalProfile,
+    /// Allocated only when profiling; not part of the memory plan.
+    Profile,
 }
 
 #[derive(Clone, Debug)]
@@ -346,6 +349,8 @@ pub(super) fn ann_buffer_table(
     entry!(ForestPairPrefix, I64, 2, false, leaf_entries);
     entry!(HeapIds, I32, 14, false, n, width);
     entry!(HeapDistances, F32, 14, false, n, width);
+    entry!(RowWorstIds, I32, 6, false, n);
+    entry!(RowWorstDistances, F32, 6, false, n);
     entry!(Flags, I32, 6, false, n, width);
     entries.extend(staging_entries(tile_slots)?);
     entry!(EndpointCounts, I32, 6, false, n);
@@ -356,7 +361,6 @@ pub(super) fn ann_buffer_table(
     entry!(ReverseCursors, I32, 4, false, n);
     entry!(ReverseSources, I32, 4, false, n.checked_mul(width)?);
     entry!(SampledIds, I32, 4, false, n, pool_width);
-    entry!(SampledPriorities, I32, 4, false, n, pool_width);
     entry!(WorkingIds, I32, 4, false, n, width);
     entry!(MergeWorkspaceIds, I32, 6, false, n, width);
     entries.last_mut()?.route = BufferRoute::Cuda;
@@ -372,14 +376,18 @@ pub(super) fn ann_buffer_table(
     entry!(JoinCursorPlaceholder, I64, 4, false, 1);
     entry!(OutputIds, I32, 8, false, n, k);
     entry!(OutputDistances, F32, 8, false, n, k);
-    entries.push(BufferEntry {
-        buffer: SurvivalCounts,
-        shape: vec![2],
-        dtype: DType::I32,
-        phases: 6,
-        route: BufferRoute::SurvivalProfile,
-        staging: false,
-    });
+    // Optional profiling counters: allocated only on profiled runs and excluded
+    // from the memory plan.
+    for (buffer, elements) in [(ProfileCounts, 1), (SurvivalCounts, 2)] {
+        entries.push(BufferEntry {
+            buffer,
+            shape: vec![elements],
+            dtype: DType::I32,
+            phases: 6,
+            route: BufferRoute::Profile,
+            staging: false,
+        });
+    }
     Some(entries)
 }
 
@@ -719,7 +727,7 @@ fn fixed_memory(
     let mut contributors = Vec::new();
     for entry in table {
         if entry.staging
-            || entry.route == BufferRoute::SurvivalProfile
+            || entry.route == BufferRoute::Profile
             || (cpu && entry.route == BufferRoute::Cuda)
         {
             continue;
@@ -952,7 +960,7 @@ fn estimate_from_plan(
     let mut cpu_runtime = [0usize; 4];
     let mut fixed = [0usize; 4];
     for entry in &table {
-        if entry.route == BufferRoute::SurvivalProfile {
+        if entry.route == BufferRoute::Profile {
             continue;
         }
         let bytes = entry.bytes().ok_or_else(overflow)?;
@@ -1088,9 +1096,16 @@ pub(super) fn reverse_count<I: Int>(
     }
 }
 
+/// Set in a `reverse_sources` entry when the source's edge to the target is new
+/// (`retained == 0`). Valid ids are below `n <= i32::MAX`, so bit 31 is free.
+pub(super) const REVERSE_NEW_BIT: u32 = 1 << 31;
+
+/// Scatter each distinct reverse edge as its source id, tagged with
+/// [`REVERSE_NEW_BIT`] from the source slot's flag.
 #[cube(launch)]
 pub(super) fn reverse_scatter<I: Int>(
     candidates: &Tensor<I>,
+    retained: &Tensor<I>,
     cursors: &mut Tensor<Atomic<I>>,
     sources: &mut Tensor<I>,
     n: u32,
@@ -1106,7 +1121,11 @@ pub(super) fn reverse_scatter<I: Int>(
                 let target = u32::cast_from(candidates[source * width + slot]) as usize;
                 let position =
                     u32::cast_from(cursors[target].fetch_add(I::cast_from(1i32))) as usize;
-                sources[position] = I::cast_from(source as i32);
+                let mut entry = source as u32;
+                if retained[source * width + slot] == I::cast_from(0i32) {
+                    entry |= REVERSE_NEW_BIT;
+                }
+                sources[position] = I::cast_from(entry as i32);
             }
         }
     }
@@ -1450,9 +1469,11 @@ mod tests {
             let staging = 32 * (1 << 22);
             // IDs, distances, two flag buffers, working IDs, reverse sources,
             // and two CUDA workspaces; forest membership is already released.
+            // The n-sized I32/F32 scratch includes the two row-worst arrays;
+            // the sampled pools hold ids only (`2c` per row, no priorities).
             let heap = 32 * n * width;
             let scratch =
-                4 * (6 * n + 2 * (n + 1) + 4 * n * c + chunks + 1) + 8 * (n + (n + 1) + chunks + 1);
+                4 * (8 * n + 2 * (n + 1) + 2 * n * c + chunks + 1) + 8 * (n + (n + 1) + chunks + 1);
             assert_eq!(estimate.retained_width, width);
             assert_eq!(host.width, width);
             assert_eq!(
@@ -1566,13 +1587,13 @@ mod tests {
         let [input, forest_init, refinement, output] = estimate.phases;
         // Original input plus the conservatively reserved contiguous copy: 2*11*2*4.
         assert_eq!(input.runtime_bytes, 176);
-        assert_eq!(forest_init.runtime_bytes, 53_188);
-        assert_eq!(refinement.runtime_bytes, 56_008);
+        assert_eq!(forest_init.runtime_bytes, 53_276);
+        assert_eq!(refinement.runtime_bytes, 55_216);
         assert_eq!(output.runtime_bytes, 1_056);
         let host = host_plan(11, 2, 3).unwrap();
         let table =
             ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
-        for (phase, expected) in [(2, 52_572), (4, 55_392)] {
+        for (phase, expected) in [(2, 52_660), (4, 54_600)] {
             let cpu: usize = table
                 .iter()
                 .filter(|entry| entry.route == BufferRoute::Both && entry.phases & phase != 0)
@@ -1649,7 +1670,7 @@ mod tests {
         let host = host_plan(11, 2, 3).unwrap();
         let table =
             ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
-        assert_eq!(table.len(), 37);
+        assert_eq!(table.len(), 39);
         let mut seen = std::collections::HashSet::new();
         for entry in &table {
             assert!(seen.insert(entry.buffer));
@@ -1674,7 +1695,7 @@ mod tests {
             let expected: usize = table
                 .iter()
                 .filter(|entry| {
-                    entry.route != BufferRoute::SurvivalProfile && entry.phases & (1 << index) != 0
+                    entry.route != BufferRoute::Profile && entry.phases & (1 << index) != 0
                 })
                 .map(|entry| entry.bytes().unwrap())
                 .sum();

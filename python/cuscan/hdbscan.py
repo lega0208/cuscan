@@ -161,8 +161,9 @@ class HDBSCAN:
     or escalate it. The estimate is conditional on the backend (``Auto`` reports both CPU and
     CUDA scenarios) and does not measure available memory. Complete-graph fits emit no advisory.
 
-    ``memory_limit_bytes`` limits the estimated ANN working set including the input.
-    It is not a reservation or a budget for the entire fit; complete-graph fits are unaffected.
+    ``memory_limit_bytes`` is an optional positive byte cap on the estimated ANN
+    working set including the input, before the 64 MiB reserve. It is not a
+    reservation or a budget for the entire fit; non-ANN search is unaffected.
     """
 
     _fitted_state: _FittedState

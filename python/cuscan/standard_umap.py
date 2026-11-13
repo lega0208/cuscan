@@ -17,8 +17,9 @@ class UMAP:
     underflows to zero (umap-learn only warns there); use ``init="random"``, a larger
     ``n_neighbors``, or scaled features instead.
 
-    ``memory_limit_bytes`` limits the estimated ANN working set including the input.
-    It is not a reservation or a budget for the entire fit; exact search is unaffected.
+    ``memory_limit_bytes`` is an optional positive byte cap on the estimated ANN
+    working set including the input, before the 64 MiB reserve. It is not a
+    reservation or a budget for the entire fit; exact search is unaffected.
     """
 
     def __init__(
