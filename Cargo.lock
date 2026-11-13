@@ -2350,6 +2350,7 @@ dependencies = [
  "cubecl-cpu",
  "cudarc",
  "rayon",
+ "sysinfo",
  "tempfile",
 ]
 

@@ -1,8 +1,17 @@
 //! Device memory availability for admission planning.
+//!
+//! CPU free memory is platform specific. Linux reads `MemAvailable` from
+//! `/proc/meminfo` and caps it by the cgroup v2 headroom of the current
+//! process. Other targets use `sysinfo`'s available memory (macOS: active,
+//! inactive and free pages, which can overstate free memory; Windows:
+//! `ullAvailPhys`), which does not see job-object or container limits; there a
+//! zero reading is an error, never total memory. On Linux an unreadable source
+//! is an error and a zero reading is admitted as zero free memory.
 
 use crate::BackendError;
 use burn::backend::DispatchDevice;
 use burn::tensor::Device;
+#[cfg(target_os = "linux")]
 use std::path::{Component, Path, PathBuf};
 
 pub const MEMORY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
@@ -54,11 +63,7 @@ pub fn resolve_memory_budget(
         cubecl::Device::Cuda(cuda) => {
             crate::cuda_backend::free_memory(cuda.index).map_err(BackendError::Unavailable)?
         }
-        cubecl::Device::Cpu(_) => cpu_available(
-            Path::new("/proc/meminfo"),
-            Path::new("/proc/self/cgroup"),
-            Path::new("/proc/self/mountinfo"),
-        )?,
+        cubecl::Device::Cpu(_) => cpu_free_memory()?,
         other => {
             return Err(BackendError::Unavailable(format!(
                 "unsupported memory device: {other:?}"
@@ -75,15 +80,41 @@ pub fn resolve_memory_budget(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn cpu_free_memory() -> Result<u64, BackendError> {
+    cpu_available(
+        Path::new("/proc/meminfo"),
+        Path::new("/proc/self/cgroup"),
+        Path::new("/proc/self/mountinfo"),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cpu_free_memory() -> Result<u64, BackendError> {
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    );
+    match system.available_memory() {
+        0 => Err(BackendError::Unavailable(
+            "CPU available memory unavailable from sysinfo".into(),
+        )),
+        bytes => Ok(bytes),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read(path: &Path) -> Result<String, BackendError> {
     std::fs::read_to_string(path)
         .map_err(|error| BackendError::Unavailable(format!("{}: {error}", path.display())))
 }
 
+#[cfg(target_os = "linux")]
 fn invalid(path: &Path, detail: &str) -> BackendError {
     BackendError::Unavailable(format!("{}: {detail}", path.display()))
 }
 
+#[cfg(target_os = "linux")]
 fn cpu_available(meminfo: &Path, cgroup: &Path, mountinfo: &Path) -> Result<u64, BackendError> {
     let text = read(meminfo)?;
     let mut available = None;
@@ -107,6 +138,7 @@ fn cpu_available(meminfo: &Path, cgroup: &Path, mountinfo: &Path) -> Result<u64,
     Ok(cgroup_headroom(cgroup, mountinfo)?.map_or(available, |cap| available.min(cap)))
 }
 
+#[cfg(target_os = "linux")]
 fn absolute_path(value: &str, source: &Path) -> Result<PathBuf, BackendError> {
     let path = Path::new(value);
     if !path.is_absolute()
@@ -122,6 +154,7 @@ fn absolute_path(value: &str, source: &Path) -> Result<PathBuf, BackendError> {
     Ok(path.to_path_buf())
 }
 
+#[cfg(target_os = "linux")]
 fn unescape_mount(value: &str, source: &Path) -> Result<String, BackendError> {
     let bytes = value.as_bytes();
     let mut result = Vec::with_capacity(bytes.len());
@@ -149,6 +182,7 @@ fn unescape_mount(value: &str, source: &Path) -> Result<String, BackendError> {
     String::from_utf8(result).map_err(|_| invalid(source, "non-UTF-8 mountinfo path"))
 }
 
+#[cfg(target_os = "linux")]
 fn cgroup_headroom(cgroup: &Path, mountinfo: &Path) -> Result<Option<u64>, BackendError> {
     let membership = match std::fs::read_to_string(cgroup) {
         Ok(text) => text,
@@ -272,7 +306,7 @@ fn cgroup_headroom(cgroup: &Path, mountinfo: &Path) -> Result<Option<u64>, Backe
     Ok(cap)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs;
