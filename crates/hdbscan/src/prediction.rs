@@ -2037,172 +2037,83 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn leaf_affinity_gather_and_scatter_preserve_identity() {
-        let values: Vec<f32> = (0..129).flat_map(|i| [i as f32 - 64.0, -0.0]).collect();
-        let tree = KdTree::build(&values, 129, 2).unwrap();
-        for row in [[-f32::MAX, 0.0], [f32::MAX, -0.0], [0.0, 0.0]] {
-            let key = leaf_affinity(&tree, &row);
-            assert!(
-                tree.starts
-                    .iter()
-                    .zip(&tree.is_leaf)
-                    .any(|(&start, &leaf)| leaf != 0 && start as usize == key)
-            );
-        }
-        let equal = vec![0.0; 129 * 2];
-        let tied = KdTree::build(&equal, 129, 2).unwrap();
-        assert_eq!(leaf_affinity(&tied, &[0.0, -0.0]), 0);
-        let single = KdTree::build(&[-0.0, 1.0], 1, 2).unwrap();
-        assert_eq!(leaf_affinity(&single, &[f32::MAX, -f32::MAX]), 0);
-        let pairs = [(0, 2), (0, 0), (0, 1)];
-        let gathered = gather_rows(&values, 2, pairs.iter().map(|&(_, row)| row), 3).unwrap();
-        for (position, &(_, row)) in pairs.iter().enumerate() {
-            assert_eq!(
-                gathered[position * 2..position * 2 + 2]
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>(),
-                values[row * 2..row * 2 + 2]
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>()
-            );
-        }
-        let packed = PredictionColumns {
-            labels: vec![12, 10, 11],
-            probabilities: vec![0.2, 0.0, 0.1],
-            connecting_points: vec![92, 90, 91],
-        };
-        let mut output = unfilled_columns(3).unwrap();
-        scatter_columns(&mut output, &packed, &pairs, 0).unwrap();
-        assert_eq!(output.labels, [10, 11, 12]);
-        assert_eq!(output.connecting_points, [90, 91, 92]);
-        assert_eq!(output.probabilities, [0.0, 0.1, 0.2]);
-        assert!(scatter_columns(&mut output, &packed, &pairs[..2], 0).is_err());
-        assert!(gather_rows(&values, 2, [129].into_iter(), 1).is_err());
-        let mut sorted = pairs;
-        sorted.sort_unstable_by_key(|&pair| pair);
-        assert_eq!(sorted, [(0, 0), (0, 1), (0, 2)]);
-    }
-
-    #[test]
-    fn phase_b_all_orders_match_candidates_cores_and_predictions() {
-        for features in [2, 8, 16, 30, 33] {
-            for quantized in [false, true] {
-                let data: Vec<Vec<f32>> = (0..129)
-                    .map(|row| {
-                        (0..features)
-                            .map(|feature| {
-                                let jitter = ((row * 17 + feature * 13) % 47) as f32;
-                                (row % 3) as f32 * 30.0
-                                    + if quantized {
-                                        (jitter / 7.0).floor()
-                                    } else {
-                                        jitter * 0.0314159
-                                    }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let config = HdbscanConfig {
-                    min_cluster_size: 5,
-                    min_samples: Some(3),
-                    ..Default::default()
-                };
-                let model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
-                    .with_search(crate::HdbscanSearch::KdTree)
-                    .fit(&data)
-                    .unwrap();
-                let state = &model.state.prediction;
-                assert!(!state.hierarchy.no_cluster_tree());
-                let queries: Vec<Vec<f32>> = (0..259)
-                    .map(|row| data[(row * 37) % data.len()].clone())
-                    .collect();
-                let target = Target::resolve(BackendChoice::Cpu).unwrap();
-                let tree = model.runtime.tree(state).unwrap();
-                let call = CallReference::upload(state, &tree, &target).unwrap();
-                let cores = compute_cores(state, &call, &tree, 63, QueryOrder::Input).unwrap();
-                let leaf_cores = compute_cores(state, &call, &tree, 63, QueryOrder::Leaf).unwrap();
-                assert_eq!(
-                    cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                    leaf_cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-                );
-                let flat: Vec<f32> = queries.iter().flatten().copied().collect();
-                let mut order: Vec<_> = queries
+    fn input_order_candidates_and_cores_match_brute_ranks() {
+        for (features, quantized) in [(16, true), (33, false)] {
+            let data: Vec<Vec<f32>> = (0..129)
+                .map(|row| {
+                    (0..features)
+                        .map(|feature| {
+                            let jitter = ((row * 17 + feature * 13) % 47) as f32;
+                            (row % 3) as f32 * 30.0
+                                + if quantized {
+                                    (jitter / 7.0).floor()
+                                } else {
+                                    jitter * 0.0314159
+                                }
+                        })
+                        .collect()
+                })
+                .collect();
+            let config = HdbscanConfig {
+                min_cluster_size: 5,
+                min_samples: Some(3),
+                ..Default::default()
+            };
+            let model = crate::HDBSCAN::new(config, BackendChoice::Cpu)
+                .with_search(crate::HdbscanSearch::KdTree)
+                .fit(&data)
+                .unwrap();
+            let state = &model.state.prediction;
+            assert!(!state.hierarchy.no_cluster_tree());
+            let target = Target::resolve(BackendChoice::Cpu).unwrap();
+            let tree = model.runtime.tree(state).unwrap();
+            let call = CallReference::upload(state, &tree, &target).unwrap();
+            let ranks = |query: &[f32]| {
+                let mut candidates: Vec<_> = data
                     .iter()
                     .enumerate()
-                    .map(|(row, values)| (leaf_affinity(&tree, values), row))
+                    .map(|(id, row)| {
+                        let distance = query.iter().zip(row).fold(0.0f32, |sum, (a, b)| {
+                            let delta = a - b;
+                            sum + delta * delta
+                        });
+                        (distance, id)
+                    })
                     .collect();
-                order.sort_unstable_by_key(|&pair| pair);
-                let input_query = Tensor::<2>::from_data(
-                    TensorData::new(flat.clone(), [queries.len(), features]),
+                candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                candidates
+            };
+            let cores = compute_cores(state, &call, &tree, 63, QueryOrder::Input).unwrap();
+            for (row, core) in data.iter().zip(&cores) {
+                let expected = f64::from(ranks(row)[2].0).sqrt();
+                assert!((core - expected).abs() <= 1e-6 + 1e-5 * expected.abs());
+            }
+            let queries: Vec<_> = (0..259)
+                .map(|row| data[(row * 37) % data.len()].clone())
+                .collect();
+            for chunk in queries.chunks(64) {
+                let flat: Vec<_> = chunk.iter().flatten().copied().collect();
+                let tensor = Tensor::<2>::from_data(
+                    TensorData::new(flat, [chunk.len(), features]),
                     &call.device,
                 );
-                let packed = gather_rows(
-                    &flat,
-                    features,
-                    order.iter().map(|&(_, row)| row),
-                    queries.len(),
-                )
-                .unwrap();
-                let leaf_query = Tensor::<2>::from_data(
-                    TensorData::new(packed, [queries.len(), features]),
-                    &call.device,
-                );
-                let (input_ids, input_distances) = call.query(input_query, 6, false, 0).unwrap();
-                let (leaf_ids, leaf_distances) = call.query(leaf_query, 6, false, 0).unwrap();
-                for (position, &(_, original)) in order.iter().enumerate() {
-                    assert_eq!(
-                        input_ids[original * 6..original * 6 + 6],
-                        leaf_ids[position * 6..position * 6 + 6]
-                    );
-                    for candidate in 0..6 {
-                        assert_eq!(
-                            input_distances[original * 6 + candidate].to_bits(),
-                            leaf_distances[position * 6 + candidate].to_bits()
+                let (ids, distances) = call.query(tensor, 6, false, 0).unwrap();
+                for (row, query) in chunk.iter().enumerate() {
+                    let expected = ranks(query);
+                    for (rank, &(distance, _)) in expected.iter().take(6).enumerate() {
+                        let index = row * 6 + rank;
+                        let id = usize::try_from(ids[index]).unwrap();
+                        assert!(id < data.len());
+                        assert!(!ids[row * 6..index].contains(&ids[index]));
+                        assert!(
+                            (distances[index] - distance).abs() <= 1e-6 + 1e-5 * distance.abs()
                         );
-                    }
-                }
-                let reference = approximate_predict_impl(
-                    state,
-                    &PredictionRuntime::new(state, BackendChoice::Cpu, None),
-                    &queries,
-                    (QueryOrder::Input, QueryOrder::Input),
-                    64,
-                )
-                .unwrap();
-                for core_order in [QueryOrder::Input, QueryOrder::Leaf] {
-                    for query_order in [QueryOrder::Input, QueryOrder::Leaf] {
-                        for batch in [1, 63, 64, 65, 1024] {
-                            let runtime = PredictionRuntime::new(state, BackendChoice::Cpu, None);
-                            let result = approximate_predict_impl(
-                                state,
-                                &runtime,
-                                &queries,
-                                (core_order, query_order),
-                                batch,
-                            )
-                            .unwrap();
-                            assert_eq!(result.labels, reference.labels);
-                            assert_eq!(result.connecting_points, reference.connecting_points);
-                            assert_eq!(
-                                result
-                                    .probabilities
-                                    .iter()
-                                    .map(|x| x.to_bits())
-                                    .collect::<Vec<_>>(),
-                                reference
-                                    .probabilities
-                                    .iter()
-                                    .map(|x| x.to_bits())
-                                    .collect::<Vec<_>>()
-                            );
-                            let published = runtime.ready_cores().unwrap().unwrap();
-                            assert_eq!(
-                                published.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                                cores.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-                            );
-                        }
+                        let actual_distance =
+                            query.iter().zip(&data[id]).fold(0.0f32, |sum, (a, b)| {
+                                let delta = a - b;
+                                sum + delta * delta
+                            });
+                        assert!((actual_distance - distance).abs() <= 1e-6 + 1e-5 * distance.abs());
                     }
                 }
             }

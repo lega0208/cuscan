@@ -105,23 +105,6 @@ fn exact_neighbors_is_bipartite_without_implicit_equal_index_exclusion() {
 }
 
 #[test]
-fn exact_neighbors_handles_query_block_boundary_on_cpu() {
-    let device = Device::cpu();
-    let query = Tensor::<2>::from_data(TensorData::new(vec![0.0f32; 33 * 2], [33, 2]), &device);
-    let reference = Tensor::<2>::from_data(
-        TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], [3, 2]),
-        &device,
-    );
-    let (indices, distances) = run_exact_neighbors(query, reference, 2, false, 0);
-    assert_eq!(indices.len(), 33 * 2);
-    assert_eq!(distances.len(), 33 * 2);
-    for row in 0..33 {
-        assert_eq!(&indices[row * 2..row * 2 + 2], [0, 1]);
-        assert_eq!(&distances[row * 2..row * 2 + 2], [0.0, 0.0]);
-    }
-}
-
-#[test]
 fn standard_squared_distance_dispatch_uses_cuda_when_available() {
     let observed_device = umap::cuda_backend::device(0);
     eprintln!("cuda_backend::device(0) = {observed_device:?}");

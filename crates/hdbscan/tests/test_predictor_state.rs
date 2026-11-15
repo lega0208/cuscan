@@ -101,20 +101,6 @@ fn exported_cpu_state_imports_on_cuda_and_predicts_identically() {
     }
 }
 
-#[test]
-fn export_is_identical_before_and_after_fitted_prediction() {
-    let model = HDBSCAN::new(config(3, 2), BackendChoice::Cpu)
-        .fit(&data())
-        .unwrap();
-    let predictor = model.to_predictor().unwrap();
-    let before = predictor.export_state().unwrap();
-    model
-        .approximate_predict(&[vec![0.25, 0.125], vec![100.5, 0.25]])
-        .unwrap();
-    let after = model.to_predictor().unwrap().export_state().unwrap();
-    assert_eq!(after, before);
-}
-
 fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
     let mut training = data();
     training[0] = vec![f32::NAN, 0.0];
@@ -135,6 +121,11 @@ fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
     let cold_predictor = cold.to_predictor().unwrap();
     let warm_predictor = warm.to_predictor().unwrap();
     let cold_state = cold_predictor.export_state().unwrap();
+    let cold_result = cold.approximate_predict(&query).unwrap();
+    assert_eq!(
+        cold.to_predictor().unwrap().export_state().unwrap(),
+        cold_state
+    );
     let warm_state = warm_predictor.export_state().unwrap();
     let (
         PredictionCoresState::Ready { rank, values },
@@ -154,6 +145,15 @@ fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
         assert_eq!(cold.to_bits(), warm.to_bits());
     }
     assert_eq!(cold_state, warm_state);
+    assert!(
+        cold_state
+            .hierarchy
+            .finite_index
+            .windows(2)
+            .all(|w| w[0] < w[1])
+    );
+    assert!(!cold_state.hierarchy.finite_index.contains(&0));
+    assert!(!cold_state.hierarchy.finite_index.contains(&13));
     let restored = HDBSCANPredictor::from_state(cold_state.clone(), backend).unwrap();
     let imported_state = restored.export_state().unwrap();
     assert_eq!(imported_state, cold_state);
@@ -172,6 +172,10 @@ fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
         restored.prediction_cache_status().unwrap().cores,
         hdbscan::PredictionCoreStatus::Ready { rank: 2, len: 22 }
     );
+    assert_eq!(cold_result.no_cluster_tree, warm_result.no_cluster_tree);
+    assert_eq!(cold_result.labels, warm_result.labels);
+    assert_eq!(cold_result.connecting_points, warm_result.connecting_points);
+    assert_eq!(cold_result.probabilities, warm_result.probabilities);
     for predictor in [&cold_predictor, &warm_predictor, &restored] {
         let actual = predictor.approximate_predict(&query).unwrap();
         assert_eq!(actual.no_cluster_tree, warm_result.no_cluster_tree);
@@ -180,6 +184,14 @@ fn conversion_and_import_preserve_ready_cores(backend: BackendChoice) {
         assert_eq!(actual.probabilities.len(), warm_result.probabilities.len());
         for (actual, expected) in actual.probabilities.iter().zip(&warm_result.probabilities) {
             assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        for (&label, &raw) in actual.labels.iter().zip(&actual.connecting_points) {
+            if label != -1 {
+                assert!(raw >= 0 && (raw as usize) < training.len());
+                assert_ne!(raw, 0);
+                assert_ne!(raw, 13);
+                assert!(training[raw as usize].iter().all(|v| v.is_finite()));
+            }
         }
         assert_eq!(predictor.export_state().unwrap(), cold_state);
     }
@@ -195,43 +207,6 @@ fn conversion_and_import_preserve_ready_cores_cuda() {
     if let Some(backend) = cuda_backend_or_skip() {
         conversion_and_import_preserve_ready_cores(backend);
     }
-}
-
-#[test]
-fn mixed_nonfinite_and_tied_geometry_roundtrips_raw_connectors() {
-    let mut training = data();
-    training[0] = vec![f32::NAN, 0.0];
-    training[1] = vec![f32::INFINITY, 0.0];
-    // Duplicate finite rows exercise tied candidate ordering and preserve raw IDs.
-    training[2] = training[3].clone();
-    let model = HDBSCAN::new(config(3, 2), BackendChoice::Cpu)
-        .fit(&training)
-        .unwrap();
-    let predictor = model.to_predictor().unwrap();
-    let state = predictor.export_state().unwrap();
-    let restored = HDBSCANPredictor::from_state(state.clone(), BackendChoice::Cpu).unwrap();
-    assert_eq!(restored.export_state().unwrap(), state);
-    assert!(state.hierarchy.finite_index.windows(2).all(|w| w[0] < w[1]));
-    assert!(!state.hierarchy.finite_index.contains(&0));
-    assert!(!state.hierarchy.finite_index.contains(&1));
-    let query = [training[2].clone(), training[3].clone(), vec![1000.0, 0.0]];
-    let expected = model.approximate_predict(&query).unwrap();
-    let actual = restored.approximate_predict(&query).unwrap();
-    assert_eq!(actual.labels, expected.labels);
-    assert_eq!(actual.probabilities, expected.probabilities);
-    assert_eq!(actual.connecting_points, expected.connecting_points);
-    assert!(
-        actual
-            .connecting_points
-            .iter()
-            .all(|&raw| raw == -1 || raw >= 2)
-    );
-    assert!(
-        actual
-            .connecting_points
-            .iter()
-            .all(|&raw| training[raw as usize].iter().all(|v| v.is_finite()))
-    );
 }
 
 #[test]
@@ -347,8 +322,9 @@ fn rejects_malformed_predictor_dimensions_cores_and_hierarchy() {
             true,
         ),
     ];
+    let baseline = clustered_state();
     for (case, corrupt, expects_overflow) in cases {
-        let mut state = clustered_state();
+        let mut state = baseline.clone();
         corrupt(&mut state);
         let result = HDBSCANPredictor::from_state(state, BackendChoice::Cpu);
         if expects_overflow {
@@ -364,7 +340,7 @@ fn rejects_malformed_predictor_dimensions_cores_and_hierarchy() {
         }
     }
 
-    let mut mismatched_clustered = clustered_state();
+    let mut mismatched_clustered = baseline.clone();
     mismatched_clustered.prediction_cores = PredictionCoresState::NotRequiredNoClusterTree;
     assert!(matches!(
         HDBSCANPredictor::from_state(mismatched_clustered, BackendChoice::Cpu),

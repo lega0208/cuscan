@@ -257,6 +257,9 @@ fn approximate_query_is_seeded_bounded_and_bipartite() {
         40,
     );
     assert_eq!(first, repeated);
+    let prevalidated =
+        run_prevalidated_query(query, reference.clone(), graph.clone(), 2, 4, 10, 19, 40);
+    assert_eq!(prevalidated, first);
     assert_eq!(first.0.len(), 8);
     assert_eq!(first.1.len(), 8);
     for (ids, distances) in first
@@ -382,24 +385,6 @@ fn approximate_query_marks_invalid_graph_indices_in_stats() {
     assert_invalid_graph_indices_in_stats(&Device::cpu());
 }
 
-#[test]
-fn approximate_query_prevalidated_matches_validating_entry_on_cpu() {
-    let device = Device::cpu();
-    let (query, reference, graph) = inputs(&device);
-    let validating = run_query(
-        query.clone(),
-        reference.clone(),
-        graph.clone(),
-        2,
-        4,
-        10,
-        19,
-        40,
-    );
-    let prevalidated = run_prevalidated_query(query, reference, graph, 2, 4, 10, 19, 40);
-    assert_eq!(prevalidated, validating);
-}
-
 fn assert_invalid_graph_indices_in_stats(device: &Device) {
     let reference =
         Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0], [4, 1]), device);
@@ -479,7 +464,22 @@ fn approximate_query_runs_on_cuda_when_requested() {
         TensorData::new(vec![1, 2, 0, 3, 0, 3, 1, 2], [4, 2]),
         &device,
     );
-    let (ids, distances, stats) = run_query(query, reference, graph, 2, 3, 4, 11, 0);
+    let checked = run_query(
+        query.clone(),
+        reference.clone(),
+        graph.clone(),
+        2,
+        3,
+        4,
+        11,
+        0,
+    );
+    let prevalidated = run_prevalidated_query(query, reference, graph, 2, 3, 4, 11, 0);
+    assert_eq!(prevalidated.0, checked.0, "indices differ");
+    assert_eq!(prevalidated.1, checked.1, "distances differ");
+    assert_eq!(prevalidated.2, checked.2, "stats differ");
+    assert!(!prevalidated.2.contains(&-1));
+    let (ids, distances, stats) = checked;
     assert_eq!(ids, [0, 1]);
     assert_eq!(distances, [0.0, 1.0]);
     assert!(stats[0] <= 3 && stats[1] <= 4);
@@ -503,34 +503,7 @@ fn approximate_query_runs_on_cuda_when_requested() {
 }
 
 #[test]
-fn approximate_query_prevalidated_matches_validating_entry_on_cuda() {
-    let Some(device) = umap::cuda_backend::device(0) else {
-        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
-            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
-        }
-        eprintln!("SKIPPED: no CUDA device");
-        return;
-    };
-    let (query, reference, graph) = inputs(&device);
-    let validating = run_query(
-        query.clone(),
-        reference.clone(),
-        graph.clone(),
-        2,
-        4,
-        10,
-        19,
-        40,
-    );
-    let prevalidated = run_prevalidated_query(query, reference, graph, 2, 4, 10, 19, 40);
-    assert_eq!(prevalidated.0, validating.0, "indices differ");
-    assert_eq!(prevalidated.1, validating.1, "distances differ");
-    assert_eq!(prevalidated.2, validating.2, "stats differ");
-    assert!(!prevalidated.2.contains(&-1));
-}
-
-#[test]
-fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
+fn approximate_query_checked_chunks_large_cuda_batch_with_host_oracle() {
     let Some(cuda_device) = umap::cuda_backend::device(0) else {
         if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
             panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
@@ -538,12 +511,12 @@ fn approximate_query_prevalidated_chunks_large_cuda_batch_with_host_oracle() {
         eprintln!("SKIPPED: no CUDA device");
         return;
     };
-    assert_prevalidated_chunks_large_batch_with_host_oracle(&cuda_device);
+    assert_checked_chunks_large_batch_with_host_oracle(&cuda_device);
 }
 
 #[test]
 fn approximate_query_cpu_chunks_large_batch_with_host_oracle() {
-    assert_prevalidated_chunks_large_batch_with_host_oracle(&Device::cpu());
+    assert_checked_chunks_large_batch_with_host_oracle(&Device::cpu());
 }
 
 #[test]
@@ -570,7 +543,7 @@ fn approximate_query_cpu_handles_single_row_chunk() {
     assert_eq!(actual, expected);
 }
 
-fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
+fn assert_checked_chunks_large_batch_with_host_oracle(device: &Device) {
     let n = 5_000usize;
     let query_rows = 7_000usize;
     let k = 15;
@@ -598,17 +571,7 @@ fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
         device,
     );
     let graph = Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), device);
-    let actual = run_prevalidated_query(
-        query.clone(),
-        reference.clone(),
-        graph.clone(),
-        k,
-        candidates,
-        visits,
-        seed,
-        query_offset,
-    );
-    let checked = run_query(
+    let actual = run_query(
         query,
         reference,
         graph,
@@ -625,7 +588,6 @@ fn assert_prevalidated_chunks_large_batch_with_host_oracle(device: &Device) {
     let expected =
         self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
 
-    assert_eq!(checked, actual, "checked/prevalidated chunk outputs differ");
     assert_eq!(actual.0, expected.0, "chunked query indices differ");
     assert_eq!(actual.1, expected.1, "chunked query distances differ");
     assert_eq!(actual.2, expected.2, "chunked query stats differ");
@@ -695,6 +657,13 @@ fn assert_twenty_one_component_transform(backend: umap::standard_umap::BackendCh
     let fitted = UMAP::new(config, backend, NeighborSearch::Exact)
         .fit(&data)
         .unwrap();
+    assert_eq!(fitted.embedding().len(), 64);
+    assert!(
+        fitted
+            .embedding()
+            .iter()
+            .all(|row| { row.len() == COMPONENTS && row.iter().all(|value| value.is_finite()) })
+    );
     let query: Vec<Vec<f32>> = (0..9)
         .map(|row| {
             let value = row as f32;

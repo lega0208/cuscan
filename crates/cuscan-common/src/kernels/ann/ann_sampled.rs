@@ -2994,8 +2994,8 @@ mod tests {
     #[test]
     fn local_join_pairs_include_new_new_and_cross_class_once() {
         let pools = SampledPools {
-            new: vec![1, 2, 1, 0],
-            old: vec![2, 3, 3],
+            new: vec![1, 2, 1, 0, 99],
+            old: vec![2, 3, 3, 1],
         };
         assert_eq!(local_pairs(&pools, 0, 5), vec![(1, 2), (1, 3), (2, 3)]);
     }

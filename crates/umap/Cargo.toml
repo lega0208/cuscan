@@ -61,4 +61,8 @@ name = "profile_standard_stages"
 required-features = ["tracing"]
 
 [[example]]
+name = "profile_transform"
+required-features = ["tracing"]
+
+[[example]]
 name = "ann_construction_worker"

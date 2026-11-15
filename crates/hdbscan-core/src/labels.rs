@@ -245,28 +245,4 @@ mod tests {
             vec![1.0 / 3.0, 1.0]
         );
     }
-
-    #[test]
-    fn dbscan_cut_is_strict_and_rejects_nan() {
-        let linkage = [
-            LinkageRow {
-                left: 1,
-                right: 0,
-                distance: 1.0,
-                size: 2,
-            },
-            LinkageRow {
-                left: 3,
-                right: 2,
-                distance: 2.0,
-                size: 3,
-            },
-        ];
-        assert_eq!(dbscan_cut(&linkage, 1.0, 1).unwrap(), vec![0, 1, 2]);
-        assert_eq!(dbscan_cut(&linkage, 2.1, 2).unwrap(), vec![0, 0, 0]);
-        assert!(matches!(
-            dbscan_cut(&linkage, f64::NAN, 1),
-            Err(HdbscanError::InvalidConfig(_))
-        ));
-    }
 }

@@ -123,26 +123,29 @@ fn rejects_malformed_arrays_graph_mapping_and_search() {
     let mut state = valid.clone();
     state.original_to_training = Some(vec![0]);
     invalid(state);
-    let mut state = estimator(NeighborSearch::Approximate, false, Some(4))
+    let approximate = estimator(NeighborSearch::Approximate, false, Some(4))
         .fit(&rows())
         .unwrap()
         .export_state()
         .unwrap();
+    let mut state = approximate.clone();
     state.query_graph.as_mut().unwrap()[0] = -1;
     invalid(state);
-    let mut state = valid;
+    let mut state = valid.clone();
     state.resolved_search = NeighborSearch::Approximate;
     invalid(state);
-}
 
-#[test]
-fn rejects_nonpositive_curve_for_exact_and_approximate_models() {
-    for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
-        let state = estimator(search, false, Some(4))
-            .fit(&rows())
-            .unwrap()
-            .export_state()
-            .unwrap();
+    let mut state = approximate.clone();
+    state.config.n_neighbors = 2;
+    state.training_rows = 2;
+    state.embedding_rows = 2;
+    state.training_features.truncate(4);
+    state.embedding.truncate(2 * state.n_components);
+    state.query_graph = Some(Vec::new());
+    state.query_graph_width = 0;
+    assert!(FittedUMAP::from_state(state, BackendChoice::Cpu).is_err());
+
+    for state in [valid, approximate] {
         for (a, b) in [
             (0.0, state.b),
             (state.a, 0.0),
@@ -155,21 +158,4 @@ fn rejects_nonpositive_curve_for_exact_and_approximate_models() {
             assert!(FittedUMAP::from_state(malformed, BackendChoice::Cpu).is_err());
         }
     }
-}
-
-#[test]
-fn rejects_two_row_approximate_state_with_zero_graph_width() {
-    let mut state = estimator(NeighborSearch::Approximate, false, Some(4))
-        .fit(&rows())
-        .unwrap()
-        .export_state()
-        .unwrap();
-    state.config.n_neighbors = 2;
-    state.training_rows = 2;
-    state.embedding_rows = 2;
-    state.training_features.truncate(4);
-    state.embedding.truncate(2 * state.n_components);
-    state.query_graph = Some(Vec::new());
-    state.query_graph_width = 0;
-    assert!(FittedUMAP::from_state(state, BackendChoice::Cpu).is_err());
 }

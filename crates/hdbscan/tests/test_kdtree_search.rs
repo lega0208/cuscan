@@ -73,39 +73,6 @@ fn make_device_tree(tree: &KdTree, components: &[i32], device: &Device) -> Devic
     }
 }
 
-fn check_extension_roundtrip(device: &Device) {
-    let values = data_values();
-    let components_values = component_values();
-    let tree = KdTree::build(&values, N, D).unwrap();
-    let data = Tensor::<2>::from_data(TensorData::new(values, [N, D]), device);
-    let components =
-        Tensor::<1, Int>::from_data(TensorData::new(components_values.clone(), [N]), device);
-    let core = Tensor::<1>::from_data(TensorData::new(vec![0.0; N], [N]), device);
-    let (weights, indices) = <Dispatch as HdbscanOps>::boruvka_candidates_kd(
-        data.into_dispatch(),
-        core.into_dispatch(),
-        components.clone().into_dispatch(),
-        make_device_tree(&tree, &components_values, device),
-        true,
-    );
-    assert_eq!(
-        Tensor::<1, Int>::from_dispatch(indices)
-            .to_data()
-            .try_to_vec::<i32>()
-            .unwrap()
-            .len(),
-        N
-    );
-    assert_eq!(
-        Tensor::<1>::from_dispatch(weights)
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap()
-            .len(),
-        N
-    );
-}
-
 fn check_kd_oracle(device: &Device) {
     let values = data_values();
     let components_values = component_values();
@@ -127,6 +94,8 @@ fn check_kd_oracle(device: &Device) {
         .unwrap();
     let mut expected_neighbors = vec![N as i32; N * 3];
     let mut expected_distances = vec![f32::INFINITY; N * 3];
+    assert_eq!(neighbors.len(), N * 3);
+    assert_eq!(distances.len(), N * 3);
     for i in 0..N {
         let mut candidates = Vec::new();
         for j in 0..N {
@@ -188,6 +157,8 @@ fn check_kd_oracle(device: &Device) {
         .unwrap();
     let mut expected_weights = vec![f32::INFINITY; N];
     let mut expected_destinations = vec![N as i32; N];
+    assert_eq!(weights.len(), N);
+    assert_eq!(destinations.len(), N);
     for i in 0..N {
         for j in 0..N {
             if components_values[i] == components_values[j] {
@@ -455,19 +426,6 @@ fn check_permuted_tree_row_oracles(device: &Device) {
             destinations[row], expected[0].1,
             "candidate index at row {row}"
         );
-    }
-}
-
-#[test]
-fn test_device_kdtree_extension_roundtrip_cpu() {
-    check_extension_roundtrip(&Device::cpu());
-}
-
-#[test]
-fn test_device_kdtree_extension_roundtrip_cuda() {
-    let device = cuda_device();
-    if let Some(device) = device {
-        check_extension_roundtrip(&device);
     }
 }
 

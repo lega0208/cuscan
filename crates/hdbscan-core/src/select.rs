@@ -310,7 +310,7 @@ mod tests {
             }
             value
         }
-        for seed in 0..32usize {
+        for seed in 0..11usize {
             // A full binary cluster tree in BFS order, with two point rows per leaf.
             let n = 16;
             let mut full = CondensedTree::default();

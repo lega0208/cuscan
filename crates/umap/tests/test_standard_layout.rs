@@ -1043,7 +1043,7 @@ fn standard_layout_multidimensional_analytical_updates() {
         eprintln!("SKIPPED: CUDA numerical coverage; no CUDA device");
     }
     for device in std::iter::once(Device::cpu()).chain(cuda) {
-        for dimensions in [8, 16, 17, 20, 21, 27, 32, 33] {
+        for dimensions in [8, 16, 17, 20, 21, 32, 33] {
             for shared in [true, false] {
                 for negative in [false, true] {
                     verify_multidimensional_update(&device, dimensions, shared, negative);

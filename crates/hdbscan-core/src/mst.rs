@@ -635,11 +635,21 @@ mod tests {
     #[test]
     fn invalid_candidates_remain_errors_even_for_padding_rows() {
         for weight in [f32::NAN, -1.0] {
-            let mut dsu = RankDsu::new(1);
-            assert!(matches!(
-                merge_components(&mut dsu, &[0], &[weight], &[-1], &mut Vec::new()),
-                Err(HdbscanError::Numerical(_))
-            ));
+            for candidate in [-1, 1] {
+                let mut dsu = RankDsu::new(2);
+                let mut edges = Vec::new();
+                assert!(matches!(
+                    merge_components(
+                        &mut dsu,
+                        &[0, 1],
+                        &[weight, 1.0],
+                        &[candidate, 0],
+                        &mut edges
+                    ),
+                    Err(HdbscanError::Numerical(_))
+                ));
+                assert!(edges.is_empty());
+            }
         }
         let mut dsu = RankDsu::new(1);
         assert!(matches!(

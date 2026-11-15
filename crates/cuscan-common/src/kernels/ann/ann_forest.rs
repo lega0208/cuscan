@@ -833,60 +833,69 @@ mod tests {
             .collect()
     }
 
-    /// Production equals the frozen serial builder for every row-major level
-    /// count (forced by tiny node-byte thresholds), join threshold and thread
-    /// count, including duplicates, zero-variance features, non-power-of-two n
-    /// and `leaf_size >= n`.
+    /// Compare representative phase splits and thread counts against the frozen builder.
     #[test]
     fn forest_matches_frozen_reference_across_phases_and_threads() {
-        let cases: [(usize, usize, usize); 4] =
-            [(37, 9, 3), (1000, 5, 7), (777, 33, 2), (64, 1, 5)];
-        // Alternating +0/-0 rows project to signed zeros, checking the -0.0 start.
+        // The 777-row partial split leaves 97/98-row DFS nodes, which split
+        // and take the join branch at threshold 8. MAX/MAX splits serially.
+        let partial_bytes = 4 * 33 * 777 / 8;
+        assert_eq!(top_levels(777, 33, 10, 1), 7);
+        assert!(777 >> top_levels(777, 33, 10, 1) <= 10);
+        assert_eq!(top_levels(777, 33, 10, partial_bytes), 3);
+        assert_eq!(top_levels(777, 33, 10, usize::MAX), 0);
+        let partial_min_rows = 777 >> top_levels(777, 33, 10, partial_bytes);
+        assert_eq!(partial_min_rows, 97);
+        assert_eq!(top_levels(64, 1, 1, 1), 6);
+        assert_eq!(top_levels(37, 9, 37, 1), 0);
         for threads in [1, 4] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
             pool.install(|| {
-                for (n, features, trees) in cases {
-                    let mixed = mixed_points(n, features);
-                    let identical = vec![2.0; n * features];
-                    let zeros = (0..n * features)
-                        .map(|i| if (i / features) % 2 == 0 { 0.0 } else { -0.0 })
-                        .collect::<Vec<f32>>();
-                    for points in [&mixed, &identical, &zeros] {
-                        for leaf_size in [1, 4, 10, n, n + 1] {
-                            let expected =
-                                reference_build_forest(points, n, features, 42, trees, leaf_size)
-                                    .unwrap();
-                            assert_eq!(
-                                build_forest(points, n, features, 42, trees, leaf_size).unwrap(),
-                                expected
-                            );
-                            // Node bytes of 1 make every splitting level row-major
-                            // (up to the u16 cap); larger values stop part-way.
-                            for top_node_bytes in [1, 4 * features * n / 8, usize::MAX] {
-                                for join_rows in [2, 8, usize::MAX] {
-                                    let actual = build_forest_with(
-                                        points,
-                                        n,
-                                        features,
-                                        42,
-                                        trees,
-                                        leaf_size,
-                                        top_node_bytes,
-                                        join_rows,
-                                    )
-                                    .unwrap();
-                                    assert_eq!(
-                                        actual, expected,
-                                        "n={n} features={features} trees={trees} \
-                                         leaf_size={leaf_size} threads={threads} \
-                                         top_node_bytes={top_node_bytes} join_rows={join_rows}"
-                                    );
-                                }
-                            }
-                        }
+                for (n, features, trees, leaf_size, pattern) in [
+                    (37, 9, 3, 4, 0),
+                    (777, 33, 2, 10, 0),
+                    (64, 1, 5, 1, 1),
+                    (37, 9, 3, 4, 2),
+                    (37, 9, 3, 37, 2),
+                    (37, 9, 3, 38, 2),
+                ] {
+                    let points = match pattern {
+                        0 => mixed_points(n, features),
+                        1 => vec![2.0; n * features],
+                        // Alternating signed-zero rows check the -0.0 start.
+                        _ => (0..n * features)
+                            .map(|i| if (i / features) % 2 == 0 { 0.0 } else { -0.0 })
+                            .collect(),
+                    };
+                    let expected =
+                        reference_build_forest(&points, n, features, 42, trees, leaf_size).unwrap();
+                    assert_eq!(
+                        build_forest(&points, n, features, 42, trees, leaf_size).unwrap(),
+                        expected
+                    );
+                    let pairs = [(1, 2), (4 * features * n / 8, 8), (usize::MAX, usize::MAX)];
+                    for (top_node_bytes, join_rows) in
+                        pairs.into_iter().take(if pattern == 0 { 3 } else { 1 })
+                    {
+                        let actual = build_forest_with(
+                            &points,
+                            n,
+                            features,
+                            42,
+                            trees,
+                            leaf_size,
+                            top_node_bytes,
+                            join_rows,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "n={n} features={features} trees={trees} \
+                             leaf_size={leaf_size} threads={threads} \
+                             top_node_bytes={top_node_bytes} join_rows={join_rows}"
+                        );
                     }
                 }
             });

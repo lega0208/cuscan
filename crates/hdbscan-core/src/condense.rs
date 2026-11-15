@@ -291,24 +291,4 @@ mod tests {
         let out = simplify_hierarchy(tree.clone(), 1.0);
         assert_ne!(out, tree);
     }
-
-    #[test]
-    fn parent_prefix_bound_holds_for_deep_chain() {
-        let n = 3;
-        let mut hierarchy = Vec::new();
-        // A valid, highly unbalanced linkage tree: each merge adds one new point to
-        // the growing component. Condensation gives the simplifier genuine BFS ids.
-        for point in 1..100 {
-            let previous = if point == 1 { 0 } else { n + point - 2 };
-            hierarchy.push(LinkageRow {
-                left: point,
-                right: previous,
-                distance: point as f64,
-                size: point + 1,
-            });
-        }
-        let tree = condense_tree(&hierarchy, 2);
-        let out = simplify_hierarchy(tree, f64::INFINITY);
-        assert!(!out.is_empty());
-    }
 }

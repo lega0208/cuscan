@@ -316,6 +316,42 @@ mod tests {
             scatter_probabilities(&[0.25, 1.0], &split.finite_index, n).unwrap(),
             [0.25, 0.0, 1.0]
         );
+
+        let raw = [0.0f32, f32::NAN, 1.0, f32::INFINITY, 2.0];
+        let split = split_finite(&raw, 1).unwrap();
+        assert_eq!(split.finite_index, [0, 2, 4]);
+        assert_eq!(split.outliers, [1, 3]);
+        let linkage = [
+            LinkageRow {
+                left: 2,
+                right: 1,
+                distance: 1.0,
+                size: 2,
+            },
+            LinkageRow {
+                left: 3,
+                right: 0,
+                distance: 2.0,
+                size: 3,
+            },
+        ];
+        let remapped = remap_linkage(&linkage, &split.finite_index, &split.outliers).unwrap();
+        assert_eq!(
+            (remapped[2].left, remapped[2].right, remapped[2].distance),
+            (1, 6, f64::INFINITY)
+        );
+        assert_eq!(
+            (remapped[3].left, remapped[3].right, remapped[3].distance),
+            (3, 7, f64::INFINITY)
+        );
+        let tree = CondensedTree {
+            parent: vec![3],
+            child: vec![0],
+            lambda: vec![1.0],
+            child_size: vec![3.0],
+        };
+        let remapped = remap_condensed(&tree, &split.finite_index, &split.outliers).unwrap();
+        assert_eq!(&remapped.child[..2], &[1, 3]);
     }
 
     #[test]

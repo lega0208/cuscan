@@ -407,7 +407,8 @@ mod tests {
     #[test]
     fn tiled_merge_matches_independent_oracle_across_query_and_reference_tails() {
         for device in devices() {
-            let query: Vec<f32> = (0..701).map(|i| (i % 17) as f32).collect();
+            let mut query: Vec<f32> = (0..701).map(|i| (i % 17) as f32).collect();
+            query[700] = f32::MAX;
             let mut reference: Vec<f32> = (0..763).map(|i| ((i * 7) % 23) as f32).collect();
             reference[12..713].copy_from_slice(&query);
             let (actual_ids, actual_distances) = exact_neighbors(
@@ -419,37 +420,20 @@ mod tests {
                 true,
             );
             let (expected_ids, expected_distances) = exact_oracle(&query, &reference, 1300, 12);
-            assert_eq!(
-                actual_ids.to_data().try_to_vec::<i32>().unwrap(),
-                expected_ids
-            );
-            assert_eq!(
-                actual_distances.to_data().try_to_vec::<f32>().unwrap(),
-                expected_distances
-            );
-        }
-    }
-
-    #[test]
-    fn squared_mode_orders_ties_and_preserves_squared_distances() {
-        for device in devices() {
-            let q = tensor(vec![0.0], 1, &device);
-            let r = tensor(vec![1.0, -1.0, 2.0], 3, &device);
-            let (ids, d) = exact_neighbors(q, r, 3, false, 0, true);
-            assert_eq!(ids.dims(), [1, 3]);
-            assert_eq!(ids.to_data().try_to_vec::<i32>().unwrap(), [0, 1, 2]);
-            assert_eq!(d.to_data().try_to_vec::<f32>().unwrap(), [1.0, 1.0, 4.0]);
-        }
-    }
-
-    #[test]
-    fn squared_mode_real_infinity_precedes_raw_n_padding() {
-        for device in devices() {
-            let q = tensor(vec![f32::MAX], 1, &device);
-            let r = tensor(vec![-f32::MAX, -f32::MAX], 2, &device);
-            let (ids, d) = exact_neighbors(q, r, 3, false, 0, true);
-            assert_eq!(ids.to_data().try_to_vec::<i32>().unwrap(), [0, 1, 2]);
-            assert_eq!(d.to_data().try_to_vec::<f32>().unwrap(), [f32::INFINITY; 3]);
+            let actual_ids = actual_ids.to_data().try_to_vec::<i32>().unwrap();
+            let actual_distances = actual_distances.to_data().try_to_vec::<f32>().unwrap();
+            assert_eq!(actual_ids, expected_ids);
+            assert_eq!(actual_distances, expected_distances);
+            assert_eq!(&actual_ids[..2], &[0, 29]);
+            assert_eq!(&actual_distances[..2], &[0.0, 0.0]);
+            assert!(actual_distances[..1300].contains(&4.0));
+            let ids = &actual_ids[700 * 1300..701 * 1300];
+            let distances = &actual_distances[700 * 1300..701 * 1300];
+            assert_eq!(&ids[..2], &[0, 1]);
+            assert!(!ids.contains(&712));
+            assert!(ids[..762].iter().all(|&id| id < 763));
+            assert!(ids[762..].iter().all(|&id| id == 763));
+            assert!(distances.iter().all(|&distance| distance == f32::INFINITY));
         }
     }
 

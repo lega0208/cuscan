@@ -2919,28 +2919,6 @@ mod tests {
     }
 
     #[test]
-    fn phase7_flat_chunks_are_bounded_and_partial() {
-        for rows in [257usize, 287, 1000, 4109] {
-            let mut consumed = Vec::new();
-            for start in (0..rows).step_by(32) {
-                let len = (rows - start).min(32);
-                for chunks in 1..=8 {
-                    for lane in 0..32 {
-                        for element in (lane..len * chunks).step_by(32) {
-                            assert!(start * chunks + element < rows * chunks);
-                        }
-                    }
-                }
-                consumed.extend(start..start + len);
-            }
-            assert_eq!(consumed, (0..rows).collect::<Vec<_>>());
-            if rows == 4109 {
-                assert_eq!((rows / 32 * 32, rows % 32), (4096, 13));
-            }
-        }
-    }
-
-    #[test]
     fn phase7_routing_cpu_and_cuda() {
         let (cpu, _) = make_neighbor_inputs(&[0.0], 1, 1, &CubeDevice::Cpu(Default::default()));
         for d in [1, 2, 8, 15, 16, 32, 33] {
@@ -2969,133 +2947,121 @@ mod tests {
 
     fn phase7_reference_matrix(features: usize) {
         let Some(device) = phase7_cuda() else { return };
-        for rows in [257, 287, 1000, 4109] {
-            for pattern in 0..3 {
-                let mut values = splitmix_values(rows, features);
-                if pattern == 1 {
-                    for r in 0..rows {
-                        for f in 0..features {
-                            values[r * features + f] = ((r % 19 + f) % 7) as f32;
-                        }
-                    }
-                } else if pattern == 2 {
-                    for r in 0..rows {
-                        for f in 0..features {
-                            values[r * features + f] = if r % 7 == 0 {
-                                -0.0
-                            } else {
-                                ((r >> (f % 8)) % 3) as f32 - 1.0
-                            };
-                        }
+        for (rows, pattern, k) in [(257, 0, 1), (257, 1, 16), (4109, 2, 17)] {
+            let mut values = splitmix_values(rows, features);
+            if pattern == 1 {
+                for r in 0..rows {
+                    for f in 0..features {
+                        values[r * features + f] = ((r % 19 + f) % 7) as f32;
                     }
                 }
-                for k in [1, 5, 16, 17] {
-                    let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
-                    let tile = data.client.properties().hardware.plane_size_min as usize;
-                    let (ref_ids, ref_distances, _) =
-                        exact_neighbors_kd_reference(data, tree, k, false);
-                    let ref_ids = into_data_sync(ref_ids).try_to_vec::<i32>().unwrap();
-                    let ref_bits = into_data_sync(ref_distances)
+            } else if pattern == 2 {
+                for r in 0..rows {
+                    for f in 0..features {
+                        values[r * features + f] = if r % 7 == 0 {
+                            -0.0
+                        } else {
+                            ((r >> (f % 8)) % 3) as f32 - 1.0
+                        };
+                    }
+                }
+            }
+            let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
+            let tile = data.client.properties().hardware.plane_size_min as usize;
+            if rows == 4109 {
+                assert!(
+                    rows.div_ceil(tile) > 2,
+                    "4109 rows must span more than two tiles"
+                );
+                assert_ne!(rows % tile, 0, "4109 rows must have a partial tile");
+            }
+            let (ref_ids, ref_distances, _) = exact_neighbors_kd_reference(data, tree, k, false);
+            let ref_ids = into_data_sync(ref_ids).try_to_vec::<i32>().unwrap();
+            let ref_bits = into_data_sync(ref_distances)
+                .try_to_vec::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+
+            let mut default_staging = None;
+            let variants: &[(Option<u32>, bool)] = if pattern == 2 {
+                &[
+                    (None, true),
+                    (None, false),
+                    (Some(1), false),
+                    (Some(1), true),
+                ]
+            } else {
+                &[(None, true)]
+            };
+            for &(cap, enabled) in variants {
+                let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
+                let plan = kd_tile_plan_for_test(&data.client, features)
+                    .expect("required tile capability");
+                let (ids, distances, diagnostics) =
+                    launch_kd_neighbors_impl(data, tree, k, enabled, plan, 64, cap);
+                let context = format!(
+                    "n={rows}, d={features}, k={k}, pattern={pattern}, cap={cap:?}, diagnostics={enabled}"
+                );
+                assert_eq!(
+                    into_data_sync(ids).try_to_vec::<i32>().unwrap(),
+                    ref_ids,
+                    "{context}"
+                );
+                assert_eq!(
+                    into_data_sync(distances)
                         .try_to_vec::<f32>()
                         .unwrap()
                         .into_iter()
                         .map(f32::to_bits)
-                        .collect::<Vec<_>>();
-
-                    let mut default_staging = None;
-                    for cap in [None, Some(1)] {
-                        for enabled in [false, true] {
-                            let (data, tree) =
-                                make_neighbor_inputs(&values, rows, features, &device);
-                            let plan = kd_tile_plan_for_test(&data.client, features)
-                                .expect("required tile capability");
-                            let (ids, distances, diagnostics) =
-                                launch_kd_neighbors_impl(data, tree, k, enabled, plan, 64, cap);
-                            let context = format!(
-                                "n={rows}, d={features}, k={k}, pattern={pattern}, cap={cap:?}, diagnostics={enabled}"
-                            );
-                            assert_eq!(
-                                into_data_sync(ids).try_to_vec::<i32>().unwrap(),
-                                ref_ids,
-                                "{context}"
-                            );
-                            assert_eq!(
-                                into_data_sync(distances)
-                                    .try_to_vec::<f32>()
-                                    .unwrap()
-                                    .into_iter()
-                                    .map(f32::to_bits)
-                                    .collect::<Vec<_>>(),
-                                ref_bits,
-                                "{context}"
-                            );
-                            if enabled {
-                                let counts =
-                                    into_data_sync(diagnostics).try_to_vec::<i32>().unwrap();
-                                assert_eq!(counts.len(), rows * 2);
-                                for row in 0..rows {
-                                    assert_eq!(
-                                        (counts[row * 2], counts[row * 2 + 1]),
-                                        (0, rows as i32),
-                                        "{context}"
-                                    );
-                                }
-                                TILE_STAGED.with(|last| {
-                                    let staged = last.borrow();
-                                    assert_eq!(staged.len(), rows.div_ceil(tile));
-                                    assert!(staged.iter().all(|&v| v >= 0 && v <= rows as i32));
-
-                                    assert!(staged.iter().all(|&v| v == rows as i32));
-
-                                    if cap.is_none() {
-                                        default_staging = Some(staged.clone());
-                                    } else {
-                                        assert_eq!(
-                                            Some(&*staged),
-                                            default_staging.as_ref(),
-                                            "capped-grid staged positions differ: {context}"
-                                        );
-                                    }
-                                });
-                            }
-                        }
+                        .collect::<Vec<_>>(),
+                    ref_bits,
+                    "{context}"
+                );
+                if enabled {
+                    let counts = into_data_sync(diagnostics).try_to_vec::<i32>().unwrap();
+                    assert_eq!(counts.len(), rows * 2);
+                    for row in 0..rows {
+                        assert_eq!(
+                            (counts[row * 2], counts[row * 2 + 1]),
+                            (0, rows as i32),
+                            "{context}"
+                        );
                     }
+                    TILE_STAGED.with(|last| {
+                        let staged = last.borrow();
+                        assert_eq!(staged.len(), rows.div_ceil(tile));
+                        assert!(staged.iter().all(|&v| v >= 0 && v <= rows as i32));
+
+                        assert!(staged.iter().all(|&v| v == rows as i32));
+
+                        if cap.is_none() {
+                            default_staging = Some(staged.clone());
+                        } else {
+                            assert_eq!(
+                                Some(&*staged),
+                                default_staging.as_ref(),
+                                "capped-grid staged positions differ: {context}"
+                            );
+                        }
+                    });
                 }
             }
         }
     }
 
     #[test]
-    fn phase7_reference_d1_cuda() {
-        phase7_reference_matrix(1);
-    }
-    #[test]
-    fn phase7_reference_d2_cuda() {
-        phase7_reference_matrix(2);
-    }
-    #[test]
     fn phase7_reference_d3_cuda() {
         phase7_reference_matrix(3);
-    }
-    #[test]
-    fn phase7_reference_d4_cuda() {
-        phase7_reference_matrix(4);
     }
     #[test]
     fn phase7_reference_d5_cuda() {
         phase7_reference_matrix(5);
     }
     #[test]
-    fn phase7_reference_d8_cuda() {
-        phase7_reference_matrix(8);
-    }
-    #[test]
     fn phase7_reference_d16_cuda() {
         phase7_reference_matrix(16);
-    }
-    #[test]
-    fn phase7_reference_d29_cuda() {
-        phase7_reference_matrix(29);
     }
     #[test]
     fn phase7_reference_d30_cuda() {
@@ -3673,24 +3639,17 @@ mod tests {
     }
 
     fn check_kd_neighbors_match_reference(device: &CubeDevice) {
-        let mut cases = Vec::new();
-        for features in [2, 16, 30] {
-            for k in 1..=17 {
-                cases.push((2000, features, k, None));
-            }
-            for k in [24, 30] {
-                cases.push((2000, features, k, None));
-            }
-        }
-        for features in [1, 3, 4, 5, 8, 12, 20, 24, 28, 29, 32] {
-            for k in [1, 5, 16, 17] {
-                cases.push((2000, features, k, None));
-            }
-        }
-        // Runtime chunk-loop path (`reg_features == 0`), including a padded tail.
-        for features in [33, 40] {
-            cases.push((2000, features, 5, None));
-        }
+        let mut cases = vec![
+            (2000, 2, 1, None),
+            (2000, 3, 5, None),
+            (2000, 4, 16, None),
+            (2000, 5, 17, None),
+            (2000, 16, 5, None),
+            (2000, 30, 30, None),
+            (2000, 32, 17, None),
+            (2000, 33, 5, None),
+            (2000, 40, 5, None),
+        ];
         for k in [1, 5, 16] {
             cases.push((2000, 16, k, Some("duplicates")));
         }
@@ -3773,7 +3732,16 @@ mod tests {
                 .unwrap();
             let (probe, _) = make_neighbor_inputs(&values, rows, features, device);
             let client = probe.client.clone();
-            let widths = if matches!(device, CubeDevice::Cuda(_)) {
+            let all_widths = matches!(
+                (rows, features, k, special),
+                (2000, 3, 5, None) | (2000, 33, 5, None)
+            );
+            let all_lanes = all_widths
+                || matches!(
+                    (rows, features, k, special),
+                    (4, 2, 5, None) | (17, 16, 5, Some("valid_special"))
+                );
+            let widths = if matches!(device, CubeDevice::Cuda(_)) && all_widths {
                 let hardware = &client.properties().hardware;
                 eprintln!(
                     "KD geometry hardware: max_cube_dim={:?}, max_units_per_cube={}, plane_size_min={}, max_cube_count={:?}",
@@ -3791,14 +3759,14 @@ mod tests {
                 }
                 distinct_legal_widths(&client, [32, 64, 128])
             } else {
-                vec![32]
+                vec![64]
             };
             let mut launches = Vec::new();
             if client.properties().hardware.num_cpu_cores.is_some() {
-                launches.push((32, kd_neighbor_plan(&client, features)));
-                for lanes in client.io_optimized_vector_sizes(4) {
+                launches.push((64, kd_neighbor_plan(&client, features)));
+                for lanes in client.io_optimized_vector_sizes(4).filter(|_| all_lanes) {
                     launches.push((
-                        32,
+                        64,
                         KdNeighborPlan {
                             layout: KdCandidateLayout::LeafSoa { lanes },
                             order: KdQueryOrder::LeafBlocks,

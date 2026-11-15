@@ -123,6 +123,7 @@ fn reference_fixtures_match_host_phase_one_outputs() {
     let mut compared = 0usize;
     let mut skipped = 0usize;
     let mut outlier_remaps_compared = 0usize;
+    let mut dbscan_compared = 0usize;
     for case in cases {
         let id = case["id"].as_str().expect("case id");
         let meta = read_json(&root.join(format!("{id}.json")));
@@ -241,15 +242,21 @@ fn reference_fixtures_match_host_phase_one_outputs() {
                 );
             }
         }
-        if let Some(order) = arrays.get("outlier_order") {
-            let outlier_order = i64_values(order)
+        if arrays.contains_key("outlier_order") || arrays.contains_key("dbscan_labels") {
+            let outlier_order = arrays
+                .get("outlier_order")
+                .map(i64_values)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|x| x as u32)
                 .collect::<Vec<_>>();
             let remapped_linkage =
                 hdbscan_core::finite::remap_linkage(&actual.linkage, &finite_index, &outlier_order)
                     .unwrap_or_else(|e| panic!("{id}: linkage remap failed: {e}"));
-            if let Some(expected) = arrays.get("remapped_linkage") {
+            if let Some(expected) = arrays
+                .get("remapped_linkage")
+                .filter(|_| arrays.contains_key("outlier_order"))
+            {
                 let got = remapped_linkage
                     .iter()
                     .flat_map(|r| [r.left as f64, r.right as f64, r.distance, r.size as f64])
@@ -260,6 +267,31 @@ fn reference_fixtures_match_host_phase_one_outputs() {
                     "{id}: remapped linkage is exact and follows fixture outlier order"
                 );
             }
+            if let Some(expected) = arrays.get("dbscan_labels") {
+                let params = &meta["parameters"];
+                let labels = hdbscan_core::labels::dbscan_cut(
+                    &remapped_linkage,
+                    params["epsilon"].as_f64().unwrap_or(0.0),
+                    parameter_usize(params, "min_samples").unwrap_or(5),
+                )
+                .unwrap();
+                let labels = labels.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                assert_eq!(labels, i64_values(expected), "{id}");
+                if let Some(expected_remapped) = arrays.get("remapped_dbscan_labels") {
+                    assert_eq!(
+                        labels,
+                        i64_values(expected_remapped),
+                        "{id}: remapped DBSCAN labels follow fixture outlier order"
+                    );
+                }
+                dbscan_compared += 1;
+            }
+        }
+        if let Some(order) = arrays.get("outlier_order") {
+            let outlier_order = i64_values(order)
+                .into_iter()
+                .map(|x| x as u32)
+                .collect::<Vec<_>>();
             let remapped_condensed = hdbscan_core::finite::remap_condensed(
                 &actual.condensed,
                 &finite_index,
@@ -315,6 +347,10 @@ fn reference_fixtures_match_host_phase_one_outputs() {
     }
     assert!(compared > 0, "no reference fixtures were exercised");
     assert!(
+        dbscan_compared > 0,
+        "no fixture DBSCAN arrays were compared"
+    );
+    assert!(
         outlier_remaps_compared > 0,
         "no reference outlier remaps were compared"
     );
@@ -322,75 +358,6 @@ fn reference_fixtures_match_host_phase_one_outputs() {
         skipped > 0,
         "fixture statuses require explicit skipped-case accounting"
     );
-}
-
-#[test]
-fn fixture_dbscan_labels_match_cut_contract() {
-    use hdbscan_core::labels::dbscan_cut;
-    let root = fixture_root();
-    let manifest = read_json(&root.join("manifest.json"));
-    let mut compared = 0;
-    for case in manifest["cases"].as_array().unwrap() {
-        let id = case["id"].as_str().unwrap();
-        let meta = read_json(&root.join(format!("{id}.json")));
-        if !matches!(meta["status"].as_str(), Some("reference" | "port_contract")) {
-            continue;
-        }
-        let arrays = load_npz(&root.join(format!("{id}.npz"))).unwrap();
-        let Some(expected) = arrays.get("dbscan_labels") else {
-            continue;
-        };
-        let mst = matrix(&root, &arrays, "mst");
-        if mst.is_empty() {
-            continue;
-        }
-        let edges = mst
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|r| SortedMstEdge {
-                src: r[0] as u32,
-                dst: r[1] as u32,
-                weight: r[2],
-            })
-            .collect::<Vec<_>>();
-        let extraction = clusters_from_spanning_tree(&edges, &config(&meta["parameters"])).unwrap();
-        let params = &meta["parameters"];
-        let outliers = arrays
-            .get("outlier_order")
-            .map(i64_values)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|x| x as u32)
-            .collect::<Vec<_>>();
-        let finite_index = i64_values(&arrays["finite_index"])
-            .into_iter()
-            .map(|x| x as u32)
-            .collect::<Vec<_>>();
-        let linkage =
-            hdbscan_core::finite::remap_linkage(&extraction.linkage, &finite_index, &outliers)
-                .unwrap();
-        let labels = dbscan_cut(
-            &linkage,
-            params["epsilon"].as_f64().unwrap_or(0.0),
-            parameter_usize(params, "min_samples").unwrap_or(5),
-        )
-        .unwrap();
-        assert_eq!(
-            labels.iter().map(|&x| x as i64).collect::<Vec<_>>(),
-            i64_values(expected),
-            "{id}"
-        );
-        if let Some(expected_remapped) = arrays.get("remapped_dbscan_labels") {
-            assert_eq!(
-                labels.iter().map(|&x| x as i64).collect::<Vec<_>>(),
-                i64_values(expected_remapped),
-                "{id}: remapped DBSCAN labels follow fixture outlier order"
-            );
-        }
-        compared += 1;
-    }
-    assert!(compared > 0, "no fixture DBSCAN arrays were compared");
 }
 
 #[test]
@@ -599,7 +566,7 @@ fn oracle_fixture_core_distances_and_mst_weights_match() {
 
 #[test]
 fn dbscan_epsilon_sweep_covers_boundaries_and_nan() {
-    use hdbscan_core::{LinkageRow, labels::dbscan_cut};
+    use hdbscan_core::{HdbscanError, LinkageRow, labels::dbscan_cut};
     let tree = [
         LinkageRow {
             left: 1,
@@ -627,50 +594,13 @@ fn dbscan_epsilon_sweep_covers_boundaries_and_nan() {
             "cut={cut}"
         );
     }
+    assert_eq!(dbscan_cut(&tree, 1.0, 1).unwrap(), [0, 1, 2, 3]);
     assert_eq!(dbscan_cut(&tree, 1.5, 2).unwrap(), [0, 0, -1, -1]);
     assert_eq!(dbscan_cut(&tree, 2.0, 2).unwrap(), [0, 0, -1, -1]);
     assert_eq!(dbscan_cut(&tree, 2.5, 2).unwrap(), [0, 0, 1, 1]);
     assert_eq!(dbscan_cut(&tree, f64::INFINITY, 2).unwrap(), [0, 0, 0, 0]);
-    assert!(dbscan_cut(&tree, f64::NAN, 2).is_err());
-}
-
-#[test]
-fn ascending_outlier_order_is_deterministic_for_remaps() {
-    use hdbscan_core::finite::{remap_condensed, remap_linkage, split_finite};
-    use hdbscan_core::{CondensedTree, LinkageRow};
-    let raw = [0.0f32, f32::NAN, 1.0, f32::INFINITY, 2.0];
-    let split = split_finite(&raw, 1).unwrap();
-    assert_eq!(split.finite_index, [0, 2, 4]);
-    assert_eq!(split.outliers, [1, 3]);
-    let linkage = [
-        LinkageRow {
-            left: 2,
-            right: 1,
-            distance: 1.0,
-            size: 2,
-        },
-        LinkageRow {
-            left: 3,
-            right: 0,
-            distance: 2.0,
-            size: 3,
-        },
-    ];
-    let remapped = remap_linkage(&linkage, &split.finite_index, &split.outliers).unwrap();
-    assert_eq!(
-        (remapped[2].left, remapped[2].right, remapped[2].distance),
-        (1, 6, f64::INFINITY)
-    );
-    assert_eq!(
-        (remapped[3].left, remapped[3].right, remapped[3].distance),
-        (3, 7, f64::INFINITY)
-    );
-    let tree = CondensedTree {
-        parent: vec![3],
-        child: vec![0],
-        lambda: vec![1.0],
-        child_size: vec![3.0],
-    };
-    let remapped = remap_condensed(&tree, &split.finite_index, &split.outliers).unwrap();
-    assert_eq!(&remapped.child[..2], &[1, 3]);
+    assert!(matches!(
+        dbscan_cut(&tree, f64::NAN, 2),
+        Err(HdbscanError::InvalidConfig(_))
+    ));
 }

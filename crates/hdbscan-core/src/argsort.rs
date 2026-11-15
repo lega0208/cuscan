@@ -84,22 +84,8 @@ mod tests {
     use super::argsort;
 
     #[test]
-    fn argsort_matches_literal_insertion_and_quicksort_shapes() {
-        assert_eq!(argsort(&[4, 1, 1, 3]), vec![1, 2, 3, 0]);
-        let values: Vec<_> = (0..40).map(|i| (i * 17 + 3) % 11).collect();
-        let result = argsort(&values);
-        assert!(
-            result
-                .windows(2)
-                .all(|pair| values[pair[0]] <= values[pair[1]])
-        );
-        let mut sorted = result.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..values.len()).collect::<Vec<_>>());
-    }
-
-    #[test]
     fn tied_permutations_match_pinned_numba() {
+        assert_eq!(argsort(&[4, 1, 1, 3]), vec![1, 2, 3, 0]);
         // Recorded from the pinned environment with @numba.njit np.argsort(int64_values).
         let values: Vec<_> = (0..40).map(|i| (i * 17 + 3) % 11).collect();
         assert_eq!(

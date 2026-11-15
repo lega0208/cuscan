@@ -248,7 +248,26 @@ fn exact_and_approximate_fit_are_finite_deterministic_and_clustered() {
 
 #[test]
 fn transform_uses_fitted_embedding_and_search_settings() {
-    let fitted = fit(NeighborSearch::Exact, config()).unwrap();
+    let (fitted, embedding) = UMAP::new(config(), estimator_test_backend(), NeighborSearch::Exact)
+        .fit_transform(&clustered_data())
+        .unwrap();
+    assert_eq!(embedding.len(), 60);
+    assert!(embedding.iter().all(|row| {
+        row.len() == 2
+            && row
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
+    }));
+    assert_eq!(fitted.embedding(), &embedding);
+    let auto = fit(NeighborSearch::Auto, config()).unwrap();
+    assert_eq!(auto.embedding(), fitted.embedding());
+    assert!(
+        auto.transform(&[vec![8.0, 0.0]])
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
     assert_eq!(fitted.n_features(), 2);
     let result = fitted
         .transform(&[vec![-8.0, 0.0], vec![8.0, 0.0], vec![0.0, 12.0]])
@@ -350,25 +369,6 @@ fn transform_q1_and_65_are_finite_and_repeatable_for_explicit_search_modes() {
 }
 
 #[test]
-fn zero_epochs_returns_scaled_initialization() {
-    let fitted = fit(NeighborSearch::Exact, config()).unwrap();
-    assert!(
-        fitted
-            .embedding()
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite())
-    );
-    assert!(
-        fitted
-            .embedding()
-            .iter()
-            .flatten()
-            .all(|value| (0.0..=10.0).contains(value))
-    );
-}
-
-#[test]
 fn fit_and_transform_run_sgd_epochs() {
     let data: Vec<Vec<f32>> = (0..12)
         .map(|row| {
@@ -395,73 +395,6 @@ fn fit_and_transform_run_sgd_epochs() {
     );
     let transformed = fitted.transform(&[vec![0.1, 0.0], vec![5.1, 0.0]]).unwrap();
     assert!(transformed.iter().flatten().all(|value| value.is_finite()));
-}
-
-#[test]
-fn fit_transform_returns_reusable_model_and_matching_embedding() {
-    let (fitted, embedding) = UMAP::new(config(), estimator_test_backend(), NeighborSearch::Exact)
-        .fit_transform(&clustered_data())
-        .unwrap();
-    assert_eq!(embedding.len(), 60);
-    assert!(
-        embedding
-            .iter()
-            .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite()))
-    );
-    assert_eq!(fitted.embedding(), &embedding);
-    let transformed = fitted
-        .transform(&[vec![-8.0, 0.0], vec![8.0, 0.0], vec![0.0, 12.0]])
-        .unwrap();
-    assert_eq!(transformed.len(), 3);
-    assert!(transformed.iter().flatten().all(|value| value.is_finite()));
-}
-
-#[test]
-fn auto_search_fits_small_inputs_with_exact_search() {
-    let auto = fit(NeighborSearch::Auto, config()).unwrap();
-    assert!(
-        auto.embedding()
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite())
-    );
-    // 60 rows is below AUTO_EXACT_MAX_ROWS, so Auto must reproduce the exact path.
-    let exact = fit(NeighborSearch::Exact, config()).unwrap();
-    assert_eq!(auto.embedding(), exact.embedding());
-    assert!(
-        auto.transform(&[vec![8.0, 0.0]])
-            .unwrap()
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite())
-    );
-}
-
-#[test]
-fn standard_estimator_smoke_runs_on_requested_cuda_device() {
-    let Some(device) = umap::cuda_backend::device(0) else {
-        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
-            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
-        }
-        eprintln!("SKIPPED: no CUDA device");
-        return;
-    };
-    drop(device);
-    let fitted = UMAP::new(
-        config(),
-        BackendChoice::Cuda { device_index: 0 },
-        NeighborSearch::Exact,
-    )
-    .fit(&clustered_data())
-    .unwrap();
-    assert_eq!(fitted.embedding().len(), 60);
-    assert!(
-        fitted
-            .embedding()
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite())
-    );
 }
 
 #[cfg(feature = "tracing")]

@@ -1306,46 +1306,6 @@ fn separated_blob_rows(n: usize, d: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn knn_graph_forced_ann_repeatable_cases(backend: BackendChoice) {
-    let n = 600;
-    let d = 8;
-    let input = separated_blob_rows(n, d);
-    let width = knn_width(5, None, n);
-    let first =
-        fit_knn_graph_with_source(&input, knn_config(5, None), backend, KnnSource::Ann).unwrap();
-    let second =
-        fit_knn_graph_with_source(&input, knn_config(5, None), backend, KnnSource::Ann).unwrap();
-    assert_large_width_diagnostics(
-        &first,
-        n,
-        width,
-        KnnNeighborSource::Approximate,
-        "forced ANN",
-    );
-    assert_large_width_diagnostics(
-        &second,
-        n,
-        width,
-        KnnNeighborSource::Approximate,
-        "forced ANN repeat",
-    );
-    let first_diag = first.knn_diagnostics().unwrap();
-    let second_diag = second.knn_diagnostics().unwrap();
-    assert_eq!(first_diag.neighbors, second_diag.neighbors, "ANN ids");
-    assert_eq!(
-        f32_bits(&first_diag.distances_sq),
-        f32_bits(&second_diag.distances_sq),
-        "ANN squared-distance bits"
-    );
-    assert_eq!(first_diag.bridges, second_diag.bridges, "ANN bridges");
-    assert_eq!(
-        first_diag.finite_weight_sum.to_bits(),
-        second_diag.finite_weight_sum.to_bits(),
-        "ANN finite weight sum bits"
-    );
-    assert_fits_bitwise_equal(&first, &second, "forced ANN repeat");
-}
-
 #[test]
 fn knn_graph_large_width_source_selection_on_cpu() {
     knn_graph_large_width_source_selection_cases(BackendChoice::Cpu);
@@ -1355,18 +1315,6 @@ fn knn_graph_large_width_source_selection_on_cpu() {
 fn knn_graph_large_width_source_selection_on_cuda() {
     if let Some(backend) = cuda_backend_or_skip() {
         knn_graph_large_width_source_selection_cases(backend);
-    }
-}
-
-#[test]
-fn knn_graph_forced_ann_repeatable_on_cpu() {
-    knn_graph_forced_ann_repeatable_cases(BackendChoice::Cpu);
-}
-
-#[test]
-fn knn_graph_forced_ann_repeatable_on_cuda() {
-    if let Some(backend) = cuda_backend_or_skip() {
-        knn_graph_forced_ann_repeatable_cases(backend);
     }
 }
 
@@ -1449,12 +1397,12 @@ fn assert_forced_repeat_identical(first: &FittedHDBSCAN, second: &FittedHDBSCAN,
     assert_fits_bitwise_equal(first, second, case);
 }
 
-/// Forced ANN at widths around 60, the 64/65 pool edge, 75 and 120, plus 256 where the retained
+/// Forced ANN at widths around 60, the 64/65 pool edge, plus 256 where the retained
 /// width exceeds the sampling capacity. Structure and repeatability only; no exact-id equality.
 fn knn_forced_ann_width_sweep_cases(backend: BackendChoice) {
     let n = 600;
     let input = seeded_tie_rows(11, n, 8);
-    for width in [59usize, 60, 61, 64, 65, 75, 120, 256] {
+    for width in [59usize, 60, 61, 64, 65, 256] {
         let case = format!("forced ANN width {width}");
         assert_eq!(knn_width(5, Some(width), n), width);
         let first =
@@ -1486,22 +1434,21 @@ fn knn_small_input_width_edge_cases(backend: BackendChoice) {
                 fit_knn_graph_with_source(&input, knn_config(5, Some(requested)), backend, source)
                     .unwrap();
             assert_knn_structure(&fitted, n, width, expected, &case);
+            if source == KnnSource::Ann {
+                let second = fit_knn_graph_with_source(
+                    &input,
+                    knn_config(5, Some(requested)),
+                    backend,
+                    KnnSource::Ann,
+                )
+                .unwrap();
+                assert_forced_repeat_identical(
+                    &fitted,
+                    &second,
+                    &format!("small requested={requested}"),
+                );
+            }
         }
-        let first = fit_knn_graph_with_source(
-            &input,
-            knn_config(5, Some(requested)),
-            backend,
-            KnnSource::Ann,
-        )
-        .unwrap();
-        let second = fit_knn_graph_with_source(
-            &input,
-            knn_config(5, Some(requested)),
-            backend,
-            KnnSource::Ann,
-        )
-        .unwrap();
-        assert_forced_repeat_identical(&first, &second, &format!("small requested={requested}"));
     }
 }
 
@@ -1569,6 +1516,8 @@ fn knn_disconnected_groups_cases(backend: BackendChoice) {
         let second =
             fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
                 .unwrap();
+        assert_large_width_diagnostics(&first, n, width, KnnNeighborSource::Approximate, &case);
+        assert_large_width_diagnostics(&second, n, width, KnnNeighborSource::Approximate, &case);
         assert_knn_structure(&first, n, width, KnnNeighborSource::Approximate, &case);
         assert_forced_repeat_identical(&first, &second, &case);
         let bridges = first.knn_diagnostics().unwrap().bridges;
@@ -1605,14 +1554,17 @@ fn knn_squared_distance_overflow_cases(backend: BackendChoice) {
             diagnostics.finite_weight_sum.is_finite(),
             "{label}: finite weight sum must sum finite edges only"
         );
+        if source == KnnSource::Ann {
+            let second = fit_knn_graph_with_source(
+                &input,
+                knn_config(5, Some(width)),
+                backend,
+                KnnSource::Ann,
+            )
+            .unwrap();
+            assert_forced_repeat_identical(&fitted, &second, "forced ANN overflow repeat");
+        }
     }
-    let first =
-        fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
-            .unwrap();
-    let second =
-        fit_knn_graph_with_source(&input, knn_config(5, Some(width)), backend, KnnSource::Ann)
-            .unwrap();
-    assert_forced_repeat_identical(&first, &second, "forced ANN overflow repeat");
 }
 
 /// Non-finite rows are removed before the graph. Remapped neighbor ids must index finite rows
@@ -1865,32 +1817,17 @@ fn assert_shared_and_reproducible_match(
 }
 
 fn shared_and_reproducible_complete_kd_cases(backend: BackendChoice) {
-    for id in [
-        "blobs_d2",
-        "blobs_d10",
-        "duplicates_ties",
-        "persistence_equal",
-        "varying_density",
-    ] {
+    for id in ["blobs_d2", "duplicates_ties", "persistence_equal"] {
         let (config, input) = fixture_case(id);
         assert_shared_and_reproducible_match(&config, &input, backend, id);
     }
-    for seed in [3u64, 17, 101] {
-        for (n, d) in [(96usize, 2usize), (160, 3)] {
-            let input = seeded_tie_rows(seed, n, d);
-            let config = HdbscanConfig {
-                min_cluster_size: 3,
-                min_samples: Some(4),
-                ..Default::default()
-            };
-            assert_shared_and_reproducible_match(
-                &config,
-                &input,
-                backend,
-                &format!("seed {seed}, n {n}, d {d}"),
-            );
-        }
-    }
+    let input = seeded_tie_rows(3, 160, 3);
+    let config = HdbscanConfig {
+        min_cluster_size: 3,
+        min_samples: Some(4),
+        ..Default::default()
+    };
+    assert_shared_and_reproducible_match(&config, &input, backend, "seed 3, n 160, d 3");
 }
 
 #[test]

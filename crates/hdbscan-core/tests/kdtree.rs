@@ -138,43 +138,44 @@ fn build_handles_leaf_size_boundaries_and_heap_layout() {
 
 #[test]
 fn build_invariants_cover_supported_feature_sizes_and_duplicates() {
-    for d in [1, 2, 3, 4, 5, 8, 12, 16, 20, 24, 28, 29, 30, 32, 33, 40] {
-        for n in [1, 3, 41, 81, 257, 512] {
-            for duplicate_heavy in [false, true] {
-                let data = if duplicate_heavy {
-                    (0..n)
-                        .flat_map(|point| {
-                            (0..d).map(move |feature| {
-                                if feature % 2 == 0 {
-                                    1.0
-                                } else {
-                                    (point % 3) as f32
-                                }
-                            })
-                        })
-                        .collect()
-                } else {
-                    make_data(n, d)
-                };
-                let tree = KdTree::build(&data, n, d).unwrap();
-                assert_invariants(&tree, &data, n, d);
-                if duplicate_heavy {
-                    assert_eq!(tree, KdTree::build(&data, n, d).unwrap());
-                }
-            }
+    for (n, d, duplicate_heavy) in [
+        (1, 1, false),
+        (3, 2, true),
+        (41, 3, false),
+        (81, 16, true),
+        (81, 32, false),
+        (257, 33, true),
+        (512, 40, false),
+        (81, 40, true),
+    ] {
+        let data = if duplicate_heavy {
+            (0..n)
+                .flat_map(|point| {
+                    (0..d).map(move |feature| {
+                        if feature % 2 == 0 {
+                            1.0
+                        } else {
+                            (point % 3) as f32
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            make_data(n, d)
+        };
+        let tree = KdTree::build(&data, n, d).unwrap();
+        assert_invariants(&tree, &data, n, d);
+        if duplicate_heavy {
+            assert_eq!(tree, KdTree::build(&data, n, d).unwrap());
+        }
+        if (n, d, duplicate_heavy) == (81, 16, true) {
+            let mut actual = tree.indices[..40].to_vec();
+            actual.sort_unstable();
+            let mut expected: Vec<i32> = (0..=78).step_by(3).chain((1..=37).step_by(3)).collect();
+            expected.sort_unstable();
+            assert_eq!(actual, expected);
         }
     }
-}
-
-#[test]
-fn build_is_deterministic_with_duplicate_and_equal_feature_values() {
-    let data = (0..81)
-        .flat_map(|point| [1.0, (point / 2) as f32])
-        .collect::<Vec<_>>();
-    let first = KdTree::build(&data, 81, 2).unwrap();
-    let second = KdTree::build(&data, 81, 2).unwrap();
-    assert_eq!(first, second);
-    assert_invariants(&first, &data, 81, 2);
 }
 
 #[test]

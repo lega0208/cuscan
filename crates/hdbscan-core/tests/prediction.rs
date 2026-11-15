@@ -622,6 +622,29 @@ mod oracle_fixture {
     #[test]
     fn controlled_reference_queries() {
         let data = fixture();
+        let core = &data["core_rank"];
+        let s = core["min_samples"].as_u64().unwrap() as usize;
+        let rows = inclusive_squared_rows(&matrix(&core["train"]), s);
+        let cores = prediction_core_from_squared_rows(&rows, s).unwrap();
+        let expected_cores = floats(&core["prediction_core_inclusive_self"]);
+        assert_eq!(cores.len(), expected_cores.len());
+        for (actual, expected) in cores.iter().zip(expected_cores) {
+            assert_rel(*actual, expected, "core_rank");
+        }
+        let query_distances = floats(&core["query_candidate_distances"]);
+        assert_eq!(query_distances[s], float(&core["query_core"]));
+
+        for case in data["width"].as_array().unwrap() {
+            let result = candidate_width(
+                case["min_samples"].as_u64().unwrap() as usize,
+                case["n_finite"].as_u64().unwrap() as usize,
+            );
+            match case["project_outcome"].as_str().unwrap() {
+                "ok" => assert!(result.is_ok(), "{case}"),
+                "ValueError" => assert!(is_invalid(result), "{case}"),
+                other => panic!("unknown outcome {other}"),
+            }
+        }
         let trees = &data["controlled"]["trees"];
         let queries = data["controlled"]["queries"].as_array().unwrap();
         assert!(!queries.is_empty());
@@ -656,35 +679,6 @@ mod oracle_fixture {
                 "{name}"
             );
             assert_rel(prediction.probability, float(&expected["strength"]), name);
-        }
-    }
-
-    #[test]
-    fn core_rank_and_width_reference() {
-        let data = fixture();
-        let core = &data["core_rank"];
-        let s = core["min_samples"].as_u64().unwrap() as usize;
-        let rows = inclusive_squared_rows(&matrix(&core["train"]), s);
-        let cores = prediction_core_from_squared_rows(&rows, s).unwrap();
-        for (actual, expected) in cores
-            .iter()
-            .zip(floats(&core["prediction_core_inclusive_self"]))
-        {
-            assert_rel(*actual, expected, "core_rank");
-        }
-        let query_distances = floats(&core["query_candidate_distances"]);
-        assert_eq!(query_distances[s], float(&core["query_core"]));
-
-        for case in data["width"].as_array().unwrap() {
-            let result = candidate_width(
-                case["min_samples"].as_u64().unwrap() as usize,
-                case["n_finite"].as_u64().unwrap() as usize,
-            );
-            match case["project_outcome"].as_str().unwrap() {
-                "ok" => assert!(result.is_ok(), "{case}"),
-                "ValueError" => assert!(is_invalid(result), "{case}"),
-                other => panic!("unknown outcome {other}"),
-            }
         }
     }
 

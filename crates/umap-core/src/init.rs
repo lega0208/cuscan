@@ -1280,52 +1280,21 @@ mod solver_tests {
         assert_eq!(first, repeat);
         assert_eq!(first_warning, repeat_warning);
 
+        let error = UmapError::Numerical("invalid operator".into());
+        let mut rng = StdRng::seed_from_u64(918);
+        let mut untouched_rng = StdRng::seed_from_u64(918);
         let mut warned = false;
-        assert!(matches!(
-            fallback_on_spectral_convergence(
-                Err(UmapError::Numerical("invalid operator".into())),
-                8,
-                2,
-                &mut StdRng::seed_from_u64(918),
-                "error classification",
-                |_| warned = true,
-            ),
-            Err(UmapError::Numerical(_))
-        ));
-        assert!(!warned);
-    }
-
-    #[test]
-    fn invariant_error_propagates_without_random_fallback() {
-        let error = UmapError::Numerical("non-finite spectral Ritz value".into());
-        let mut rng = StdRng::seed_from_u64(919);
-        let mut untouched_rng = StdRng::seed_from_u64(919);
-        let mut warned = false;
-
         let result = fallback_on_spectral_convergence(
             Err(error.clone()),
             8,
             2,
             &mut rng,
-            "invariant error regression",
+            "error classification",
             |_| warned = true,
         );
-
         assert_eq!(result, Err(error));
         assert!(!warned);
         assert_eq!(rng.random::<u64>(), untouched_rng.random::<u64>());
-    }
-
-    #[test]
-    fn nonfinite_weight_is_rejected_before_solver() {
-        assert!(matches!(
-            SparseGraph::from_edges(3, &[0], &[1], &[f32::NAN]),
-            Err(UmapError::InvalidInput(_))
-        ));
-        assert!(matches!(
-            SparseGraph::from_edges(3, &[0], &[1], &[f32::INFINITY]),
-            Err(UmapError::InvalidInput(_))
-        ));
     }
 
     #[cfg(feature = "tracing")]

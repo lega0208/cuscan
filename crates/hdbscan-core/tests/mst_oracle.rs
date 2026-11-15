@@ -8,20 +8,6 @@ use hdbscan_core::mst::{
 use hdbscan_core::oracle::{brute_force_mst, exact_neighbors};
 
 #[test]
-#[cfg(feature = "test-support")]
-fn merge_rejects_nan_and_negative_candidates() {
-    for weight in [f32::NAN, -1.0] {
-        let mut dsu = RankDsu::new(2);
-        let mut edges = Vec::new();
-        assert!(matches!(
-            merge_components(&mut dsu, &[0, 1], &[weight, 1.0], &[1, 0], &mut edges),
-            Err(HdbscanError::Numerical(_))
-        ));
-        assert!(edges.is_empty());
-    }
-}
-
-#[test]
 fn knn_initialization_skips_padding_and_picks_first_eligible_neighbor() {
     let core = [2.0, 2.0, 3.0];
     let neighbors = [-1, 1, 0, -1, 0, -1];

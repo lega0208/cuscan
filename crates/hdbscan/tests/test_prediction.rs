@@ -199,21 +199,19 @@ fn every_fit_route(backend: BackendChoice) {
     for features in [2usize, 16, 30] {
         let data = blobs(30, features);
         let query = queries(features, 37);
-        let mut models = vec![
-            (
+        let mut models = vec![(
+            "kd",
+            fit(backend, config(5, 3), HdbscanSearch::KdTree, &data),
+        )];
+        if features == 2 {
+            models.push((
                 "brute",
                 fit(backend, config(5, 3), HdbscanSearch::BruteForce, &data),
-            ),
-            (
-                "kd",
-                fit(backend, config(5, 3), HdbscanSearch::KdTree, &data),
-            ),
-            (
+            ));
+            models.push((
                 "knn-exact",
                 fit_knn_graph_with_source(&data, config(5, 3), backend, KnnSource::Exact).unwrap(),
-            ),
-        ];
-        if backend == BackendChoice::Cpu || features <= 16 {
+            ));
             models.push((
                 "knn-ann",
                 fit_knn_graph_with_source(&data, config(5, 3), backend, KnnSource::Ann).unwrap(),
@@ -547,6 +545,39 @@ fn permuted_duplicate_queries_restore_raw_connectors(backend: BackendChoice) {
 #[test]
 fn permuted_duplicate_queries_restore_raw_connectors_cpu() {
     permuted_duplicate_queries_restore_raw_connectors(BackendChoice::Cpu);
+    for (features, quantized) in [(16, true), (33, false)] {
+        let data: Vec<Vec<f32>> = (0..129)
+            .map(|row| {
+                (0..features)
+                    .map(|feature| {
+                        let jitter = ((row * 17 + feature * 13) % 47) as f32;
+                        (row % 3) as f32 * 30.0
+                            + if quantized {
+                                (jitter / 7.0).floor()
+                            } else {
+                                jitter * 0.0314159
+                            }
+                    })
+                    .collect()
+            })
+            .collect();
+        let model = fit(
+            BackendChoice::Cpu,
+            config(5, 3),
+            HdbscanSearch::KdTree,
+            &data,
+        );
+        let query: Vec<_> = (0..259)
+            .map(|row| data[(row * 37) % data.len()].clone())
+            .collect();
+        let actual = model.approximate_predict(&query).unwrap();
+        assert!(!actual.no_cluster_tree);
+        assert_matches(
+            &actual,
+            &oracle(&model, &data, &query),
+            &format!("input-order features={features} quantized={quantized}"),
+        );
+    }
 }
 
 #[test]

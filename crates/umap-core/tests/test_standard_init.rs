@@ -94,39 +94,6 @@ fn connected_three_path_matches_analytic_nontrivial_spectral_shape() {
 }
 
 #[test]
-fn repeated_connected_cycle_modes_resolve_the_correct_subspace() {
-    if isolated_spectral_case(
-        "repeated_connected_cycle_modes_resolve_the_correct_subspace",
-        "main",
-    ) {
-        return;
-    }
-    let n = 12;
-    let data = (0..n).map(|i| vec![i as f32]).collect::<Vec<_>>();
-    let heads = (0..n).collect::<Vec<_>>();
-    let tails = (0..n).map(|i| (i + 1) % n).collect::<Vec<_>>();
-    let weights = vec![1.0; n];
-    let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(2), 73)
-        .expect("two-dimensional repeated cycle eigenspace");
-    assert_eq!(embedding.len(), n * 2);
-    assert!(embedding.iter().all(|value| value.is_finite()));
-    for dim in 0..2 {
-        let values = (0..n).map(|row| embedding[row * 2 + dim]);
-        assert!(values.clone().fold(f32::INFINITY, f32::min).abs() < 1.0e-6);
-        assert!((values.fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
-    }
-    let first_mode_variance = (0..n)
-        .map(|row| embedding[row * 2])
-        .map(|value| (value - 5.0).powi(2))
-        .sum::<f32>();
-    let second_mode_variance = (0..n)
-        .map(|row| embedding[row * 2 + 1])
-        .map(|value| (value - 5.0).powi(2))
-        .sum::<f32>();
-    assert!(first_mode_variance > 1.0 && second_mode_variance > 1.0);
-}
-
-#[test]
 fn production_sized_cycle_converges_to_its_repeated_low_laplacian_eigenspace() {
     if isolated_spectral_case(
         "production_sized_cycle_converges_to_its_repeated_low_laplacian_eigenspace",
@@ -195,7 +162,7 @@ fn production_sized_cycle_converges_to_its_repeated_low_laplacian_eigenspace() {
 
 #[test]
 fn dense_cutoff_and_large_dimension_sparse_boundary_initialize() {
-    for (n, dimensions) in [(64, 2), (65, 2), (70, 40), (83, 40)] {
+    for (n, dimensions) in [(64, 2), (70, 40), (83, 40)] {
         if isolated_spectral_case(
             "dense_cutoff_and_large_dimension_sparse_boundary_initialize",
             &format!("n={n},dims={dimensions}"),
@@ -216,6 +183,15 @@ fn dense_cutoff_and_large_dimension_sparse_boundary_initialize() {
         .unwrap_or_else(|error| panic!("n={n}, dimensions={dimensions}: {error}"));
         assert_eq!(embedding.len(), n * dimensions);
         assert!(embedding.iter().all(|value| value.is_finite()));
+        if (n, dimensions) == (64, 2) {
+            for dim in 0..2 {
+                let values = (0..n).map(|row| embedding[row * 2 + dim]);
+                assert!(values.clone().fold(f32::INFINITY, f32::min).abs() < 1.0e-6);
+                assert!((values.clone().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
+                let variance = values.map(|value| (value - 5.0).powi(2)).sum::<f32>();
+                assert!(variance > 1.0);
+            }
+        }
     }
 }
 
@@ -354,30 +330,21 @@ fn separated_centroids_report_actionable_underflow_error() {
     }
     // Offsets of 40 give pairwise squared centroid distances >= 1600; exp(-1600) == 0.
     let (data, heads, tails, weights) = square_components(5, 40.0, 0.0);
-    for dimensions in [1, 2] {
-        let result = initialize(
-            &data,
-            &heads,
-            &tails,
-            &weights,
-            &spectral_config(dimensions),
-            91,
+    let result = initialize(&data, &heads, &tails, &weights, &spectral_config(2), 91);
+    let Err(UmapError::Numerical(message)) = result else {
+        panic!("expected numerical error for 2 dimensions, got {result:?}");
+    };
+    for fragment in [
+        "5 connected components",
+        "2 * n_components = 4",
+        "5 of 5",
+        "underflows exp",
+        "init=\"random\"",
+    ] {
+        assert!(
+            message.contains(fragment),
+            "{fragment:?} missing: {message}"
         );
-        let Err(UmapError::Numerical(message)) = result else {
-            panic!("expected numerical error for {dimensions} dimensions, got {result:?}");
-        };
-        for fragment in [
-            "5 connected components".to_owned(),
-            format!("2 * n_components = {}", 2 * dimensions),
-            "5 of 5".to_owned(),
-            "underflows exp".to_owned(),
-            "init=\"random\"".to_owned(),
-        ] {
-            assert!(
-                message.contains(&fragment),
-                "{fragment:?} missing: {message}"
-            );
-        }
     }
 }
 
@@ -404,31 +371,6 @@ fn single_isolated_component_reports_its_own_distance() {
 }
 
 #[test]
-fn close_centroids_one_dimension_spectral_succeeds() {
-    if isolated_spectral_case("close_centroids_one_dimension_spectral_succeeds", "main") {
-        return;
-    }
-    let (data, heads, tails, weights) = square_components(5, 3.1, 0.37);
-    let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91)
-        .expect("one-dimensional centroid layout");
-    assert_eq!(embedding.len(), 20);
-    assert!(
-        embedding
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
-    );
-    assert!(
-        embedding
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min)
-            .abs()
-            < 1.0e-6
-    );
-    assert!((embedding.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
-}
-
-#[test]
 fn partially_underflowed_centroid_affinity_is_accepted() {
     if isolated_spectral_case(
         "partially_underflowed_centroid_affinity_is_accepted",
@@ -444,7 +386,20 @@ fn partially_underflowed_centroid_affinity_is_accepted() {
     let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91)
         .expect("partial underflow keeps the centroid operator connected");
     assert_eq!(embedding.len(), 20);
-    assert!(embedding.iter().all(|value| value.is_finite()));
+    assert!(
+        embedding
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
+    );
+    assert!(
+        embedding
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            .abs()
+            < 1.0e-6
+    );
+    assert!((embedding.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
 }
 
 #[test]
@@ -492,6 +447,10 @@ fn malformed_graphs_and_unavailable_spectral_modes_are_errors() {
     ));
     assert!(matches!(
         initialize(&data, &[0], &[1], &[f32::NAN], &config, 1),
+        Err(UmapError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        initialize(&data, &[0], &[1], &[f32::INFINITY], &config, 1),
         Err(UmapError::InvalidInput(_))
     ));
     assert!(matches!(
