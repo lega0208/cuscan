@@ -98,6 +98,22 @@ mod tests {
     }
 }
 
+/// Requires finite, non-negative distances no greater than `sqrt(f32::MAX)`.
+/// This is a caller precondition: the row kernel checks indices, not distances,
+/// so valid indices paired with infinity or NaN are not rejected here.
+///
+/// Estimator producers (common direct/tiled exact search, ANN fit, and checked
+/// or prevalidated approximate query) take square roots of finite non-negative
+/// squared-distance sums; finite inputs cannot produce NaN. Overflowed or
+/// unfilled slots instead use index `n_reference` and distance `sqrt(f32::MAX)`;
+/// the row kernel flags the index and the caller rejects the whole graph. Thus
+/// upstream's finite-only filtering cannot trigger for an accepted graph.
+///
+/// Row sums are at most `k * sqrt(MAX)` and the global sum is at most
+/// `n * k * sqrt(MAX) < 2e28`, since `2 * n * k <= i32::MAX` is asserted.
+/// Before its floor, sigma lies in `[2^-64, 2^64]` after at most 64 halvings
+/// or doublings from 1; the floor is at most `1e-3 * sqrt(MAX)`. Hence
+/// memberships `exp(-delta / sigma)` are finite and in `[0, 1]`.
 #[cube]
 fn smooth_row<F: Float>(
     distances: &Tensor<F>,
@@ -726,6 +742,7 @@ pub(crate) fn fuzzy_graph(
     );
     // Backend mean over the flattened contiguous distances. Only the f32
     // summation order changes; the mean feeds the `1e-3 * mean` sigma floor.
+    // Its finite-sum bound and caller precondition are documented at `smooth_row`.
     let flat_distances = <CubeBackend as FloatTensorOps<CubeBackend>>::float_reshape(
         distances.clone(),
         Shape::new([element_count]),

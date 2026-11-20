@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 
 _FORMAT = "cuscan_fitted_model"
-_VERSION = 1
 _FILTER_ID = 32026
 _CHUNK_ROWS = 32_768
 
@@ -85,7 +84,9 @@ def _attr(group: Any, name: str) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
-def _validate_root(file: Any, h5py: Any, *, model_kind: str, groups: set[str]) -> int:
+def _validate_root(
+    file: Any, h5py: Any, *, model_kind: str, groups: set[str], schema_version: int
+) -> int:
     _validate_links(file, h5py)
     expected_attrs = {
         "format",
@@ -109,12 +110,12 @@ def _validate_root(file: Any, h5py: Any, *, model_kind: str, groups: set[str]) -
     found_kind = _attr(file, "model_kind")
     if found_kind != model_kind:
         raise ValueError(f"model kind mismatch: found {found_kind!r}, expected {model_kind!r}")
-    if set(file.keys()) != groups:
-        raise ValueError("invalid schema groups")
     if _attr(file, "format") != _FORMAT:
         raise ValueError("unsupported serialization format")
-    if _attr(file, "schema_version") != _VERSION:
+    if _attr(file, "schema_version") != schema_version:
         raise ValueError("unsupported serialization schema version")
+    if set(file.keys()) != groups:
+        raise ValueError("invalid schema groups")
     if (_attr(file, "filter_id"), _attr(file, "codec"), _attr(file, "shuffle")) != (
         _FILTER_ID,
         "zstd",
@@ -125,10 +126,10 @@ def _validate_root(file: Any, h5py: Any, *, model_kind: str, groups: set[str]) -
     return clevel
 
 
-def _write_root(file: Any, producer_version: str, model_kind: str) -> None:
+def _write_root(file: Any, producer_version: str, model_kind: str, *, schema_version: int) -> None:
     file.attrs.update(
         format=_FORMAT,
-        schema_version=np.uint32(_VERSION),
+        schema_version=np.uint32(schema_version),
         producer_version=producer_version,
         model_kind=model_kind,
         filter_id=np.uint32(_FILTER_ID),

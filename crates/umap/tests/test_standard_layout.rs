@@ -496,6 +496,7 @@ fn standard_layout_runs_estimator_produced_f64_clock_state() {
     let config = UMAPConfig {
         n_neighbors: 4,
         n_epochs: Some(2),
+        optimizer: umap::Optimizer::Compatibility,
         init: Init::Random,
         random_state: Some(31),
         ..Default::default()

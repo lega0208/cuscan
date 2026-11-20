@@ -10,7 +10,14 @@ fn query_phase1_byte_capture() {
     let mode = std::env::var("CUSCAN_QUERY_PHASE1_CAPTURE_MODE")
         .expect("explicit capture or verify mode is required");
     assert!(mode == "capture" || mode == "verify");
-    let device = Device::cpu();
+    let device = match std::env::var("CUSCAN_QUERY_PHASE1_CAPTURE_DEVICE")
+        .as_deref()
+        .unwrap_or("cpu")
+    {
+        "cpu" => Device::cpu(),
+        "cuda" => umap::cuda_backend::device(0).expect("CUDA capture requires a CUDA device"),
+        other => panic!("unsupported capture device: {other}"),
+    };
     let n = 32768usize;
     // Scratch per row: 4*12 + n*8 + 8 + 128 = 262328 bytes.
     // The 256 MiB budget therefore fits 1023 rows; 1027 spans two chunks.
@@ -183,6 +190,73 @@ fn inputs(device: &Device) -> (Tensor<2>, Tensor<2>, Tensor<2, Int>) {
     (query, reference, graph)
 }
 
+fn check_approximate_query_overflow_uses_unsquared_sentinel(device: &Device) {
+    let seed = 42;
+    let offset = 17;
+    let mut starts = reference_floyd_starts(4, 4, seed, offset);
+    starts.sort_unstable();
+    assert_eq!(starts, vec![0, 1, 2, 3]);
+
+    for (query_value, reference_values, expected_indices, expected_distances) in [
+        (
+            1e20f32,
+            vec![0.0f32, 1.0, 2.0, 3.0],
+            vec![4, 4, 4, 4],
+            vec![f32::MAX.sqrt(); 4],
+        ),
+        (
+            1e19f32,
+            vec![-1e19f32, 0.0, 1.0, 2.0],
+            vec![1, 2, 3, 4],
+            vec![(1e19f32 * 1e19f32).sqrt(); 3]
+                .into_iter()
+                .chain([f32::MAX.sqrt()])
+                .collect(),
+        ),
+    ] {
+        for prevalidated in [false, true] {
+            let query = Tensor::<2>::from_data(TensorData::new(vec![query_value], [1, 1]), device);
+            let reference =
+                Tensor::<2>::from_data(TensorData::new(reference_values.clone(), [4, 1]), device);
+            let graph =
+                Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 2, 3], [4, 1]), device);
+            let (indices, distances, stats) =
+                run_query_with_entry(query, reference, graph, 4, 4, 4, seed, offset, prevalidated);
+            assert_eq!(indices, expected_indices, "prevalidated={prevalidated}");
+            assert!(distances.iter().all(|distance| distance.is_finite()));
+            assert_eq!(
+                distances
+                    .iter()
+                    .map(|distance| distance.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_distances
+                    .iter()
+                    .map(|distance| distance.to_bits())
+                    .collect::<Vec<_>>(),
+                "prevalidated={prevalidated}"
+            );
+            assert_eq!(stats, vec![starts.len() as i32, starts.len() as i32]);
+        }
+    }
+}
+
+#[test]
+fn approximate_query_overflow_uses_unsquared_sentinel_cpu() {
+    check_approximate_query_overflow_uses_unsquared_sentinel(&Device::cpu());
+}
+
+#[test]
+fn approximate_query_overflow_uses_unsquared_sentinel_cuda() {
+    let Some(device) = umap::cuda_backend::device(0) else {
+        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+    check_approximate_query_overflow_uses_unsquared_sentinel(&device);
+}
+
 fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u64) -> Vec<i32> {
     const MODULUS: i64 = 2_147_483_647;
     let n_u64 = u64::try_from(n).unwrap();
@@ -208,6 +282,77 @@ fn reference_floyd_starts(n: usize, capacity: usize, seed: u64, query_offset: u6
     starts
 }
 
+// This oracle models the frontier as optional live entries, independently of
+// the kernel's expanded flags and scratch buffers. Fixtures use finite 1D data.
+#[allow(clippy::too_many_arguments)]
+fn query_reference(
+    reference: &[f32],
+    graph: &[i32],
+    width: usize,
+    query: f32,
+    k: usize,
+    capacity: usize,
+    visits: usize,
+    seed: u64,
+    offset: u64,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let n = reference.len();
+    let distance = |id: i32| {
+        let d = query - reference[id as usize];
+        d * d
+    };
+    let mut seen = reference_floyd_starts(n, capacity, seed, offset)
+        .into_iter()
+        .map(|id| (id, distance(id)))
+        .collect::<Vec<_>>();
+    let mut frontier = seen.iter().copied().map(Some).collect::<Vec<_>>();
+    let rank = |a: &(i32, f32), b: &(i32, f32)| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0));
+    let mut peak = capacity;
+    while seen.len() < visits {
+        let Some(slot) = frontier
+            .iter()
+            .enumerate()
+            .filter_map(|(i, x)| x.map(|v| (i, v)))
+            .min_by(|a, b| rank(&a.1, &b.1))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        let (id, _) = frontier[slot].take().unwrap();
+        for &neighbor in &graph[id as usize * width..(id as usize + 1) * width] {
+            if seen.len() == visits {
+                break;
+            }
+            if neighbor < 0 || neighbor as usize >= n || seen.iter().any(|x| x.0 == neighbor) {
+                continue;
+            }
+            let candidate = (neighbor, distance(neighbor));
+            seen.push(candidate);
+            let free = frontier.iter().position(Option::is_none);
+            let replacement = free.or_else(|| {
+                let (i, worst) = frontier
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (i, x.unwrap()))
+                    .max_by(|a, b| rank(&a.1, &b.1))
+                    .unwrap();
+                (rank(&candidate, &worst).is_lt()).then_some(i)
+            });
+            if let Some(i) = replacement {
+                frontier[i] = Some(candidate);
+            }
+            peak = peak.max(frontier.iter().filter(|x| x.is_some()).count());
+        }
+    }
+    let evaluated = seen.len();
+    seen.sort_by(rank);
+    (
+        seen.iter().take(k).map(|x| x.0).collect(),
+        seen.iter().take(k).map(|x| x.1.sqrt()).collect(),
+        vec![peak as i32, evaluated as i32],
+    )
+}
+
 fn self_edge_query_reference(
     n: usize,
     capacity: usize,
@@ -215,21 +360,215 @@ fn self_edge_query_reference(
     query_offset: u64,
     query_rows: usize,
 ) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
-    let mut indices = Vec::with_capacity(query_rows * capacity);
-    let mut distances = Vec::with_capacity(query_rows * capacity);
-    let mut stats = Vec::with_capacity(query_rows * 2);
+    let reference = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+    let graph = (0..n as i32).collect::<Vec<_>>();
+    let mut result = (Vec::new(), Vec::new(), Vec::new());
     for row in 0..query_rows {
-        let absolute_offset = query_offset + u64::try_from(row).unwrap();
-        let mut ranked = reference_floyd_starts(n, capacity, seed, absolute_offset)
-            .into_iter()
-            .map(|id| (id, (id as f32 - 0.5).abs()))
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
-        indices.extend(ranked.iter().map(|&(id, _)| id));
-        distances.extend(ranked.iter().map(|&(_, distance)| distance));
-        stats.extend([capacity as i32, capacity as i32]);
+        let expected = query_reference(
+            &reference,
+            &graph,
+            1,
+            0.5,
+            capacity,
+            capacity,
+            n,
+            seed,
+            query_offset + row as u64,
+        );
+        result.0.extend(expected.0);
+        result.1.extend(expected.1);
+        result.2.extend(expected.2);
     }
-    (indices, distances, stats)
+    result
+}
+
+fn assert_retention_cases(device: &Device) {
+    // Build the graph around the actual Floyd starts, so the first start is a
+    // branching node in physical slot zero and the second is a live candidate.
+    for seed in [0u64, 4, 19] {
+        let n = 8usize;
+        let starts = reference_floyd_starts(n, 2, seed, 0);
+        let others = (0..n as i32)
+            .filter(|id| !starts.contains(id))
+            .collect::<Vec<_>>();
+        let (a, b, x, rejected, replacement, target) = (
+            starts[0], starts[1], others[0], others[1], others[2], others[3],
+        );
+        let mut reference = vec![20.0f32; n];
+        for (id, value) in [
+            (a, 1.0),
+            (b, 4.0),
+            (x, 2.0),
+            (rejected, 8.0),
+            (replacement, 3.0),
+            (target, 0.5),
+        ] {
+            reference[id as usize] = value;
+        }
+        let width = 4;
+        let mut graph = vec![-1; n * width];
+        graph[a as usize * width..a as usize * width + width].copy_from_slice(&[
+            x,
+            rejected,
+            replacement,
+            x,
+        ]);
+        graph[x as usize * width..x as usize * width + width]
+            .copy_from_slice(&[target, a, x, target]);
+        graph[replacement as usize * width] = replacement;
+        for visits in [4usize, 7, 8] {
+            let expected = query_reference(&reference, &graph, width, 0.0, 2, 2, visits, seed, 0);
+            let query = Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device);
+            let refs = Tensor::<2>::from_data(TensorData::new(reference.clone(), [n, 1]), device);
+            let edges =
+                Tensor::<2, Int>::from_data(TensorData::new(graph.clone(), [n, width]), device);
+            let actual = run_query(
+                query.clone(),
+                refs.clone(),
+                edges.clone(),
+                2,
+                2,
+                visits as u32,
+                seed,
+                0,
+            );
+            let unchecked =
+                run_prevalidated_query(query, refs, edges, 2, 2, visits as u32, seed, 0);
+            assert_eq!(actual, expected, "seed {seed}, visits {visits}");
+            assert_eq!(unchecked, expected);
+            if visits >= 7 {
+                assert_eq!(actual.0[0], target);
+            }
+        }
+
+        // Equal-distance candidates exercise both directions of the ID tie rule.
+        for id in [b, x, rejected, replacement] {
+            reference[id as usize] = 2.0;
+        }
+        let expected = query_reference(&reference, &graph, width, 0.0, 2, 2, 8, seed, 0);
+        let actual = run_query(
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device),
+            Tensor::<2>::from_data(TensorData::new(reference.clone(), [n, 1]), device),
+            Tensor::<2, Int>::from_data(TensorData::new(graph.clone(), [n, width]), device),
+            2,
+            2,
+            8,
+            seed,
+            0,
+        );
+        assert_eq!(actual, expected, "equal-distance seed {seed}");
+
+        // Expand the second physical start first and reuse its nonzero slot.
+        reference[a as usize] = 4.0;
+        reference[b as usize] = 1.0;
+        graph[b as usize * width..b as usize * width + width].copy_from_slice(&[
+            x,
+            rejected,
+            replacement,
+            b,
+        ]);
+        let expected = query_reference(&reference, &graph, width, 0.0, 2, 2, 8, seed, 0);
+        let actual = run_query(
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device),
+            Tensor::<2>::from_data(TensorData::new(reference.clone(), [n, 1]), device),
+            Tensor::<2, Int>::from_data(TensorData::new(graph.clone(), [n, width]), device),
+            2,
+            2,
+            8,
+            seed,
+            0,
+        );
+        assert_eq!(actual, expected, "nonzero reusable slot seed {seed}");
+
+        // Disconnected starts and absolute offsets must agree between a batch
+        // and independently launched rows, including an offset across N.
+        let disconnected = vec![-1; n];
+        let refs = Tensor::<2>::from_data(TensorData::new(reference.clone(), [n, 1]), device);
+        let edges =
+            Tensor::<2, Int>::from_data(TensorData::new(disconnected.clone(), [n, 1]), device);
+        let batch = run_query(
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32; 3], [3, 1]), device),
+            refs.clone(),
+            edges.clone(),
+            2,
+            2,
+            8,
+            seed,
+            7,
+        );
+        for row in 0..3 {
+            let expected = query_reference(
+                &reference,
+                &disconnected,
+                1,
+                0.0,
+                2,
+                2,
+                8,
+                seed,
+                7 + row as u64,
+            );
+            let single = run_query(
+                Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device),
+                refs.clone(),
+                edges.clone(),
+                2,
+                2,
+                8,
+                seed,
+                7 + row as u64,
+            );
+            assert_eq!(single, expected);
+            assert_eq!(&batch.0[row * 2..row * 2 + 2], single.0);
+            assert_eq!(&batch.1[row * 2..row * 2 + 2], single.1);
+            assert_eq!(&batch.2[row * 2..row * 2 + 2], single.2);
+        }
+
+        // A complete adjacency row exhausts the visit budget mid-row and, at
+        // V=N, must return the same ordering as exhaustive one-dimensional kNN.
+        let complete = (0..n).flat_map(|_| 0..n as i32).collect::<Vec<_>>();
+        for visits in [5usize, n] {
+            let expected = query_reference(&reference, &complete, n, 0.0, 2, 2, visits, seed, 3);
+            let actual = run_query(
+                Tensor::<2>::from_data(TensorData::new(vec![0.0f32], [1, 1]), device),
+                Tensor::<2>::from_data(TensorData::new(reference.clone(), [n, 1]), device),
+                Tensor::<2, Int>::from_data(TensorData::new(complete.clone(), [n, n]), device),
+                2,
+                2,
+                visits as u32,
+                seed,
+                3,
+            );
+            assert_eq!(actual, expected);
+            if visits == n {
+                let mut exhaustive = (0..n as i32).collect::<Vec<_>>();
+                exhaustive.sort_by(|&a, &b| {
+                    reference[a as usize]
+                        .abs()
+                        .total_cmp(&reference[b as usize].abs())
+                        .then(a.cmp(&b))
+                });
+                assert_eq!(actual.0, exhaustive[..2]);
+            }
+        }
+    }
+}
+
+#[test]
+fn approximate_query_retention_cases_cpu() {
+    assert_retention_cases(&Device::cpu());
+}
+
+#[test]
+fn approximate_query_retention_cases_cuda() {
+    let Some(device) = umap::cuda_backend::device(0) else {
+        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+    assert_retention_cases(&device);
 }
 
 #[test]
@@ -503,6 +842,75 @@ fn approximate_query_runs_on_cuda_when_requested() {
 }
 
 #[test]
+fn approximate_query_cuda_packed_tail_byte_and_stats_parity() {
+    let Some(device) = umap::cuda_backend::device(0) else {
+        if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+            panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+        }
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    };
+    let n = 37usize;
+    let reference_values = (0..n).map(|row| row as f32).collect::<Vec<_>>();
+    let graph_values = (0..n).map(|row| ((row + 1) % n) as i32).collect::<Vec<_>>();
+    let reference =
+        Tensor::<2>::from_data(TensorData::new(reference_values.clone(), [n, 1]), &device);
+    let graph = Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), &device);
+    for rows in [31, 32, 33, 63, 64, 65, 127, 128, 129] {
+        let query_values = (0..rows)
+            .map(|row| (row % n) as f32 + 0.5)
+            .collect::<Vec<_>>();
+        let query =
+            Tensor::<2>::from_data(TensorData::new(query_values.clone(), [rows, 1]), &device);
+        let mut expected = (Vec::new(), Vec::new(), Vec::new());
+        for (row, &value) in query_values.iter().enumerate() {
+            let result = query_reference(
+                &reference_values,
+                &graph_values,
+                1,
+                value,
+                4,
+                4,
+                20,
+                42,
+                17 + row as u64,
+            );
+            expected.0.extend(result.0);
+            expected.1.extend(result.1);
+            expected.2.extend(result.2);
+        }
+        assert!(
+            expected
+                .2
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|stats| stats[1] == 20)
+        );
+        for prevalidated in [false, true, false] {
+            let actual = run_query_with_entry(
+                query.clone(),
+                reference.clone(),
+                graph.clone(),
+                4,
+                4,
+                20,
+                42,
+                17,
+                prevalidated,
+            );
+            assert_eq!(actual.0, expected.0, "indices at {rows} rows");
+            assert_eq!(
+                actual.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "distance bits at {rows} rows"
+            );
+            assert_eq!(actual.2, expected.2, "stats at {rows} rows");
+        }
+    }
+}
+
+#[test]
 fn approximate_query_checked_chunks_large_cuda_batch_with_host_oracle() {
     let Some(cuda_device) = umap::cuda_backend::device(0) else {
         if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
@@ -561,8 +969,12 @@ fn assert_checked_chunks_large_batch_with_host_oracle(device: &Device) {
     assert!(max_chunk_rows < query_rows);
     assert_ne!(query_rows % max_chunk_rows, 0);
     let reference_values = (0..n).map(|row| row as f32).collect::<Vec<_>>();
-    let graph_values = (0..n).map(|row| row as i32).collect::<Vec<_>>();
-    let query_values = vec![0.5f32; query_rows];
+    // Each even vertex discovers its odd partner; odd vertices terminate.
+    // This exercises expansion without making the large-budget oracle quadratic in n.
+    let graph_values = (0..n).map(|row| (row | 1) as i32).collect::<Vec<_>>();
+    let query_values = (0..query_rows)
+        .map(|row| (row % n) as f32 + 0.5)
+        .collect::<Vec<_>>();
 
     let reference =
         Tensor::<2>::from_data(TensorData::new(reference_values.clone(), [n, 1]), device);
@@ -572,6 +984,16 @@ fn assert_checked_chunks_large_batch_with_host_oracle(device: &Device) {
     );
     let graph = Tensor::<2, Int>::from_data(TensorData::new(graph_values.clone(), [n, 1]), device);
     let actual = run_query(
+        query.clone(),
+        reference.clone(),
+        graph.clone(),
+        k,
+        candidates,
+        visits,
+        seed,
+        query_offset,
+    );
+    let repeated = run_query(
         query,
         reference,
         graph,
@@ -582,23 +1004,46 @@ fn assert_checked_chunks_large_batch_with_host_oracle(device: &Device) {
         query_offset,
     );
 
-    // With self-edges, search cannot visit beyond the initial Floyd starts.
-    // Compute those starts, sorted distances, and exact search statistics on
-    // the host rather than using another production backend as an oracle.
-    let expected =
-        self_edge_query_reference(n, candidates as usize, seed, query_offset, query_rows);
+    // Independently model each row, including discoveries in the second chunk.
+    let mut expected = (Vec::new(), Vec::new(), Vec::new());
+    for (row, &value) in query_values.iter().enumerate() {
+        let result = query_reference(
+            &reference_values,
+            &graph_values,
+            1,
+            value,
+            k as usize,
+            candidates as usize,
+            visits as usize,
+            seed,
+            query_offset + row as u64,
+        );
+        expected.0.extend(result.0);
+        expected.1.extend(result.1);
+        expected.2.extend(result.2);
+    }
 
     assert_eq!(actual.0, expected.0, "chunked query indices differ");
-    assert_eq!(actual.1, expected.1, "chunked query distances differ");
-    assert_eq!(actual.2, expected.2, "chunked query stats differ");
-    assert!(
-        actual
-            .2
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .all(|stats| stats[0] == 15 && stats[1] == 15)
+    assert_eq!(
+        actual.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        expected.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "chunked query distance bits differ"
     );
+    assert_eq!(actual.2, expected.2, "chunked query stats differ");
+    assert_eq!(repeated.0, actual.0, "repeated chunked indices differ");
+    assert_eq!(
+        repeated.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        actual.1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "repeated chunked distance bits differ"
+    );
+    assert_eq!(repeated.2, actual.2, "repeated chunked stats differ");
+    for chunk in expected.2.as_chunks::<2>().0.chunks(max_chunk_rows) {
+        assert!(
+            chunk
+                .iter()
+                .any(|stats| stats[1] as usize > candidates as usize)
+        );
+    }
 
     let mut invalid_graph_values = graph_values;
     invalid_graph_values[n - 1] = -2;
@@ -648,6 +1093,7 @@ fn assert_twenty_one_component_transform(backend: umap::standard_umap::BackendCh
     let config = UMAPConfig {
         n_components: COMPONENTS,
         n_neighbors: 10,
+        optimizer: umap::Optimizer::Compatibility,
         n_epochs: Some(50),
         init: Init::Random,
         random_state: Some(7),

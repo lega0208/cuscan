@@ -58,6 +58,7 @@ fn fit_rejection(backend: BackendChoice) {
     let result = UMAP::new(
         UMAPConfig {
             memory_limit_bytes: Some(1),
+            optimizer: umap::Optimizer::Compatibility,
             random_state: Some(42),
             init: Init::Random,
             n_epochs: Some(2),

@@ -1,5 +1,5 @@
 use criterion::Criterion;
-use umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
+use umap::{BackendChoice, Init, NeighborSearch, Optimizer, UMAP, UMAPConfig};
 
 const SEED: u64 = 42;
 
@@ -66,16 +66,44 @@ fn data(rows: usize, features: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn estimator(backend: BackendChoice, workload: &Workload) -> UMAP {
-    let config = UMAPConfig {
+/// Configuration axis. `Random` is the pre-flip variant pinned to `Init::Random` with
+/// `Optimizer::Compatibility`; its Criterion IDs are unchanged so historical comparisons stay
+/// valid. `Default` leaves `init` and `optimizer` at the library defaults (recursive init with
+/// Adam since Phase 6).
+#[derive(Clone, Copy)]
+enum Variant {
+    Random,
+    Default,
+}
+
+const VARIANTS: [Variant; 2] = [Variant::Random, Variant::Default];
+
+impl Variant {
+    fn label(self) -> &'static str {
+        match self {
+            Variant::Random => "random",
+            Variant::Default => "default",
+        }
+    }
+}
+
+fn estimator(backend: BackendChoice, workload: &Workload, variant: Variant) -> UMAP {
+    let base = UMAPConfig {
         n_components: 2,
         n_neighbors: workload.neighbors,
         n_epochs: Some(workload.epochs),
-        init: Init::Random,
         random_state: Some(SEED),
         transform_seed: SEED,
         transform_queue_size: workload.transform_queue_size,
         ..UMAPConfig::default()
+    };
+    let config = match variant {
+        Variant::Random => UMAPConfig {
+            init: Init::Random,
+            optimizer: Optimizer::Compatibility,
+            ..base
+        },
+        Variant::Default => base,
     };
     UMAP::new(config, backend, workload.search)
 }
@@ -94,45 +122,50 @@ pub fn benchmarks(c: &mut Criterion, backend_name: &str, backend: BackendChoice)
     for workload in &WORKLOADS {
         let fit_data = data(workload.fit_rows, workload.features);
         let query_data = data(workload.query_rows, workload.features);
-        let estimator = estimator(backend, workload);
         let transform_epochs = workload.epochs / 3;
         let search = search_label(workload.search);
         let mut group =
             c.benchmark_group(format!("standard_umap/{backend_name}/{}", workload.name));
-        group.bench_function(
-            format!(
-                "fit/{}x{}_{search}_random_{}epochs",
-                workload.fit_rows, workload.features, workload.epochs
-            ),
-            |b| {
-                b.iter(|| {
-                    estimator
-                        .fit(std::hint::black_box(&fit_data))
-                        .unwrap_or_else(|error| panic!("{backend_name} fit failed: {error}"))
-                })
-            },
-        );
-        group.bench_function(
-            format!(
-                "transform/{}x{}_against_{}_{search}_random_{}epochs",
-                workload.query_rows, workload.features, workload.fit_rows, transform_epochs
-            ),
-            |b| {
-                // Criterion invokes this only when the benchmark matches its filter;
-                // prepare the fitted model before the timed transform iterations.
-                let fitted = estimator.fit(&fit_data).unwrap_or_else(|error| {
-                    panic!(
-                        "{backend_name} {} benchmark setup fit failed: {error}",
-                        workload.name
-                    )
-                });
-                b.iter(|| {
-                    fitted
-                        .transform(std::hint::black_box(&query_data))
-                        .unwrap_or_else(|error| panic!("{backend_name} transform failed: {error}"))
-                })
-            },
-        );
+        for variant in VARIANTS {
+            let estimator = estimator(backend, workload, variant);
+            let label = variant.label();
+            group.bench_function(
+                format!(
+                    "fit/{}x{}_{search}_{label}_{}epochs",
+                    workload.fit_rows, workload.features, workload.epochs
+                ),
+                |b| {
+                    b.iter(|| {
+                        estimator
+                            .fit(std::hint::black_box(&fit_data))
+                            .unwrap_or_else(|error| panic!("{backend_name} fit failed: {error}"))
+                    })
+                },
+            );
+            group.bench_function(
+                format!(
+                    "transform/{}x{}_against_{}_{search}_{label}_{}epochs",
+                    workload.query_rows, workload.features, workload.fit_rows, transform_epochs
+                ),
+                |b| {
+                    // Criterion invokes this only when the benchmark matches its filter;
+                    // prepare the fitted model before the timed transform iterations.
+                    let fitted = estimator.fit(&fit_data).unwrap_or_else(|error| {
+                        panic!(
+                            "{backend_name} {} {label} benchmark setup fit failed: {error}",
+                            workload.name
+                        )
+                    });
+                    b.iter(|| {
+                        fitted
+                            .transform(std::hint::black_box(&query_data))
+                            .unwrap_or_else(|error| {
+                                panic!("{backend_name} transform failed: {error}")
+                            })
+                    })
+                },
+            );
+        }
         group.finish();
     }
 }

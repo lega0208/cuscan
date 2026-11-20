@@ -82,6 +82,9 @@ pub trait StandardUmapOps: Backend {
     /// unused slots are zero. Bipartite query and reference ids retain their indices.
     /// If an index other than the valid range or the `-1` disconnected marker is
     /// present, the first COO entry is marked by head/tail `-2` and weight `-1`.
+    /// Distances must be finite, non-negative, and at most `sqrt(f32::MAX)`.
+    /// This precondition is not checked: valid indices with infinite or NaN
+    /// distances are not rejected, so direct callers must ensure it themselves.
     #[allow(clippy::type_complexity)]
     fn fuzzy_graph(
         indices: IntTensor<Self>,
@@ -133,6 +136,76 @@ pub trait StandardUmapOps: Backend {
         weights: FloatTensor<Self>,
         head_rows: u32,
     ) -> (IntTensor<Self>, IntTensor<Self>);
+
+    #[fusion(meta = |head, fixed_tail, offsets, indices, source_order, negative_order, source_ranks, periods, next_positive, negative_periods, next_negative, updates, m, v, epoch, a, b, gamma, scale, negative_range, alpha, mu, correction1, correction2, momentum, shared, negatives, exclude_graph_neighbors| {
+        (
+            burn::backend::fusion::custom::TensorSpec::new(head.shape.clone(), head.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(next_positive.shape.clone(), next_positive.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(next_negative.shape.clone(), next_negative.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(updates.shape.clone(), updates.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(m.shape.clone(), m.dtype),
+            burn::backend::fusion::custom::TensorSpec::new(v.shape.clone(), v.dtype),
+        )
+    })]
+    /// Execute one modern epoch using preallocated buffers. One-dimensional
+    /// arrays must be contiguous; coordinate tensors may have pitched strides.
+    ///
+    /// CSR must be compact and sorted, orders must be valid permutations, and
+    /// clocks and periods must be finite and valid for the selected sampling
+    /// mode. The caller checks all shapes, dtypes, device/index limits and
+    /// aliasing. Mutable head, clocks, updates, m and v are overwritten in
+    /// place; retained clones observe writes and must not be used independently.
+    /// They must not alias each other or read-only inputs. `shared` explicitly
+    /// selects fit; otherwise `fixed_tail` is read-only even when row counts
+    /// coincide. Launches use the same ordered client stream. No epoch tensor
+    /// buffers are allocated; callers own synchronization and buffer lifetime.
+    ///
+    /// `negative_range` is the effective window R in `1..=N` (N = rows of
+    /// `negative_order`). Large layouts (more than 1024 source rows) select
+    /// `negative_order[start + (e*(epoch+p+1) mod R)]` with
+    /// `start = clamp(source_ranks[i] - R/2, 0, N-R)`; R=N is the global path
+    /// and does not read `source_ranks`. Small layouts ignore R and the ranks.
+    /// `exclude_graph_neighbors` rejects candidates in the current sorted CSR
+    /// row (and the source itself only when `shared`): large layouts drop
+    /// them, small layouts retry with bounded attempts.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn modern_epoch(
+        head: FloatTensor<Self>,
+        fixed_tail: FloatTensor<Self>,
+        offsets: IntTensor<Self>,
+        indices: IntTensor<Self>,
+        source_order: IntTensor<Self>,
+        negative_order: IntTensor<Self>,
+        source_ranks: IntTensor<Self>,
+        periods: FloatTensor<Self>,
+        next_positive: FloatTensor<Self>,
+        negative_periods: FloatTensor<Self>,
+        next_negative: FloatTensor<Self>,
+        updates: FloatTensor<Self>,
+        m: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        epoch: u32,
+        a: f32,
+        b: f32,
+        gamma: f32,
+        scale: f32,
+        negative_range: u32,
+        alpha: f32,
+        mu: f32,
+        correction1: f32,
+        correction2: f32,
+        momentum: bool,
+        shared: bool,
+        negatives: bool,
+        exclude_graph_neighbors: bool,
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    );
 
     #[fusion(meta = |head_embedding, tail_embedding, heads, tails, weights, epochs_per_sample, epoch_of_next_sample, epochs_per_negative_sample, epoch_of_next_negative_sample, rng_state, head_offsets, head_edges, epoch, a, b, gamma, alpha, negative_sample_rate, move_other, shared_embeddings| {
         (

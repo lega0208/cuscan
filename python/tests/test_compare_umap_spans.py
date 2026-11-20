@@ -226,7 +226,7 @@ def test_benchmark_cli_mocked_campaign_exercises_complete_orchestration(
             result = module._stage2_worker(payload)
         elif payload.get("kind") == "provenance":
             result = {
-                "dependencies": {"umap-learn": "0.5.12"},
+                "dependencies": {"umap-learn": "0.6.0"},
                 "python": "test",
                 "platform": "test",
                 "gpu": {"status": "unavailable"},
@@ -260,7 +260,7 @@ def test_benchmark_cli_mocked_campaign_exercises_complete_orchestration(
                 "fit_trustworthiness": 0.95,
                 "fit_recall": 0.95,
                 "transform": [{"trustworthiness": 0.95} for _ in range(3)],
-                "reference": {"version": "0.5.12", "mode": payload["mode"]},
+                "reference": {"version": "0.6.0", "mode": payload["mode"]},
             }
         return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
 
@@ -1007,8 +1007,7 @@ def test_umap_exact_reference_index_transforms_and_missing_index_fails() -> None
     from pynndescent import NNDescent
     from sklearn.neighbors import NearestNeighbors
 
-    if umap.__version__ != "0.5.12":
-        pytest.skip("real compatibility fixture requires pinned umap-learn 0.5.12")
+    module.require_reference()
     training = np.random.default_rng(11).normal(size=(80, 5)).astype(np.float32)
     queries = np.random.default_rng(12).normal(size=(12, 5)).astype(np.float32)
     estimator = module._stage2_reference_fit(training, "exact", seed=5, epochs=20, neighbors=25)
@@ -1027,7 +1026,7 @@ def test_umap_exact_reference_index_transforms_and_missing_index_fails() -> None
         n_neighbors=12,
         n_components=2,
         n_epochs=20,
-        init="random",
+        **module.reference_kwargs(optimizer="compatibility", init="random"),
         random_state=5,
         transform_seed=5,
         precomputed_knn=(indices, distances, index),
@@ -1044,7 +1043,7 @@ def test_umap_exact_reference_index_transforms_and_missing_index_fails() -> None
         n_neighbors=12,
         n_components=2,
         n_epochs=20,
-        init="random",
+        **module.reference_kwargs(optimizer="compatibility", init="random"),
         random_state=5,
         precomputed_knn=(indices, distances, None),
     ).fit(training)

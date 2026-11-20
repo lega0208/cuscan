@@ -738,6 +738,8 @@ def test_composed_umap_then_hdbscan(
     embedding = UMAP(
         n_neighbors=5,
         n_epochs=20,
+        init="spectral",
+        optimizer="compatibility",
         random_state=7,
         backend=hdbscan_backend,
     ).fit_transform(x)

@@ -9,7 +9,7 @@ from . import _serialization_common as _common
 
 DurabilityUncertainError = _common.DurabilityUncertainError
 _FORMAT = _common._FORMAT
-_VERSION = _common._VERSION
+_VERSION = 5
 
 _FLOATS = (
     "min_dist",
@@ -18,6 +18,7 @@ _FLOATS = (
     "set_op_mix_ratio",
     "learning_rate",
     "repulsion_strength",
+    "init_scale_factor",
 )
 _CONFIG = (
     "n_components",
@@ -30,6 +31,8 @@ _CONFIG = (
     "negative_sample_rate",
     "repulsion_strength",
     "init",
+    "init_rescale",
+    "init_scale_factor",
     "transform_seed",
     "transform_queue_size",
     "unique",
@@ -38,6 +41,15 @@ _CONFIG = (
     "training_rows",
     "n_features",
     "query_graph_width",
+    "optimizer",
+    "negative_selection_range",
+    "exclude_graph_neighbors",
+    "negative_sample_scale_adaptation_samples",
+    "recursive_coarsening_ratio",
+    "recursive_base_init_threshold",
+    "recursive_n_embedding_epochs",
+    "recursive_hub_selection",
+    "recursive_anchor_sample_size",
 )
 _ARRAYS = ("training_features", "embedding", "query_graph", "original_to_training")
 _CONSTRUCTOR = (
@@ -52,11 +64,17 @@ _CONSTRUCTOR = (
     "negative_sample_rate",
     "repulsion_strength",
     "init",
+    "init_rescale",
     "random_state",
     "transform_seed",
     "transform_queue_size",
     "unique",
+    "optimizer",
+    "negative_selection_range",
+    "exclude_graph_neighbors",
+    "negative_sample_scale_adaptation_samples",
 )
+_I32_MAX = 2**31 - 1
 
 
 def _deps() -> tuple[Any, Any]:
@@ -68,6 +86,31 @@ def _native_f32(value: Any, name: str) -> np.float32:
     if not np.isfinite(result):
         raise ValueError(f"invalid native float metadata: {name}")
     return result
+
+
+def _validate_precision(metadata: dict[str, Any], precision: dict[str, Any]) -> None:
+    for key in _FLOATS:
+        expected_native = _native_f32(precision[key], key)
+        if expected_native.view(np.uint32) != np.asarray(metadata[key], dtype="<f4").view(
+            np.uint32
+        ):
+            raise ValueError(f"Python precision metadata disagrees with native config: {key}")
+    if not np.isfinite(precision["init_scale_factor"]) or precision["init_scale_factor"] <= 0:
+        raise ValueError("invalid Python precision init_scale_factor")
+    scale = precision["negative_sample_scale"]
+    native_scale = metadata["negative_sample_scale"]
+    if (scale is None) != (native_scale is None):
+        raise ValueError("Python negative_sample_scale disagrees with native config")
+    if scale is not None:
+        if not np.isfinite(scale) or scale < 0:
+            raise ValueError("invalid Python precision negative_sample_scale")
+        rounded = _native_f32(scale, "negative_sample_scale")
+        if (scale != 0 and rounded == 0) or rounded.view(np.uint32) != np.asarray(
+            native_scale, dtype="<f4"
+        ).view(np.uint32):
+            raise ValueError(
+                "Python precision metadata disagrees with native config: negative_sample_scale"
+            )
 
 
 def _validate_links(group: Any, h5py: Any) -> None:
@@ -94,28 +137,70 @@ def _validate_config(config: Any, precision: Any, curve: Any) -> None:
         "training_rows",
         "n_features",
         "query_graph_width",
+        "negative_selection_range",
+        "negative_sample_scale_adaptation_samples",
+        "recursive_coarsening_ratio",
+        "recursive_base_init_threshold",
+        "recursive_n_embedding_epochs",
+        "recursive_anchor_sample_size",
     ):
         _check_scalar(config, name, "<u8")
     for name in _FLOATS:
         _check_scalar(config, name, "<f4")
         _check_scalar(precision, name, "<f8")
     _check_scalar(config, "transform_queue_size", "<f8")
+    _check_scalar(config, "negative_sample_scale_value", "<f4")
+    _check_scalar(precision, "negative_sample_scale", "<f8")
     for name in (
         "unique",
+        "exclude_graph_neighbors",
         "n_epochs_is_auto",
         "random_state_is_none",
         "memory_limit_bytes_is_none",
+        "negative_sample_scale_is_auto",
     ):
         _check_scalar(config, name, "|b1")
-    for name in ("init", "requested_search", "resolved_search"):
+    for name in (
+        "init",
+        "init_rescale",
+        "requested_search",
+        "resolved_search",
+        "optimizer",
+        "recursive_hub_selection",
+    ):
         text = _check_text(config, name)
         options = {
-            "init": {"random", "spectral"},
+            "init": {"random", "spectral", "recursive", "auto"},
+            "init_rescale": {"isotropic", "per_axis", "graph_edge"},
             "requested_search": {"auto", "exact", "approximate"},
             "resolved_search": {"exact", "approximate"},
+            "optimizer": {"compatibility", "adam", "momentum"},
+            "recursive_hub_selection": {"degree", "diverse", "random"},
         }[name]
         if text not in options:
             raise ValueError(f"invalid enum value: {name}")
+    factor = _attr(config, "init_scale_factor")
+    if not np.isfinite(factor) or factor <= 0:
+        raise ValueError("invalid init_scale_factor")
+    if not 0 < _attr(config, "negative_selection_range") <= 2**31 - 1:
+        raise ValueError("invalid negative_selection_range")
+    if not 0 <= _attr(config, "negative_sample_scale_adaptation_samples") <= _I32_MAX:
+        raise ValueError("invalid negative_sample_scale_adaptation_samples")
+    if _attr(config, "recursive_coarsening_ratio") not in (2, 3, 4):
+        raise ValueError("invalid recursive_coarsening_ratio")
+    if not 2 <= _attr(config, "recursive_base_init_threshold") <= _I32_MAX:
+        raise ValueError("invalid recursive_base_init_threshold")
+    if _attr(config, "recursive_n_embedding_epochs") < 1:
+        raise ValueError("invalid recursive_n_embedding_epochs")
+    if not 1 <= _attr(config, "recursive_anchor_sample_size") <= _I32_MAX:
+        raise ValueError("invalid recursive_anchor_sample_size")
+    scale = _attr(config, "negative_sample_scale_value")
+    py_scale = _attr(precision, "negative_sample_scale")
+    auto = _attr(config, "negative_sample_scale_is_auto")
+    if not np.isfinite(scale) or scale < 0 or not np.isfinite(py_scale) or py_scale < 0:
+        raise ValueError("invalid negative_sample_scale")
+    if auto and (scale != 0 or py_scale != 0 or np.signbit(scale) or np.signbit(py_scale)):
+        raise ValueError("noncanonical negative_sample_scale auto payload")
     for name in ("a", "b"):
         _check_scalar(curve, name, "<f4")
 
@@ -135,7 +220,10 @@ def save_model(
     def write(file: Any, h5py: Any, plugin: Any) -> None:
         from . import _cuscan
 
-        _common._write_root(file, _cuscan.__version__, "standard_umap")
+        for key in ("optimizer", "negative_selection_range"):
+            if key not in metadata or metadata[key] != precision[key]:
+                raise ValueError(f"Python metadata disagrees with native config: {key}")
+        _common._write_root(file, _cuscan.__version__, "standard_umap", schema_version=_VERSION)
         config = file.create_group("config")
         for key in _CONFIG:
             if key not in metadata:
@@ -145,10 +233,34 @@ def save_model(
                 value = np.asarray(value, dtype="<f4")
             elif key == "transform_queue_size":
                 value = np.asarray(value, dtype="<f8")
-            elif key in ("unique",):
+            elif key in ("unique", "exclude_graph_neighbors"):
+                if not isinstance(value, (bool, np.bool_)):
+                    raise ValueError(f"invalid native bool metadata: {key}")
                 value = np.bool_(value)
-            elif key in ("requested_search", "resolved_search", "init"):
-                value = str(value)
+            elif key in (
+                "negative_sample_scale_adaptation_samples",
+                "recursive_coarsening_ratio",
+                "recursive_base_init_threshold",
+                "recursive_n_embedding_epochs",
+                "recursive_anchor_sample_size",
+            ):
+                if (
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                    or not 0 <= int(value) <= (2**64 - 1)
+                ):
+                    raise ValueError(f"invalid native integer metadata: {key}")
+                value = np.uint64(value)
+            elif key in (
+                "requested_search",
+                "resolved_search",
+                "init",
+                "init_rescale",
+                "optimizer",
+                "recursive_hub_selection",
+            ):
+                if not isinstance(value, str):
+                    raise ValueError(f"invalid native text metadata: {key}")
             else:
                 value = np.uint64(value)
             config.attrs[key] = value
@@ -171,9 +283,20 @@ def save_model(
         py_config = file.create_group("python_precision")
         for key in _FLOATS:
             py_config.attrs[key] = np.asarray(precision[key], dtype="<f8")
+        scale = metadata["negative_sample_scale"]
+        py_scale = precision["negative_sample_scale"]
+        config.attrs["negative_sample_scale_is_auto"] = np.bool_(scale is None)
+        config.attrs["negative_sample_scale_value"] = np.asarray(
+            0 if scale is None else scale, dtype="<f4"
+        )
+        py_config.attrs["negative_sample_scale"] = np.asarray(
+            0 if py_scale is None else py_scale, dtype="<f8"
+        )
         curve = file.create_group("curve")
         curve.attrs["a"] = np.asarray(metadata["a"], dtype="<f4")
         curve.attrs["b"] = np.asarray(metadata["b"], dtype="<f4")
+        _validate_config(config, py_config, curve)
+        _validate_precision(metadata, precision)
         state = file.create_group("state")
         for name in _ARRAYS:
             value = arrays.get(name)
@@ -206,6 +329,7 @@ def load_model(
             h5py,
             model_kind="standard_umap",
             groups={"config", "python_precision", "curve", "state"},
+            schema_version=_VERSION,
         )
         config, precision, curve, state = (
             file[name] for name in ("config", "python_precision", "curve", "state")
@@ -220,14 +344,24 @@ def load_model(
             "random_state_value",
             "memory_limit_bytes_is_none",
             "memory_limit_bytes_value",
+            "negative_sample_scale_is_auto",
+            "negative_sample_scale_value",
         }
         if (
             set(config.attrs) != expected_config
-            or set(precision.attrs) != set(_FLOATS)
+            or set(precision.attrs) != set(_FLOATS) | {"negative_sample_scale"}
             or set(curve.attrs) != {"a", "b"}
         ):
             raise ValueError("invalid schema attributes")
         metadata = {key: _attr(config, key) for key in _CONFIG}
+        metadata["exclude_graph_neighbors"] = bool(metadata["exclude_graph_neighbors"])
+        metadata["negative_sample_scale_adaptation_samples"] = int(
+            metadata["negative_sample_scale_adaptation_samples"]
+        )
+        scale_is_auto = _attr(config, "negative_sample_scale_is_auto")
+        metadata["negative_sample_scale"] = (
+            None if scale_is_auto else float(_attr(config, "negative_sample_scale_value"))
+        )
         metadata["n_epochs"] = (
             None if _attr(config, "n_epochs_is_auto") else int(_attr(config, "n_epochs_value"))
         )
@@ -247,7 +381,13 @@ def load_model(
         metadata["memory_limit_bytes"] = None if memory_is_none else memory_value
         for key in ("a", "b"):
             metadata[key] = _attr(curve, key)
-        precision_values = {key: float(_attr(precision, key)) for key in _FLOATS}
+        precision_values: dict[str, float | None] = {
+            key: float(_attr(precision, key)) for key in _FLOATS
+        }
+        precision_values["negative_sample_scale"] = (
+            None if scale_is_auto else float(_attr(precision, "negative_sample_scale"))
+        )
+        _validate_precision(metadata, precision_values)
         arrays: dict[str, Any] = {}
         expected = {
             "training_features": ("<f4", 2),
@@ -315,12 +455,6 @@ def load_model(
         or np.any(mapping > np.iinfo(np.int32).max)
     ):
         raise ValueError("invalid inverse mapping value")
-    for key in _FLOATS:
-        expected_native = _native_f32(precision_values[key], key)
-        if expected_native.view(np.uint32) != np.asarray(metadata[key], dtype="<f4").view(
-            np.uint32
-        ):
-            raise ValueError(f"Python precision metadata disagrees with native config: {key}")
     from . import _cuscan
 
     native = _cuscan.load(arrays, metadata, backend=backend, device_index=device_index)
@@ -331,6 +465,13 @@ def load_model(
         device_index=device_index,
         neighbor_search=metadata["requested_search"],
         memory_limit_bytes=None if memory_is_none else memory_value,
+        recursive_coarsening_ratio=int(metadata["recursive_coarsening_ratio"]),
+        recursive_init_kwds={
+            "base_init_threshold": int(metadata["recursive_base_init_threshold"]),
+            "n_embedding_epochs": int(metadata["recursive_n_embedding_epochs"]),
+            "hub_selection": metadata["recursive_hub_selection"],
+            "anchor_sample_size": int(metadata["recursive_anchor_sample_size"]),
+        },
     )
     model = cls(**constructor)
     model._model = native

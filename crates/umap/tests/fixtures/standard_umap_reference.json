@@ -1,16 +1,17 @@
 {
   "reference": {
     "distribution": "umap-learn",
-    "version": "0.5.12",
+    "version": "0.6.0",
     "python": "3.14.0 (main, Oct 31 2025, 23:03:06) [Clang 21.1.4 ]",
     "numpy": "2.5.3",
     "scipy": "1.18.1",
     "scikit_learn": "1.9.1",
     "numba": "0.68.0",
+    "pynndescent": "0.7.0",
     "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.44",
     "machine": "x86_64",
     "processor": "",
-    "generator_sha256": "b847ce1a2e020b5a8910161d6a3a2f8ca53c48a82caa6b7d36f46378e5789268"
+    "generator_sha256": "7032bba602a84db7d1276e19da577297ab38774c9b8b425158c62493c77b2cd2"
   },
   "controls": {
     "n_neighbors": 10,
@@ -315,9 +316,9 @@
     }
   ],
   "source_basis": {
-    "graph": "umap.umap_.smooth_knn_dist and compute_membership_strengths; fuzzy set operation follows UMAP's sparse union/intersection expression.",
+    "graph": "umap-learn 0.6.0 umap.umap_.smooth_knn_dist and compute_membership_strengths use fastmath flags nsz, arcp, contract, afn, reassoc; fuzzy set operation follows UMAP's sparse union/intersection expression.",
     "positive_schedule": "umap.umap_.make_epochs_per_sample",
-    "optimizer": "umap.layouts.optimize_layout_euclidean with the installed _get_optimize_layout_euclidean_single_epoch_fn wrapped to record states after each epoch and ordered event prefix."
+    "optimizer": "umap-learn 0.6.0 umap.layouts.optimize_layout_euclidean with the compatibility optimizer (fastmath flags nsz, afn, reassoc) and the installed _get_optimize_layout_euclidean_single_epoch_fn wrapped to record states after each epoch and ordered event prefix."
   },
   "optimizer_probes": [
     {
@@ -3046,101 +3047,301 @@
       "recall": "Fit uses k=9 (= n_neighbors - 1; fit's kNN includes self), held-out transform uses k=10 (= n_neighbors). For each row, unique returned neighbors within the exact kth-distance boundary earn 1/k; denominator remains k. Fit excludes self; query searches training rows. Ties are inclusive.",
       "freeze": "Datasets, splits, controls, references, and score definitions are fixed before implementation scoring; do not retune after observing results."
     },
-    "scores": {
-      "clusters": [
-        {
-          "seed": 11,
-          "fit_trustworthiness_at_15": 0.9919044901065449,
-          "transform_trustworthiness_at_15": 0.7303921568627452
-        },
-        {
-          "seed": 29,
-          "fit_trustworthiness_at_15": 0.9917332572298325,
-          "transform_trustworthiness_at_15": 0.7204901960784313
-        },
-        {
-          "seed": 47,
-          "fit_trustworthiness_at_15": 0.9924372146118722,
-          "transform_trustworthiness_at_15": 0.643921568627451
-        }
-      ],
-      "manifold": [
-        {
-          "seed": 11,
-          "fit_trustworthiness_at_15": 0.9985635464231355,
-          "transform_trustworthiness_at_15": 0.9762745098039216
-        },
-        {
-          "seed": 29,
-          "fit_trustworthiness_at_15": 0.9985350076103501,
-          "transform_trustworthiness_at_15": 0.9905882352941177
-        },
-        {
-          "seed": 47,
-          "fit_trustworthiness_at_15": 0.9976312785388128,
-          "transform_trustworthiness_at_15": 0.9883333333333333
-        }
-      ],
-      "duplicates": [
-        {
-          "seed": 11,
-          "fit_trustworthiness_at_15": 0.8363888888888888,
-          "transform_trustworthiness_at_15": 0.7611764705882353
-        },
-        {
-          "seed": 29,
-          "fit_trustworthiness_at_15": 0.8420760233918129,
-          "transform_trustworthiness_at_15": 0.7145098039215687
-        },
-        {
-          "seed": 47,
-          "fit_trustworthiness_at_15": 0.8359941520467836,
-          "transform_trustworthiness_at_15": 0.7100980392156863
-        }
-      ],
-      "ties": [
-        {
-          "seed": 11,
-          "fit_trustworthiness_at_15": 0.873729674796748,
-          "transform_trustworthiness_at_15": 0.8500980392156863
-        },
-        {
-          "seed": 29,
-          "fit_trustworthiness_at_15": 0.870020325203252,
-          "transform_trustworthiness_at_15": 0.8364705882352941
-        },
-        {
-          "seed": 47,
-          "fit_trustworthiness_at_15": 0.8690294715447154,
-          "transform_trustworthiness_at_15": 0.8106862745098039
-        }
-      ],
-      "disconnected": [
-        {
-          "seed": 11,
-          "fit_trustworthiness_at_15": 0.9510749619482496,
-          "transform_trustworthiness_at_15": 0.9804901960784314
-        },
-        {
-          "seed": 29,
-          "fit_trustworthiness_at_15": 0.9513318112633181,
-          "transform_trustworthiness_at_15": 0.9757843137254902
-        },
-        {
-          "seed": 47,
-          "fit_trustworthiness_at_15": 0.9440924657534246,
-          "transform_trustworthiness_at_15": 0.9736274509803922
-        }
-      ]
-    },
     "long_run": {
       "case": "clusters",
       "seed": 11,
       "n_neighbors": 15,
       "fit_epochs": 200,
       "transform_epochs": 66,
-      "fit_trustworthiness_at_15": 0.9923420852359208,
-      "transform_trustworthiness_at_15": 0.5408823529411765
+      "fit_trustworthiness_at_15": 0.9937404870624049,
+      "transform_trustworthiness_at_15": 0.568529411764706
+    },
+    "scores": {
+      "clusters": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.9924086757990868,
+          "transform_trustworthiness_at_15": 0.7001960784313725
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.992579908675799,
+          "transform_trustworthiness_at_15": 0.7911764705882354
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.993312404870624,
+          "transform_trustworthiness_at_15": 0.6104901960784315
+        }
+      ],
+      "manifold": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.9985064687975647,
+          "transform_trustworthiness_at_15": 0.985
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.9988774733637747,
+          "transform_trustworthiness_at_15": 0.9888235294117647
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.9979452054794521,
+          "transform_trustworthiness_at_15": 0.9891176470588235
+        }
+      ],
+      "duplicates": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.8634941520467836,
+          "transform_trustworthiness_at_15": 0.7990196078431373
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.8462865497076023,
+          "transform_trustworthiness_at_15": 0.8008823529411765
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.8593128654970761,
+          "transform_trustworthiness_at_15": 0.7793137254901961
+        }
+      ],
+      "ties": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.8694613821138212,
+          "transform_trustworthiness_at_15": 0.8336274509803921
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.8926575203252033,
+          "transform_trustworthiness_at_15": 0.8337254901960784
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.8805386178861788,
+          "transform_trustworthiness_at_15": 0.7938235294117647
+        }
+      ],
+      "disconnected": [
+        {
+          "seed": 11,
+          "fit_trustworthiness_at_15": 0.9467941400304414,
+          "transform_trustworthiness_at_15": 0.9770588235294118
+        },
+        {
+          "seed": 29,
+          "fit_trustworthiness_at_15": 0.9476027397260274,
+          "transform_trustworthiness_at_15": 0.9738235294117648
+        },
+        {
+          "seed": 47,
+          "fit_trustworthiness_at_15": 0.9482876712328767,
+          "transform_trustworthiness_at_15": 0.9727450980392157
+        }
+      ]
+    }
+  },
+  "init_rescale": {
+    "version": "0.6.0",
+    "source_sha256": "1441f803cf35a3412172c9d598f3ed6309e21dcfc4e416e4e677163faf05af88",
+    "coordinates": [
+      [
+        0.0,
+        4.0
+      ],
+      [
+        2.0,
+        4.0
+      ],
+      [
+        3.0,
+        8.0
+      ],
+      [
+        9.0,
+        20.0
+      ]
+    ],
+    "repulsion_strength": 1.0,
+    "init_scale_factor": 1.25,
+    "heads": [
+      0,
+      0,
+      1,
+      2,
+      3
+    ],
+    "tails": [
+      1,
+      2,
+      0,
+      3,
+      2
+    ],
+    "weights": [
+      2.0,
+      3.0,
+      1.0,
+      1.0,
+      4.0
+    ],
+    "fuzzy_graph": {
+      "n": 4,
+      "k": 5,
+      "local_connectivity": 1.0,
+      "bandwidth": 1.0,
+      "set_op_mix_ratio": 1.0,
+      "indices": [
+        0,
+        3,
+        1,
+        3,
+        2,
+        1,
+        3,
+        0,
+        2,
+        0,
+        2,
+        0,
+        3,
+        0,
+        1,
+        3,
+        2,
+        1,
+        0,
+        2
+      ],
+      "distances": [
+        0.0,
+        1.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        1.0,
+        2.0,
+        3.0
+      ],
+      "rho": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "sigma": [
+        0.73443603515625,
+        0.73443603515625,
+        0.73443603515625,
+        0.73443603515625
+      ],
+      "directed": [
+        0.0,
+        1.0,
+        0.06566574424505234,
+        1.2562532424926758,
+        1.0656657218933105,
+        0.0,
+        0.25625327229499817,
+        1.0,
+        1.2562532424926758,
+        0.06566574424505234,
+        0.0,
+        1.0,
+        0.25625327229499817,
+        1.0,
+        1.0656657218933105,
+        0.0
+      ],
+      "symmetric": [
+        0.0,
+        1.0,
+        1.2394261360168457,
+        1.1905875205993652,
+        1.0,
+        0.0,
+        0.3050919771194458,
+        1.0,
+        1.2394261360168457,
+        0.3050919771194458,
+        0.0,
+        1.0,
+        1.1905875205993652,
+        1.0,
+        1.0,
+        0.0
+      ]
+    },
+    "outputs": {
+      "isotropic": [
+        [
+          -0.7508401870727539,
+          -1.0726288557052612
+        ],
+        [
+          -0.3217886686325073,
+          -1.0726288557052612
+        ],
+        [
+          -0.10726288706064224,
+          -0.21452577412128448
+        ],
+        [
+          1.1798917055130005,
+          2.359783411026001
+        ]
+      ],
+      "per_axis": [
+        [
+          -1.013081669807434,
+          -0.794973611831665
+        ],
+        [
+          -0.43417784571647644,
+          -0.794973611831665
+        ],
+        [
+          -0.1447259485721588,
+          -0.15899471938610077
+        ],
+        [
+          1.5919854640960693,
+          1.7489418983459473
+        ]
+      ],
+      "graph_edge": [
+        [
+          -0.875,
+          -1.25
+        ],
+        [
+          -0.375,
+          -1.25
+        ],
+        [
+          -0.125,
+          -0.25
+        ],
+        [
+          1.375,
+          2.75
+        ]
+      ]
     }
   }
 }

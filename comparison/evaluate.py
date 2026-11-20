@@ -302,7 +302,6 @@ settings = dict(
     n_components=2,
     n_neighbors=15,
     min_dist=0.0,
-    init="spectral",
     transform_seed=42 if seed == "none" else int(seed),
     random_state=None if seed == "none" else int(seed),
     unique=method.endswith("unique"),
@@ -314,13 +313,22 @@ with warnings.catch_warnings(record=True) as caught:
         from cuscan import UMAP
         model = UMAP(
             **settings,
-            backend=backend,
+            init="spectral",
+            optimizer="compatibility",
+            backend=device,
             neighbor_search="approximate",
         )
     else:
         import umap
-        model = umap.UMAP(**settings, metric="euclidean", verbose=False,
-                          n_jobs=1 if seed != "none" else -1)
+        from comparison.umap_reference import reference_kwargs, require_reference
+        require_reference()
+        model = umap.UMAP(
+            **settings,
+            **reference_kwargs(optimizer="compatibility", init="spectral"),
+            metric="euclidean",
+            verbose=False,
+            n_jobs=1 if seed != "none" else -1,
+        )
     fit_seconds = []
     for _ in range(int(fit_count)):
         started = time.perf_counter()
@@ -354,7 +362,12 @@ print(json.dumps({"fit_seconds": fit_seconds, "warnings": warning_data}))
         started = perf_counter()
         try:
             completed = subprocess.run(
-                command, capture_output=True, text=True, timeout=timeout * fit_count, check=False
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=timeout * fit_count,
+                check=False,
             )
         except subprocess.TimeoutExpired as error:
             elapsed = perf_counter() - started

@@ -171,8 +171,80 @@ uv run ty check
 
 Run these scripts from the repository root after `uv sync` and a release
 `maturin develop` build as above. Use `uv run --no-sync` to retain the locally
-built extension. The reference implementations are **umap-learn 0.5.12** and
+built extension. The reference implementations are **umap-learn 0.6.0** and
 **fast-hdbscan 0.3.2**, respectively.
+
+UMAP comparison callers use `comparison/umap_reference.py`, which requires the
+pinned reference environment and explicitly sets `compatibility_layout=False`
+and `nearest_neighbor_backend="pynndescent"`. The current cuscan classic optimizer
+maps to upstream `optimizer="compatibility"` with an explicitly named init.
+
+#### UMAP 0.6.0 reference harness
+
+`comparison/umap06/` evaluates the explicit classic, Adam and momentum reference
+configurations with deterministic inputs, seed sets and float64 quality metrics.
+Workers run in separate processes: upstream never imports cuscan, and cuscan never
+imports upstream UMAP. CPU and CUDA baselines use strict backends, run serially,
+and record cold JIT separately from warm samples. Do not run other campaigns
+concurrently with these measurements.
+
+The harness always passes `optimizer` and `init` explicitly, so library-default
+changes do not alter its configurations. `cuscan_worker.py --library-defaults`
+(mutually exclusive with `--optimizer` and `--init`) omits both keywords and
+labels its record config `default`, which no quality receipt accepts.
+
+```sh
+uv run --no-sync python -m comparison.umap06.run generate
+uv run --no-sync python -m comparison.umap06.run upstream --fixtures blobs_1k --seeds 11 --record-extension
+uv run --no-sync python -m comparison.umap06.run cuscan --backend cpu --fixtures blobs_1k --seeds 11
+uv run --no-sync python -m comparison.umap06.run cuscan --backend cuda --fixtures blobs_1k --seeds 11
+uv run --no-sync python -m comparison.umap06.run score
+uv run --no-sync python -m comparison.umap06.run summarize
+uv run --no-sync python -m comparison.umap06.run check
+```
+
+The small pilot is not a complete reference. Run seed 11 of every `mix_1m`
+configuration before its remaining seeds; each pilot must finish warm-up, fit and
+transforms within 4.8 hours. The full reference has 122 ordinary upstream runs,
+plus separate determinism checks. The checker fails on missing evidence rather
+than treating a partial campaign as complete. Raw runs are retained under
+`artifacts/umap06_p0/`; generated inputs and hash-verified evaluation caches live
+under `data/umap06/`. Existing mismatched files are never overwritten.
+
+After the small pilot, run `upstream --fixtures mix_1m --seeds 11`, then
+`upstream` for the remaining reference identities. Run `cuscan --backend cpu`
+and `cuscan --backend cuda` separately, followed by `determinism` and `stages`.
+Offline `score` shares input-space ranks and exact query neighbors across runs;
+completed per-fixture score shards are reusable after an interrupted invocation.
+Use `summarize --freeze` only when all evidence is complete; ordinary `summarize`
+writes an artifact summary without publishing a frozen reference. The final
+`check` validates the frozen files. Measurement-defining source changes invalidate
+timings; metric-source changes invalidate scores, not otherwise unchanged fits.
+Upstream recall reports the 14 non-self neighbors in its self-inclusive 15-slot
+graph, with a tie-inclusive boundary and explicit missing-neighbor counts.
+Small exact upstream fits do not expose `_knn_indices`; their recall diagnostic
+is unavailable rather than synthesized from the input or fuzzy graph.
+
+Regenerate the Rust test oracle with
+`uv run --no-sync python crates/umap/tests/fixtures/generate_standard_umap.py`.
+For the ANN campaign, use `--campaign --input data/umap06/ann_campaign_train.f32le`
+and explicit `--output-reference` / `--output-quality` paths for the campaign
+fixtures. Preserve the previous files and compare with `diff_standard_umap.py`:
+graph and optimizer exact fields must stay equal, and floats must satisfy their
+unchanged consuming-test tolerances. Enable both quality opt-ins and required
+CUDA when validating regenerated fixtures. Never widen the trustworthiness gate
+to accommodate a new reference.
+
+The upstream JSON is frozen and regenerated only by explicit decision. Preserve
+the Phase 0 cuscan baseline permanently; later phases also capture a fresh
+immediate-predecessor baseline. The quality rule is one-sided: candidate mean
+must be at least upstream mean minus the fixture's margin. Trustworthiness uses
+`max(0.010, 2 * pooled_seed_std)`; preservation uses
+`max(0.020, 2 * pooled_seed_std)`. Pool the per-configuration sample variances,
+not the configuration means. Timings, scale and diagnostics are not gates.
+Applying this rule to Phase 0 cuscan is diagnostic only, while the regenerated
+Rust quality tests remain blocking. Record any required per-section or 1M-budget
+user decisions with their observed values; never silently shrink a fixture.
 
 The local parquet datasets under `comparison/` are gitignored and are not shipped.
 Commands using them require user-provided schema-compatible parquet files. For the
@@ -339,9 +411,156 @@ script's `--help` lists its full options.
 ## Standard UMAP
 
 `UMAP` / `FittedUMAP` (Rust) and `cuscan.UMAP` (Python) are a
-non-parametric estimator that follows umap-learn 0.5.12: smooth-kNN fuzzy graph,
-spectral (or random) initialization, and direct coordinate SGD with the
-reference Tausworthe negative sampling and epoch schedule.
+non-parametric estimator with a smooth-kNN fuzzy graph, recursive or
+umap-learn 0.6-style spectral or random initialization and shared rescaling,
+followed by modern Adam/momentum layouts or classic coordinate SGD. The defaults
+are `Init::Auto` (recursive) and `Optimizer::Adam`. Classic SGD uses Tausworthe
+negative sampling and is selected with `Optimizer::Compatibility`. This
+does not claim all 0.6 features or bit parity: cuscan uses its own host
+eigensolver and RNG, and rescaling arithmetic differs in floating precision.
+
+Fit defaults to `init="auto"`, which resolves to recursive initialization for
+every optimizer: host graph coarsening in `umap_core::recursive_init`, with
+CPU or CUDA Adam layouts at coarse levels driven by `UMAP::fit`. Rescaling
+defaults to isotropic with scale factor 1.0. Rust exposes `InitRescale::{Isotropic, PerAxis, GraphEdge}` via
+`UMAPConfig::init_rescale`; Python accepts `"isotropic"`, `"per_axis"` and
+`"graph_edge"` via `init_rescale`. Both use `init_scale_factor`, which must be
+positive and finite. Each mode centers coordinates; isotropic and per-axis use
+robust axis spans, whereas graph-edge uses the weighted median distance of
+positive pruned directed graph edges. These are fit-only controls; transform
+initialization is unchanged.
+
+`umap_core::init::initialize` is a host-only helper for explicit
+`Init::Random` and `Init::Spectral`; it returns `InvalidConfig` ("recursive
+initialization requires the fit layout driver") for `Recursive` and `Auto`,
+including `UMAPConfig::default()`.
+
+Previous defaults: pass `Optimizer::Compatibility` with `Init::Spectral`
+(Python `optimizer="compatibility", init="spectral"`). A default model
+transforms with Adam.
+
+Spectral and random initialization run on the host. Spectral initialization or graph-edge
+rescaling exports the pruned graph: full-capacity head, tail and weight
+readbacks overlap compact positive directed edges, then the readbacks are
+released before initialization scratch. Spectral solver state is released
+before rescaling; robust modes use centered coordinates and reusable axis
+scratch, while graph-edge uses distance/weight records. Rescale scratch is
+released before upload and exported edges before layout. Random isotropic and
+per-axis fits do not export the graph for initialization. These host allocations
+are outside the ANN-only memory limit; initialization adds no device allocation
+beyond the existing graph and embedding upload.
+
+`Optimizer::{Compatibility, Adam, Momentum}` selects the Rust layout; Python uses
+`optimizer="compatibility"`, `"adam"` or `"momentum"`. Modern layouts accumulate
+source-only gradients over sorted compact positive CSR edges, without atomic
+tail updates. Adam uses a whole-epoch Jacobi gradient and lazy coordinate steps;
+large momentum layouts apply sequential source blocks and decay velocity once
+per epoch. Transform references never move, even when query and reference counts
+match. The seeded shuffle stream is cuscan's `StdRng`, not NumPy RandomState;
+upstream coordinate or cross-backend bit parity is not promised.
+
+Transform uses its actual epoch count to prune graph weights, including when the
+count is at most 10; fit retains its separate short-epoch rule. Approximate
+transform retains candidates in a bounded frontier on the stored forward graph.
+Corrected forward search is the fallback selected after the scoped reverse-edge
+comparison missed recall floors; this is not a quality-pass claim. CUDA packs
+32 query lanes with slot-major scratch, while CPU query geometry is unchanged.
+D8 initializes a query by copying the embedding of the smallest training ID
+whose raw coalesced membership is exactly 1.0; a required copy with no valid ID
+returns a typed numerical error. D7 and D8 can change exact-search transform
+outputs as well as approximate-search outputs.
+
+Modern fit and transform accept any fitted reference count N (post-unique for
+fit). With raw Q = `negative_selection_range` (default 200000) below N, a seeded
+random direction projects the references (and transform queries), the stable
+radix argsort orders them, and the projection is refreshed after every epoch
+(also before epoch 0 when H > 1024). Large layouts (H > 1024 source rows) draw
+negatives from a centered, endpoint-clamped window of effective width
+R = min(N, max(Q, 200)) around each source's rank; R = N is the global path.
+The refresh trigger is raw Q < N, so it can run while R = N. Layouts with at
+most 1024 source rows, including small transform batches, sample globally, use
+scale 1 and half-strength attraction, and ignore R and ranks.
+If the sampled direction has zero or non-finite norm, its mathematical
+degenerate-direction definition is the deterministic first unit axis; this is
+not a backend fallback.
+
+`exclude_graph_neighbors` (default false) rejects candidates in the source's
+sorted CSR row, and the source itself only for fit: large layouts drop them,
+small layouts retry with a bounded attempt count.
+`negative_sample_scale_adaptation_samples` (default 128; 0 disables) applies
+only to Adam fit with Q < N: at epochs 10, 20, ... up to half the epochs, before
+that epoch's gradient, sampled raw-Q local versus global force ratios update the
+scale. The first observation sets an anchor without changing the scale; later
+steps stay within 0.5-2x of the initial scale and change at most 1.1^0.1 per
+step. An explicit scale of 0 stays 0. Momentum and transform use the initial
+scale only. `negative_sample_scale=None` resolves `(min(Q,N)/N)^0.75` when
+adaptation is enabled and R/N when it is disabled; explicit finite nonnegative
+values are used as given on large layouts. Compatibility ignores these modern settings during layout but still
+validates and persists them. The ANN memory limit remains ANN-only, not a
+whole-fit memory budget, with no fallback. The approved performance budget is
+restricted to seed 11, two timed repetitions total (first and warm), and sort
+sizes 200k and 1M only; no 10M or larger workload is authorized. Performance
+checks passed all 52 scoped ceilings, including the complete production-loop
+per-epoch delta over 42 epochs; this does not establish full phase acceptance.
+All 182 permitted quality runs were scored: of 252 comparisons, 220 passed.
+All 99 gating comparisons passed with no fit-gating errors; 31 non-gating
+transform failures are deferred to Phase 7, and the sole frozen CUDA `curve_20k`
+classic random-initialization neighbor-preservation exception is unchanged.
+`scoped_quality_passed=true`, but the 18 user-excluded `mix_1m` runs mean
+complete and passed remain false.
+
+Modern layout admission checks future compact-graph construction and layout
+storage against uncapped available memory: combined host/runtime memory on CPU,
+separate host/device memory on CUDA. Already-owned storage is not charged again.
+Search and spectral construction retain individual allocation checks; their
+mutually exclusive conservative bounds are not summed into a whole-fit budget.
+Availability checks are snapshots, not memory reservations or whole-fit OOM guarantees.
+
+Modern coordinate kernels honor physical tensor strides, including CUDA's
+pitched rows. Their logical component count does not include row padding.
+Orders use two fixed device slots per distinct permutation, mapped host copies
+on CPU and owning pinned staging on CUDA. Execution-witness tests check actual
+CPU work and CUDA device-event intervals, not merely queued submissions.
+
+`profile_standard_stages --optimizer adam` (or `momentum`) records producer-thread
+shuffle and upload-completion spans with the `tracing` feature. These host spans
+can overlap optimizer work; do not subtract their sums from fit wall time.
+`CUBECL_DEBUG_LOG=PATH CUBECL_DEBUG_OPTION=profile` enables a separate diagnostic
+kernel profile. Profiling can perturb scheduling and is not a replacement for
+the uninstrumented cold/warm comparison campaign.
+
+The profiling examples pass `optimizer` and `init` explicitly rather than using
+the library defaults: `profile_standard_stages` defaults to `--optimizer
+compatibility` and `--init spectral`, and `profile_transform` fits with
+`Init::Random` and accepts `--optimizer compatibility|adam|momentum` (default
+`compatibility`). Pass `--optimizer adam` (and `--init auto` where supported)
+to profile the default configuration.
+
+The isolated `cuscan-common` example `umap06_radix_spike` is research only: stable
+two-bit LSD argsort with checked ping-pong buffers and three kernels per pass.
+It is separate from the `cuscan_common::radix` sort UMAP uses. Its reported
+device elapsed time includes JIT; setup and readback are reported separately.
+
+Python fitted UMAP persistence uses strict schema version 5, including the
+fit-time rescale, optimizer, graph-exclusion, adaptation and recursive initialization settings; older UMAP schemas are rejected. The independent
+HDBSCAN predictor remains schema version 1.
+
+### Intentional differences from umap-learn 0.6.0
+
+- Every neighbor search path rejects missing neighbors, including those whose
+  squared feature distance overflows float32, with
+  `fuzzy graph contains missing or invalid neighbor indices (for example, a squared feature distance overflowed float32)`.
+  Upstream instead excludes non-finite distances from rho and sigma statistics;
+  cuscan rejects even partially overflowing rows rather than returning a
+  meaningless placement.
+- Connected graphs need at least `n_components + 2` samples for spectral
+  initialization. Smaller graphs raise an actionable numerical error; use random
+  initialization. Upstream uses uniform `U(-10, 10)` initialization below the
+  `n_components + 1` threshold and a dense eigensolver at equality.
+
+Python computation and `embedding_` remain float32. `fit_transform` and
+`transform` return the input's NumPy floating dtype; integer and list inputs
+return float32, matching umap-learn 0.6.0.
 
 ```rust
 use umap::{BackendChoice, NeighborSearch, UMAP, UMAPConfig};
@@ -411,7 +630,8 @@ projected = model.transform(X_new)
   `UmapError::Memory` or `HdbscanError::Memory` and Python raises `MemoryError`.
   This is admission, not a reservation or execution fallback: concurrent
   allocations can overcommit after the check, and WSL2 can permit overcommit.
-  Fuzzy graph and layout, exact search, and transform are not budgeted by it.
+  Fuzzy graph, initialization and layout, exact search, and transform are not
+  budgeted by it.
 
   **Estimates:** `ann_host_estimate` returns `AnnEstimate`: `retained_width`
   is `min(k + 4, n - 1)`, `sample_capacity` is `min(60, n - 1)` per new/old
@@ -515,7 +735,7 @@ the selected device when `tracing` is enabled; enabling detailed tracing adds
 overhead. The benches measure complete fit and transform calls, including host
 embedding readback, with deterministic inputs prepared outside the timed loop.
 
-Compare standard UMAP with **umap-learn 0.5.12**, using CUDA only:
+Compare standard UMAP with **umap-learn 0.6.0** (`compatibility_layout=False`), using CUDA only:
 
 ```sh
 cargo build -p umap --release --features tracing --example profile_standard_cuda
@@ -754,7 +974,7 @@ fitted `HDBSCAN` estimator and does not preserve fit outputs. Install the option
 dependencies locally with `uv sync --extra serialization`, then rebuild the local
 extension with `uv run maturin develop --release`. Saving exports the already-ready
 prediction state before filesystem publication and performs no prediction or
-core preparation. Files use the shared strict schema-v1 HDF5 publisher with
+core preparation. Files use the strict predictor schema-v1 HDF5 publisher with
 atomic no-clobber publication by default; `overwrite=True` explicitly replaces
 an existing file. Publication flushes a same-directory temporary file and syncs the
 directory on POSIX; a post-commit sync failure reports uncertain durability without

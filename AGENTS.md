@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`cuscan` provides Standard (non-parametric) UMAP following umap-learn 0.5.12 semantics and HDBSCAN, with Rust facades and a Python extension. It has CUDA and CubeCL LLVM CPU execution.
+`cuscan` provides Standard (non-parametric) UMAP with recursive initialization and Adam layouts by default, plus umap-learn 0.6-style random/spectral initialization, compatibility SGD and momentum layouts, and HDBSCAN, with Rust facades and a Python extension. This is not full 0.6 feature or bit parity. It has CUDA and CubeCL LLVM CPU execution.
 
 ## Architecture & Data Flow
 
@@ -11,6 +11,41 @@
 - `cuscan-common` owns backend choice/errors, CUDA discovery and device resolution. CPU and CUDA implementations are always compiled; UMAP maps common errors locally to preserve its error contract.
 
 Trace actual consumers before documenting or changing configuration behavior.
+
+UMAP defaults to `Init::Auto` (resolves to recursive for every optimizer) and
+`Optimizer::Adam`; a default model transforms with Adam. Explicit
+`Optimizer::Compatibility` with `Init::Spectral` (Python
+`optimizer="compatibility", init="spectral"`) gives the previous defaults.
+Recursive initialization does host graph coarsening in
+`umap-core::recursive_init`; `UMAP::fit` in the facade drives it and runs the
+coarse Adam layouts on the device. `umap_core::init::initialize` is host-only:
+it accepts explicit `Random`/`Spectral` and rejects `Recursive`/`Auto` with
+`InvalidConfig`, so it errors on `UMAPConfig::default()`.
+Modern layouts use compact positive sorted CSR edge positions for negative
+hashing, source-only gradients and separate ordered steps, including arbitrary
+embedding dimensions. Transform references are immutable even when H=N. Raw Q =
+`negative_selection_range` < N enables per-epoch projection refresh; large layouts
+(H>1024) use windows of effective R=min(N,max(Q,200)) (R=N is global), while
+adaptation uses raw Q. Small source layouts (H<=1024) sample globally with unit
+scale. Adaptation (default 128 samples, 0 disables) is Adam-fit-only, anchored
+and applied before the gradient; explicit scale 0 is absorbing; momentum and
+transform use the initial scale; automatic scale is R/N when adaptation is
+disabled. `exclude_graph_neighbors` (default false) excludes CSR neighbors (and
+self for fit only). UMAP persistence is strict schema v5; HDBSCAN predictor
+persistence remains v1.
+Modern coordinate kernels use each tensor's physical row and column strides;
+CUDA uploads can be pitched (for example, 48 logical components need not have
+a row stride of 48). Logical element counts must not index physical padding.
+
+Approximate transform uses corrected bounded-frontier retention on the stored
+forward graph; reverse edges and a larger default queue were not adopted. CUDA
+packs 32 query lanes with slot-major scratch; CPU retains per-query geometry.
+Transform pruning uses its actual epoch count, including counts at most 10,
+unlike fit's short-epoch rule. D8 copies the embedding of the smallest training
+ID with raw coalesced membership exactly 1.0; a required copy without a valid ID
+returns a typed numerical error. Exact-search transform outputs can change too.
+These changes do not alter the public API or v5
+schema.
 
 HDBSCAN `approximate_predict` CPU KD queries use the C16 leaf-SoA candidate scan in
 input query order, including cold prediction-core batches. CUDA queries retain the

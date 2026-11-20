@@ -1,8 +1,24 @@
-use umap_core::{Init, UMAPConfig, UmapError, initialize};
+use umap_core::{Init, Optimizer, UMAPConfig, UmapError, initialize};
+
+#[test]
+fn default_config_requires_fit_driver() {
+    let data = vec![vec![0.0], vec![1.0], vec![2.0]];
+    let result = initialize(
+        &data,
+        &[0, 1],
+        &[1, 2],
+        &[1.0, 1.0],
+        &UMAPConfig::default(),
+        7,
+    );
+    assert!(matches!(result, Err(UmapError::InvalidConfig(message))
+        if message == "recursive initialization requires the fit layout driver"));
+}
 
 fn spectral_config(dimensions: usize) -> UMAPConfig {
     UMAPConfig {
         init: Init::Spectral,
+        optimizer: Optimizer::Compatibility,
         n_components: dimensions,
         ..UMAPConfig::default()
     }
@@ -88,9 +104,10 @@ fn connected_three_path_matches_analytic_nontrivial_spectral_shape() {
     let [left, middle, right] = embedding.as_slice() else {
         panic!("expected three scalar coordinates");
     };
-    assert!((*left + *right - 10.0).abs() < 1.0e-3);
-    assert!(((*left - *middle).abs() - 5.0).abs() < 1.0e-3);
-    assert!(((*right - *middle).abs() - 5.0).abs() < 1.0e-3);
+    let half = (3.0_f32.log10() * 3.0) / 1.8;
+    assert!((*left + *middle + *right).abs() < 1.0e-5);
+    assert!(((*left - *middle).abs() - half).abs() < 2.0e-3);
+    assert!(((*right - *middle).abs() - half).abs() < 2.0e-3);
 }
 
 #[test]
@@ -186,9 +203,8 @@ fn dense_cutoff_and_large_dimension_sparse_boundary_initialize() {
         if (n, dimensions) == (64, 2) {
             for dim in 0..2 {
                 let values = (0..n).map(|row| embedding[row * 2 + dim]);
-                assert!(values.clone().fold(f32::INFINITY, f32::min).abs() < 1.0e-6);
-                assert!((values.clone().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
-                let variance = values.map(|value| (value - 5.0).powi(2)).sum::<f32>();
+                assert!(values.clone().sum::<f32>().abs() < 1.0e-4);
+                let variance = values.map(|value| value.powi(2)).sum::<f32>();
                 assert!(variance > 1.0);
             }
         }
@@ -206,6 +222,7 @@ fn random_initialization_is_seeded_and_reference_scaled() {
     let data = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]];
     let config = UMAPConfig {
         init: Init::Random,
+        optimizer: Optimizer::Compatibility,
         n_components: 3,
         ..UMAPConfig::default()
     };
@@ -215,11 +232,9 @@ fn random_initialization_is_seeded_and_reference_scaled() {
     assert_eq!(first, repeated);
     assert_ne!(first, different);
     for dim in 0..3 {
-        let values = (0..4).map(|row| first[row * 3 + dim]);
-        let min = values.clone().fold(f32::INFINITY, f32::min);
-        let max = values.fold(f32::NEG_INFINITY, f32::max);
-        assert!(min.abs() < 1.0e-6);
-        assert!((max - 10.0).abs() < 1.0e-6);
+        let mut values = (0..4).map(|row| first[row * 3 + dim]);
+        assert!(values.clone().sum::<f32>().abs() < 1.0e-5);
+        assert!(values.all(|value| value.is_finite()));
     }
 }
 
@@ -244,11 +259,7 @@ fn disconnected_components_use_signed_axis_centers_and_seeded_local_layouts() {
     let repeated = initialize(&data, &[0, 1, 3, 4], &[1, 2, 4, 5], &[1.0; 4], &config, 22).unwrap();
     assert_eq!(first, repeated);
     assert_eq!(first.len(), data.len() * 2);
-    assert!(
-        first
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
-    );
+    assert!(first.iter().all(|value| value.is_finite()));
     let left_center = (0..3).map(|row| first[row * 2]).sum::<f32>() / 3.0;
     let right_center = (3..6).map(|row| first[row * 2]).sum::<f32>() / 3.0;
     assert!((left_center - right_center).abs() > 1.0);
@@ -283,15 +294,10 @@ fn many_components_use_matrix_free_centroid_affinity_layout() {
     let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(2), 91)
         .expect("matrix-free complete centroid affinity and per-component spectral layouts");
     assert_eq!(embedding.len(), 40);
-    assert!(
-        embedding
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
-    );
+    assert!(embedding.iter().all(|value| value.is_finite()));
     for dim in 0..2 {
         let values = (0..20).map(|row| embedding[row * 2 + dim]);
-        assert!(values.clone().fold(f32::INFINITY, f32::min).abs() < 1.0e-6);
-        assert!((values.fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
+        assert!(values.sum::<f32>().abs() < 1.0e-4);
     }
 }
 
@@ -386,20 +392,8 @@ fn partially_underflowed_centroid_affinity_is_accepted() {
     let embedding = initialize(&data, &heads, &tails, &weights, &spectral_config(1), 91)
         .expect("partial underflow keeps the centroid operator connected");
     assert_eq!(embedding.len(), 20);
-    assert!(
-        embedding
-            .iter()
-            .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
-    );
-    assert!(
-        embedding
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min)
-            .abs()
-            < 1.0e-6
-    );
-    assert!((embedding.iter().copied().fold(f32::NEG_INFINITY, f32::max) - 10.0).abs() < 1.0e-6);
+    assert!(embedding.iter().all(|value| value.is_finite()));
+    assert!(embedding.iter().sum::<f32>().abs() < 1.0e-4);
 }
 
 #[test]
@@ -425,6 +419,53 @@ fn one_sample_reference_zero_span_is_explicitly_zero() {
     }
     let embedding = initialize(&[vec![3.0, -2.0]], &[], &[], &[], &spectral_config(2), 4).unwrap();
     assert_eq!(embedding, vec![0.0, 0.0]);
+}
+
+#[test]
+fn connected_tiny_graph_spectral_boundaries() {
+    for (n, dimensions, succeeds) in [
+        (2, 1, false),
+        (3, 2, false),
+        (4, 3, false),
+        (3, 3, false),
+        (2, 2, false),
+        (3, 1, true),
+        (4, 2, true),
+        (5, 3, true),
+    ] {
+        if isolated_spectral_case(
+            "connected_tiny_graph_spectral_boundaries",
+            &format!("{n}-{dimensions}"),
+        ) {
+            continue;
+        }
+        let data = (0..n).map(|i| vec![i as f32]).collect::<Vec<_>>();
+        let mut heads = Vec::new();
+        let mut tails = Vec::new();
+        for i in 0..n {
+            for j in i + 1..n {
+                heads.push(i);
+                tails.push(j);
+            }
+        }
+        let weights = vec![1.0; heads.len()];
+        let result = initialize(
+            &data,
+            &heads,
+            &tails,
+            &weights,
+            &spectral_config(dimensions),
+            1,
+        );
+        if succeeds {
+            let embedding = result.expect("boundary graph should initialize");
+            assert_eq!(embedding.len(), n * dimensions);
+            assert!(embedding.iter().all(|value| value.is_finite()));
+        } else {
+            assert!(matches!(result, Err(UmapError::Numerical(message))
+                if message.contains("cannot provide") && message.contains("n_components + 2")));
+        }
+    }
 }
 
 #[test]
@@ -455,10 +496,54 @@ fn malformed_graphs_and_unavailable_spectral_modes_are_errors() {
     ));
     assert!(matches!(
         initialize(&data, &[0, 1], &[1, 2], &[1.0, 1.0], &spectral_config(3), 1),
-        Err(UmapError::Numerical(_))
+        Err(UmapError::Numerical(message)) if message.contains("cannot provide") && message.contains("n_components + 2")
     ));
     assert!(matches!(
         initialize(&data, &[0, 1], &[1, 2], &[1.0, 1.0], &spectral_config(2), 1),
-        Err(UmapError::Numerical(_))
+        Err(UmapError::Numerical(message)) if message.contains("cannot provide") && message.contains("n_components + 2")
     ));
+}
+
+#[test]
+fn random_modes_validate_edges_and_factors_before_initialization() {
+    use umap_core::InitRescale;
+    let data = vec![vec![0.0], vec![1.0], vec![2.0]];
+    for mode in [
+        InitRescale::Isotropic,
+        InitRescale::PerAxis,
+        InitRescale::GraphEdge,
+    ] {
+        let mut config = UMAPConfig {
+            init: Init::Random,
+            optimizer: Optimizer::Compatibility,
+            init_rescale: mode,
+            ..UMAPConfig::default()
+        };
+        for factor in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            config.init_scale_factor = factor;
+            assert!(matches!(
+                initialize(&data, &[], &[], &[], &config, 1),
+                Err(UmapError::InvalidConfig(_))
+            ));
+        }
+        config.init_scale_factor = 1.0;
+        for (heads, tails, weights) in [
+            (vec![0], vec![], vec![1.0]),
+            (vec![0], vec![3], vec![1.0]),
+            (vec![1], vec![1], vec![1.0]),
+            (vec![0], vec![1], vec![0.0]),
+            (vec![0], vec![1], vec![-1.0]),
+            (vec![0], vec![1], vec![f32::NAN]),
+            (vec![0], vec![1], vec![f32::INFINITY]),
+        ] {
+            assert!(matches!(
+                initialize(&data, &heads, &tails, &weights, &config, 1),
+                Err(UmapError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            initialize(&data[..1], &[0], &[1], &[1.0], &config, 1),
+            Err(UmapError::InvalidInput(_))
+        ));
+    }
 }

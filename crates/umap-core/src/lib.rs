@@ -3,12 +3,16 @@
 
 mod config;
 pub mod init;
+mod init_rescale;
+pub mod modern_layout;
 pub mod query;
+pub mod recursive_init;
 mod state;
 
 pub use config::{
-    FitNeighborWidths, Init, NeighborSearch, QueryBudget, UMAPConfig, approximate_query_budget,
-    fit_curve, fit_neighbor_widths, query_neighbor_width, validate_input, validate_search_settings,
+    FitNeighborWidths, HubSelection, Init, InitRescale, NeighborSearch, Optimizer, QueryBudget,
+    RecursiveInitConfig, UMAPConfig, approximate_query_budget, fit_curve, fit_neighbor_widths,
+    query_neighbor_width, validate_input, validate_search_settings,
 };
 pub use init::initialize;
 pub use state::ModelState;

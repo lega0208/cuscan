@@ -9,6 +9,11 @@ class FittedUMAP:
     @property
     def embedding(self) -> NDArray[np.float32]: ...
     def transform(self, x: NDArray[np.float32]) -> NDArray[np.float32]: ...
+    # These diagnostic methods are available only in tracing builds.
+    def _timed_transform(self, x: NDArray[np.float32]) -> tuple[NDArray[np.float32], int, int]: ...
+    def _diagnostic_transform(
+        self, x: NDArray[np.float32]
+    ) -> tuple[NDArray[np.float32], NDArray[np.int32]]: ...
     def export_state(self) -> tuple[dict[str, NDArray[np.generic] | None], dict[str, object]]: ...
 
 class FittedHDBSCAN:
@@ -120,7 +125,7 @@ def fit_umap(
     learning_rate: float = 1.0,
     negative_sample_rate: int = 5,
     repulsion_strength: float = 1.0,
-    init: Literal["spectral", "random"] = "spectral",
+    init: Literal["spectral", "random", "recursive", "auto"] = "auto",
     random_state: int | None = None,
     transform_seed: int = 42,
     transform_queue_size: float = 4.0,
@@ -129,6 +134,18 @@ def fit_umap(
     neighbor_search: Literal["auto", "exact", "approximate"] = "auto",
     unique: bool = False,
     memory_limit_bytes: int | None = None,
+    init_rescale: Literal["isotropic", "per_axis", "graph_edge"] = "isotropic",
+    init_scale_factor: float = 1.0,
+    optimizer: Literal["compatibility", "adam", "momentum"] = "adam",
+    negative_selection_range: int = 200_000,
+    negative_sample_scale: float | None = None,
+    exclude_graph_neighbors: bool = False,
+    negative_sample_scale_adaptation_samples: int = 128,
+    recursive_coarsening_ratio: int = 4,
+    recursive_base_init_threshold: int = 1024,
+    recursive_n_embedding_epochs: int = 50,
+    recursive_hub_selection: Literal["degree", "diverse", "random"] = "degree",
+    recursive_anchor_sample_size: int = 16384,
 ) -> FittedUMAP: ...
 def load(
     arrays: dict[str, NDArray[np.generic] | None],

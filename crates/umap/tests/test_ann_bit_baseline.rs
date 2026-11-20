@@ -245,6 +245,7 @@ fn ann_neighbors(
 fn fitted_embedding_bits(backend: BackendChoice, rows: &[Vec<f32>]) -> Vec<u32> {
     let config = UMAPConfig {
         n_components: EMBEDDING_DIMS,
+        optimizer: umap::Optimizer::Compatibility,
         n_neighbors: N_NEIGHBORS,
         n_epochs: Some(FIT_EPOCHS),
         init: Init::Random,

@@ -1,5 +1,5 @@
 use std::time::Instant;
-use umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
+use umap::{BackendChoice, Init, NeighborSearch, Optimizer, UMAP, UMAPConfig};
 
 const SIZES: [usize; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
 const FEATURES: usize = 64;
@@ -22,6 +22,7 @@ fn measure(backend: BackendChoice, data: &[Vec<f32>], search: NeighborSearch) ->
         n_neighbors: 15,
         n_components: 2,
         init: Init::Random,
+        optimizer: Optimizer::Compatibility,
         n_epochs: Some(5),
         random_state: Some(47),
         ..UMAPConfig::default()

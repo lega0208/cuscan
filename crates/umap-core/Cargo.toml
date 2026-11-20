@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 faer = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]

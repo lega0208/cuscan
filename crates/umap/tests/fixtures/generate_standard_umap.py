@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate frozen numerical, optimizer, and quality references from umap-learn 0.5.12."""
+"""Generate frozen numerical, optimizer, and quality references from umap-learn 0.6.0."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ from sklearn.manifold import trustworthiness
 from umap import layouts
 from umap.umap_ import compute_membership_strengths, make_epochs_per_sample, smooth_knn_dist
 
-REFERENCE_VERSION = "0.5.12"
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from comparison.umap_reference import reference_kwargs, require_reference  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 REFERENCE_JSON = HERE / "standard_umap_reference.json"
 QUALITY_NPZ = HERE / "standard_umap_quality.npz"
@@ -167,6 +172,7 @@ def optimizer_probe(
                 verbose=False,
                 tqdm_kwds={"disable": True},
                 move_other=move_other,
+                optimizer="compatibility",
             )
         return records, head_array, tail_array, rng_state
 
@@ -273,7 +279,7 @@ def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray], dict[
                 learning_rate=1.0,
                 negative_sample_rate=5,
                 repulsion_strength=1.0,
-                init="spectral",
+                **reference_kwargs(optimizer="compatibility", init="spectral"),
                 random_state=seed,
                 transform_seed=seed,
                 metric="euclidean",
@@ -310,7 +316,7 @@ def run_quality_cases() -> tuple[dict[str, object], dict[str, np.ndarray], dict[
         learning_rate=1.0,
         negative_sample_rate=5,
         repulsion_strength=1.0,
-        init="spectral",
+        **reference_kwargs(optimizer="compatibility", init="spectral"),
         random_state=11,
         transform_seed=11,
         metric="euclidean",
@@ -385,9 +391,8 @@ def exact_trustworthiness_bounded(original: np.ndarray, embedded: np.ndarray, k:
 def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> None:
     import umap
 
+    require_reference()
     actual_version = version("umap-learn")
-    if actual_version != REFERENCE_VERSION:
-        raise RuntimeError(f"expected umap-learn {REFERENCE_VERSION}, found {actual_version}")
     expected_values = 16384 * 16
     raw = input_path.read_bytes()
     if len(raw) != expected_values * 4:
@@ -410,7 +415,7 @@ def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> 
             learning_rate=1.0,
             negative_sample_rate=5,
             repulsion_strength=1.0,
-            init="spectral",
+            **reference_kwargs(optimizer="compatibility", init="spectral"),
             random_state=seed,
             transform_seed=seed,
             metric="euclidean",
@@ -442,6 +447,7 @@ def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> 
             "scipy": scipy.__version__,
             "scikit_learn": version("scikit-learn"),
             "numba": version("numba"),
+            "pynndescent": version("pynndescent"),
             "platform": platform.platform(),
             "machine": platform.machine(),
             "processor": platform.processor(),
@@ -492,8 +498,58 @@ def run_campaign(input_path: Path, reference_path: Path, quality_path: Path) -> 
     np.savez_compressed(quality_path, **arrays)
 
 
+def init_rescale_oracle() -> dict[str, object]:
+    import umap.umap_ as source
+
+    require_reference()
+    coordinates = np.array([[0, 4], [2, 4], [3, 8], [9, 20]], dtype=np.float32)
+    graph = coo_matrix(
+        (
+            np.array([1, 3, 2, 1, 4], dtype=np.float32),
+            (np.array([2, 0, 0, 1, 3]), np.array([3, 2, 1, 0, 2])),
+        ),
+        shape=(4, 4),
+    ).tocsr()
+    graph.sum_duplicates()
+    graph.sort_indices()
+    graph.eliminate_zeros()
+    coo = graph.tocoo()
+    return {
+        "version": version("umap-learn"),
+        "source_sha256": hashlib.sha256(Path(source.__file__).read_bytes()).hexdigest(),
+        "coordinates": coordinates.tolist(),
+        "repulsion_strength": 1.0,
+        "init_scale_factor": 1.25,
+        "heads": coo.row.tolist(),
+        "tails": coo.col.tolist(),
+        "weights": coo.data.tolist(),
+        "fuzzy_graph": source_graph(
+            {
+                "n": 4,
+                "k": 5,
+                "local_connectivity": 1.0,
+                "bandwidth": 1.0,
+                "set_op_mix_ratio": 1.0,
+                "indices": [0, 3, 1, 3, 2, 1, 3, 0, 2, 0, 2, 0, 3, 0, 1, 3, 2, 1, 0, 2],
+                "distances": [0.0, 1.0, 1.0, 2.0, 3.0] * 4,
+            }
+        ),
+        "outputs": {
+            mode: source._rescale_embedding(
+                coordinates, 4, 1.0, method=mode, scale_factor=1.25, graph=graph
+            ).tolist()
+            for mode in ("isotropic", "per_axis", "graph_edge")
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--init-rescale-only",
+        action="store_true",
+        help="update only the isolated modern initialization oracle section",
+    )
     parser.add_argument(
         "--quality-only",
         action="store_true",
@@ -508,6 +564,19 @@ def main() -> None:
     parser.add_argument("--output-reference", type=Path, help="campaign reference JSON output")
     parser.add_argument("--output-quality", type=Path, help="campaign quality NPZ output")
     args = parser.parse_args()
+    if args.init_rescale_only:
+        if (
+            args.campaign
+            or args.quality_only
+            or any((args.input, args.output_reference, args.output_quality))
+        ):
+            parser.error("--init-rescale-only cannot be combined with other generation modes")
+        result = json.loads(REFERENCE_JSON.read_text(encoding="utf-8"))
+        result["init_rescale"] = init_rescale_oracle()
+        REFERENCE_JSON.write_text(
+            json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        return
     if args.campaign:
         if not all((args.input, args.output_reference, args.output_quality)):
             parser.error("--campaign requires --input, --output-reference, and --output-quality")
@@ -521,9 +590,8 @@ def main() -> None:
         return
     if any((args.input, args.output_reference, args.output_quality)):
         parser.error("campaign input/output controls require --campaign")
+    require_reference()
     actual_version = version("umap-learn")
-    if actual_version != REFERENCE_VERSION:
-        raise RuntimeError(f"expected umap-learn {REFERENCE_VERSION}, found {actual_version}")
     scores, quality_arrays, long_run = run_quality_cases()
     if args.quality_only:
         result = json.loads(REFERENCE_JSON.read_text(encoding="utf-8"))
@@ -614,6 +682,7 @@ def main() -> None:
             "scipy": scipy.__version__,
             "scikit_learn": version("scikit-learn"),
             "numba": version("numba"),
+            "pynndescent": version("pynndescent"),
             "platform": platform.platform(),
             "machine": platform.machine(),
             "processor": platform.processor(),
@@ -653,12 +722,14 @@ def main() -> None:
         "graph_cases": graph_cases,
         "source_basis": {
             "graph": (
-                "umap.umap_.smooth_knn_dist and compute_membership_strengths; "
+                "umap-learn 0.6.0 umap.umap_.smooth_knn_dist and compute_membership_strengths "
+                "use fastmath flags nsz, arcp, contract, afn, reassoc; "
                 "fuzzy set operation follows UMAP's sparse union/intersection expression."
             ),
             "positive_schedule": "umap.umap_.make_epochs_per_sample",
             "optimizer": (
-                "umap.layouts.optimize_layout_euclidean with the installed "
+                "umap-learn 0.6.0 umap.layouts.optimize_layout_euclidean with the "
+                "compatibility optimizer (fastmath flags nsz, afn, reassoc) and the installed "
                 "_get_optimize_layout_euclidean_single_epoch_fn wrapped to record states "
                 "after each epoch and ordered event prefix."
             ),

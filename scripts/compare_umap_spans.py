@@ -1,5 +1,5 @@
-#!/usr/bin/env -S uv run --script
-"""Stage-1 benchmark suite: umap-learn 0.5.12 (parallel) vs cuscan CUDA standard UMAP.
+#!/usr/bin/env -S uv run --no-sync python
+"""Stage-1 benchmark suite: umap-learn 0.6.0 (parallel) vs cuscan CUDA standard UMAP.
 
 Run from the repository root with ``uv run --no-sync python scripts/compare_umap_spans.py``.
 Build the companion first (build time is excluded from the runtime budget):
@@ -36,6 +36,7 @@ import csv
 import ctypes
 import datetime
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -53,6 +54,14 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+_umap_reference = importlib.import_module("comparison.umap_reference")
+REFERENCE_VERSION = _umap_reference.REFERENCE_VERSION
+reference_kwargs = _umap_reference.reference_kwargs
+require_reference = _umap_reference.require_reference
+
 DEFAULT_BINARY = ROOT / "target" / "release" / "examples" / "profile_standard_cuda"
 PRIMARY = (5000, 32, 20)
 SMALL = ((512, 16, 30), (1024, 32, 100))
@@ -918,8 +927,7 @@ def _stage2_reference_fit(matrix: Any, mode: str, seed: int, epochs: int, neighb
     from pynndescent import NNDescent
     from sklearn.neighbors import NearestNeighbors
 
-    if umap.__version__ != "0.5.12":
-        raise ValueError(f"Stage2 requires umap-learn 0.5.12, got {umap.__version__}")
+    require_reference()
     n_neighbors = neighbors
     index = NNDescent(matrix, n_neighbors=n_neighbors, metric="euclidean", random_state=seed)
     if mode == "exact":
@@ -933,7 +941,7 @@ def _stage2_reference_fit(matrix: Any, mode: str, seed: int, epochs: int, neighb
         n_neighbors=n_neighbors,
         n_components=2,
         n_epochs=epochs,
-        init="spectral",
+        **reference_kwargs(optimizer="compatibility", init="spectral"),
         min_dist=0.0,
         random_state=seed,
         transform_seed=seed,
@@ -1117,9 +1125,16 @@ def _stage2_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "transform": [],
         "reference": {
             "package": "umap-learn",
-            "version": "0.5.12",
+            "version": REFERENCE_VERSION,
             "index": "pynndescent.NNDescent",
             "index_version": __import__("pynndescent").__version__,
+            "compatibility_layout": False,
+            "optimizer": "compatibility",
+            "nearest_neighbor_backend": "precomputed NNDescent"
+            if mode == "exact"
+            else "pynndescent",
+            "nearest_neighbor_backend_pin": "pynndescent",
+            "precomputed_index_role": "transform search" if mode == "exact" else None,
             "mode": mode,
             "random_state": seed,
             "transform_seed": seed,
@@ -1736,8 +1751,7 @@ def _python_worker(
     import umap
     from sklearn.neighbors import NearestNeighbors
 
-    if umap.__version__ != "0.5.12":
-        raise ValueError("This harness requires umap-learn 0.5.12")
+    require_reference()
     matrix = np.fromfile(input_path, dtype="<f4").reshape(rows, features)
 
     def fit_once() -> Any:
@@ -1750,7 +1764,7 @@ def _python_worker(
             n_neighbors=NEIGHBORS,
             n_components=2,
             n_epochs=epochs,
-            init="random",
+            **reference_kwargs(optimizer="compatibility", init="random"),
             min_dist=0.0,
             random_state=None,
             metric="euclidean",
@@ -1776,6 +1790,13 @@ def _python_worker(
         "numba_threads": numba.get_num_threads(),
         "cpu_count": os.cpu_count(),
         "config": {
+            "compatibility_layout": False,
+            "optimizer": "compatibility",
+            "init": "random",
+            "nearest_neighbor_backend": "precomputed exact neighbors"
+            if mode == "exact"
+            else "pynndescent",
+            "nearest_neighbor_backend_pin": "pynndescent",
             "random_state": None,
             "n_jobs": -1,
             "min_dist": 0.0,

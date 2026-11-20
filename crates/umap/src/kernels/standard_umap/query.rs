@@ -12,7 +12,29 @@ use umap_core::query::{
     approximate_query_scratch_layout, query_chunk_rows, query_output_allocation,
 };
 
-const QUERY_CUBE_DIM: CubeDim = CubeDim::new_1d(1);
+const QUERY_CUDA_WIDTH: u32 = 32;
+
+fn query_cuda_chunk_geometry(
+    rows: u32,
+    max_cube_dim_x: u32,
+    max_units_per_cube: u32,
+    max_cube_count: u32,
+) -> (CubeCount, CubeDim) {
+    assert!(rows > 0, "query chunk row count must be nonzero");
+    assert!(
+        QUERY_CUDA_WIDTH <= max_cube_dim_x && QUERY_CUDA_WIDTH <= max_units_per_cube,
+        "query CUDA width exceeds hardware limits"
+    );
+    let count = rows.div_ceil(QUERY_CUDA_WIDTH);
+    assert!(
+        count <= max_cube_count,
+        "query chunk requires x cube count {count}; maximum is {max_cube_count}"
+    );
+    (
+        CubeCount::Static(count, 1, 1),
+        CubeDim::new_1d(QUERY_CUDA_WIDTH),
+    )
+}
 
 fn query_cpu_chunk_geometry(
     rows: u32,
@@ -76,6 +98,7 @@ fn approximate_query_kernel<F: Float, I: Int>(
     query_offset: u32,
     row_start: u32,
     chunk_rows: u32,
+    #[comptime] slot_major: bool,
     invalid_flag: ComptimeOption<&Tensor<I>>,
     #[comptime] checked: bool,
     candidate_ids: &mut Tensor<I>,
@@ -102,16 +125,21 @@ fn approximate_query_kernel<F: Float, I: Int>(
         if checked {
             invalid_graph = i32::cast_from(invalid_flag.unwrap()[0]) != 0;
         }
-        let candidate_base = local_row * c;
-        let seen_base = local_row * v;
+        // Each lane owns a logical scratch row; packed CUDA lanes interleave its slots.
+        let candidate_base = if slot_major { local_row } else { local_row * c };
+        let seen_base = if slot_major { local_row } else { local_row * v };
+        let mut slot_stride = 1usize;
+        if slot_major {
+            slot_stride = chunk_rows as usize;
+        }
         for slot in 0..c {
-            candidate_ids[candidate_base + slot] = I::cast_from(-1i32);
-            candidate_distances[candidate_base + slot] = F::new(3.402_823_5e38_f32);
-            candidate_expanded[candidate_base + slot] = I::cast_from(0u32);
+            candidate_ids[candidate_base + slot * slot_stride] = I::cast_from(-1i32);
+            candidate_distances[candidate_base + slot * slot_stride] = F::new(3.402_823_5e38_f32);
+            candidate_expanded[candidate_base + slot * slot_stride] = I::cast_from(0u32);
         }
         for slot in 0..v {
-            seen_ids[seen_base + slot] = I::cast_from(-1i32);
-            seen_distances[seen_base + slot] = F::new(3.402_823_5e38_f32);
+            seen_ids[seen_base + slot * slot_stride] = I::cast_from(-1i32);
+            seen_distances[seen_base + slot * slot_stride] = F::new(3.402_823_5e38_f32);
         }
         let n_u32 = reference_rows as u32;
         let query_key = (query_offset + row as u32) % n_u32;
@@ -135,7 +163,7 @@ fn approximate_query_kernel<F: Float, I: Int>(
             let draw = (rng_state - 1i32) as u32 % (j as u32 + 1u32);
             let mut collision = false;
             for previous in 0..slot {
-                if u32::cast_from(candidate_ids[candidate_base + previous]) == draw {
+                if u32::cast_from(candidate_ids[candidate_base + previous * slot_stride]) == draw {
                     collision = true;
                 }
             }
@@ -146,11 +174,11 @@ fn approximate_query_kernel<F: Float, I: Int>(
                     - reference[start as usize * features + feature];
                 distance += difference * difference;
             }
-            candidate_ids[candidate_base + slot] = I::cast_from(start);
-            candidate_distances[candidate_base + slot] = distance;
-            seen_ids[seen_base + slot] = I::cast_from(start);
-            seen_distances[seen_base + slot] = distance;
-            candidate_expanded[candidate_base + slot] = I::cast_from(0u32);
+            candidate_ids[candidate_base + slot * slot_stride] = I::cast_from(start);
+            candidate_distances[candidate_base + slot * slot_stride] = distance;
+            seen_ids[seen_base + slot * slot_stride] = I::cast_from(start);
+            seen_distances[seen_base + slot * slot_stride] = distance;
+            candidate_expanded[candidate_base + slot * slot_stride] = I::cast_from(0u32);
         }
         let mut evaluated = c;
         let mut peak_queue = c;
@@ -162,11 +190,12 @@ fn approximate_query_kernel<F: Float, I: Int>(
                 let mut best_distance = F::new(3.402_823_5e38_f32);
                 for slot in 0..c {
                     let candidate_id =
-                        u32::cast_from(candidate_ids[candidate_base + slot]) as usize;
+                        u32::cast_from(candidate_ids[candidate_base + slot * slot_stride]) as usize;
                     if candidate_id < reference_rows
-                        && candidate_expanded[candidate_base + slot] == I::cast_from(0u32)
+                        && candidate_expanded[candidate_base + slot * slot_stride]
+                            == I::cast_from(0u32)
                     {
-                        let distance = candidate_distances[candidate_base + slot];
+                        let distance = candidate_distances[candidate_base + slot * slot_stride];
                         if best_slot == c
                             || distance < best_distance
                             || (distance == best_distance && candidate_id < best_id)
@@ -180,7 +209,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
                 if best_slot == c {
                     searching = false;
                 } else {
-                    candidate_expanded[candidate_base + best_slot] = I::cast_from(1u32);
+                    candidate_expanded[candidate_base + best_slot * slot_stride] =
+                        I::cast_from(1u32);
                     for edge_slot in 0..graph_width {
                         if evaluated < v {
                             let raw_id = i32::cast_from(graph[best_id * graph_width + edge_slot]);
@@ -188,7 +218,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
                                 let neighbor = raw_id as usize;
                                 let mut already_seen = false;
                                 for seen_slot in 0..evaluated {
-                                    if u32::cast_from(seen_ids[seen_base + seen_slot]) as usize
+                                    if u32::cast_from(seen_ids[seen_base + seen_slot * slot_stride])
+                                        as usize
                                         == neighbor
                                     {
                                         already_seen = true;
@@ -201,8 +232,9 @@ fn approximate_query_kernel<F: Float, I: Int>(
                                             - reference[neighbor * features + feature];
                                         distance += difference * difference;
                                     }
-                                    seen_ids[seen_base + evaluated] = I::cast_from(neighbor);
-                                    seen_distances[seen_base + evaluated] = distance;
+                                    seen_ids[seen_base + evaluated * slot_stride] =
+                                        I::cast_from(neighbor);
+                                    seen_distances[seen_base + evaluated * slot_stride] = distance;
                                     evaluated += 1;
                                     let mut insertion = c;
                                     let mut worst_slot = c;
@@ -210,19 +242,18 @@ fn approximate_query_kernel<F: Float, I: Int>(
                                     let mut worst_id = 0usize;
                                     let mut active_count = 0usize;
                                     for slot in 0..c {
-                                        let queued =
-                                            u32::cast_from(candidate_ids[candidate_base + slot])
-                                                as usize;
+                                        let queued = u32::cast_from(
+                                            candidate_ids[candidate_base + slot * slot_stride],
+                                        )
+                                            as usize;
                                         if queued < reference_rows
-                                            && candidate_expanded[candidate_base + slot]
+                                            && candidate_expanded
+                                                [candidate_base + slot * slot_stride]
                                                 == I::cast_from(0u32)
                                         {
                                             active_count += 1;
-                                            if insertion == c {
-                                                insertion = slot;
-                                            }
-                                            let queued_distance =
-                                                candidate_distances[candidate_base + slot];
+                                            let queued_distance = candidate_distances
+                                                [candidate_base + slot * slot_stride];
                                             if worst_slot == c
                                                 || queued_distance > worst_distance
                                                 || (queued_distance == worst_distance
@@ -244,10 +275,12 @@ fn approximate_query_kernel<F: Float, I: Int>(
                                         insertion = worst_slot;
                                     }
                                     if insertion < c {
-                                        candidate_ids[candidate_base + insertion] =
+                                        candidate_ids[candidate_base + insertion * slot_stride] =
                                             I::cast_from(neighbor);
-                                        candidate_distances[candidate_base + insertion] = distance;
-                                        candidate_expanded[candidate_base + insertion] =
+                                        candidate_distances
+                                            [candidate_base + insertion * slot_stride] = distance;
+                                        candidate_expanded
+                                            [candidate_base + insertion * slot_stride] =
                                             I::cast_from(0u32);
                                     }
                                     let retained = if active_count < c {
@@ -270,8 +303,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
             let mut best_id = reference_rows;
             let mut best_distance = F::new(3.402_823_5e38_f32);
             for seen_slot in 0..evaluated {
-                let id = u32::cast_from(seen_ids[seen_base + seen_slot]) as usize;
-                let distance = seen_distances[seen_base + seen_slot];
+                let id = u32::cast_from(seen_ids[seen_base + seen_slot * slot_stride]) as usize;
+                let distance = seen_distances[seen_base + seen_slot * slot_stride];
                 if id < reference_rows
                     && (best == v
                         || distance < best_distance
@@ -284,12 +317,19 @@ fn approximate_query_kernel<F: Float, I: Int>(
             }
             let output = row * k_usize + output_slot;
             if best < v {
-                output_indices[output] = I::cast_from(best_id);
-                output_distances[output] = F::sqrt(best_distance);
-                seen_ids[seen_base + best] = I::cast_from(reference_rows);
+                if best_distance > F::new(3.402_823_5e38_f32) {
+                    // Sentinel preserves the finite-distance precondition of smooth_row.
+                    output_indices[output] = I::cast_from(reference_rows);
+                    output_distances[output] = F::sqrt(F::new(3.402_823_5e38_f32));
+                } else {
+                    output_indices[output] = I::cast_from(best_id);
+                    output_distances[output] = F::sqrt(best_distance);
+                }
+                seen_ids[seen_base + best * slot_stride] = I::cast_from(reference_rows);
             } else {
-                output_indices[output] = I::cast_from(-1i32);
-                output_distances[output] = F::new(3.402_823_5e38_f32);
+                // Unreachable with candidate_capacity >= k; overflow uses the sentinel above.
+                output_indices[output] = I::cast_from(reference_rows);
+                output_distances[output] = F::sqrt(F::new(3.402_823_5e38_f32));
             }
         }
         stats[row * 2] = I::cast_from(if invalid_graph {
@@ -305,6 +345,8 @@ fn approximate_query_kernel<F: Float, I: Int>(
     }
 }
 
+/// Returns finite unsquared distances. An unrepresentable neighbor is encoded
+/// as `(reference_rows, sqrt(f32::MAX))` and rejected by the fuzzy graph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn approximate_query(
     query: FloatTensor<CubeBackend>,
@@ -568,12 +610,13 @@ fn approximate_query_impl(
                 hardware.max_cube_count.0,
             )
         } else {
-            assert!(
-                rows_u32 <= client.properties().hardware.max_cube_count.0,
-                "query chunk requires x cube count {rows_u32}; maximum is {}",
-                client.properties().hardware.max_cube_count.0
-            );
-            (CubeCount::Static(rows_u32, 1, 1), QUERY_CUBE_DIM)
+            let hardware = &client.properties().hardware;
+            query_cuda_chunk_geometry(
+                rows_u32,
+                hardware.max_cube_dim.0,
+                hardware.max_units_per_cube,
+                hardware.max_cube_count.0,
+            )
         };
         approximate_query_kernel::launch(
             &client,
@@ -589,6 +632,7 @@ fn approximate_query_impl(
             offset,
             row_start_u32,
             rows_u32,
+            client.name() != "cpu",
             match invalid_flag.as_ref() {
                 Some(flag) => ComptimeOptionArgs::Some(flag.clone().into_tensor_arg()),
                 None => ComptimeOptionArgs::None,
@@ -611,7 +655,30 @@ fn approximate_query_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::{CubeCount, query_cpu_chunk_geometry};
+    use super::{CubeCount, QUERY_CUDA_WIDTH, query_cpu_chunk_geometry, query_cuda_chunk_geometry};
+
+    #[test]
+    fn query_cuda_geometry_checks_caps_and_rounded_counts() {
+        for rows in [31, 32, 33, 63, 64, 65] {
+            let (CubeCount::Static(count, 1, 1), dim) =
+                query_cuda_chunk_geometry(rows, 128, 128, u32::MAX)
+            else {
+                panic!("query geometry must use a static one-dimensional count");
+            };
+            assert_eq!(count, rows.div_ceil(QUERY_CUDA_WIDTH));
+            assert_eq!(dim.x, QUERY_CUDA_WIDTH);
+        }
+        assert!(std::panic::catch_unwind(|| query_cuda_chunk_geometry(1, 31, 32, 1)).is_err());
+        assert!(std::panic::catch_unwind(|| query_cuda_chunk_geometry(1, 32, 31, 1)).is_err());
+        assert!(std::panic::catch_unwind(|| query_cuda_chunk_geometry(65, 32, 32, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| query_cuda_chunk_geometry(0, 32, 32, 1)).is_err());
+        let (CubeCount::Static(count, 1, 1), _) =
+            query_cuda_chunk_geometry(u32::MAX, 32, 32, u32::MAX)
+        else {
+            panic!("query geometry must use a static one-dimensional count");
+        };
+        assert_eq!(count, u32::MAX.div_ceil(32));
+    }
 
     fn geometry(rows: u32, cores: u32, max_x: u32, max_units: u32, max_cubes: u32) -> (u32, u32) {
         let (CubeCount::Static(count, 1, 1), dim) =

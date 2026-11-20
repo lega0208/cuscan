@@ -10,10 +10,310 @@ use std::mem::MaybeUninit;
 const RESIDUAL_TOLERANCE: f64 = 1.0e-6;
 const ORTHOGONALITY_TOLERANCE: f64 = 1.0e-8;
 
+fn check_host_array(rows: usize, columns: usize, element: usize, name: &'static str) -> Result<()> {
+    let bytes = rows
+        .checked_mul(columns)
+        .and_then(|n| n.checked_mul(element))
+        .ok_or(UmapError::Overflow(name))?;
+    if bytes > isize::MAX as usize {
+        return Err(UmapError::Capacity(format!(
+            "{name} allocation requires {bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn reserved_vec<T>(capacity: usize, name: &'static str) -> Result<Vec<T>> {
+    check_host_array(capacity, 1, size_of::<T>(), name)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|error| UmapError::Memory(format!("{name}: {error}")))?;
+    Ok(result)
+}
+
+fn push_checked<T>(values: &mut Vec<T>, value: T, name: &'static str) -> Result<()> {
+    values
+        .try_reserve(1)
+        .map_err(|error| UmapError::Memory(format!("{name}: {error}")))?;
+    values.push(value);
+    Ok(())
+}
+
+fn evd_scratch_bytes(req: faer::dyn_stack::StackReq, name: &'static str) -> Result<usize> {
+    if req.align_bytes() == 0 {
+        return Err(UmapError::Overflow(name));
+    }
+    let bytes = req
+        .size_bytes()
+        .checked_add(req.align_bytes())
+        .ok_or(UmapError::Overflow(name))?;
+    check_host_array(bytes, 1, 1, name)?;
+    Ok(bytes)
+}
+
+// faer 0.24.4 RawMatUnit aligns f64 matrix columns to 64 bytes.
+fn check_faer_matrix(rows: usize, columns: usize, name: &'static str) -> Result<()> {
+    let padded = rows.checked_add(7).ok_or(UmapError::Overflow(name))? / 8 * 8;
+    check_host_array(padded, columns, size_of::<f64>(), name)
+}
+
+/// Bounds the always-possible dense and block spectral solver matrices.
+/// Graph-dependent component and sparse-graph allocations are checked at their sources.
+pub fn spectral_solver_buffers(
+    n: usize,
+    dimensions: usize,
+    features: usize,
+    edge_capacity: usize,
+) -> Result<Vec<crate::modern_layout::LiveBuffer>> {
+    use crate::modern_layout::{BufferLifetime, BufferSpace, LiveBuffer};
+    let k = dimensions
+        .checked_add(1)
+        .ok_or(UmapError::Overflow("spectral mode count"))?;
+    let width = 64usize.max(
+        k.checked_mul(2)
+            .ok_or(UmapError::Overflow("spectral max dimension"))?,
+    );
+    let dense_n = n.min(width);
+    let matrix = |rows: usize, columns: usize| -> Result<usize> {
+        check_faer_matrix(rows, columns, "spectral matrix")?;
+        let padded = rows
+            .checked_add(7)
+            .ok_or(UmapError::Overflow("spectral matrix rows"))?
+            / 8
+            * 8;
+        padded
+            .checked_mul(columns)
+            .and_then(|v| v.checked_mul(size_of::<f64>()))
+            .ok_or(UmapError::Overflow("spectral matrix bytes"))
+    };
+    let dense_bytes = matrix(dense_n, dense_n)?;
+    if dense_bytes > isize::MAX as usize {
+        return Err(UmapError::Capacity(
+            "dense spectral matrix exceeds host limit".into(),
+        ));
+    }
+    let scratch = if dense_n == 0 {
+        0
+    } else {
+        let req = self_adjoint_evd_scratch::<f64>(
+            dense_n,
+            ComputeEigenvectors::Yes,
+            Par::Seq,
+            Spec::<evd::SelfAdjointEvdParams, f64>::default(),
+        );
+        evd_scratch_bytes(req, "dense EVD scratch")?
+    };
+    let projected = if n > width {
+        width.min(n.saturating_sub(3))
+    } else {
+        0
+    };
+    let projected_scratch = if projected == 0 {
+        0
+    } else {
+        check_faer_matrix(projected, projected, "projected spectral EVD")?;
+        let req = self_adjoint_evd_scratch::<f64>(
+            projected,
+            ComputeEigenvectors::Yes,
+            faer::get_global_parallelism(),
+            Spec::<evd::SelfAdjointEvdParams, f64>::default(),
+        );
+        evd_scratch_bytes(req, "projected EVD scratch")?
+    };
+    check_host_array(scratch, 1, 1, "dense EVD scratch")?;
+    check_host_array(projected_scratch, 1, 1, "projected EVD scratch")?;
+    let bytes = |count: usize, element: usize| -> Result<usize> {
+        check_host_array(count, 1, element, "spectral graph allocation")?;
+        count
+            .checked_mul(element)
+            .ok_or(UmapError::Overflow("spectral graph bytes"))
+    };
+    let graph_edges = edge_capacity
+        .checked_mul(2)
+        .ok_or(UmapError::Overflow("spectral graph edges"))?;
+    let graph_row_capacity = graph_edges
+        .checked_next_power_of_two()
+        .ok_or(UmapError::Overflow("spectral row capacity"))?
+        .max(4);
+    let component_capacity = n
+        .checked_next_power_of_two()
+        .ok_or(UmapError::Overflow("spectral component capacity"))?
+        .max(4);
+    let mode_capacity = width
+        .checked_next_power_of_two()
+        .ok_or(UmapError::Overflow("spectral mode capacity"))?
+        .max(4);
+    let offsets = n
+        .checked_add(1)
+        .ok_or(UmapError::Overflow("spectral graph offsets"))?;
+    let centroid_edges = n
+        .checked_mul(n)
+        .ok_or(UmapError::Overflow("centroid graph edges"))?;
+    // Pinned Rust BTreeMap node.rs has 11 keys/values and up to 12 child pointers.
+    // Count every entry as a separate maximum-sized internal node, for both maps.
+    let tree_node =
+        64 + 11 * (size_of::<(usize, usize)>() + size_of::<f64>()) + 12 * size_of::<usize>();
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(32)
+        .map_err(|error| UmapError::Memory(format!("spectral plan: {error}")))?;
+    for (name, bytes, count) in [
+        ("spectral dense matrices", dense_bytes, 3),
+        ("spectral dense EVD scratch", scratch, 1),
+        (
+            "spectral block bases and Ritz vectors",
+            if n > width { matrix(n, width)? } else { 0 },
+            if n > width { 12 } else { 0 },
+        ),
+        (
+            "spectral packed application buffers",
+            if n > width {
+                bytes(
+                    n.checked_mul(projected)
+                        .ok_or(UmapError::Overflow("spectral packed application"))?,
+                    size_of::<f64>(),
+                )?
+            } else {
+                0
+            },
+            if n > width { 2 } else { 0 },
+        ),
+        (
+            "spectral projected matrices",
+            if n > width { matrix(width, width)? } else { 0 },
+            if n > width { 8 } else { 0 },
+        ),
+        (
+            "spectral projected EVD eigenvalue column",
+            if projected != 0 {
+                matrix(projected, 1)?
+            } else {
+                0
+            },
+            1,
+        ),
+        ("spectral projected EVD scratch", projected_scratch, 1),
+        (
+            "spectral graph tree nodes",
+            tree_node,
+            edge_capacity
+                .checked_mul(2)
+                .ok_or(UmapError::Overflow("spectral graph tree nodes"))?,
+        ),
+        (
+            "spectral graph row metadata",
+            bytes(n, size_of::<Vec<(usize, f64)>>())?,
+            2,
+        ),
+        (
+            "spectral graph row storage",
+            bytes(graph_row_capacity, size_of::<(usize, f64)>())?,
+            n.checked_mul(2)
+                .ok_or(UmapError::Overflow("spectral graph rows"))?,
+        ),
+        ("spectral graph degrees", bytes(n, size_of::<f64>())?, 3),
+        (
+            "spectral graph CSR offsets",
+            bytes(offsets, size_of::<usize>())?,
+            3,
+        ),
+        (
+            "spectral graph CSR columns",
+            bytes(graph_edges, size_of::<usize>())?,
+            2,
+        ),
+        (
+            "spectral graph CSR values",
+            bytes(graph_edges, size_of::<f64>())?,
+            2,
+        ),
+        (
+            "centroid CSR columns",
+            bytes(centroid_edges, size_of::<usize>())?,
+            1,
+        ),
+        (
+            "centroid CSR values",
+            bytes(centroid_edges, size_of::<f64>())?,
+            1,
+        ),
+        (
+            "centroid feature rows",
+            bytes(features, size_of::<f64>())?,
+            n,
+        ),
+        (
+            "component and centroid row metadata",
+            bytes(component_capacity, size_of::<Vec<usize>>())?,
+            4,
+        ),
+        (
+            "component vertex rows",
+            bytes(component_capacity, size_of::<usize>())?,
+            n,
+        ),
+        (
+            "component queue and index arrays",
+            bytes(component_capacity, size_of::<usize>())?,
+            3,
+        ),
+        ("component seen flags", bytes(n, size_of::<bool>())?, 1),
+        (
+            "component centers",
+            bytes(dimensions, size_of::<f64>())?,
+            n.checked_mul(2)
+                .ok_or(UmapError::Overflow("spectral component centers"))?,
+        ),
+        (
+            "spectral mode vectors",
+            bytes(n, size_of::<f64>())?,
+            width
+                .checked_mul(4)
+                .ok_or(UmapError::Overflow("spectral mode vectors"))?,
+        ),
+        (
+            "spectral eigenpair metadata",
+            bytes(mode_capacity, size_of::<(f64, Vec<f64>)>())?,
+            4,
+        ),
+        (
+            "spectral mode metadata",
+            bytes(mode_capacity, size_of::<Vec<f64>>())?,
+            4,
+        ),
+        (
+            "spectral scalar work vectors",
+            bytes(n.max(mode_capacity), size_of::<f64>())?,
+            12,
+        ),
+        (
+            "spectral embedding",
+            bytes(
+                n.checked_mul(dimensions)
+                    .ok_or(UmapError::Overflow("spectral embedding"))?,
+                size_of::<f32>(),
+            )?,
+            1,
+        ),
+    ] {
+        buffers.push(LiveBuffer {
+            name,
+            space: BufferSpace::Host,
+            lifetime: BufferLifetime::RepeatedBuild(count),
+            bytes,
+        });
+    }
+    Ok(buffers)
+}
+
 #[path = "block_spectral.rs"]
 mod block_spectral;
 
 /// Construct the initialization embedding in row-major order.
+///
+/// Pass an explicit [`Init::Random`] or [`Init::Spectral`] to this host helper.
+/// Default-config fits go through `UMAP::fit`, which drives recursive initialization.
 ///
 /// The sparse graph is interpreted as weighted undirected affinity. If an edge
 /// is supplied in both directions, the larger accumulated directed weight is
@@ -39,32 +339,69 @@ pub fn initialize(
     seed: u64,
 ) -> Result<Vec<f32>> {
     config.validate()?;
-    let (n, _) = crate::validate_input(data, None)?;
-    n.checked_mul(config.n_components)
-        .ok_or(UmapError::Overflow("embedding shape"))?;
-    if heads.len() != tails.len() || heads.len() != weights.len() {
-        return Err(UmapError::InvalidInput(
-            "spectral graph head, tail, and weight arrays must have equal lengths".into(),
-        ));
-    }
-    let graph = SparseGraph::from_edges(n, heads, tails, weights)?;
+    let (n, features) = crate::validate_input(data, None)?;
+    crate::init_rescale::check_extents(n, config.n_components, heads.len(), config.init_rescale)?;
+    validate_edges(n, heads, tails, weights)?;
     if n == 1 {
         let output_size = n
             .checked_mul(config.n_components)
             .ok_or(UmapError::Overflow("embedding shape"))?;
-        return Ok(vec![0.0; output_size]);
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_size)
+            .map_err(|e| UmapError::Memory(e.to_string()))?;
+        output.resize(output_size, 0.0);
+        return Ok(output);
     }
     let mut rng = StdRng::seed_from_u64(seed);
 
     let mut embedding = match config.init {
         Init::Random => random_embedding(n, config.n_components, &mut rng)?,
-        Init::Spectral => spectral_embedding(data, &graph, config.n_components, &mut rng)?,
+        Init::Spectral => {
+            let _ = spectral_solver_buffers(n, config.n_components, features, heads.len())?;
+            let graph = SparseGraph::from_edges(n, heads, tails, weights)?;
+            spectral_embedding(data, &graph, config.n_components, &mut rng)?
+        }
+        Init::Recursive | Init::Auto => {
+            return Err(UmapError::InvalidConfig(
+                "recursive initialization requires the fit layout driver".into(),
+            ));
+        }
     };
     if config.init == Init::Spectral {
-        noisy_scale_coordinates(&mut embedding, n, config.n_components, &mut rng)?;
+        modern_spectral_scale(&mut embedding, &mut rng)?;
     }
-    minmax_scale(&mut embedding, n, config.n_components)?;
+    crate::init_rescale::rescale(
+        &mut embedding,
+        n,
+        config.n_components,
+        heads,
+        tails,
+        weights,
+        config,
+    )?;
     Ok(embedding)
+}
+
+fn validate_edges(n: usize, heads: &[usize], tails: &[usize], weights: &[f32]) -> Result<()> {
+    if heads.len() != tails.len() || heads.len() != weights.len() {
+        return Err(UmapError::InvalidInput(
+            "graph COO arrays have different lengths".into(),
+        ));
+    }
+    for (edge, ((&head, &tail), &weight)) in heads.iter().zip(tails).zip(weights).enumerate() {
+        if head >= n || tail >= n || head == tail {
+            return Err(UmapError::InvalidInput(format!(
+                "graph edge {edge} has invalid endpoints ({head}, {tail}) for {n} rows"
+            )));
+        }
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(UmapError::InvalidInput(format!(
+                "graph edge {edge} has invalid weight {weight}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -83,9 +420,17 @@ struct NormalizedCsr {
 
 impl NormalizedCsr {
     fn from_rows(rows: &[Vec<(usize, f64)>], degrees: &[f64]) -> Result<Self> {
-        let mut row_offsets = Vec::with_capacity(rows.len() + 1);
-        let mut columns = Vec::new();
-        let mut values = Vec::new();
+        let offsets = rows
+            .len()
+            .checked_add(1)
+            .ok_or(UmapError::Overflow("spectral CSR offsets"))?;
+        let edges = rows.iter().try_fold(0usize, |sum, row| {
+            sum.checked_add(row.len())
+                .ok_or(UmapError::Overflow("spectral CSR edges"))
+        })?;
+        let mut row_offsets = reserved_vec(offsets, "spectral CSR offsets")?;
+        let mut columns = reserved_vec(edges, "spectral CSR columns")?;
+        let mut values = reserved_vec(edges, "spectral CSR values")?;
         row_offsets.push(0);
         for (i, row) in rows.iter().enumerate() {
             if !degrees[i].is_finite() || (degrees[i] <= 0.0 && !row.is_empty()) {
@@ -132,6 +477,17 @@ impl SparseGraph {
                 "spectral graph COO arrays have different lengths".into(),
             ));
         }
+        let edge_bound = heads
+            .len()
+            .checked_mul(2)
+            .ok_or(UmapError::Overflow("spectral graph edges"))?;
+        check_host_array(n, 1, size_of::<Vec<(usize, f64)>>(), "spectral graph rows")?;
+        check_host_array(
+            edge_bound,
+            1,
+            size_of::<(usize, f64)>(),
+            "spectral graph row",
+        )?;
         let mut directed = BTreeMap::<(usize, usize), f64>::new();
         for (edge, ((&head, &tail), &weight)) in heads.iter().zip(tails).zip(weights).enumerate() {
             if head >= n || tail >= n || head == tail {
@@ -157,18 +513,20 @@ impl SparseGraph {
                 .and_modify(|current| *current = current.max(symmetric_weight))
                 .or_insert(symmetric_weight);
         }
-        let mut rows = vec![Vec::new(); n];
+        let mut rows = reserved_vec(n, "spectral graph rows")?;
+        rows.resize_with(n, Vec::new);
         for ((left, right), weight) in undirected {
-            rows[left].push((right, weight));
-            rows[right].push((left, weight));
+            push_checked(&mut rows[left], (right, weight), "spectral graph row")?;
+            push_checked(&mut rows[right], (left, weight), "spectral graph row")?;
         }
         for row in &mut rows {
             row.sort_unstable_by_key(|&(neighbor, _)| neighbor);
         }
-        let degrees = rows
-            .iter()
-            .map(|row| row.iter().map(|&(_, weight)| weight).sum::<f64>())
-            .collect::<Vec<f64>>();
+        let mut degrees = reserved_vec(rows.len(), "spectral graph degrees")?;
+        degrees.extend(
+            rows.iter()
+                .map(|row| row.iter().map(|&(_, weight)| weight).sum::<f64>()),
+        );
         if degrees.iter().any(|degree| !degree.is_finite()) {
             return Err(numerical("spectral graph degree overflowed"));
         }
@@ -188,50 +546,61 @@ impl SparseGraph {
         self.normalized.shifted_apply(x, out);
     }
 
-    fn components(&self) -> Vec<Vec<usize>> {
-        let mut seen = vec![false; self.n()];
+    fn components(&self) -> Result<Vec<Vec<usize>>> {
+        let mut seen = reserved_vec(self.n(), "spectral component flags")?;
+        seen.resize(self.n(), false);
         let mut components = Vec::new();
         for start in 0..self.n() {
             if seen[start] {
                 continue;
             }
             seen[start] = true;
-            let mut queue = VecDeque::from([start]);
+            let mut queue = VecDeque::new();
+            queue
+                .try_reserve(1)
+                .map_err(|error| UmapError::Memory(format!("spectral component queue: {error}")))?;
+            queue.push_back(start);
             let mut component = Vec::new();
             while let Some(vertex) = queue.pop_front() {
-                component.push(vertex);
+                push_checked(&mut component, vertex, "spectral component vertices")?;
                 for &(neighbor, _) in &self.rows[vertex] {
                     if !seen[neighbor] {
                         seen[neighbor] = true;
+                        queue.try_reserve(1).map_err(|error| {
+                            UmapError::Memory(format!("spectral component queue: {error}"))
+                        })?;
                         queue.push_back(neighbor);
                     }
                 }
             }
             component.sort_unstable();
-            components.push(component);
+            push_checked(&mut components, component, "spectral components")?;
         }
-        components
+        Ok(components)
     }
 
     fn induced(&self, vertices: &[usize]) -> Result<Self> {
-        let mut local = vec![usize::MAX; self.n()];
+        let mut local = reserved_vec(self.n(), "spectral local index")?;
+        local.resize(self.n(), usize::MAX);
         for (index, &vertex) in vertices.iter().enumerate() {
             local[vertex] = index;
         }
-        let mut rows = vec![Vec::new(); vertices.len()];
+        let mut rows = reserved_vec(vertices.len(), "induced graph rows")?;
+        rows.resize_with(vertices.len(), Vec::new);
         for (index, &vertex) in vertices.iter().enumerate() {
             for &(neighbor, weight) in &self.rows[vertex] {
                 let mapped = local[neighbor];
                 if mapped != usize::MAX {
-                    rows[index].push((mapped, weight));
+                    push_checked(&mut rows[index], (mapped, weight), "induced graph row")?;
                 }
             }
             rows[index].sort_unstable_by_key(|&(neighbor, _)| neighbor);
         }
-        let degrees = rows
-            .iter()
-            .map(|row| row.iter().map(|&(_, weight)| weight).sum::<f64>())
-            .collect::<Vec<f64>>();
+        let mut degrees = reserved_vec(rows.len(), "induced graph degrees")?;
+        degrees.extend(
+            rows.iter()
+                .map(|row| row.iter().map(|&(_, weight)| weight).sum::<f64>()),
+        );
         if degrees.iter().any(|degree| !degree.is_finite()) {
             return Err(numerical("induced graph degree overflowed"));
         }
@@ -254,21 +623,20 @@ struct CentroidGraph {
 impl CentroidGraph {
     fn new(data: &[Vec<f32>], components: &[Vec<usize>], dimensions: usize) -> Result<Self> {
         let n_features = data[0].len();
-        let centroids = components
-            .iter()
-            .map(|component| {
-                (0..n_features)
-                    .map(|feature| {
-                        component
-                            .iter()
-                            .map(|&vertex| f64::from(data[vertex][feature]))
-                            .sum::<f64>()
-                            / component.len() as f64
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut degrees = vec![0.0; components.len()];
+        let mut centroids = reserved_vec(components.len(), "spectral centroids")?;
+        for component in components {
+            let mut centroid = reserved_vec(n_features, "spectral centroid features")?;
+            centroid.extend((0..n_features).map(|feature| {
+                component
+                    .iter()
+                    .map(|&vertex| f64::from(data[vertex][feature]))
+                    .sum::<f64>()
+                    / component.len() as f64
+            }));
+            centroids.push(centroid);
+        }
+        let mut degrees = reserved_vec(components.len(), "centroid degrees")?;
+        degrees.resize(components.len(), 0.0);
         for i in 0..components.len() {
             for j in 0..components.len() {
                 degrees[i] += centroid_affinity(&centroids[i], &centroids[j]);
@@ -305,7 +673,7 @@ impl CentroidGraph {
             }
             if let Some(first) = first {
                 return Err(numerical(format!(
-                    "spectral initialization failed: the k-NN graph has {m} connected components (more than 2 * n_components = {}), so components are placed by a spectral layout of centroid affinities exp(-squared distance); {isolated} of {m} components (first: component {first}, {} rows) have zero affinity to every other component because their smallest squared centroid distance is {min_sq:.3e}, which underflows exp. umap-learn 0.5.12 would only warn and place these components arbitrarily; cuscan rejects the fit. Use init=\"random\", increase n_neighbors so the graph connects, or scale the features so cluster centroids are closer.",
+                    "spectral initialization failed: the k-NN graph has {m} connected components (more than 2 * n_components = {}), so components are placed by a spectral layout of centroid affinities exp(-squared distance); {isolated} of {m} components (first: component {first}, {} rows) have zero affinity to every other component because their smallest squared centroid distance is {min_sq:.3e}, which underflows exp. umap-learn 0.6.0 would only warn and place these components arbitrarily; cuscan rejects the fit. Use init=\"random\", increase n_neighbors so the graph connects, or scale the features so cluster centroids are closer.",
                     2 * dimensions,
                     components[first].len(),
                 )));
@@ -315,9 +683,14 @@ impl CentroidGraph {
         let capacity = n
             .checked_mul(n)
             .ok_or(UmapError::Overflow("centroid affinity matrix"))?;
-        let mut row_offsets = Vec::with_capacity(n + 1);
-        let mut columns = Vec::with_capacity(capacity);
-        let mut values = Vec::with_capacity(capacity);
+        check_host_array(capacity, 1, size_of::<usize>(), "centroid affinity columns")?;
+        check_host_array(capacity, 1, size_of::<f64>(), "centroid affinity values")?;
+        let offset_count = n
+            .checked_add(1)
+            .ok_or(UmapError::Overflow("centroid CSR offsets"))?;
+        let mut row_offsets = reserved_vec(offset_count, "centroid CSR offsets")?;
+        let mut columns = reserved_vec(capacity, "centroid affinity columns")?;
+        let mut values = reserved_vec(capacity, "centroid affinity values")?;
         row_offsets.push(0);
         for i in 0..n {
             for j in 0..n {
@@ -406,7 +779,7 @@ fn spectral_embedding(
     dimensions: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<f32>> {
-    let components = graph.components();
+    let components = graph.components()?;
     if components.len() == 1 {
         if graph.n()
             <= dimensions
@@ -414,7 +787,7 @@ fn spectral_embedding(
                 .ok_or(UmapError::Overflow("spectral mode count"))?
         {
             return Err(numerical(format!(
-                "connected graph with {} vertices cannot provide {} spectral dimensions",
+                "connected graph with {} vertices cannot provide {} spectral dimensions; spectral initialization needs at least n_components + 2 samples, use random initialization",
                 graph.n(),
                 dimensions
             )));
@@ -429,7 +802,8 @@ fn spectral_embedding(
             .n()
             .checked_mul(dimensions)
             .ok_or(UmapError::Overflow("embedding shape"))?;
-        let mut embedding = vec![0.0; output_size];
+        let mut embedding = reserved_vec(output_size, "spectral embedding")?;
+        embedding.resize(output_size, 0.0);
         for row in 0..graph.n() {
             for dim in 0..dimensions {
                 embedding[row * dimensions + dim] = modes[dim][row] as f32;
@@ -450,7 +824,8 @@ fn spectral_embedding(
         .n()
         .checked_mul(dimensions)
         .ok_or(UmapError::Overflow("embedding shape"))?;
-    let mut output = vec![0.0_f32; output_size];
+    let mut output = reserved_vec(output_size, "spectral embedding")?;
+    output.resize(output_size, 0.0_f32);
     for (component_index, vertices) in components.iter().enumerate() {
         let center = &centers[component_index];
         let radius = nearest_center_distance(component_index, &centers)? / 2.0;
@@ -632,7 +1007,21 @@ fn solve_spectral(
     let dense = n <= cutoff;
     let max_dim = m;
     let solve_count = if dense { n } else { k };
-    let mut values = vec![0.0; if dense { n } else { solve_count }];
+    check_faer_matrix(n, solve_count, "spectral eigenvectors")?;
+    if dense {
+        check_faer_matrix(n, n, "dense spectral matrix")?;
+        let req = self_adjoint_evd_scratch::<f64>(
+            n,
+            ComputeEigenvectors::Yes,
+            Par::Seq,
+            Spec::<evd::SelfAdjointEvdParams, f64>::default(),
+        );
+        evd_scratch_bytes(req, "dense EVD scratch")?;
+    } else {
+        block_spectral::check_buffer_extents(n, max_dim)?;
+    }
+    let mut values = reserved_vec(solve_count, "spectral eigenvalues")?;
+    values.resize(solve_count, 0.0);
     let mut vectors = Mat::zeros(n, values.len());
     let par = Par::Seq;
     #[cfg(all(test, feature = "tracing"))]
@@ -650,11 +1039,9 @@ fn solve_spectral(
         }
         let params = Spec::<evd::SelfAdjointEvdParams, f64>::default();
         let req = self_adjoint_evd_scratch::<f64>(n, ComputeEigenvectors::Yes, par, params);
-        let size = req
-            .size_bytes()
-            .checked_add(req.align_bytes())
-            .ok_or_else(|| numerical("dense EVD scratch size overflow"))?;
-        let mut scratch = vec![MaybeUninit::<u8>::uninit(); size];
+        let size = evd_scratch_bytes(req, "dense EVD scratch")?;
+        let mut scratch = reserved_vec(size, "dense EVD scratch")?;
+        scratch.resize(size, MaybeUninit::<u8>::uninit());
         let mut eigenvalue_matrix = Mat::zeros(n, n);
         self_adjoint_evd(
             matrix.as_ref(),
@@ -1133,17 +1520,18 @@ fn random_embedding(n: usize, dimensions: usize, rng: &mut StdRng) -> Result<Vec
     let size = n
         .checked_mul(dimensions)
         .ok_or(UmapError::Overflow("embedding shape"))?;
-    Ok((0..size)
-        .map(|_| rng.random_range(-10.0_f32..10.0_f32))
-        .collect())
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(size)
+        .map_err(|e| UmapError::Memory(e.to_string()))?;
+    result.extend((0..size).map(|_| rng.random_range(-10.0_f32..10.0_f32)));
+    Ok(result)
 }
 
-fn noisy_scale_coordinates(
-    embedding: &mut [f32],
-    n: usize,
-    dimensions: usize,
-    rng: &mut StdRng,
-) -> Result<()> {
+fn modern_spectral_scale(embedding: &mut [f32], rng: &mut StdRng) -> Result<()> {
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Err(numerical("spectral embedding has non-finite coordinates"));
+    }
     let max_abs = embedding
         .iter()
         .map(|value| value.abs())
@@ -1154,52 +1542,13 @@ fn noisy_scale_coordinates(
         ));
     }
     for value in embedding.iter_mut() {
-        let noise = gaussian(rng) * 1.0e-4;
-        *value = *value / max_abs * 10.0 + noise as f32;
+        let noise = gaussian(rng) * 0.01;
+        *value = (*value * (40.0 / max_abs)) + noise as f32;
     }
-    let expected = n
-        .checked_mul(dimensions)
-        .ok_or(UmapError::Overflow("embedding shape"))?;
-    if embedding.len() != expected || embedding.iter().any(|value| !value.is_finite()) {
+    if embedding.iter().any(|value| !value.is_finite()) {
         return Err(numerical(
             "scaled spectral coordinates are non-finite or malformed",
         ));
-    }
-    Ok(())
-}
-
-fn minmax_scale(embedding: &mut [f32], n: usize, dimensions: usize) -> Result<()> {
-    if embedding.len()
-        != n.checked_mul(dimensions)
-            .ok_or(UmapError::Overflow("embedding shape"))?
-    {
-        return Err(UmapError::InvalidInput(
-            "embedding storage does not match its row-major shape".into(),
-        ));
-    }
-    for dimension in 0..dimensions {
-        let mut minimum = f32::INFINITY;
-        let mut maximum = f32::NEG_INFINITY;
-        for row in 0..n {
-            let value = embedding[row * dimensions + dimension];
-            if !value.is_finite() {
-                return Err(numerical(format!(
-                    "embedding coordinate ({row}, {dimension}) is non-finite"
-                )));
-            }
-            minimum = minimum.min(value);
-            maximum = maximum.max(value);
-        }
-        let span = maximum - minimum;
-        if !span.is_finite() || span <= 0.0 {
-            return Err(numerical(format!(
-                "embedding dimension {dimension} has zero or non-finite span"
-            )));
-        }
-        for row in 0..n {
-            embedding[row * dimensions + dimension] =
-                10.0 * (embedding[row * dimensions + dimension] - minimum) / span;
-        }
     }
     Ok(())
 }
@@ -1211,6 +1560,72 @@ fn numerical(message: impl Into<String>) -> UmapError {
 #[cfg(test)]
 mod solver_tests {
     use super::*;
+
+    #[test]
+    fn spectral_buffer_plan_covers_projected_workspace_and_graph_shapes() {
+        let plan = spectral_solver_buffers(128, 2, 13, 600).unwrap();
+        let scratch = plan
+            .iter()
+            .find(|entry| entry.name == "spectral projected EVD scratch")
+            .unwrap();
+        let req = self_adjoint_evd_scratch::<f64>(
+            64,
+            ComputeEigenvectors::Yes,
+            faer::get_global_parallelism(),
+            Spec::<evd::SelfAdjointEvdParams, f64>::default(),
+        );
+        assert!(scratch.bytes >= req.size_bytes());
+        let csr = plan
+            .iter()
+            .find(|entry| entry.name == "spectral graph CSR columns")
+            .unwrap();
+        assert_eq!(csr.bytes, 1200 * size_of::<usize>());
+        assert!(spectral_solver_buffers(128, usize::MAX, 13, 600).is_err());
+        assert!(spectral_solver_buffers(128, 2, 13, usize::MAX).is_err());
+        assert!(spectral_solver_buffers(usize::MAX, 2, 13, 600).is_err());
+    }
+
+    #[test]
+    fn checked_host_reservation_rejects_overflow() {
+        assert!(reserved_vec::<u64>(usize::MAX, "test reservation").is_err());
+        assert_eq!(reserved_vec::<u64>(8, "test reservation").unwrap().len(), 0);
+        assert!(evd_scratch_bytes(faer::dyn_stack::StackReq::OVERFLOW, "test scratch").is_err());
+    }
+
+    #[test]
+    fn faer_f64_storage_rounds_rows_to_eight() {
+        for rows in [1, 7, 8, 9, 63, 64, 65] {
+            let matrix = Mat::<f64>::zeros(rows, 2);
+            assert_eq!(matrix.col_stride() as usize, rows.div_ceil(8) * 8);
+        }
+    }
+
+    #[test]
+    fn modern_noise_uses_seeded_gaussian_draws_in_order() {
+        let mut actual_rng = StdRng::seed_from_u64(174);
+        let mut expected_rng = StdRng::seed_from_u64(174);
+        let mut values = [-2.0, 1.0, 0.0];
+        let expected = [-40.0, 20.0, 0.0].map(|v| v + (gaussian(&mut expected_rng) * 0.01) as f32);
+        modern_spectral_scale(&mut values, &mut actual_rng).unwrap();
+        assert_eq!(values, expected);
+        assert_eq!(actual_rng.random::<u64>(), expected_rng.random::<u64>());
+        assert!(matches!(
+            modern_spectral_scale(&mut [0.0], &mut actual_rng),
+            Err(UmapError::Numerical(_))
+        ));
+    }
+
+    #[test]
+    fn random_raw_range_and_stream_are_unchanged() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut expected_rng = StdRng::seed_from_u64(9);
+        let actual = random_embedding(3, 2, &mut rng).unwrap();
+        let expected: Vec<f32> = (0..6)
+            .map(|_| expected_rng.random_range(-10.0_f32..10.0_f32))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|x| (-10.0..10.0).contains(x)));
+    }
 
     #[test]
     fn dense_solver_returns_the_analytic_path_mode() {
@@ -1232,14 +1647,6 @@ mod solver_tests {
         );
         assert!(residual < RESIDUAL_TOLERANCE);
         assert!((dot(&modes[0], &modes[0]) - 1.0).abs() < ORTHOGONALITY_TOLERANCE);
-    }
-
-    #[test]
-    fn zero_coordinate_span_is_an_explicit_numerical_error() {
-        assert!(matches!(
-            minmax_scale(&mut [2.0, 2.0], 2, 1),
-            Err(UmapError::Numerical(_))
-        ));
     }
 
     #[test]
@@ -1342,7 +1749,7 @@ mod solver_tests {
             let graph =
                 SparseGraph::from_edges(n, &heads, &tails, &weights).expect("valid runtime graph");
             assert_eq!(
-                graph.components().len(),
+                graph.components().unwrap().len(),
                 1,
                 "runtime spectral graph must be connected"
             );

@@ -1,6 +1,6 @@
 # cuscan
 
-cuscan 0.1.0 provides non-parametric [UMAP](https://github.com/lmcinnes/umap) dimensionality reduction and [HDBSCAN](https://github.com/TutteInstitute/fast_hdbscan) clustering in Rust and Python. UMAP follows umap-learn 0.5.12 semantics. The implementation uses [Burn](https://github.com/tracel-ai/burn) and [CubeCL](https://github.com/tracel-ai/cubecl) for CPU and CUDA execution.
+cuscan 0.1.0 provides non-parametric [UMAP](https://github.com/lmcinnes/umap) dimensionality reduction and [HDBSCAN](https://github.com/TutteInstitute/fast_hdbscan) clustering in Rust and Python. UMAP defaults to recursive initialization (host graph coarsening with Adam layouts at coarse levels) followed by an Adam layout, with umap-learn 0.6-style random or spectral initialization and rescaling, compatibility SGD, and momentum layouts also available; it does not implement all 0.6 features or promise bit parity. The implementation uses [Burn](https://github.com/tracel-ai/burn) and [CubeCL](https://github.com/tracel-ai/cubecl) for CPU and CUDA execution.
 
 ## Local build
 
@@ -36,6 +36,10 @@ new_labels, strengths = clusterer.approximate_predict(X[:5])
 
 Both estimators accept `backend="auto"`, `"cpu"`, or `"cuda"`. Auto prefers a discovered usable CUDA device and selects CPU only when CUDA is unavailable. Explicit choices are strict; execution errors do not trigger fallback.
 
+UMAP fit defaults to `init="auto"`, which resolves to recursive initialization for every optimizer, including compatibility: host graph coarsening with CPU or CUDA Adam layouts at coarse levels. Rescaling defaults to `init_rescale="isotropic"` with `init_scale_factor=1.0`; `"per_axis"` and `"graph_edge"` are also available. `init="spectral"` and `init="random"` remain available. Python accepts `recursive_coarsening_ratio` (2, 3, or 4) and `recursive_init_kwds` with `base_init_threshold`, `n_embedding_epochs`, `hub_selection`, or `anchor_sample_size`. These controls do not affect transform initialization. cuscan does not promise bit parity with umap-learn; see [Standard UMAP](docs/development.md#standard-umap).
+
+UMAP defaults to `optimizer="adam"`, so a default model also transforms with Adam. Pass `optimizer="compatibility", init="spectral"` to get the previous defaults (classic SGD after spectral initialization). `"adam"` and `"momentum"` use source-only modern layouts for fit and transform. When the fitted reference row count (after `unique=True`) exceeds `negative_selection_range` (default 200000), layouts with more than 1024 source rows draw negatives from per-epoch random-projection windows; smaller layouts, including small transform batches, sample globally with scale 1. `exclude_graph_neighbors=False` controls whether graph neighbors are excluded from negatives. `negative_sample_scale_adaptation_samples=128` adapts the scale during Adam fits only (0 disables); momentum and transform keep the initial scale. `negative_sample_scale=None` resolves the automatic scale; an explicit finite nonnegative scale is used as given (0 stays 0). Saved models retain these fit-time settings. Measured quality and performance results, and the items still open, are recorded in the [Standard UMAP notes](docs/development.md#standard-umap) and the [Phase 5](umap_06_phase5_measurement_gaps.md) and [Phase 6](umap_06_phase6_measurement_gaps.md) gap reports; full-seed quality is not claimed. Known limitation: transform quality trails upstream umap-learn; closing that gap is Phase 7 work (see the Phase 6 gap report, item N4).
+
 ### Fitted-model serialization
 
 Install the optional HDF5 dependencies locally with `uv sync --extra serialization`, then rebuild with `uv run maturin develop --release`. The extra supplies `h5py` and `hdf5plugin`; ordinary fitting does not require them.
@@ -53,7 +57,7 @@ predictor.save("predictor.h5")
 
 Files use a versioned HDF5 schema and lossless Blosc2 Zstandard compression, not pickle. External HDF5 readers need the Blosc2 filter plugin (ID 32026). Files contain training data or geometry and derived model state; protect them like the original data. Schema validation and compression do not authenticate files. Rust does not provide an HDF5 persistence API. Serialized numeric state does not guarantee identical execution across hardware, software versions or backends.
 
-The `cuscan_fitted_model` format rejects older model files; retrain and save them in the new format. There are no compatibility aliases for prior imports, crates or environment variables.
+UMAP uses strict schema version 5 and rejects older UMAP files; retrain and save them in the new format. HDBSCAN predictor files remain version 1. There are no compatibility aliases for prior imports, crates or environment variables.
 
 ## Rust
 

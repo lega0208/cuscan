@@ -17,7 +17,8 @@ fn standard_config_defaults_match_the_reference_controls() {
     assert_eq!(config.learning_rate, 1.0);
     assert_eq!(config.negative_sample_rate, 5);
     assert_eq!(config.repulsion_strength, 1.0);
-    assert_eq!(config.init, Init::Spectral);
+    assert_eq!(config.init, Init::Auto);
+    assert_eq!(config.optimizer, umap::Optimizer::Adam);
     assert_eq!(config.random_state, None);
     assert_eq!(config.transform_seed, 42);
     assert_eq!(config.transform_queue_size, 4.0);

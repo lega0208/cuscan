@@ -8,10 +8,11 @@ use std::sync::OnceLock;
 
 use crate::backend::StandardUmapOps;
 use cuscan_common::{AnnError, ann_preflight};
+use umap_core::modern_layout::{BufferLifetime, BufferSpace, LayoutOperation, LiveBuffer};
 
 use super::{
-    Embedding, Init, NeighborSearch, Result, UMAPConfig, UmapError, approximate_query_budget,
-    fit_curve, fit_neighbor_widths,
+    Embedding, Init, InitRescale, NeighborSearch, QueryBudget, Result, UMAPConfig, UmapError,
+    approximate_query_budget, fit_curve, fit_neighbor_widths,
     query::{approximate_query_scratch_layout, query_output_allocation},
     query_neighbor_width, validate_input, validate_search_settings,
 };
@@ -35,19 +36,37 @@ fn profile_sync(device: &Device) -> Result<()> {
 }
 
 fn distinct_training_rows(data: &[Vec<f32>]) -> Result<(Vec<Vec<f32>>, Vec<usize>)> {
-    let mut indices = HashMap::<Vec<u32>, usize>::with_capacity(data.len());
+    let mut indices = HashMap::<Vec<u32>, usize>::new();
+    indices
+        .try_reserve(data.len())
+        .map_err(|error| UmapError::Memory(format!("unique index: {error}")))?;
     let mut rows = Vec::new();
-    let mut inverse = Vec::with_capacity(data.len());
+    rows.try_reserve_exact(data.len())
+        .map_err(|error| UmapError::Memory(format!("unique rows: {error}")))?;
+    let mut inverse = Vec::new();
+    inverse
+        .try_reserve_exact(data.len())
+        .map_err(|error| UmapError::Memory(format!("unique inverse: {error}")))?;
     for row in data {
-        let key = row
-            .iter()
-            .map(|&value| if value == 0.0 { 0 } else { value.to_bits() })
-            .collect();
-        let index = *indices.entry(key).or_insert_with(|| {
-            let index = rows.len();
-            rows.push(row.clone());
+        let mut key = Vec::new();
+        key.try_reserve_exact(row.len())
+            .map_err(|error| UmapError::Memory(format!("unique key: {error}")))?;
+        key.extend(
+            row.iter()
+                .map(|&value| if value == 0.0 { 0 } else { value.to_bits() }),
+        );
+        let index = if let Some(&index) = indices.get(&key) {
             index
-        });
+        } else {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(row.len())
+                .map_err(|error| UmapError::Memory(format!("unique row: {error}")))?;
+            copy.extend_from_slice(row);
+            let index = rows.len();
+            rows.push(copy);
+            indices.insert(key, index);
+            index
+        };
         inverse.push(index);
     }
     if rows.len() < 2 {
@@ -101,6 +120,43 @@ impl UMAP {
         original_n
             .checked_mul(self.config.n_components)
             .ok_or(UmapError::Overflow("original embedding shape"))?;
+        if self.config.unique {
+            let bytes = super::modern_runtime::allocation_bytes;
+            let row = bytes(features, 1, size_of::<f32>())?;
+            // HashMap reserves at least 7/8 of a power-of-two bucket table. Two
+            // buckets per entry, rounded up, conservatively includes controls.
+            let buckets = original_n
+                .checked_mul(2)
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or(UmapError::Overflow("unique hash table"))?
+                .max(8);
+            let table = bytes(buckets, 1, size_of::<(Vec<u32>, usize)>() + 1)?
+                .checked_add(16)
+                .ok_or(UmapError::Overflow("unique hash table"))?;
+            let allocations = [
+                ("original input rows", row, original_n),
+                (
+                    "original input row metadata",
+                    bytes(original_n, 1, size_of::<Vec<f32>>())?,
+                    1,
+                ),
+                ("unique keys", row, original_n),
+                ("unique transient key", row, 1),
+                ("distinct training rows", row, original_n),
+                (
+                    "distinct training row metadata",
+                    bytes(original_n, 1, size_of::<Vec<f32>>())?,
+                    1,
+                ),
+                (
+                    "unique inverse mapping",
+                    bytes(original_n, 1, size_of::<usize>())?,
+                    1,
+                ),
+                ("unique hash table", table, 1),
+            ];
+            super::modern_runtime::validate_host_allocations(&allocations)?;
+        }
         // Validate every original value before canonicalizing or dropping rows.
         let (distinct, original_to_training) = if self.config.unique {
             let (rows, inverse) = distinct_training_rows(data)?;
@@ -130,6 +186,224 @@ impl UMAP {
             validate_layout_work(capacity, self.config.negative_sample_rate)?;
         }
         let (device, backend) = selected_device(self.backend)?;
+        let ann_plan = if search == NeighborSearch::Approximate && n > 1 && widths.nonself > 0 {
+            let budget = cuscan_common::memory::resolve_memory_budget(
+                &device,
+                self.config.memory_limit_bytes,
+            )
+            .map_err(|error| UmapError::BackendUnavailable(error.to_string()))?;
+            Some(
+                ann_preflight(&device, n, features, widths.nonself, &budget)
+                    .map_err(map_ann_error)?,
+            )
+        } else {
+            None
+        };
+        let mut modern_buffers = Vec::new();
+        if self.config.optimizer != super::Optimizer::Compatibility && n > 1 && widths.nonself > 0 {
+            let size = super::modern_runtime::allocation_bytes;
+            let matrix = |rows, columns| {
+                super::modern_runtime::matrix_allocation_bytes(&device, rows, columns, 4)
+            };
+            modern_buffers
+                .try_reserve_exact(192)
+                .map_err(|e| UmapError::Memory(format!("modern plan entries: {e}")))?;
+            modern_buffers.push(LiveBuffer {
+                name: "retained training features",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Both,
+                bytes: matrix(n, features)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "retained fit graph",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Both,
+                bytes: matrix(n, widths.nonself)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "original input rows",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::RepeatedBoth(original_n),
+                bytes: size(features, 1, 4)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "original input row metadata",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Both,
+                bytes: size(original_n, 1, size_of::<Vec<f32>>())?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "fit output rows",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::FutureResult(n),
+                bytes: size(self.config.n_components, 1, 4)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "fit output row metadata",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::FutureResult(1),
+                bytes: size(n, 1, size_of::<Vec<f32>>())?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "training feature upload staging",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Build,
+                bytes: size(n, features, 4)?,
+            });
+            if matches!(
+                device.as_dispatch(),
+                burn::backend::DispatchDevice::Cube(burn_cubecl::CubeDevice::Cuda(_))
+            ) {
+                modern_buffers.push(LiveBuffer {
+                    name: "training feature pinned upload staging",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(n, features, 4)?,
+                });
+            }
+            modern_buffers.push(LiveBuffer {
+                name: "initialization flat upload",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Build,
+                bytes: size(n, self.config.n_components, 4)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "neighbor distances",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: matrix(n, widths.nonself)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "self-inclusive neighbor indices",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: matrix(n, widths.self_inclusive)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "self-inclusive neighbor distances",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: matrix(n, widths.self_inclusive)?,
+            });
+            let capacity = size(n, widths.self_inclusive, 2)?;
+            if self.config.init == Init::Spectral {
+                modern_buffers.extend(umap_core::init::spectral_solver_buffers(
+                    n,
+                    self.config.n_components,
+                    features,
+                    capacity,
+                )?);
+            }
+            if search == NeighborSearch::Exact {
+                super::modern_runtime::exact_search_buffers(
+                    &mut modern_buffers,
+                    &device,
+                    n,
+                    n,
+                    features,
+                    widths.nonself,
+                )?;
+            }
+            if self.config.init == Init::Spectral
+                || self.config.init_rescale == InitRescale::GraphEdge
+            {
+                for name in [
+                    "initialization graph head readback",
+                    "initialization graph tail readback",
+                    "initialization graph weight readback",
+                ] {
+                    modern_buffers.push(LiveBuffer {
+                        name,
+                        space: BufferSpace::Host,
+                        lifetime: BufferLifetime::Build,
+                        bytes: size(capacity, 1, 4)?,
+                    });
+                }
+                for (name, element) in [
+                    ("initialization compact heads", size_of::<usize>()),
+                    ("initialization compact tails", size_of::<usize>()),
+                    ("initialization compact weights", size_of::<f32>()),
+                ] {
+                    modern_buffers.push(LiveBuffer {
+                        name,
+                        space: BufferSpace::Host,
+                        lifetime: BufferLifetime::Build,
+                        bytes: size(capacity, 1, element)?,
+                    });
+                }
+            }
+            for name in [
+                "graph rho",
+                "graph sigma",
+                "graph counts",
+                "graph offsets",
+                "graph cursors",
+            ] {
+                modern_buffers.push(LiveBuffer {
+                    name,
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(n, 1, 4)?,
+                });
+            }
+            modern_buffers.push(LiveBuffer {
+                name: "graph directed weights",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: size(n, widths.self_inclusive, 4)?,
+            });
+            if self.config.init.resolve() != Init::Recursive {
+                for name in ["classic positive intervals", "classic negative intervals"] {
+                    modern_buffers.push(LiveBuffer {
+                        name,
+                        space: BufferSpace::Device,
+                        lifetime: BufferLifetime::Build,
+                        bytes: size(capacity, 1, 8)?,
+                    });
+                }
+                modern_buffers.push(LiveBuffer {
+                    name: "classic RNG",
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: matrix(n, 3)?,
+                });
+            }
+            if self.config.unique {
+                modern_buffers.push(LiveBuffer {
+                    name: "distinct training rows",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::RepeatedBoth(n),
+                    bytes: size(features, 1, 4)?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "distinct training row metadata",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes: size(original_n, 1, size_of::<Vec<f32>>())?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "unique inverse mapping",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes: size(original_n, 1, size_of::<usize>())?,
+                });
+            }
+            super::modern_runtime::preflight(
+                &device,
+                super::modern_runtime::LayoutAdmissionStage::ConstructionBoundsOnly,
+                LayoutOperation::Fit,
+                n,
+                n,
+                self.config.n_components,
+                features,
+                original_n,
+                capacity,
+                capacity,
+                &self.config,
+                &modern_buffers,
+                ann_plan.as_ref(),
+            )?;
+        }
         let training_data = matrix_tensor(data, &device);
         let n_components = self.config.n_components;
         n.checked_mul(n_components)
@@ -181,17 +455,13 @@ impl UMAP {
                 (neighbors.indices, neighbors.distances)
             }
             NeighborSearch::Approximate => {
-                let budget = cuscan_common::memory::resolve_memory_budget(
-                    &device,
-                    self.config.memory_limit_bytes,
-                )
-                .map_err(|error| UmapError::BackendUnavailable(error.to_string()))?;
-                let plan = ann_preflight(&device, n, features, widths.nonself, &budget)
-                    .map_err(map_ann_error)?;
+                let plan = ann_plan
+                    .as_ref()
+                    .ok_or_else(|| UmapError::Numerical("ANN plan unavailable".into()))?;
                 let iters = (n as f64).log2().round().max(5.0) as u32;
                 cuscan_common::neighbors::approximate_neighbors(
                     training_data.clone(),
-                    &plan,
+                    plan,
                     seed,
                     iters,
                     false,
@@ -245,7 +515,7 @@ impl UMAP {
             })?;
         if graph_marker.first() == Some(&-2) {
             return Err(UmapError::Numerical(
-                "fuzzy graph contains invalid neighbor indices".into(),
+                "fuzzy graph contains missing or invalid neighbor indices (for example, a squared feature distance overflowed float32)".into(),
             ));
         }
         let fit_graph = ValidatedFitGraph(fit_graph);
@@ -253,19 +523,41 @@ impl UMAP {
         let requested_epochs = self.config.n_epochs.unwrap_or(default_epochs);
         let n_epochs = u32::try_from(requested_epochs)
             .map_err(|_| UmapError::Overflow("optimization epochs"))?;
+        let recursive = self.config.init.resolve() == Init::Recursive;
+        let recursive_modern =
+            recursive && self.config.optimizer != super::Optimizer::Compatibility;
         #[cfg(feature = "tracing")]
         let _schedule_span = tracing::info_span!("schedule", rows = n).entered();
         let maximum = weights.clone().max_dim(0);
-        let (heads, tails, weights, positive, next_positive, negative, next_negative) =
-            prepare_schedule(
+        let (heads, tails, weights, clocks) = if recursive_modern {
+            let divisor = if n_epochs > 10 {
+                n_epochs as f64
+            } else {
+                default_epochs as f64
+            };
+            let threshold = maximum.clone().div_scalar(divisor);
+            let pruned = weights
+                .clone()
+                .mask_fill(weights.clone().lower(threshold), 0.0);
+            (heads, tails, pruned, None)
+        } else {
+            let (heads, tails, weights, positive, next_positive, negative, next_negative) =
+                prepare_schedule(
+                    heads,
+                    tails,
+                    weights,
+                    maximum.clone(),
+                    n_epochs,
+                    default_epochs,
+                    self.config.negative_sample_rate,
+                )?;
+            (
                 heads,
                 tails,
                 weights,
-                maximum.clone(),
-                n_epochs,
-                default_epochs,
-                self.config.negative_sample_rate,
-            )?;
+                Some((positive, next_positive, negative, next_negative)),
+            )
+        };
 
         #[cfg(feature = "tracing")]
         profile_sync(&device)?;
@@ -282,29 +574,120 @@ impl UMAP {
 
         #[cfg(feature = "tracing")]
         let _export_span = tracing::info_span!("spectral_graph_export", rows = n).entered();
-        let (init_heads, init_tails, init_weights) = if self.config.init == Init::Spectral {
+        let (init_heads, init_tails, init_weights) = if recursive
+            || self.config.init == Init::Spectral
+            || self.config.init_rescale == InitRescale::GraphEdge
+        {
+            // Export peak: 12*C readback bytes overlap E*(2*sizeof(usize)+4)
+            // compact directed bytes. Raw arrays die here, before core scratch;
+            // compact edges die after initialize, before upload/layout.
+            let readback_bytes = weights.dims()[0]
+                .checked_mul(2 * size_of::<i32>() + size_of::<f32>())
+                .ok_or(UmapError::Overflow("initialization graph readback"))?;
+            if recursive {
+                let edge_bytes = weights.dims()[0]
+                    .checked_mul(
+                        3 * size_of::<usize>()
+                            + 2 * size_of::<f32>()
+                            + size_of::<(usize, usize, f32)>(),
+                    )
+                    .ok_or(UmapError::Overflow("recursive export edges"))?;
+                let offset_bytes = n
+                    .checked_add(1)
+                    .and_then(|rows| rows.checked_mul(size_of::<usize>()))
+                    .ok_or(UmapError::Overflow("recursive export offsets"))?;
+                let csr_build = edge_bytes
+                    .checked_add(offset_bytes)
+                    .ok_or(UmapError::Overflow("recursive export CSR build"))?;
+                let readback_peak = weights.dims()[0]
+                    .checked_mul(2 * size_of::<usize>() + size_of::<f32>())
+                    .and_then(|bytes| bytes.checked_add(readback_bytes))
+                    .ok_or(UmapError::Overflow("recursive export readback peak"))?;
+                admit_recursive_layout(
+                    &device,
+                    "recursive export",
+                    csr_build.max(readback_peak),
+                    0,
+                )?;
+            }
             let host_heads = heads.to_data().try_to_vec::<i32>().map_err(|error| {
-                UmapError::Numerical(format!("could not read spectral graph heads: {error}"))
+                UmapError::Numerical(format!(
+                    "could not read initialization graph heads: {error}"
+                ))
             })?;
             let host_tails = tails.to_data().try_to_vec::<i32>().map_err(|error| {
-                UmapError::Numerical(format!("could not read spectral graph tails: {error}"))
+                UmapError::Numerical(format!(
+                    "could not read initialization graph tails: {error}"
+                ))
             })?;
             let host_weights = weights.to_data().try_to_vec::<f32>().map_err(|error| {
-                UmapError::Numerical(format!("could not read spectral graph weights: {error}"))
+                UmapError::Numerical(format!(
+                    "could not read initialization graph weights: {error}"
+                ))
             })?;
+            let positive_edges = host_weights.iter().filter(|&&weight| weight > 0.0).count();
+            #[cfg(feature = "tracing")]
+            tracing::debug!(target: "umap::init_export", positive_edges, "exported pruned initialization graph");
+            positive_edges
+                .checked_mul(2 * size_of::<usize>() + size_of::<f32>())
+                .and_then(|bytes| bytes.checked_add(readback_bytes))
+                .ok_or(UmapError::Overflow("initialization graph export peak"))?;
             let mut valid_heads = Vec::new();
             let mut valid_tails = Vec::new();
             let mut valid_weights = Vec::new();
+            valid_heads
+                .try_reserve_exact(positive_edges)
+                .map_err(|error| {
+                    UmapError::Memory(format!(
+                        "could not allocate initialization graph heads: {error}"
+                    ))
+                })?;
+            valid_tails
+                .try_reserve_exact(positive_edges)
+                .map_err(|error| {
+                    UmapError::Memory(format!(
+                        "could not allocate initialization graph tails: {error}"
+                    ))
+                })?;
+            valid_weights
+                .try_reserve_exact(positive_edges)
+                .map_err(|error| {
+                    UmapError::Memory(format!(
+                        "could not allocate initialization graph weights: {error}"
+                    ))
+                })?;
             for ((head, tail), weight) in host_heads.into_iter().zip(host_tails).zip(host_weights) {
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(UmapError::Numerical(
+                        "invalid initialization graph weight".into(),
+                    ));
+                }
                 if weight > 0.0 {
-                    valid_heads.push(head as usize);
-                    valid_tails.push(tail as usize);
+                    let head = usize::try_from(head).map_err(|_| {
+                        UmapError::Numerical("invalid initialization graph head".into())
+                    })?;
+                    let tail = usize::try_from(tail).map_err(|_| {
+                        UmapError::Numerical("invalid initialization graph tail".into())
+                    })?;
+                    if head >= n || tail >= n || head == tail {
+                        return Err(UmapError::Numerical(
+                            "invalid initialization graph endpoints".into(),
+                        ));
+                    }
+                    valid_heads.push(head);
+                    valid_tails.push(tail);
                     valid_weights.push(weight);
                 }
             }
             (valid_heads, valid_tails, valid_weights)
         } else {
             (Vec::new(), Vec::new(), Vec::new())
+        };
+        let legacy_graph = if recursive_modern {
+            drop((heads, tails, weights));
+            None
+        } else {
+            Some((heads, tails, weights))
         };
         #[cfg(feature = "tracing")]
         drop(_export_span);
@@ -316,49 +699,289 @@ impl UMAP {
             method = ?self.config.init,
         )
         .entered();
-        let flat = super::initialize(
-            data,
-            &init_heads,
-            &init_tails,
-            &init_weights,
-            &self.config,
-            seed,
-        )?;
+        use umap_core::{
+            modern_layout::{ModernLayoutParams, compact_graph_from_csr},
+            recursive_init,
+        };
+        let (a, b) = fit_curve(self.config.min_dist, self.config.spread)?;
+        let mut recursive_graph = None;
+        let flat = if recursive {
+            let graph = recursive_init::graph::HostCsr::from_coo(
+                n,
+                &init_heads,
+                &init_tails,
+                &init_weights,
+            )?;
+            let feature_bytes = n
+                .checked_mul(features)
+                .and_then(|count| count.checked_mul(size_of::<f32>()))
+                .ok_or(UmapError::Overflow("recursive features"))?;
+            admit_recursive_layout(&device, "recursive features", feature_bytes, 0)?;
+            let mut feature_values = Vec::new();
+            feature_values
+                .try_reserve_exact(
+                    n.checked_mul(features)
+                        .ok_or(UmapError::Overflow("recursive features"))?,
+                )
+                .map_err(|error| UmapError::Memory(error.to_string()))?;
+            feature_values.extend(data.iter().flatten().copied());
+            let size = super::modern_runtime::allocation_bytes;
+            let matrix = |rows, columns| {
+                super::modern_runtime::matrix_allocation_bytes(&device, rows, columns, 4)
+            };
+            let mut retained = Vec::new();
+            retained
+                .try_reserve_exact(10)
+                .map_err(|error| UmapError::Memory(error.to_string()))?;
+            for (name, space, bytes) in [
+                (
+                    "retained training features",
+                    BufferSpace::Device,
+                    matrix(n, features)?,
+                ),
+                (
+                    "retained fit graph",
+                    BufferSpace::Device,
+                    matrix(n, widths.nonself)?,
+                ),
+                (
+                    "original input rows",
+                    BufferSpace::Host,
+                    size(original_n, features, 4)?,
+                ),
+                (
+                    "original input row metadata",
+                    BufferSpace::Host,
+                    size(original_n, 1, size_of::<Vec<f32>>())?,
+                ),
+                (
+                    "recursive exported heads",
+                    BufferSpace::Host,
+                    size(init_heads.capacity(), 1, size_of::<usize>())?,
+                ),
+                (
+                    "recursive exported tails",
+                    BufferSpace::Host,
+                    size(init_tails.capacity(), 1, size_of::<usize>())?,
+                ),
+                (
+                    "recursive exported weights",
+                    BufferSpace::Host,
+                    size(init_weights.capacity(), 1, size_of::<f32>())?,
+                ),
+            ] {
+                retained.push(LiveBuffer {
+                    name,
+                    space,
+                    lifetime: BufferLifetime::Both,
+                    bytes,
+                });
+            }
+            if let Some(rows) = &distinct {
+                let row_bytes = rows
+                    .iter()
+                    .try_fold(0usize, |sum, row| {
+                        sum.checked_add(row.capacity().checked_mul(size_of::<f32>())?)
+                    })
+                    .ok_or(UmapError::Overflow("distinct training rows"))?;
+                let bytes = row_bytes
+                    .checked_add(size(rows.capacity(), 1, size_of::<Vec<f32>>())?)
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            original_to_training
+                                .as_ref()?
+                                .capacity()
+                                .checked_mul(size_of::<usize>())?,
+                        )
+                    })
+                    .ok_or(UmapError::Overflow("distinct training rows"))?;
+                retained.push(LiveBuffer {
+                    name: "distinct rows and inverse",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes,
+                });
+            }
+            if let Some((heads, _, _)) = &legacy_graph {
+                let bytes = size(heads.dims()[0], 7, size_of::<f32>())?;
+                retained.push(LiveBuffer {
+                    name: "legacy COO and clocks",
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Both,
+                    bytes,
+                });
+            }
+            let mut values = recursive_driver(
+                &graph,
+                &feature_values,
+                features,
+                (a, b),
+                &self.config,
+                seed,
+                &device,
+                &retained,
+            )?;
+            drop(feature_values);
+            let scratch = if self.config.init_rescale == InitRescale::GraphEdge {
+                init_heads.len().checked_mul(size_of::<(usize, f64, f64)>())
+            } else {
+                n.checked_add(n_components)
+                    .and_then(|count| count.checked_mul(size_of::<f64>()))
+            }
+            .ok_or(UmapError::Overflow("recursive finish scratch"))?;
+            let upload = n
+                .checked_mul(n_components)
+                .and_then(|count| count.checked_mul(size_of::<f32>()))
+                .ok_or(UmapError::Overflow("recursive initialization upload"))?;
+            let device_upload = super::modern_runtime::matrix_allocation_bytes(
+                &device,
+                n,
+                n_components,
+                size_of::<f32>(),
+            )?;
+            admit_recursive_layout(
+                &device,
+                "recursive finish",
+                scratch.max(upload),
+                device_upload,
+            )?;
+            recursive_init::finish(
+                &mut values,
+                n,
+                &init_heads,
+                &init_tails,
+                &init_weights,
+                &self.config,
+            )?;
+            recursive_graph = Some(graph);
+            values
+        } else {
+            super::initialize(
+                data,
+                &init_heads,
+                &init_tails,
+                &init_weights,
+                &self.config,
+                seed,
+            )?
+        };
+        drop((init_heads, init_tails, init_weights));
         #[cfg(feature = "tracing")]
         drop(_initialization_span);
-        let rng = optimizer_rng_from_first_coordinates(
-            flat.chunks_exact(n_components).map(|row| row[0]),
-            n,
-            seed,
-            &device,
-        )?;
+        let rng = if recursive_modern {
+            None
+        } else {
+            if recursive {
+                let mut host = n
+                    .checked_mul(3 * size_of::<i64>())
+                    .ok_or(UmapError::Overflow("recursive optimizer RNG"))?;
+                if device != Device::cpu() {
+                    host = host
+                        .checked_mul(2)
+                        .ok_or(UmapError::Overflow("recursive optimizer RNG upload"))?;
+                }
+                let device_bytes = super::modern_runtime::matrix_allocation_bytes(
+                    &device,
+                    n,
+                    3,
+                    size_of::<i64>(),
+                )?;
+                admit_recursive_layout(&device, "recursive optimizer RNG", host, device_bytes)?;
+            }
+            Some(optimizer_rng_from_first_coordinates(
+                flat.chunks_exact(n_components).map(|row| row[0]),
+                n,
+                seed,
+                &device,
+            )?)
+        };
         let initial = Tensor::<2>::from_data(TensorData::new(flat, [n, n_components]), &device);
-        let (a, b) = fit_curve(self.config.min_dist, self.config.spread)?;
         #[cfg(feature = "tracing")]
         profile_sync(&device)?;
         #[cfg(feature = "tracing")]
         let _optimization_span =
             tracing::info_span!("optimization", rows = n, epochs = n_epochs).entered();
-        let embedding_tensor = optimize(
-            initial.clone(),
-            initial,
-            heads,
-            tails,
-            weights,
-            positive,
-            next_positive,
-            negative,
-            next_negative,
-            rng,
-            n_epochs,
-            a,
-            b,
-            self.config.learning_rate,
-            self.config.repulsion_strength,
-            self.config.negative_sample_rate,
-            true,
-            true,
-        )?;
+        let embedding_tensor = if self.config.optimizer == super::Optimizer::Compatibility {
+            let (heads, tails, weights) = legacy_graph.expect("compatibility graph");
+            let (positive, next_positive, negative, next_negative) =
+                clocks.expect("compatibility clocks");
+            optimize(
+                initial.clone(),
+                initial,
+                heads,
+                tails,
+                weights,
+                positive,
+                next_positive,
+                negative,
+                next_negative,
+                rng.expect("compatibility RNG"),
+                n_epochs,
+                a,
+                b,
+                self.config.learning_rate,
+                self.config.repulsion_strength,
+                self.config.negative_sample_rate,
+                true,
+                true,
+            )?
+        } else if let Some(graph) = recursive_graph {
+            if n_epochs == 0 {
+                initial
+            } else {
+                let params = ModernLayoutParams::main(
+                    &self.config,
+                    n_epochs,
+                    a,
+                    b,
+                    self.config.learning_rate,
+                    true,
+                    seed,
+                );
+                admit_recursive_layout(
+                    &device,
+                    "recursive main compact",
+                    recursive_compact_bytes(n, graph.indices.len())?,
+                    0,
+                )?;
+                let compact = compact_graph_from_csr(
+                    &graph,
+                    n_epochs as usize,
+                    self.config.negative_sample_rate as f32,
+                )?;
+                drop(graph);
+                super::modern_runtime::optimize_compact(
+                    initial.clone(),
+                    initial,
+                    compact,
+                    &params,
+                    LayoutOperation::Fit,
+                    features,
+                    original_n,
+                    &modern_buffers,
+                )?
+            }
+        } else {
+            let (heads, tails, weights) = legacy_graph.expect("modern graph");
+            drop((clocks, rng));
+            super::modern_runtime::optimize(
+                initial.clone(),
+                initial,
+                heads,
+                tails,
+                weights,
+                n_epochs,
+                a,
+                b,
+                self.config.learning_rate,
+                &self.config,
+                LayoutOperation::Fit,
+                seed,
+                features,
+                original_n,
+                &modern_buffers,
+            )?
+        };
         #[cfg(feature = "tracing")]
         profile_sync(&device)?;
         #[cfg(feature = "tracing")]
@@ -785,7 +1408,7 @@ impl FittedUMAP {
                 position % n_features
             )));
         }
-        self.transform_flat_impl(data, n_rows, n_features, None)
+        self.transform_flat_impl(data, n_rows, n_features, false, None)
     }
 
     /// Return the transform and the actual training-neighbor IDs used by it.
@@ -799,29 +1422,238 @@ impl FittedUMAP {
         Ok((embedding, indices))
     }
 
+    /// Measurement-only stage replay, search entry (Phase 7 D6).
+    ///
+    /// Runs cuscan's query search, graph, pruning, initialization, schedule and
+    /// layout, returning every stage boundary. `budget` replaces the
+    /// queue-derived approximate budget (C/V override); it must satisfy
+    /// `k <= candidates <= visits <= n_fitted` and requires approximate search.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    pub fn replay_transform_search(
+        &self,
+        data: &[Vec<f32>],
+        budget: Option<QueryBudget>,
+    ) -> Result<TransformReplay> {
+        let (q, features) = validate_input(data, Some(self.n_features))?;
+        if budget.is_some() {
+            let n = self.training_data.dims()[0];
+            self.query_budget(n, query_neighbor_width(n, self.config.n_neighbors)?, budget)?;
+        }
+        let count = q
+            .checked_mul(features)
+            .ok_or(UmapError::Overflow("replay input shape"))?;
+        let modern_buffers = self.prepare_transform(q, features, true, budget)?;
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(count)
+            .map_err(|error| UmapError::Memory(format!("replay input: {error}")))?;
+        flat.extend(data.iter().flat_map(|row| row.iter().copied()));
+        let mut replay = TransformReplay::default();
+        let (indices, distances) = self.transform_neighbors(
+            flat,
+            q,
+            features,
+            budget,
+            None,
+            Some(&mut replay.query_stats),
+        )?;
+        self.replay_from_neighbors(indices, distances, &modern_buffers, replay)
+    }
+
+    /// Measurement-only stage replay, graph entry (Phase 7 D6).
+    ///
+    /// Takes injected query kNN (`rows * k` training IDs and distances,
+    /// row-major, `k = query_neighbor_width(n_fitted, n_neighbors)`) and runs
+    /// cuscan's graph, pruning, initialization, schedule and layout.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    pub fn replay_transform_graph(
+        &self,
+        rows: usize,
+        indices: &[i32],
+        distances: &[f32],
+    ) -> Result<TransformReplay> {
+        let n = self.training_data.dims()[0];
+        let k = query_neighbor_width(n, self.config.n_neighbors)?;
+        let count = rows
+            .checked_mul(k)
+            .ok_or(UmapError::Overflow("replay neighbor shape"))?;
+        if rows == 0 || indices.len() != count || distances.len() != count {
+            return Err(UmapError::InvalidInput(format!(
+                "injected neighbors need {rows} nonzero rows of {k} IDs and distances"
+            )));
+        }
+        if let Some(position) = indices.iter().position(|&id| id < 0 || id as usize >= n) {
+            return Err(UmapError::InvalidInput(format!(
+                "injected neighbor ID at row {}, slot {} is outside [0, {n})",
+                position / k,
+                position % k
+            )));
+        }
+        let limit = f32::MAX.sqrt();
+        if let Some(position) = distances
+            .iter()
+            .position(|&value| !(0.0..=limit).contains(&value))
+        {
+            return Err(UmapError::InvalidInput(format!(
+                "injected neighbor distance at row {}, slot {} is not in [0, sqrt(f32::MAX)]",
+                position / k,
+                position % k
+            )));
+        }
+        let modern_buffers = self.prepare_transform(rows, self.n_features, false, None)?;
+        let device = self.training_data.device();
+        let indices =
+            Tensor::<2, Int>::from_data(TensorData::new(indices.to_vec(), [rows, k]), &device)
+                .cast(burn::tensor::IntDType::I32);
+        let distances =
+            Tensor::<2>::from_data(TensorData::new(distances.to_vec(), [rows, k]), &device);
+        self.replay_from_neighbors(
+            indices,
+            distances,
+            &modern_buffers,
+            TransformReplay::default(),
+        )
+    }
+
+    #[cfg(feature = "tracing")]
+    fn replay_from_neighbors(
+        &self,
+        indices: Tensor<2, Int>,
+        distances: Tensor<2>,
+        modern_buffers: &[LiveBuffer],
+        mut replay: TransformReplay,
+    ) -> Result<TransformReplay> {
+        replay.neighbor_indices = read_ints(indices.clone(), "replay neighbor IDs")?;
+        replay.neighbor_distances = read_floats(distances.clone(), "replay neighbor distances")?;
+        let embedding =
+            self.transform_from_neighbors(indices, distances, modern_buffers, Some(&mut replay))?;
+        replay.embedding = embedding;
+        Ok(replay)
+    }
+
+    /// Measurement-only stage replay, layout entry (Phase 7 D6).
+    ///
+    /// Takes an injected ordered pruned edge stream (query heads in `[0, rows)`,
+    /// training tails, non-negative weights; COO order for Compatibility, any
+    /// order for modern optimizers, which build sorted CSR) and an injected
+    /// `[rows, n_components]` initial placement. Runs only cuscan's schedule
+    /// (pruning against the stream's own maximum) and layout, and returns the
+    /// schedule arrays and final embedding. Graph fields stay empty.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    pub fn replay_transform_layout(
+        &self,
+        rows: usize,
+        heads: &[i32],
+        tails: &[i32],
+        weights: &[f32],
+        initial: &[f32],
+    ) -> Result<TransformReplay> {
+        let n = self.training_data.dims()[0];
+        let components = self.config.n_components;
+        let edges = weights.len();
+        if rows == 0 || edges == 0 || heads.len() != edges || tails.len() != edges {
+            return Err(UmapError::InvalidInput(
+                "injected edge stream needs equal, nonzero head, tail and weight counts".into(),
+            ));
+        }
+        if i32::try_from(edges).is_err() || i32::try_from(rows).is_err() {
+            return Err(UmapError::Overflow("injected edge stream indices"));
+        }
+        if heads.iter().any(|&head| head < 0 || head as usize >= rows)
+            || tails.iter().any(|&tail| tail < 0 || tail as usize >= n)
+        {
+            return Err(UmapError::InvalidInput(
+                "injected edge endpoints are outside the query or training rows".into(),
+            ));
+        }
+        if weights
+            .iter()
+            .any(|&weight| !weight.is_finite() || weight < 0.0)
+        {
+            return Err(UmapError::InvalidInput(
+                "injected edge weights must be finite and non-negative".into(),
+            ));
+        }
+        let placement = rows
+            .checked_mul(components)
+            .ok_or(UmapError::Overflow("injected initial placement"))?;
+        if initial.len() != placement || initial.iter().any(|value| !value.is_finite()) {
+            return Err(UmapError::InvalidInput(format!(
+                "injected initial placement needs {placement} finite values"
+            )));
+        }
+        validate_layout_work(edges, self.config.negative_sample_rate)?;
+        let modern_buffers = self.prepare_transform(rows, self.n_features, false, None)?;
+        let device = self.training_data.device();
+        let int = |values: &[i32]| {
+            Tensor::<1, Int>::from_data(TensorData::new(values.to_vec(), [edges]), &device)
+                .cast(burn::tensor::IntDType::I32)
+        };
+        let heads = int(heads);
+        let tails = int(tails);
+        let weights = Tensor::<1>::from_data(TensorData::new(weights.to_vec(), [edges]), &device);
+        let maximum = weights.clone().max_dim(0);
+        validate_graph_maximum(
+            maximum.clone(),
+            "could not inspect injected transform graph",
+            "injected transform graph has no positive edge",
+        )?;
+        let initial = Tensor::<2>::from_data(
+            TensorData::new(initial.to_vec(), [rows, components]),
+            &device,
+        );
+        let mut replay = TransformReplay::default();
+        let embedding = self.transform_layout(
+            initial,
+            heads,
+            tails,
+            weights,
+            maximum,
+            &modern_buffers,
+            Some(&mut replay),
+        )?;
+        replay.embedding = embedding;
+        Ok(replay)
+    }
+
     fn transform_impl(
         &self,
         data: &[Vec<f32>],
         diagnostic_indices: Option<&mut Vec<i32>>,
     ) -> Result<Embedding> {
         let (q, query_features) = validate_input(data, Some(self.n_features))?;
-        q.checked_mul(query_features)
+        let count = q
+            .checked_mul(query_features)
             .ok_or(UmapError::Overflow("transform input shape"))?;
-        let flat = data.iter().flat_map(|row| row.iter().copied()).collect();
-        let values = self.transform_flat_impl(flat, q, query_features, diagnostic_indices)?;
+        let bytes = count
+            .checked_mul(size_of::<f32>())
+            .ok_or(UmapError::Overflow("transform input bytes"))?;
+        if bytes > isize::MAX as usize {
+            return Err(UmapError::Capacity(
+                "transform input allocation exceeds host limit".into(),
+            ));
+        }
+        self.prepare_transform(q, query_features, true, None)?;
+        let mut flat = Vec::new();
+        flat.try_reserve_exact(count)
+            .map_err(|error| UmapError::Memory(format!("transform input: {error}")))?;
+        flat.extend(data.iter().flat_map(|row| row.iter().copied()));
+        let values = self.transform_flat_impl(flat, q, query_features, true, diagnostic_indices)?;
         Ok(values
             .chunks_exact(self.embedding_tensor.dims()[1])
             .map(|row| row.to_vec())
             .collect())
     }
 
-    fn transform_flat_impl(
+    fn prepare_transform(
         &self,
-        data: Vec<f32>,
         q: usize,
         query_features: usize,
-        diagnostic_indices: Option<&mut Vec<i32>>,
-    ) -> Result<Vec<f32>> {
+        nested: bool,
+        budget: Option<QueryBudget>,
+    ) -> Result<Vec<LiveBuffer>> {
         if self.training_data.dims()[0] == 1 {
             return Err(UmapError::InvalidInput(
                 "Transform unavailable when model was fit with only a single data sample.".into(),
@@ -838,6 +1670,270 @@ impl FittedUMAP {
             return Err(UmapError::Overflow("transform graph COO indices"));
         }
         validate_layout_work(graph_capacity, self.config.negative_sample_rate)?;
+        let mut modern_buffers = Vec::new();
+        if self.config.optimizer != super::Optimizer::Compatibility {
+            let size = super::modern_runtime::allocation_bytes;
+            let matrix = |rows, columns| {
+                super::modern_runtime::matrix_allocation_bytes(&device, rows, columns, 4)
+            };
+            modern_buffers
+                .try_reserve_exact(192)
+                .map_err(|e| UmapError::Memory(format!("modern plan entries: {e}")))?;
+            modern_buffers.push(LiveBuffer {
+                name: "retained training features",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Both,
+                bytes: matrix(n, self.n_features)?,
+            });
+            if let Some(graph) = &self.fit_graph {
+                modern_buffers.push(LiveBuffer {
+                    name: "retained fit graph",
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Both,
+                    bytes: matrix(n, graph.0.dims()[1])?,
+                });
+            }
+            modern_buffers.push(LiveBuffer {
+                name: "retained host embedding rows",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::RepeatedBoth(n),
+                bytes: size(self.config.n_components, 1, 4)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "retained host embedding row metadata",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Both,
+                bytes: size(n, 1, size_of::<Vec<f32>>())?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "query upload",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: matrix(q, query_features)?,
+            });
+            modern_buffers.push(LiveBuffer {
+                name: "query input",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Build,
+                bytes: size(q, query_features, 4)?,
+            });
+            if matches!(
+                device.as_dispatch(),
+                burn::backend::DispatchDevice::Cube(burn_cubecl::CubeDevice::Cuda(_))
+            ) {
+                modern_buffers.push(LiveBuffer {
+                    name: "query pinned upload staging",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(q, query_features, 4)?,
+                });
+            }
+            if nested {
+                modern_buffers.push(LiveBuffer {
+                    name: "nested query rows",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::RepeatedBoth(q),
+                    bytes: size(query_features, 1, 4)?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "nested query metadata",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes: size(q, 1, size_of::<Vec<f32>>())?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "nested transform output rows",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::FutureResult(q),
+                    bytes: size(self.config.n_components, 1, 4)?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "nested transform output metadata",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::FutureResult(1),
+                    bytes: size(q, 1, size_of::<Vec<f32>>())?,
+                });
+            }
+            for name in ["graph rho", "graph sigma"] {
+                modern_buffers.push(LiveBuffer {
+                    name,
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(q, 1, 4)?,
+                });
+            }
+            let nodes = q
+                .checked_add(n)
+                .ok_or(UmapError::Overflow("transform graph nodes"))?;
+            i32::try_from(nodes).map_err(|_| UmapError::Overflow("transform graph nodes"))?;
+            for name in ["graph counts", "graph offsets", "graph cursors"] {
+                modern_buffers.push(LiveBuffer {
+                    name,
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(nodes, 1, 4)?,
+                });
+            }
+            for name in [
+                "query indices",
+                "query distances",
+                "directed weights",
+                "normalized weights",
+            ] {
+                modern_buffers.push(LiveBuffer {
+                    name,
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: matrix(q, k)?,
+                });
+            }
+            if self.search == NeighborSearch::Exact {
+                super::modern_runtime::exact_search_buffers(
+                    &mut modern_buffers,
+                    &device,
+                    q,
+                    n,
+                    query_features,
+                    k,
+                )?;
+            }
+            for name in ["classic positive intervals", "classic negative intervals"] {
+                modern_buffers.push(LiveBuffer {
+                    name,
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: size(graph_capacity, 1, 8)?,
+                });
+            }
+            modern_buffers.push(LiveBuffer {
+                name: "classic RNG",
+                space: BufferSpace::Device,
+                lifetime: BufferLifetime::Build,
+                bytes: matrix(q, 3)?,
+            });
+            if self.search == NeighborSearch::Approximate {
+                let budget = self.query_budget(n, k, budget)?;
+                let graph = self.fit_graph.as_ref().ok_or_else(|| {
+                    UmapError::Numerical("validated fit graph unavailable".into())
+                })?;
+                let chunk = approximate_query_scratch_layout(
+                    q,
+                    budget.candidates,
+                    budget.visits,
+                    graph.0.dims()[1],
+                )?
+                .max_chunk_rows;
+                for name in ["candidate ids", "candidate distances", "candidate expanded"] {
+                    modern_buffers.push(LiveBuffer {
+                        name,
+                        space: BufferSpace::Device,
+                        lifetime: BufferLifetime::Build,
+                        bytes: matrix(chunk, budget.candidates)?,
+                    });
+                }
+                for name in ["visited ids", "visited distances"] {
+                    modern_buffers.push(LiveBuffer {
+                        name,
+                        space: BufferSpace::Device,
+                        lifetime: BufferLifetime::Build,
+                        bytes: matrix(chunk, budget.visits)?,
+                    });
+                }
+                modern_buffers.push(LiveBuffer {
+                    name: "query statistics",
+                    space: BufferSpace::Device,
+                    lifetime: BufferLifetime::Build,
+                    bytes: matrix(q, 2)?,
+                });
+            }
+            if let Some(inverse) = &self.original_to_training {
+                modern_buffers.push(LiveBuffer {
+                    name: "unique inverse mapping",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes: size(inverse.len(), 1, size_of::<usize>())?,
+                });
+            }
+            if let Some(expanded) = self.expanded_embedding.get() {
+                modern_buffers.push(LiveBuffer {
+                    name: "expanded host embedding rows",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::RepeatedBoth(expanded.len()),
+                    bytes: size(self.config.n_components, 1, 4)?,
+                });
+                modern_buffers.push(LiveBuffer {
+                    name: "expanded host embedding row metadata",
+                    space: BufferSpace::Host,
+                    lifetime: BufferLifetime::Both,
+                    bytes: size(expanded.len(), 1, size_of::<Vec<f32>>())?,
+                });
+            }
+            super::modern_runtime::preflight(
+                &device,
+                super::modern_runtime::LayoutAdmissionStage::ConstructionBoundsOnly,
+                LayoutOperation::Transform,
+                q,
+                n,
+                self.config.n_components,
+                self.n_features,
+                q,
+                graph_capacity,
+                graph_capacity,
+                &self.config,
+                &modern_buffers,
+                None,
+            )?;
+        }
+        Ok(modern_buffers)
+    }
+
+    fn transform_flat_impl(
+        &self,
+        data: Vec<f32>,
+        q: usize,
+        query_features: usize,
+        nested: bool,
+        diagnostic_indices: Option<&mut Vec<i32>>,
+    ) -> Result<Vec<f32>> {
+        let modern_buffers = self.prepare_transform(q, query_features, nested, None)?;
+        let (indices, distances) =
+            self.transform_neighbors(data, q, query_features, None, diagnostic_indices, None)?;
+        self.transform_from_neighbors(indices, distances, &modern_buffers, None)
+    }
+
+    /// The approximate-search budget: the configured one, or a measurement override.
+    fn query_budget(&self, n: usize, k: usize, budget: Option<QueryBudget>) -> Result<QueryBudget> {
+        match budget {
+            None => approximate_query_budget(n, k, self.config.transform_queue_size),
+            Some(budget) => {
+                if self.search != NeighborSearch::Approximate {
+                    return Err(UmapError::InvalidInput(
+                        "a query budget override requires approximate search".into(),
+                    ));
+                }
+                if budget.candidates < k || budget.visits < budget.candidates || budget.visits > n {
+                    return Err(UmapError::InvalidInput(format!(
+                        "query budget override must satisfy {k} <= candidates <= visits <= {n}"
+                    )));
+                }
+                Ok(budget)
+            }
+        }
+    }
+
+    /// Transform query kNN: training-neighbor IDs and distances, `[q, k]`.
+    fn transform_neighbors(
+        &self,
+        data: Vec<f32>,
+        q: usize,
+        query_features: usize,
+        budget: Option<QueryBudget>,
+        diagnostic_indices: Option<&mut Vec<i32>>,
+        mut diagnostic_stats: Option<&mut Vec<i32>>,
+    ) -> Result<(Tensor<2, Int>, Tensor<2>)> {
+        let device = self.training_data.device();
+        let n = self.training_data.dims()[0];
+        let k = query_neighbor_width(n, self.config.n_neighbors)?;
         #[cfg(feature = "tracing")]
         let _neighbors_span = tracing::info_span!(
             "neighbor_search",
@@ -858,7 +1954,7 @@ impl FittedUMAP {
                 (result.indices, result.distances)
             }
             NeighborSearch::Approximate => {
-                let budget = approximate_query_budget(n, k, self.config.transform_queue_size)?;
+                let budget = self.query_budget(n, k, budget)?;
                 let k_u32 =
                     u32::try_from(k).map_err(|_| UmapError::Overflow("transform query width"))?;
                 let candidates = u32::try_from(budget.candidates)
@@ -897,7 +1993,11 @@ impl FittedUMAP {
                             self.config.transform_seed,
                             0,
                         );
-                    check_query_stats(Tensor::from_dispatch(stats))?;
+                    let stats = Tensor::from_dispatch(stats);
+                    if let Some(output) = diagnostic_stats.as_deref_mut() {
+                        read_query_stats(&stats, output)?;
+                    }
+                    check_query_stats(stats)?;
                     (
                         Tensor::<2, Int>::from_dispatch(indices),
                         Tensor::<2>::from_dispatch(distances),
@@ -933,7 +2033,11 @@ impl FittedUMAP {
                                 u64::try_from(start)
                                     .map_err(|_| UmapError::Overflow("query row offset"))?,
                             );
-                        check_query_stats(Tensor::from_dispatch(stats))?;
+                        let stats = Tensor::from_dispatch(stats);
+                        if let Some(output) = diagnostic_stats.as_deref_mut() {
+                            read_query_stats(&stats, output)?;
+                        }
+                        check_query_stats(stats)?;
                         all_indices.push(Tensor::<2, Int>::from_dispatch(indices));
                         all_distances.push(Tensor::<2>::from_dispatch(distances));
                     }
@@ -951,18 +2055,33 @@ impl FittedUMAP {
         }
         #[cfg(feature = "tracing")]
         drop(_neighbors_span);
+        Ok((indices, distances))
+    }
+
+    /// Transform graph, pruning and initialization from query kNN, then layout.
+    fn transform_from_neighbors(
+        &self,
+        indices: Tensor<2, Int>,
+        distances: Tensor<2>,
+        modern_buffers: &[LiveBuffer],
+        mut capture: Option<&mut TransformReplay>,
+    ) -> Result<Vec<f32>> {
+        let q = indices.dims()[0];
+        let n = self.training_data.dims()[0];
         let local_connectivity = (self.config.local_connectivity - 1.0).max(0.0);
         #[cfg(feature = "tracing")]
-        let _graph_span = tracing::info_span!("fuzzy_graph", rows = q, neighbors = k).entered();
-        let (heads, tails, weights, _, _, directed) = <Dispatch as StandardUmapOps>::fuzzy_graph(
-            indices.clone().into_dispatch(),
-            distances.into_dispatch(),
-            local_connectivity,
-            1.0,
-            self.config.set_op_mix_ratio,
-            true,
-            u32::try_from(n).map_err(|_| UmapError::Overflow("reference count"))?,
-        );
+        let _graph_span =
+            tracing::info_span!("fuzzy_graph", rows = q, neighbors = indices.dims()[1]).entered();
+        let (heads, tails, weights, rho, sigma, directed) =
+            <Dispatch as StandardUmapOps>::fuzzy_graph(
+                indices.clone().into_dispatch(),
+                distances.into_dispatch(),
+                local_connectivity,
+                1.0,
+                self.config.set_op_mix_ratio,
+                true,
+                u32::try_from(n).map_err(|_| UmapError::Overflow("reference count"))?,
+            );
         #[cfg(feature = "tracing")]
         drop(_graph_span);
         let heads: Tensor<1, Int> = Tensor::from_dispatch(heads);
@@ -970,14 +2089,16 @@ impl FittedUMAP {
         let weights: Tensor<1> = Tensor::from_dispatch(weights);
         let directed: Tensor<2> = Tensor::from_dispatch(directed);
         check_graph_marker(&heads)?;
-        let n_epochs = self
-            .config
-            .n_epochs
-            .map(|epochs| epochs / 3)
-            .unwrap_or(if q <= 10_000 { 100 } else { 30 });
-        let n_epochs_u32 = u32::try_from(n_epochs)
-            .map_err(|_| UmapError::Overflow("transform optimization epochs"))?;
-        let default_epochs = if q <= 10_000 { 100 } else { 30 };
+        if let Some(replay) = capture.as_deref_mut() {
+            replay.rho = read_floats(Tensor::<1>::from_dispatch(rho), "replay rho")?;
+            replay.sigma = read_floats(Tensor::<1>::from_dispatch(sigma), "replay sigma")?;
+            replay.memberships = read_floats(directed.clone(), "replay memberships")?;
+            replay.graph_heads = read_ints(heads.clone(), "replay graph heads")?;
+            replay.graph_tails = read_ints(tails.clone(), "replay graph tails")?;
+            replay.graph_weights = read_floats(weights.clone(), "replay graph weights")?;
+        } else {
+            drop((rho, sigma));
+        }
         let maximum = weights.clone().max_dim(0);
         validate_graph_maximum(
             maximum.clone(),
@@ -985,13 +2106,54 @@ impl FittedUMAP {
             "transform fuzzy graph is empty after positive-edge pruning",
         )?;
         let sums = directed.clone().sum_dim(1).reshape([q, 1]);
-        let normalized = directed.div(sums.clone().mask_fill(sums.equal_elem(0.0), 1.0));
+        let normalized = directed
+            .clone()
+            .div(sums.clone().mask_fill(sums.equal_elem(0.0), 1.0));
         let initial = weighted_initialization(
             &self.embedding_tensor,
             &indices,
             &normalized,
+            &directed,
             super::query::TRANSFORM_SCRATCH_BUDGET_BYTES,
         )?;
+        drop((indices, normalized));
+        self.transform_layout(
+            initial,
+            heads,
+            tails,
+            weights,
+            maximum,
+            modern_buffers,
+            capture,
+        )
+    }
+
+    /// Transform schedule and layout from a COO edge stream (query heads,
+    /// training tails) and an initial placement. `maximum` is the validated
+    /// pre-prune maximum of `weights`.
+    #[allow(clippy::too_many_arguments)]
+    fn transform_layout(
+        &self,
+        initial: Tensor<2>,
+        heads: Tensor<1, Int>,
+        tails: Tensor<1, Int>,
+        weights: Tensor<1>,
+        maximum: Tensor<1>,
+        modern_buffers: &[LiveBuffer],
+        capture: Option<&mut TransformReplay>,
+    ) -> Result<Vec<f32>> {
+        let q = initial.dims()[0];
+        let n = self.training_data.dims()[0];
+        let device = self.training_data.device();
+        let n_epochs = self
+            .config
+            .n_epochs
+            .map(|epochs| epochs / 3)
+            .unwrap_or(if q <= 10_000 { 100 } else { 30 });
+        let n_epochs_u32 = u32::try_from(n_epochs)
+            .map_err(|_| UmapError::Overflow("transform optimization epochs"))?;
+        // Unlike fit, upstream transform prunes using the actual epoch count,
+        // even when it is at most ten (or zero).
         let (heads, tails, weights, positive, next_positive, negative, next_negative) =
             prepare_schedule(
                 heads,
@@ -999,9 +2161,40 @@ impl FittedUMAP {
                 weights,
                 maximum,
                 n_epochs_u32,
-                default_epochs,
+                n_epochs,
                 self.config.negative_sample_rate,
             )?;
+        if let Some(replay) = capture {
+            replay.epochs = n_epochs_u32;
+            replay.initial_alpha = self.config.learning_rate / 4.0;
+            replay.initial = read_floats(initial.clone(), "replay initial placement")?;
+            replay.edge_heads = read_ints(heads.clone(), "replay edge heads")?;
+            replay.edge_tails = read_ints(tails.clone(), "replay edge tails")?;
+            replay.edge_weights = read_floats(weights.clone(), "replay edge weights")?;
+            if self.config.optimizer == super::Optimizer::Compatibility {
+                replay.periods = read_f64(positive.clone(), "replay periods")?;
+                replay.next_positive = read_f64(next_positive.clone(), "replay positive clocks")?;
+                replay.negative_periods = read_f64(negative.clone(), "replay negative periods")?;
+                replay.next_negative = read_f64(next_negative.clone(), "replay negative clocks")?;
+            } else if let Some(graph) = super::modern_runtime::diagnostic_compact_schedule(
+                q,
+                n,
+                heads.clone(),
+                tails.clone(),
+                weights.clone(),
+                n_epochs_u32,
+                &self.config,
+                LayoutOperation::Transform,
+            )? {
+                replay.csr_offsets = graph.offsets;
+                replay.csr_indices = graph.indices;
+                replay.csr_weights = graph.weights;
+                replay.periods = graph.periods;
+                replay.negative_periods = graph.negative_periods;
+                replay.next_positive = graph.next_positive;
+                replay.next_negative = graph.next_negative;
+            }
+        }
         let transform_seed = self.config.transform_seed;
         let first_coordinates = initial
             .clone()
@@ -1021,26 +2214,47 @@ impl FittedUMAP {
         #[cfg(feature = "tracing")]
         let _optimization_span =
             tracing::info_span!("optimization", rows = q, epochs = n_epochs_u32).entered();
-        let embedding = optimize(
-            initial,
-            self.embedding_tensor.clone(),
-            heads,
-            tails,
-            weights,
-            positive,
-            next_positive,
-            negative,
-            next_negative,
-            rng,
-            n_epochs_u32,
-            self.a,
-            self.b,
-            self.config.learning_rate / 4.0,
-            self.config.repulsion_strength,
-            self.config.negative_sample_rate,
-            false,
-            false,
-        )?;
+        let embedding = if self.config.optimizer == super::Optimizer::Compatibility {
+            optimize(
+                initial,
+                self.embedding_tensor.clone(),
+                heads,
+                tails,
+                weights,
+                positive,
+                next_positive,
+                negative,
+                next_negative,
+                rng,
+                n_epochs_u32,
+                self.a,
+                self.b,
+                self.config.learning_rate / 4.0,
+                self.config.repulsion_strength,
+                self.config.negative_sample_rate,
+                false,
+                false,
+            )?
+        } else {
+            drop((positive, next_positive, negative, next_negative, rng));
+            super::modern_runtime::optimize(
+                initial,
+                self.embedding_tensor.clone(),
+                heads,
+                tails,
+                weights,
+                n_epochs_u32,
+                self.a,
+                self.b,
+                self.config.learning_rate / 4.0,
+                &self.config,
+                LayoutOperation::Transform,
+                transform_seed,
+                self.n_features,
+                q,
+                modern_buffers,
+            )?
+        };
         #[cfg(feature = "tracing")]
         drop(_optimization_span);
         embedding
@@ -1050,21 +2264,101 @@ impl FittedUMAP {
     }
 }
 
+/// Measurement-only stage-replay output (Phase 7 D6). Matrices are row-major.
+///
+/// Graph fields are empty for the layout entry. Schedule arrays are the ones
+/// the selected optimizer consumes: for Compatibility they align with the COO
+/// edge stream (pruned zero-weight slots carry `maximum / 1` intervals and are
+/// never sampled) and the CSR fields are empty; for modern optimizers they
+/// align with the compact CSR built from the positive edges, and all schedule
+/// fields are empty at zero epochs.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+pub struct TransformReplay {
+    /// Query neighbor IDs and distances used, `[q, k]`.
+    pub neighbor_indices: Vec<i32>,
+    pub neighbor_distances: Vec<f32>,
+    /// Approximate-search `[peak_candidates, unique_evaluations]`, `[q, 2]`;
+    /// empty for exact search and injected neighbors.
+    pub query_stats: Vec<i32>,
+    /// Per-query smooth-kNN rho and sigma, `[q]`.
+    pub rho: Vec<f32>,
+    pub sigma: Vec<f32>,
+    /// Raw directed memberships per neighbor slot, `[q, k]`.
+    pub memberships: Vec<f32>,
+    /// Coalesced COO graph before pruning, capacity `2 * q * k`, zero-padded.
+    pub graph_heads: Vec<i32>,
+    pub graph_tails: Vec<i32>,
+    pub graph_weights: Vec<f32>,
+    /// Pruned COO edge stream in consumption order (query heads, training tails).
+    pub edge_heads: Vec<i32>,
+    pub edge_tails: Vec<i32>,
+    pub edge_weights: Vec<f32>,
+    /// Transform epochs and initial learning rate.
+    pub epochs: u32,
+    pub initial_alpha: f32,
+    /// Modern compact CSR (`offsets` has `q + 1` entries).
+    pub csr_offsets: Vec<u32>,
+    pub csr_indices: Vec<u32>,
+    pub csr_weights: Vec<f32>,
+    /// Positive and negative periods and their initial clocks.
+    pub periods: Vec<f64>,
+    pub negative_periods: Vec<f64>,
+    pub next_positive: Vec<f64>,
+    pub next_negative: Vec<f64>,
+    /// Initial placement and final embedding, `[q, n_components]`.
+    pub initial: Vec<f32>,
+    pub embedding: Vec<f32>,
+}
+
+fn read_floats<const D: usize>(tensor: Tensor<D>, what: &str) -> Result<Vec<f32>> {
+    tensor
+        .to_data()
+        .try_to_vec::<f32>()
+        .map_err(|error| UmapError::Numerical(format!("could not read {what}: {error}")))
+}
+
+fn read_f64(tensor: Tensor<1>, what: &str) -> Result<Vec<f64>> {
+    tensor
+        .to_data()
+        .try_to_vec::<f64>()
+        .map_err(|error| UmapError::Numerical(format!("could not read {what}: {error}")))
+}
+
+fn read_ints<const D: usize>(tensor: Tensor<D, Int>, what: &str) -> Result<Vec<i32>> {
+    tensor
+        .to_data()
+        .try_to_vec::<i32>()
+        .map_err(|error| UmapError::Numerical(format!("could not read {what}: {error}")))
+}
+
+fn read_query_stats(stats: &Tensor<2, Int>, output: &mut Vec<i32>) -> Result<()> {
+    let values = read_ints(stats.clone(), "query statistics")?;
+    output
+        .try_reserve(values.len())
+        .map_err(|error| UmapError::Memory(format!("query statistics: {error}")))?;
+    output.extend(values);
+    Ok(())
+}
+
 fn weighted_initialization_chunk_rows(
     query_rows: usize,
     k: usize,
     components: usize,
     scratch_limit_bytes: usize,
 ) -> Result<usize> {
-    // Include gather/reshape storage, indices, the broadcast product, the live
-    // slot, and old and new accumulator tensors, including k=2.
+    // Include weighted-mean buffers, host copies of IDs and memberships,
+    // copy IDs and masks on host and device, and the gathered replacement.
     let row_words = k
         .checked_mul(components)
         .and_then(|value| value.checked_mul(2))
         .and_then(|value| value.checked_add(k))
+        .and_then(|value| k.checked_mul(4).and_then(|extra| value.checked_add(extra)))
+        .and_then(|value| value.checked_add(6))
         .and_then(|value| {
             components
-                .checked_mul(4)
+                .checked_mul(8)
                 .and_then(|extra| value.checked_add(extra))
         })
         .ok_or(UmapError::Overflow("transform initialization scratch"))?;
@@ -1092,6 +2386,7 @@ fn weighted_initialization(
     embedding: &Tensor<2>,
     indices: &Tensor<2, Int>,
     normalized: &Tensor<2>,
+    directed: &Tensor<2>,
     scratch_limit_bytes: usize,
 ) -> Result<Tensor<2>> {
     let [query_rows, k] = indices.dims();
@@ -1103,6 +2398,50 @@ fn weighted_initialization(
     for start in (0..query_rows).step_by(chunk_rows) {
         let rows = (query_rows - start).min(chunk_rows);
         let end = start + rows;
+        let host_ids = read_ints(
+            indices.clone().slice_dim(0, start..end),
+            "initialization indices",
+        )?;
+        let host_weights = read_floats(
+            directed.clone().slice_dim(0, start..end),
+            "initialization memberships",
+        )?;
+        let mut copy_ids = Vec::new();
+        let mut copy_flags = Vec::new();
+        copy_ids
+            .try_reserve_exact(rows)
+            .map_err(|e| UmapError::Memory(format!("initialization copy indices: {e}")))?;
+        copy_flags
+            .try_reserve_exact(rows)
+            .map_err(|e| UmapError::Memory(format!("initialization copy flags: {e}")))?;
+        for (ids, weights) in host_ids.chunks_exact(k).zip(host_weights.chunks_exact(k)) {
+            let mut selected: Option<i32> = None;
+            let mut positive = false;
+            for slot in 0..k {
+                let id = ids[slot];
+                if id < 0 || ids[..slot].contains(&id) {
+                    continue;
+                }
+                let mut weight = 0.0f32;
+                for other in 0..k {
+                    if ids[other] == id {
+                        weight += weights[other];
+                    }
+                }
+                positive |= weight > 0.0;
+                if weight == 1.0 && selected.is_none_or(|previous| id < previous) {
+                    selected = Some(id);
+                }
+            }
+            if !positive {
+                return Err(UmapError::Numerical(
+                    "transform initialization row has no positive memberships".into(),
+                ));
+            }
+            copy_ids.push(selected.unwrap_or(0));
+            copy_flags.push(i32::from(selected.is_some()));
+        }
+        drop((host_ids, host_weights));
         let index_count = rows
             .checked_mul(k)
             .ok_or(UmapError::Overflow("transform initialization scratch"))?;
@@ -1130,9 +2469,195 @@ fn weighted_initialization(
                 .reshape([rows, components]);
             sum = sum.add(values);
         }
-        chunks.push(sum);
+        let copy_ids = Tensor::<1, Int>::from_data(TensorData::new(copy_ids, [rows]), &device);
+        let copy_mask =
+            Tensor::<2, Int>::from_data(TensorData::new(copy_flags, [rows, 1]), &device)
+                .equal_elem(1)
+                .repeat_dim(1, components);
+        let copies = embedding.clone().select(0, copy_ids);
+        chunks.push(sum.mask_where(copy_mask, copies));
     }
     Ok(Tensor::cat(chunks, 0))
+}
+
+#[doc(hidden)]
+pub fn profile_recursive_driver(
+    graph: &umap_core::recursive_init::graph::HostCsr,
+    data: &[f32],
+    features: usize,
+    backend: super::BackendChoice,
+    seed: u64,
+) -> Result<Vec<f32>> {
+    let config = UMAPConfig::default();
+    let curve = fit_curve(config.min_dist, config.spread)?;
+    recursive_driver(
+        graph,
+        data,
+        features,
+        curve,
+        &config,
+        seed,
+        &selected_device(backend)?.0,
+        &[],
+    )
+}
+
+fn recursive_driver(
+    graph: &umap_core::recursive_init::graph::HostCsr,
+    data: &[f32],
+    features: usize,
+    curve: (f32, f32),
+    config: &UMAPConfig,
+    seed: u64,
+    device: &Device,
+    retained: &[LiveBuffer],
+) -> Result<Vec<f32>> {
+    use umap_core::{
+        modern_layout::{ModernLayoutParams, compact_graph_from_csr},
+        recursive_init,
+    };
+    let d = config.n_components;
+    recursive_init::run(
+        graph,
+        data,
+        features,
+        d,
+        curve,
+        &config.recursive_init,
+        seed,
+        |stage, bytes| admit_recursive_layout(device, stage, bytes, 0),
+        |coarse, values, level, level_seed, recursive_owners| {
+            let params = ModernLayoutParams::recursive_level(level, coarse.n, level_seed);
+            let host_bytes = recursive_compact_bytes(coarse.n, coarse.indices.len())?;
+            let coordinate_bytes =
+                super::modern_runtime::matrix_allocation_bytes(device, coarse.n, d, 4)?;
+            admit_recursive_layout(
+                device,
+                "recursive coarse layout",
+                host_bytes,
+                coordinate_bytes,
+            )?;
+            let compact = compact_graph_from_csr(coarse, level.epochs as usize, 1.0)?;
+            let coords = Tensor::<2>::from_data(TensorData::new(values, [coarse.n, d]), device);
+            let mut caller = Vec::new();
+            caller
+                .try_reserve_exact(
+                    retained
+                        .len()
+                        .checked_add(2)
+                        .ok_or(UmapError::Overflow("recursive owner table"))?,
+                )
+                .map_err(|error| UmapError::Memory(error.to_string()))?;
+            caller.extend_from_slice(retained);
+            caller.push(LiveBuffer {
+                name: "recursive feature input",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Both,
+                bytes: data
+                    .len()
+                    .checked_mul(size_of::<f32>())
+                    .ok_or(UmapError::Overflow("recursive feature input"))?,
+            });
+            caller.push(LiveBuffer {
+                name: "recursive level owners",
+                space: BufferSpace::Host,
+                lifetime: BufferLifetime::Both,
+                bytes: recursive_owners,
+            });
+            let optimized = super::modern_runtime::optimize_compact(
+                coords.clone(),
+                coords,
+                compact,
+                &params,
+                LayoutOperation::Fit,
+                features,
+                coarse.n,
+                &caller,
+            )?;
+            let readback_bytes = coarse
+                .n
+                .checked_mul(d)
+                .and_then(|count| count.checked_mul(2 * size_of::<f32>()))
+                .ok_or(UmapError::Overflow("recursive layout readback"))?;
+            admit_recursive_layout(device, "recursive layout readback", readback_bytes, 0)?;
+            optimized.to_data().try_to_vec::<f32>().map_err(|error| {
+                UmapError::Numerical(format!("recursive layout readback: {error}"))
+            })
+        },
+    )
+}
+
+fn recursive_compact_bytes(rows: usize, edges: usize) -> Result<usize> {
+    const EDGE_BYTES: usize = size_of::<u32>() + size_of::<f32>() + 4 * size_of::<f64>();
+    rows.checked_add(1)
+        .and_then(|offsets| offsets.checked_mul(size_of::<u32>()))
+        .and_then(|offsets| {
+            edges
+                .checked_mul(EDGE_BYTES)
+                .and_then(|edges| offsets.checked_add(edges))
+        })
+        .ok_or(UmapError::Overflow("recursive compact graph"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides (host, device) headroom for one named recursive admission.
+    static RECURSIVE_BUDGET: std::cell::Cell<Option<(&'static str, u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+    /// Records every recursive admission as (stage, host bytes, device bytes).
+    static RECURSIVE_ADMISSIONS: std::cell::RefCell<Option<Vec<(&'static str, usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn admit_recursive_layout(
+    device: &Device,
+    stage: &'static str,
+    host_bytes: usize,
+    device_bytes: usize,
+) -> Result<()> {
+    super::modern_runtime::check_injected_name(stage)?;
+    #[cfg(test)]
+    RECURSIVE_ADMISSIONS.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push((stage, host_bytes, device_bytes));
+        }
+    });
+    let map_error = super::backend_choice::map_backend_error;
+    let cpu = *device == Device::cpu();
+    #[cfg(test)]
+    let budget = RECURSIVE_BUDGET
+        .with(|slot| slot.get())
+        .filter(|(name, _, _)| *name == stage)
+        .map(|(_, host, headroom)| (host, headroom));
+    #[cfg(not(test))]
+    let budget: Option<(u64, u64)> = None;
+    let (host_budget, device_budget) = if let Some((host, headroom)) = budget {
+        // CPU host and runtime memory share one budget.
+        (if cpu { headroom } else { host }, headroom)
+    } else {
+        let device_budget = cuscan_common::resolve_memory_budget(device, None)
+            .map_err(map_error)?
+            .usable_bytes(0);
+        let host_budget = if cpu {
+            device_budget
+        } else {
+            cuscan_common::host_usable_memory().map_err(map_error)?
+        };
+        (host_budget, device_budget)
+    };
+    let host_needed = if cpu {
+        host_bytes
+            .checked_add(device_bytes)
+            .ok_or(UmapError::Overflow("recursive layout staging"))?
+    } else {
+        host_bytes
+    };
+    if host_needed as u64 > host_budget || (!cpu && device_bytes as u64 > device_budget) {
+        return Err(UmapError::Capacity(
+            "recursive layout staging exceeds available memory".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn selected_device(
@@ -1158,7 +2683,7 @@ fn check_graph_marker(heads: &Tensor<1, Int>) -> Result<()> {
         })?;
     if marker.first() == Some(&-2) {
         Err(UmapError::Numerical(
-            "fuzzy graph contains invalid neighbor indices".into(),
+            "fuzzy graph contains missing or invalid neighbor indices (for example, a squared feature distance overflowed float32)".into(),
         ))
     } else {
         Ok(())
@@ -1216,8 +2741,9 @@ fn validate_graph_maximum(maximum: Tensor<1>, context: &str, empty_message: &str
 
 #[allow(clippy::type_complexity)]
 /// `maximum` is the pre-prune maximum of `weights`. Pruning zeroes weights below
-/// `maximum / divisor` with `divisor >= 1`, so a finite positive maximum always
-/// survives and remains the post-prune maximum. Callers validate it once.
+/// `maximum / divisor`. Fit uses a positive fallback divisor; transform uses its
+/// actual epoch count, including zero (which prunes every edge). Callers validate
+/// the pre-prune maximum once.
 #[allow(clippy::too_many_arguments)]
 fn prepare_schedule(
     heads: Tensor<1, Int>,
@@ -1278,10 +2804,13 @@ fn optimizer_rng_from_first_coordinates(
         random.random_range(i32::MIN..i32::MAX) as i64,
         random.random_range(i32::MIN..i32::MAX) as i64,
     ];
-    let mut state = Vec::with_capacity(
-        rows.checked_mul(3)
-            .ok_or(UmapError::Overflow("optimizer RNG state"))?,
-    );
+    let count = rows
+        .checked_mul(3)
+        .ok_or(UmapError::Overflow("optimizer RNG state"))?;
+    let mut state = Vec::new();
+    state
+        .try_reserve_exact(count)
+        .map_err(|error| UmapError::Memory(format!("optimizer RNG state: {error}")))?;
     for value in values {
         let offset = f64::from(value).to_bits() as i64;
         for value in base {
@@ -1616,7 +3145,7 @@ fn tensor_embedding(tensor: &Tensor<2>) -> Result<Embedding> {
 
 /// Maps ANN preflight failures onto the UMAP error contract. Capacity rejections keep the
 /// precise ANN message (quantity, value, limit and shape).
-fn map_ann_error(error: AnnError) -> UmapError {
+pub(super) fn map_ann_error(error: AnnError) -> UmapError {
     match error {
         AnnError::InvalidInput(message) => UmapError::InvalidInput(message),
         AnnError::Capability(message) => UmapError::BackendUnavailable(message),
@@ -1629,6 +3158,761 @@ fn map_ann_error(error: AnnError) -> UmapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orchestration_rejects_injected_allocations_before_fit_and_transform() {
+        let data: Vec<Vec<f32>> = (0..12).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+        let original = data.clone();
+        let config = UMAPConfig {
+            optimizer: super::super::Optimizer::Momentum,
+            n_neighbors: 4,
+            n_epochs: Some(2),
+            init: Init::Random,
+            negative_selection_range: 7,
+            unique: true,
+            ..Default::default()
+        };
+        let estimator = UMAP::new(
+            config,
+            super::super::BackendChoice::Cpu,
+            NeighborSearch::Exact,
+        );
+        super::super::modern_runtime::inject_allocation_failure(Some("unique keys"));
+        let error = estimator.fit(&data).unwrap_err();
+        super::super::modern_runtime::inject_allocation_failure(None);
+        assert!(
+            matches!(error, UmapError::Capacity(ref message) if message == "injected allocation failure: unique keys")
+        );
+        assert_eq!(data, original);
+
+        super::super::modern_runtime::inject_allocation_failure(Some("exact block indices"));
+        let error = estimator.fit(&data).unwrap_err();
+        super::super::modern_runtime::inject_allocation_failure(None);
+        assert!(
+            matches!(error, UmapError::Capacity(ref message) if message == "injected allocation failure: exact block indices")
+        );
+        assert_eq!(data, original);
+
+        for name in ["source ranks", "keys_a"] {
+            super::super::modern_runtime::inject_allocation_failure(Some(name));
+            let error = estimator.fit(&data).unwrap_err();
+            super::super::modern_runtime::inject_allocation_failure(None);
+            assert!(matches!(error, UmapError::Capacity(ref message)
+                if message == &format!("injected allocation failure: {name}")));
+            assert_eq!(data, original);
+        }
+
+        let fitted = estimator.fit(&data).unwrap();
+        let before = fitted.embedding().clone();
+        super::super::modern_runtime::inject_allocation_failure(Some("nested query metadata"));
+        let error = fitted.transform(&data).unwrap_err();
+        super::super::modern_runtime::inject_allocation_failure(None);
+        assert!(
+            matches!(error, UmapError::Capacity(ref message) if message == "injected allocation failure: nested query metadata")
+        );
+        assert_eq!(fitted.embedding(), &before);
+        assert_eq!(data, original);
+        super::super::modern_runtime::inject_allocation_failure(Some("query projections"));
+        let error = fitted.transform(&data[..1]).unwrap_err();
+        super::super::modern_runtime::inject_allocation_failure(None);
+        assert!(matches!(error, UmapError::Capacity(ref message)
+            if message == "injected allocation failure: query projections"));
+        assert_eq!(fitted.embedding(), &before);
+    }
+
+    type Admission = (&'static str, usize, usize);
+
+    fn recursive_backends() -> Vec<super::super::BackendChoice> {
+        let mut backends = vec![super::super::BackendChoice::Cpu];
+        if crate::cuda_backend::device(0).is_some() {
+            backends.push(super::super::BackendChoice::Cuda { device_index: 0 });
+        } else {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+        }
+        backends
+    }
+
+    fn recursive_estimator(
+        backend: super::super::BackendChoice,
+        optimizer: super::super::Optimizer,
+        n_neighbors: usize,
+        threshold: usize,
+    ) -> UMAP {
+        UMAP::new(
+            UMAPConfig {
+                optimizer,
+                init: Init::Recursive,
+                recursive_init: super::super::RecursiveInitConfig {
+                    base_init_threshold: threshold,
+                    n_embedding_epochs: 3,
+                    ..Default::default()
+                },
+                n_neighbors,
+                n_epochs: Some(3),
+                random_state: Some(7),
+                ..Default::default()
+            },
+            backend,
+            NeighborSearch::Exact,
+        )
+    }
+
+    fn recorded<T>(run: impl FnOnce() -> T) -> (T, Vec<Admission>) {
+        RECURSIVE_ADMISSIONS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let result = run();
+        let log = RECURSIVE_ADMISSIONS
+            .with(|log| log.borrow_mut().take())
+            .expect("admission log");
+        (result, log)
+    }
+
+    fn with_budget<T>(
+        stage: &'static str,
+        host: usize,
+        device: usize,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        RECURSIVE_BUDGET.with(|slot| slot.set(Some((stage, host as u64, device as u64))));
+        let result = run();
+        RECURSIVE_BUDGET.with(|slot| slot.set(None));
+        result
+    }
+
+    fn multi_level_data() -> Vec<Vec<f32>> {
+        (0..40)
+            .map(|i| {
+                let t = i as f32 * 0.31;
+                vec![
+                    t.cos() * (1.0 + 0.05 * t),
+                    t.sin() * (1.0 + 0.05 * t),
+                    0.1 * t,
+                ]
+            })
+            .collect()
+    }
+
+    fn stages(log: &[Admission]) -> Vec<&'static str> {
+        let mut names: Vec<_> = log.iter().map(|(name, _, _)| *name).collect();
+        names.dedup();
+        names
+    }
+
+    /// Injects a failure at each named recursive stage observed in a successful
+    /// recorded fit and checks the explicit error precedes that admission.
+    fn assert_named_injections(estimator: &UMAP, data: &[Vec<f32>], required: &[&'static str]) {
+        let original = data.to_vec();
+        let (fitted, log) = recorded(|| estimator.fit(data));
+        fitted.unwrap();
+        let observed = stages(&log);
+        for stage in required {
+            assert!(
+                observed.contains(stage),
+                "{stage} missing from {observed:?}"
+            );
+        }
+        for stage in observed {
+            super::super::modern_runtime::inject_allocation_failure(Some(stage));
+            let (error, log) = recorded(|| estimator.fit(data));
+            super::super::modern_runtime::inject_allocation_failure(None);
+            let error = error.unwrap_err();
+            assert!(
+                matches!(error, UmapError::Capacity(ref message)
+                    if message == &format!("injected allocation failure: {stage}")),
+                "{stage}: {error:?}"
+            );
+            assert!(log.iter().all(|(name, _, _)| *name != stage), "{stage}");
+            assert_eq!(data, original.as_slice());
+        }
+    }
+
+    #[test]
+    fn recursive_named_injections_multi_level() {
+        let data = multi_level_data();
+        for backend in recursive_backends() {
+            assert_named_injections(
+                &recursive_estimator(backend, super::super::Optimizer::Adam, 4, 4),
+                &data,
+                &[
+                    "recursive export",
+                    "recursive features",
+                    "recursive anchor",
+                    "recursive labels",
+                    "recursive outliers",
+                    "recursive remap",
+                    "recursive count",
+                    "recursive aggregate",
+                    "recursive transition",
+                    "recursive coarse anchor",
+                    "recursive base",
+                    "recursive coarse layout",
+                    "recursive layout readback",
+                    "recursive prolongation",
+                    "recursive Procrustes",
+                    "recursive finish",
+                    "recursive main compact",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_named_injections_compatibility_rng() {
+        let data = multi_level_data();
+        for backend in recursive_backends() {
+            let estimator =
+                recursive_estimator(backend, super::super::Optimizer::Compatibility, 4, 4);
+            assert_named_injections(
+                &estimator,
+                &data,
+                &[
+                    "recursive export",
+                    "recursive anchor",
+                    "recursive coarse layout",
+                    "recursive finish",
+                    "recursive optimizer RNG",
+                ],
+            );
+            // Compatibility keeps the legacy graph and never builds a main compact graph.
+            let (_, log) = recorded(|| estimator.fit(&data).unwrap());
+            assert!(
+                stages(&log)
+                    .iter()
+                    .all(|name| *name != "recursive main compact")
+            );
+            let (host, device) = log
+                .iter()
+                .find(|(name, _, _)| *name == "recursive optimizer RNG")
+                .map(|&(_, host, device)| (host, device))
+                .unwrap();
+            let cpu = backend == super::super::BackendChoice::Cpu;
+            let exact = if cpu { host + device } else { host.max(device) };
+            with_budget(
+                "recursive optimizer RNG",
+                host,
+                if cpu { exact } else { device },
+                || {
+                    estimator.fit(&data).unwrap();
+                },
+            );
+            let tight = if cpu {
+                (host, exact - 1)
+            } else {
+                (host, device - 1)
+            };
+            let error = with_budget("recursive optimizer RNG", tight.0, tight.1, || {
+                estimator.fit(&data).unwrap_err()
+            });
+            assert!(matches!(error, UmapError::Capacity(_)), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn recursive_named_injections_base_only_and_three_rows() {
+        for backend in recursive_backends() {
+            // n <= T: base-only, no coarse or level work.
+            let data: Vec<Vec<f32>> = (0..6).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+            let estimator = recursive_estimator(backend, super::super::Optimizer::Adam, 3, 8);
+            assert_named_injections(&estimator, &data, &["recursive anchor", "recursive base"]);
+            let (_, log) = recorded(|| estimator.fit(&data).unwrap());
+            assert!(
+                stages(&log)
+                    .iter()
+                    .all(|name| *name != "recursive labels" && *name != "recursive coarse layout")
+            );
+
+            // n = 3, T = 2 gives p1 = 2 > floor(n / 2).
+            let data = vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![2.5, 0.5]];
+            let estimator = recursive_estimator(backend, super::super::Optimizer::Adam, 2, 2);
+            assert_named_injections(
+                &estimator,
+                &data,
+                &["recursive anchor", "recursive labels", "recursive base"],
+            );
+            let (_, log) = recorded(|| estimator.fit(&data).unwrap());
+            let anchor = log
+                .iter()
+                .find(|(name, _, _)| *name == "recursive anchor")
+                .unwrap()
+                .1;
+            with_budget("recursive anchor", anchor, anchor, || {
+                estimator.fit(&data).unwrap()
+            });
+            let error = with_budget("recursive anchor", anchor - 1, anchor - 1, || {
+                estimator.fit(&data).unwrap_err()
+            });
+            assert!(matches!(error, UmapError::Capacity(_)), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn recursive_main_compact_tight_budget_includes_u32_offsets() {
+        let data = multi_level_data();
+        let n = data.len();
+        for backend in recursive_backends() {
+            let estimator = recursive_estimator(backend, super::super::Optimizer::Adam, 4, 4);
+            let (_, log) = recorded(|| estimator.fit(&data).unwrap());
+            let main: Vec<_> = log
+                .iter()
+                .filter(|(name, _, _)| *name == "recursive main compact")
+                .collect();
+            assert_eq!(main.len(), 1);
+            let &(_, bytes, device) = main[0];
+            assert_eq!(device, 0);
+            let offsets = (n + 1) * size_of::<u32>();
+            let edges = bytes - offsets;
+            const EDGE_BYTES: usize = size_of::<u32>() + size_of::<f32>() + 4 * size_of::<f64>();
+            assert_eq!(edges % EDGE_BYTES, 0);
+            assert!(edges > 0);
+            assert_eq!(
+                bytes,
+                recursive_compact_bytes(n, edges / EDGE_BYTES).unwrap()
+            );
+            with_budget("recursive main compact", bytes, bytes, || {
+                estimator.fit(&data).unwrap();
+            });
+            for budget in [bytes - 1, edges] {
+                let error = with_budget("recursive main compact", budget, budget, || {
+                    estimator.fit(&data).unwrap_err()
+                });
+                assert!(
+                    matches!(error, UmapError::Capacity(ref message)
+                        if message == "recursive layout staging exceeds available memory"),
+                    "{budget}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_coarse_layout_tight_budget_unified_and_separate() {
+        let data = multi_level_data();
+        for backend in recursive_backends() {
+            let estimator = recursive_estimator(backend, super::super::Optimizer::Adam, 4, 4);
+            let (_, log) = recorded(|| estimator.fit(&data).unwrap());
+            let coarse: Vec<_> = log
+                .iter()
+                .filter(|(name, _, _)| *name == "recursive coarse layout")
+                .map(|&(_, host, device)| (host, device))
+                .collect();
+            assert!(!coarse.is_empty());
+            let stage = "recursive coarse layout";
+            if backend == super::super::BackendChoice::Cpu {
+                // CPU host staging and device coordinates share one budget.
+                let unified = coarse.iter().map(|(h, d)| h + d).max().unwrap();
+                with_budget(stage, 0, unified, || estimator.fit(&data).unwrap());
+                let error = with_budget(stage, usize::MAX >> 1, unified - 1, || {
+                    estimator.fit(&data).unwrap_err()
+                });
+                assert!(matches!(error, UmapError::Capacity(_)), "{error:?}");
+            } else {
+                let host = coarse.iter().map(|(h, _)| *h).max().unwrap();
+                let device = coarse.iter().map(|(_, d)| *d).max().unwrap();
+                // Separate spaces: neither is charged for the other's bytes.
+                with_budget(stage, host, device, || estimator.fit(&data).unwrap());
+                for (h, d) in [(host - 1, usize::MAX >> 1), (usize::MAX >> 1, device - 1)] {
+                    let error = with_budget(stage, h, d, || estimator.fit(&data).unwrap_err());
+                    assert!(matches!(error, UmapError::Capacity(_)), "{error:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_empty_coarse_graph_skips_layout_admission() {
+        // Two distant pairs coarsen to two isolated labels: the coarse graph is
+        // empty, so its hypothetical layout must never be admitted or rejected.
+        let graph = umap_core::recursive_init::graph::HostCsr::from_coo(
+            4,
+            &[0, 1, 2, 3],
+            &[2, 3, 0, 1],
+            &[1.0; 4],
+        )
+        .unwrap();
+        let data = [0.0, 0.1, 100.0, 100.1];
+        let config = UMAPConfig {
+            optimizer: umap_core::Optimizer::Compatibility,
+            init: Init::Spectral,
+            recursive_init: umap_core::RecursiveInitConfig {
+                base_init_threshold: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for backend in recursive_backends() {
+            let device = selected_device(backend).unwrap().0;
+            let (embedding, log) = recorded(|| {
+                with_budget("recursive coarse layout", 0, 0, || {
+                    recursive_driver(&graph, &data, 1, (1.0, 1.0), &config, 11, &device, &[])
+                })
+            });
+            let embedding = embedding.unwrap();
+            let names = stages(&log);
+            assert!(names.contains(&"recursive transition"), "{names:?}");
+            assert!(names.contains(&"recursive prolongation"), "{names:?}");
+            assert!(!names.contains(&"recursive coarse layout"), "{names:?}");
+            assert!(!names.contains(&"recursive layout readback"), "{names:?}");
+            assert_eq!(embedding.len(), 4 * config.n_components);
+            assert!(embedding.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn modern_reference_windows_allow_raw_ranges_below_cardinality() {
+        for optimizer in [
+            super::super::Optimizer::Adam,
+            super::super::Optimizer::Momentum,
+        ] {
+            for range in [1, 17, 200_000] {
+                let config = UMAPConfig {
+                    optimizer,
+                    negative_selection_range: range,
+                    n_neighbors: 3,
+                    n_epochs: Some(3),
+                    init: Init::Random,
+                    ..Default::default()
+                };
+                let data: Vec<Vec<f32>> =
+                    (0..24).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+                let fitted = UMAP::new(
+                    config,
+                    super::super::BackendChoice::Cpu,
+                    NeighborSearch::Exact,
+                )
+                .fit(&data)
+                .unwrap();
+                let before = fitted.embedding().clone();
+                assert_eq!(fitted.transform(&data).unwrap().len(), data.len());
+                assert_eq!(fitted.embedding(), &before);
+            }
+        }
+    }
+
+    #[test]
+    fn modern_fit_transform_is_seeded_and_keeps_reference_fixed() {
+        let data: Vec<Vec<f32>> = (0..12)
+            .map(|i| vec![i as f32 * 0.2, (i as f32 * 0.7).sin()])
+            .collect();
+        for optimizer in [
+            super::super::Optimizer::Adam,
+            super::super::Optimizer::Momentum,
+        ] {
+            for dimensions in [16, 48] {
+                let config = UMAPConfig {
+                    optimizer,
+                    n_components: dimensions,
+                    n_neighbors: 4,
+                    n_epochs: Some(12),
+                    init: Init::Random,
+                    random_state: Some(17),
+                    negative_selection_range: 12,
+                    ..Default::default()
+                };
+                let mut initial_config = config.clone();
+                initial_config.n_epochs = Some(0);
+                let initial = UMAP::new(
+                    initial_config,
+                    super::super::BackendChoice::Cpu,
+                    NeighborSearch::Exact,
+                )
+                .fit(&data)
+                .unwrap();
+                let estimator = UMAP::new(
+                    config,
+                    super::super::BackendChoice::Cpu,
+                    NeighborSearch::Exact,
+                );
+                let fitted = estimator.fit(&data).unwrap();
+                let repeated = estimator.fit(&data).unwrap();
+                assert_eq!(fitted.embedding(), repeated.embedding());
+                assert_ne!(fitted.embedding(), initial.embedding());
+                assert!(fitted.embedding().iter().flatten().all(|x| x.is_finite()));
+                let before = fitted.embedding().clone();
+                let transformed = fitted.transform(&data).unwrap();
+                assert!(transformed.iter().flatten().all(|x| x.is_finite()));
+                assert_eq!(&before, fitted.embedding());
+                assert_eq!(transformed, fitted.transform(&data).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn modern_unique_windows_use_distinct_rows() {
+        let data = vec![vec![0.0], vec![1.0], vec![2.0], vec![0.0], vec![1.0]];
+        for optimizer in [
+            super::super::Optimizer::Adam,
+            super::super::Optimizer::Momentum,
+        ] {
+            let config = UMAPConfig {
+                optimizer,
+                unique: true,
+                n_neighbors: 2,
+                n_epochs: Some(4),
+                init: Init::Random,
+                negative_selection_range: 1,
+                ..Default::default()
+            };
+            let fitted = UMAP::new(
+                config,
+                super::super::BackendChoice::Cpu,
+                NeighborSearch::Exact,
+            )
+            .fit(&data)
+            .unwrap();
+            assert_eq!(fitted.embedding()[0], fitted.embedding()[3]);
+            assert_eq!(fitted.embedding()[1], fitted.embedding()[4]);
+        }
+    }
+
+    #[test]
+    fn modern_persisted_windows_use_reference_cardinality() {
+        let data: Vec<Vec<f32>> = (0..12).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 4,
+                n_epochs: Some(3),
+                init: Init::Random,
+                optimizer: crate::standard_umap::Optimizer::Compatibility,
+                ..Default::default()
+            },
+            super::super::BackendChoice::Cpu,
+            NeighborSearch::Exact,
+        )
+        .fit(&data)
+        .unwrap();
+        let mut state = fitted.export_state().unwrap();
+        state.config.optimizer = super::super::Optimizer::Momentum;
+        state.config.negative_selection_range = 11;
+        let loaded = FittedUMAP::from_state(state, super::super::BackendChoice::Cpu).unwrap();
+        assert_eq!(loaded.transform(&data[..1]).unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn initialization_downloads_graph_only_when_consumed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+        struct Exports(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for Exports {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "umap::init_export" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Exports(count.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let data: Vec<Vec<f32>> = (0..16).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+        for init in [Init::Random, Init::Spectral] {
+            for mode in [
+                InitRescale::Isotropic,
+                InitRescale::PerAxis,
+                InitRescale::GraphEdge,
+            ] {
+                count.store(0, Ordering::SeqCst);
+                UMAP::new(
+                    UMAPConfig {
+                        init,
+                        init_rescale: mode,
+                        n_neighbors: 4,
+                        optimizer: crate::standard_umap::Optimizer::Compatibility,
+                        n_epochs: Some(0),
+                        ..Default::default()
+                    },
+                    super::super::BackendChoice::Cpu,
+                    NeighborSearch::Exact,
+                )
+                .fit(&data)
+                .unwrap();
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    usize::from(init == Init::Spectral || mode == InitRescale::GraphEdge)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modern_fit_initialization_matches_core_on_identical_pruned_graph() {
+        let mut backends = vec![super::super::BackendChoice::Cpu];
+        if crate::cuda_backend::device(0).is_some() {
+            backends.push(super::super::BackendChoice::Cuda { device_index: 0 });
+        } else {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+        }
+        let data: Vec<Vec<f32>> = (0..24)
+            .map(|i| vec![i as f32 * 0.2, (i as f32 * 0.3).sin()])
+            .collect();
+        for backend in backends {
+            let (device, _) = selected_device(backend).unwrap();
+            let input = matrix_tensor(&data, &device);
+            let neighbors =
+                super::super::neighbors::exact_neighbors(input.clone(), input, 5, true).unwrap();
+            let rows = Tensor::<1, Int>::arange(0..24, &device)
+                .cast(burn::tensor::IntDType::I32)
+                .reshape([24, 1]);
+            let indices = Tensor::<2, Int>::cat(vec![rows, neighbors.indices], 1);
+            let distances = Tensor::<2>::cat(
+                vec![Tensor::<2>::zeros([24, 1], &device), neighbors.distances],
+                1,
+            );
+            let (heads, tails, weights, _, _, _) = <Dispatch as StandardUmapOps>::fuzzy_graph(
+                indices.into_dispatch(),
+                distances.into_dispatch(),
+                1.0,
+                1.0,
+                1.0,
+                false,
+                24,
+            );
+            let heads = Tensor::<1, Int>::from_dispatch(heads);
+            let tails = Tensor::<1, Int>::from_dispatch(tails);
+            let weights = Tensor::<1>::from_dispatch(weights);
+            let maximum = weights.clone().max_dim(0);
+            let (heads, tails, weights, ..) =
+                prepare_schedule(heads, tails, weights, maximum, 0, 500, 5).unwrap();
+            let heads = heads.to_data().try_to_vec::<i32>().unwrap();
+            let tails = tails.to_data().try_to_vec::<i32>().unwrap();
+            let weights = weights.to_data().try_to_vec::<f32>().unwrap();
+            let mut h = Vec::new();
+            let mut t = Vec::new();
+            let mut w = Vec::new();
+            for ((head, tail), weight) in heads.into_iter().zip(tails).zip(weights) {
+                if weight > 0.0 {
+                    h.push(head as usize);
+                    t.push(tail as usize);
+                    w.push(weight);
+                }
+            }
+            assert!(
+                h.iter()
+                    .zip(&t)
+                    .zip(h.iter().zip(&t).skip(1))
+                    .all(|((a, b), (c, d))| (a, b) < (c, d))
+            );
+            for init in [Init::Random, Init::Spectral] {
+                for mode in [
+                    InitRescale::Isotropic,
+                    InitRescale::PerAxis,
+                    InitRescale::GraphEdge,
+                ] {
+                    let config = UMAPConfig {
+                        init,
+                        init_rescale: mode,
+                        init_scale_factor: 1.25,
+                        optimizer: crate::standard_umap::Optimizer::Compatibility,
+                        n_neighbors: 6,
+                        n_epochs: Some(0),
+                        random_state: Some(19),
+                        ..Default::default()
+                    };
+                    let expected =
+                        super::super::initialize(&data, &h, &t, &w, &config, 19).unwrap();
+                    let fit = UMAP::new(config, backend, NeighborSearch::Exact)
+                        .fit(&data)
+                        .unwrap();
+                    assert_eq!(
+                        fit.embedding()
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "{backend:?} {init:?} {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initialization_pruning_preserves_threshold_order_and_caller_aliases() {
+        let mut devices = vec![Device::cpu()];
+        if let Some(device) = crate::cuda_backend::device(0) {
+            devices.push(device);
+        } else {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+        }
+        for device in devices {
+            for epochs in [0, 10, 11] {
+                // max=11: epochs 0/10 use the default divisor 22; epoch11
+                // uses divisor 11. Equality survives; its immediate predecessor
+                // must not. Padding remains a device slot, preserving edge IDs.
+                let threshold: f32 = if epochs > 10 { 1.0 } else { 0.5 };
+                let values = vec![
+                    11.0,
+                    threshold,
+                    f32::from_bits(threshold.to_bits() - 1),
+                    0.0,
+                ];
+                let heads = Tensor::<1, Int>::from_data(
+                    TensorData::new(vec![0_i32, 0, 1, 0], [4]),
+                    &device,
+                );
+                let tails = Tensor::<1, Int>::from_data(
+                    TensorData::new(vec![1_i32, 2, 2, 0], [4]),
+                    &device,
+                );
+                let weights = Tensor::<1>::from_data(TensorData::new(values.clone(), [4]), &device);
+                let aliases = (heads.clone(), tails.clone(), weights.clone());
+                let before_heads = aliases.0.to_data().try_to_vec::<i32>().unwrap();
+                let before_tails = aliases.1.to_data().try_to_vec::<i32>().unwrap();
+                let before_weights = aliases.2.to_data().try_to_vec::<f32>().unwrap();
+                let maximum = weights.clone().max_dim(0);
+                let (h, t, w, positive, next_positive, negative, next_negative) =
+                    prepare_schedule(heads, tails, weights, maximum, epochs, 22, 5).unwrap();
+                assert_eq!(h.to_data().try_to_vec::<i32>().unwrap(), before_heads);
+                assert_eq!(t.to_data().try_to_vec::<i32>().unwrap(), before_tails);
+                assert_eq!(
+                    w.to_data().try_to_vec::<f32>().unwrap(),
+                    vec![11.0, threshold, 0.0, 0.0]
+                );
+                assert_eq!(
+                    aliases.0.to_data().try_to_vec::<i32>().unwrap(),
+                    before_heads
+                );
+                assert_eq!(
+                    aliases.1.to_data().try_to_vec::<i32>().unwrap(),
+                    before_tails
+                );
+                assert_eq!(
+                    aliases.2.to_data().try_to_vec::<f32>().unwrap(),
+                    before_weights
+                );
+                let positive = positive.to_data().try_to_vec::<f64>().unwrap();
+                assert_eq!(positive, vec![1.0, 11.0 / f64::from(threshold), 11.0, 11.0]);
+                assert_eq!(
+                    next_positive.to_data().try_to_vec::<f64>().unwrap(),
+                    positive
+                );
+                let negative = negative.to_data().try_to_vec::<f64>().unwrap();
+                assert_eq!(
+                    negative,
+                    positive.iter().map(|v| v / 5.0).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    next_negative.to_data().try_to_vec::<f64>().unwrap(),
+                    negative
+                );
+            }
+        }
+    }
 
     #[test]
     fn ann_capacity_error_keeps_precise_message() {
@@ -1677,6 +3961,7 @@ mod tests {
             init: Init::Random,
             random_state: Some(31),
             learning_rate: 0.987_654_3,
+            optimizer: crate::standard_umap::Optimizer::Compatibility,
             ..Default::default()
         };
         let estimator = UMAP::new(
@@ -1712,6 +3997,7 @@ mod tests {
                 n_neighbors: 3,
                 n_epochs: Some(0),
                 init: Init::Random,
+                optimizer: crate::standard_umap::Optimizer::Compatibility,
                 ..Default::default()
             },
             backend,
@@ -1807,9 +4093,14 @@ mod tests {
     ) {
         let (embedding, indices, normalized) = weighted_initialization_inputs(device);
         let expected = original_weighted_initialization(&embedding, &indices, &normalized);
-        let actual =
-            weighted_initialization(&embedding, &indices, &normalized, scratch_limit_bytes)
-                .unwrap();
+        let actual = weighted_initialization(
+            &embedding,
+            &indices,
+            &normalized,
+            &normalized,
+            scratch_limit_bytes,
+        )
+        .unwrap();
         let expected_values = expected.to_data().try_to_vec::<f32>().unwrap();
         let actual_values = actual.to_data().try_to_vec::<f32>().unwrap();
         assert_eq!(actual_values.len(), expected_values.len());
@@ -1891,7 +4182,11 @@ mod tests {
 
     fn estimator(search: NeighborSearch) -> UMAP {
         UMAP::new(
-            UMAPConfig::default(),
+            UMAPConfig {
+                optimizer: crate::standard_umap::Optimizer::Compatibility,
+                init: Init::Spectral,
+                ..UMAPConfig::default()
+            },
             crate::standard_umap::BackendChoice::Cpu,
             search,
         )
@@ -1965,7 +4260,7 @@ mod tests {
 
     #[test]
     fn weighted_initialization_scratch_accounting_checks_limits_and_overflow() {
-        const ROW_BYTES: usize = (2 * 3 * 2 + 3 + 4 * 2) * std::mem::size_of::<f32>();
+        const ROW_BYTES: usize = (2 * 3 * 2 + 3 * 5 + 6 + 8 * 2) * std::mem::size_of::<f32>();
         assert_eq!(
             weighted_initialization_chunk_rows(7, 3, 2, ROW_BYTES),
             Ok(1)
@@ -1985,10 +4280,11 @@ mod tests {
             Err(UmapError::Overflow("transform initialization scratch"))
         );
         assert_eq!(
-            weighted_initialization_chunk_rows(usize::MAX, 1, 1, 32),
+            weighted_initialization_chunk_rows(usize::MAX, 1, 1, 128),
             Err(UmapError::Overflow("transform initialization output"))
         );
-        const TWO_NEIGHBOR_ROW_BYTES: usize = (2 * 2 * 8 + 2 + 4 * 8) * std::mem::size_of::<f32>();
+        const TWO_NEIGHBOR_ROW_BYTES: usize =
+            (2 * 2 * 8 + 5 * 2 + 6 + 8 * 8) * std::mem::size_of::<f32>();
         assert_eq!(
             weighted_initialization_chunk_rows(7, 2, 8, TWO_NEIGHBOR_ROW_BYTES * 2),
             Ok(2)
@@ -2003,7 +4299,7 @@ mod tests {
 
     #[test]
     fn chunked_weighted_initialization_matches_original_on_cpu() {
-        assert_chunked_weighted_initialization_matches_original(&Device::cpu(), 200);
+        assert_chunked_weighted_initialization_matches_original(&Device::cpu(), 400);
     }
 
     #[test]
@@ -2016,8 +4312,63 @@ mod tests {
             return;
         };
         // Q=7 and two rows per chunk leaves a one-row final chunk.
-        assert_eq!(weighted_initialization_chunk_rows(7, 3, 2, 200), Ok(2));
-        assert_chunked_weighted_initialization_matches_original(&device, 200);
+        assert_eq!(weighted_initialization_chunk_rows(7, 3, 2, 400), Ok(2));
+        assert_chunked_weighted_initialization_matches_original(&device, 400);
+    }
+
+    fn assert_copy_initialization(device: &Device) {
+        let embedding = Tensor::<2>::from_data(
+            TensorData::new(vec![10.0, 20.0, 30.0, 40.0], [4, 1]),
+            device,
+        );
+        // Unsorted IDs: the first row has two exact memberships, the second
+        // coalesces duplicate slots to one, and the third is a weighted mean.
+        let indices = Tensor::<2, Int>::from_data(
+            TensorData::new(vec![3, 1, 0, 2, 2, 0, 3, 1, 0], [3, 3]),
+            device,
+        );
+        let raw = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![1.0, 1.0, 0.25, 0.5, 0.5, 0.25, 0.25, 0.5, 0.25],
+                [3, 3],
+            ),
+            device,
+        );
+        let sums = raw.clone().sum_dim(1);
+        let normalized = raw.clone().div(sums);
+        let actual = weighted_initialization(&embedding, &indices, &normalized, &raw, 1024)
+            .unwrap()
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual[0], 20.0);
+        assert_eq!(actual[1], 30.0);
+        // Upstream S3 uses rtol=1e-4 and atol=1e-5.
+        assert!((actual[2] - 22.5).abs() <= 1e-5 + 1e-4 * 22.5);
+
+        let empty = Tensor::<2>::zeros([1, 3], device);
+        let one_row = indices.slice_dim(0, 0..1);
+        assert!(matches!(
+            weighted_initialization(&embedding, &one_row, &empty, &empty, 1024),
+            Err(UmapError::Numerical(_))
+        ));
+    }
+
+    #[test]
+    fn copy_initialization_on_cpu() {
+        assert_copy_initialization(&Device::cpu());
+    }
+
+    #[test]
+    fn copy_initialization_on_cuda() {
+        let Some(device) = crate::cuda_backend::device(0) else {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUDA is required"
+            );
+            return;
+        };
+        assert_copy_initialization(&device);
     }
 
     fn singleton_maximum(value: f32, device: &Device) -> Tensor<1> {
@@ -2210,7 +4561,7 @@ mod tests {
         let valid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![0], [1]), &device);
         let invalid_heads = Tensor::<1, Int>::from_data(TensorData::new(vec![-2, 0], [2]), &device);
         let expected = Err(UmapError::Numerical(
-            "fuzzy graph contains invalid neighbor indices".into(),
+            "fuzzy graph contains missing or invalid neighbor indices (for example, a squared feature distance overflowed float32)".into(),
         ));
 
         assert_eq!(check_graph_marker(&valid_heads), Ok(()));

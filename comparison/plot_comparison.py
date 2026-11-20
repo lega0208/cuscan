@@ -8,6 +8,11 @@ import plotly.graph_objects as go
 import polars as pl
 from plotly.subplots import make_subplots
 
+if __package__:
+    from .umap_reference import reference_kwargs, require_reference
+else:
+    from umap_reference import reference_kwargs, require_reference
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "data.parquet"
 DEFAULT_OUTPUT = SCRIPT_DIR / "umap_comparison.html"
@@ -88,11 +93,14 @@ def main() -> None:
 
     from cuscan import UMAP
 
-    umap_config = {**config}
+    require_reference()
+    umap_config = {**config, **reference_kwargs(optimizer="adam", init="recursive")}
     # fast_config = {**config, "device": args.device, "n_epochs": 2500}
     fast_config = {
         **{k: v for k, v in config.items() if k != "metric" and k != "verbose"},
         "backend": args.device,
+        "optimizer": "adam",
+        "init": "recursive",
     }
 
     print("starting umap-learn")

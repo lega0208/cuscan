@@ -2,15 +2,56 @@ use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyModule};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyModule};
 use umap::{
-    BackendChoice, FittedUMAP as RustFittedUMAP, Init, NeighborSearch, UMAP, UMAPConfig, UmapError,
+    BackendChoice, FittedUMAP as RustFittedUMAP, HubSelection, Init, InitRescale, NeighborSearch,
+    Optimizer, RecursiveInitConfig, UMAP, UMAPConfig, UmapError,
 };
 
 pub(crate) mod hdbscan;
 
 #[cfg(feature = "tracing")]
 type DiagnosticTransformArrays<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i32>>);
+
+/// Flat 1-D NumPy arrays for every replay field; callers reshape `[q, k]`
+/// fields with `k = len(neighbor_indices) // q` and placements with
+/// `n_components`.
+// A macro because the replay type is not nameable outside the hook methods.
+#[cfg(feature = "tracing")]
+macro_rules! replay_dict {
+    ($py:expr, $replay:expr) => {{
+        let py = $py;
+        let replay = $replay;
+        let dict = PyDict::new(py);
+        dict.set_item("neighbor_indices", replay.neighbor_indices.into_pyarray(py))?;
+        dict.set_item(
+            "neighbor_distances",
+            replay.neighbor_distances.into_pyarray(py),
+        )?;
+        dict.set_item("query_stats", replay.query_stats.into_pyarray(py))?;
+        dict.set_item("rho", replay.rho.into_pyarray(py))?;
+        dict.set_item("sigma", replay.sigma.into_pyarray(py))?;
+        dict.set_item("memberships", replay.memberships.into_pyarray(py))?;
+        dict.set_item("graph_heads", replay.graph_heads.into_pyarray(py))?;
+        dict.set_item("graph_tails", replay.graph_tails.into_pyarray(py))?;
+        dict.set_item("graph_weights", replay.graph_weights.into_pyarray(py))?;
+        dict.set_item("edge_heads", replay.edge_heads.into_pyarray(py))?;
+        dict.set_item("edge_tails", replay.edge_tails.into_pyarray(py))?;
+        dict.set_item("edge_weights", replay.edge_weights.into_pyarray(py))?;
+        dict.set_item("epochs", replay.epochs)?;
+        dict.set_item("initial_alpha", replay.initial_alpha)?;
+        dict.set_item("csr_offsets", replay.csr_offsets.into_pyarray(py))?;
+        dict.set_item("csr_indices", replay.csr_indices.into_pyarray(py))?;
+        dict.set_item("csr_weights", replay.csr_weights.into_pyarray(py))?;
+        dict.set_item("periods", replay.periods.into_pyarray(py))?;
+        dict.set_item("negative_periods", replay.negative_periods.into_pyarray(py))?;
+        dict.set_item("next_positive", replay.next_positive.into_pyarray(py))?;
+        dict.set_item("next_negative", replay.next_negative.into_pyarray(py))?;
+        dict.set_item("initial", replay.initial.into_pyarray(py))?;
+        dict.set_item("embedding", replay.embedding.into_pyarray(py))?;
+        PyResult::Ok(dict)
+    }};
+}
 
 #[pyclass(frozen, unsendable)]
 struct FittedUMAP {
@@ -67,12 +108,51 @@ impl FittedUMAP {
         metadata.set_item("learning_rate", c.learning_rate)?;
         metadata.set_item("negative_sample_rate", c.negative_sample_rate)?;
         metadata.set_item("repulsion_strength", c.repulsion_strength)?;
+        metadata.set_item("optimizer", optimizer_name(c.optimizer))?;
+        metadata.set_item("negative_selection_range", c.negative_selection_range)?;
+        metadata.set_item("negative_sample_scale", c.negative_sample_scale)?;
+        metadata.set_item("exclude_graph_neighbors", c.exclude_graph_neighbors)?;
+        metadata.set_item(
+            "negative_sample_scale_adaptation_samples",
+            c.negative_sample_scale_adaptation_samples,
+        )?;
+        metadata.set_item("init_scale_factor", c.init_scale_factor)?;
+        metadata.set_item(
+            "init_rescale",
+            match c.init_rescale {
+                InitRescale::Isotropic => "isotropic",
+                InitRescale::PerAxis => "per_axis",
+                InitRescale::GraphEdge => "graph_edge",
+            },
+        )?;
         metadata.set_item(
             "init",
             match c.init {
                 Init::Random => "random",
                 Init::Spectral => "spectral",
+                Init::Recursive => "recursive",
+                Init::Auto => "auto",
             },
+        )?;
+        metadata.set_item(
+            "recursive_coarsening_ratio",
+            c.recursive_init.coarsening_ratio,
+        )?;
+        metadata.set_item(
+            "recursive_base_init_threshold",
+            c.recursive_init.base_init_threshold,
+        )?;
+        metadata.set_item(
+            "recursive_n_embedding_epochs",
+            c.recursive_init.n_embedding_epochs,
+        )?;
+        metadata.set_item(
+            "recursive_hub_selection",
+            hub_selection_name(c.recursive_init.hub_selection),
+        )?;
+        metadata.set_item(
+            "recursive_anchor_sample_size",
+            c.recursive_init.anchor_sample_size,
         )?;
         metadata.set_item("random_state", c.random_state)?;
         metadata.set_item("transform_seed", c.transform_seed)?;
@@ -150,6 +230,95 @@ impl FittedUMAP {
                 .expect("neighbor diagnostics are rectangular")
                 .into_pyarray(py),
         ))
+    }
+
+    /// Measurement-only stage replay (Phase 7 D6), search entry. `candidates`
+    /// and `visits` override the approximate budget together (C/V sweep).
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    #[pyo3(signature = (x, candidates=None, visits=None))]
+    fn _replay_transform_search<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        candidates: Option<usize>,
+        visits: Option<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let budget = match (candidates, visits) {
+            (None, None) => None,
+            (Some(candidates), Some(visits)) => {
+                Some(umap::standard_umap::QueryBudget { candidates, visits })
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "candidates and visits must be given together",
+                ));
+            }
+        };
+        let data: Vec<Vec<f32>> = x
+            .as_array()
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect();
+        drop(x);
+        let replay = py
+            .detach(|| self.inner.replay_transform_search(&data, budget))
+            .map_err(map_umap_error)?;
+        replay_dict!(py, replay)
+    }
+
+    /// Measurement-only stage replay (Phase 7 D6), graph entry from injected
+    /// `[rows, k]` query neighbor IDs and distances.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    fn _replay_transform_graph<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray2<'py, i32>,
+        distances: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if indices.shape() != distances.shape() {
+            return Err(PyValueError::new_err(
+                "indices and distances must have the same shape",
+            ));
+        }
+        let rows = indices.shape()[0];
+        let indices = indices.as_array().iter().copied().collect::<Vec<_>>();
+        let distances = distances.as_array().iter().copied().collect::<Vec<_>>();
+        let replay = py
+            .detach(|| {
+                self.inner
+                    .replay_transform_graph(rows, &indices, &distances)
+            })
+            .map_err(map_umap_error)?;
+        replay_dict!(py, replay)
+    }
+
+    /// Measurement-only stage replay (Phase 7 D6), layout entry from an
+    /// injected ordered pruned edge stream and `[rows, n_components]` placement.
+    #[cfg(feature = "tracing")]
+    #[doc(hidden)]
+    fn _replay_transform_layout<'py>(
+        &self,
+        py: Python<'py>,
+        heads: PyReadonlyArray1<'py, i32>,
+        tails: PyReadonlyArray1<'py, i32>,
+        weights: PyReadonlyArray1<'py, f32>,
+        initial: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rows = initial.shape()[0];
+        let heads = heads.as_array().iter().copied().collect::<Vec<_>>();
+        let tails = tails.as_array().iter().copied().collect::<Vec<_>>();
+        let weights = weights.as_array().iter().copied().collect::<Vec<_>>();
+        let initial = initial.as_array().iter().copied().collect::<Vec<_>>();
+        let replay = py
+            .detach(|| {
+                self.inner
+                    .replay_transform_layout(rows, &heads, &tails, &weights, &initial)
+            })
+            .map_err(map_umap_error)?;
+        replay_dict!(py, replay)
     }
 }
 
@@ -231,6 +400,154 @@ fn parse_search(value: &str) -> PyResult<NeighborSearch> {
     }
 }
 
+fn optimizer_name(value: Optimizer) -> &'static str {
+    match value {
+        Optimizer::Compatibility => "compatibility",
+        Optimizer::Adam => "adam",
+        Optimizer::Momentum => "momentum",
+    }
+}
+
+fn parse_optimizer(value: &str) -> PyResult<Optimizer> {
+    match value {
+        "compatibility" => Ok(Optimizer::Compatibility),
+        "adam" => Ok(Optimizer::Adam),
+        "momentum" => Ok(Optimizer::Momentum),
+        _ => Err(PyValueError::new_err(
+            "optimizer must be 'compatibility', 'adam', or 'momentum'",
+        )),
+    }
+}
+
+fn hub_selection_name(value: HubSelection) -> &'static str {
+    match value {
+        HubSelection::Degree => "degree",
+        HubSelection::Diverse => "diverse",
+        HubSelection::Random => "random",
+    }
+}
+
+fn parse_hub_selection(value: &str) -> PyResult<HubSelection> {
+    match value {
+        "degree" => Ok(HubSelection::Degree),
+        "diverse" => Ok(HubSelection::Diverse),
+        "random" => Ok(HubSelection::Random),
+        _ => Err(PyValueError::new_err(
+            "hub_selection must be 'degree', 'diverse', or 'random'",
+        )),
+    }
+}
+
+struct RecursiveInteger(usize);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for RecursiveInteger {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let rejected = || {
+            PyValueError::new_err("recursive option must be a non-negative integer fitting usize")
+        };
+        if !is_numeric_scalar(&value, false)? {
+            return Err(rejected());
+        }
+        value.extract::<usize>().map(Self).map_err(|_| rejected())
+    }
+}
+
+struct NegativeSelectionRange(usize);
+
+fn is_numeric_scalar(value: &Bound<'_, PyAny>, allow_float: bool) -> PyResult<bool> {
+    let numpy = PyModule::import(value.py(), "numpy")?;
+    if value.is_instance_of::<PyBool>() || value.is_instance(&numpy.getattr("bool_")?)? {
+        return Ok(false);
+    }
+    Ok(value.is_instance_of::<PyInt>()
+        || value.is_instance(&numpy.getattr("integer")?)?
+        || (allow_float
+            && (value.is_instance_of::<PyFloat>()
+                || value.is_instance(&numpy.getattr("floating")?)?)))
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for NegativeSelectionRange {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let rejected = || {
+            PyValueError::new_err(
+                "negative_selection_range must be a positive integer that fits in i32",
+            )
+        };
+        if !is_numeric_scalar(&value, false)? {
+            return Err(rejected());
+        }
+        match value.extract::<usize>() {
+            Ok(range) if range > 0 && i32::try_from(range).is_ok() => Ok(Self(range)),
+            _ => Err(rejected()),
+        }
+    }
+}
+
+struct AdaptationSamples(usize);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for AdaptationSamples {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let rejected = || {
+            PyValueError::new_err(
+                "negative_sample_scale_adaptation_samples must be a nonnegative integer that fits in i32",
+            )
+        };
+        if !is_numeric_scalar(&value, false)? {
+            return Err(rejected());
+        }
+        match value.extract::<usize>() {
+            Ok(samples) if i32::try_from(samples).is_ok() => Ok(Self(samples)),
+            _ => Err(rejected()),
+        }
+    }
+}
+
+struct StrictBool(bool);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for StrictBool {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let numpy = PyModule::import(value.py(), "numpy")?;
+        if value.is_instance_of::<PyBool>() || value.is_instance(&numpy.getattr("bool_")?)? {
+            return Ok(Self(value.is_truthy()?));
+        }
+        Err(PyValueError::new_err(
+            "exclude_graph_neighbors must be a boolean",
+        ))
+    }
+}
+
+fn optional_negative_sample_scale(value: &Bound<'_, PyAny>) -> PyResult<Option<f32>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let rejected = || {
+        PyValueError::new_err(
+            "negative_sample_scale must be a finite nonnegative number representable as f32 or None",
+        )
+    };
+    if !is_numeric_scalar(value, true)? {
+        return Err(rejected());
+    }
+    let scale = value.extract::<f64>().map_err(|_| rejected())?;
+    let narrowed = scale as f32;
+    if !scale.is_finite()
+        || scale < 0.0
+        || !narrowed.is_finite()
+        || (scale != 0.0 && narrowed == 0.0)
+    {
+        return Err(rejected());
+    }
+    Ok(Some(narrowed))
+}
+
 #[pyfunction(signature = (arrays, metadata, backend="auto", device_index=0))]
 #[allow(clippy::too_many_arguments)]
 fn load(
@@ -278,6 +595,8 @@ fn load(
     let init = match get!("init").extract::<String>()?.as_str() {
         "random" => Init::Random,
         "spectral" => Init::Spectral,
+        "recursive" => Init::Recursive,
+        "auto" => Init::Auto,
         _ => return Err(PyValueError::new_err("invalid init")),
     };
     let requested_search = parse_search(&get!("requested_search").extract::<String>()?)?;
@@ -293,13 +612,42 @@ fn load(
         learning_rate: get!("learning_rate").extract()?,
         negative_sample_rate: get!("negative_sample_rate").extract()?,
         repulsion_strength: get!("repulsion_strength").extract()?,
+        optimizer: parse_optimizer(&get!("optimizer").extract::<String>()?)?,
+        negative_selection_range: get!("negative_selection_range")
+            .extract::<NegativeSelectionRange>()?
+            .0,
+        negative_sample_scale: optional_negative_sample_scale(&get!("negative_sample_scale"))?,
+        exclude_graph_neighbors: get!("exclude_graph_neighbors").extract::<StrictBool>()?.0,
+        negative_sample_scale_adaptation_samples: get!("negative_sample_scale_adaptation_samples")
+            .extract::<AdaptationSamples>()?
+            .0,
         init,
+        recursive_init: RecursiveInitConfig {
+            coarsening_ratio: get!("recursive_coarsening_ratio")
+                .extract::<RecursiveInteger>()?
+                .0,
+            base_init_threshold: get!("recursive_base_init_threshold")
+                .extract::<RecursiveInteger>()?
+                .0,
+            n_embedding_epochs: get!("recursive_n_embedding_epochs")
+                .extract::<RecursiveInteger>()?
+                .0,
+            hub_selection: parse_hub_selection(
+                &get!("recursive_hub_selection").extract::<String>()?,
+            )?,
+            anchor_sample_size: get!("recursive_anchor_sample_size")
+                .extract::<RecursiveInteger>()?
+                .0,
+        },
+        init_rescale: parse_init_rescale(&get!("init_rescale").extract::<String>()?)?,
+        init_scale_factor: get!("init_scale_factor").extract()?,
         random_state: get!("random_state").extract()?,
         transform_seed: get!("transform_seed").extract()?,
         transform_queue_size: get!("transform_queue_size").extract()?,
         unique: get!("unique").extract()?,
         memory_limit_bytes: optional_memory_limit(&get!("memory_limit_bytes"))?,
     };
+    config.validate().map_err(map_umap_error)?;
     let fshape = training_features.shape();
     let eshape = embedding.shape();
     if get!("training_rows").extract::<usize>()? != fshape[0]
@@ -359,13 +707,20 @@ fn load(
         .map_err(map_umap_error)
 }
 
-#[pyfunction(signature = (
+#[pyfunction(text_signature = "(x, *, n_components=2, n_neighbors=15, min_dist=0.1, spread=1.0, local_connectivity=1.0, set_op_mix_ratio=1.0, n_epochs=None, learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0, init='auto', random_state=None, transform_seed=42, transform_queue_size=4.0, backend='auto', device_index=0, neighbor_search='auto', unique=False, memory_limit_bytes=None, init_rescale='isotropic', init_scale_factor=1.0, optimizer='adam', negative_selection_range=200000, negative_sample_scale=None, exclude_graph_neighbors=False, negative_sample_scale_adaptation_samples=128, recursive_coarsening_ratio=4, recursive_base_init_threshold=1024, recursive_n_embedding_epochs=50, recursive_hub_selection='degree', recursive_anchor_sample_size=16384)", signature = (
   x, *, n_components=2, n_neighbors=15, min_dist=0.1, spread=1.0,
   local_connectivity=1.0, set_op_mix_ratio=1.0, n_epochs=None,
   learning_rate=1.0, negative_sample_rate=5, repulsion_strength=1.0,
-  init="spectral", random_state=None, transform_seed=42,
+  init="auto", random_state=None, transform_seed=42,
   transform_queue_size=4.0, backend="auto", device_index=0,
-  neighbor_search="auto", unique=false, memory_limit_bytes=None))]
+  neighbor_search="auto", unique=false, memory_limit_bytes=None,
+  init_rescale="isotropic", init_scale_factor=1.0,
+  optimizer="adam", negative_selection_range=NegativeSelectionRange(200_000),
+  negative_sample_scale=None, exclude_graph_neighbors=StrictBool(false),
+  negative_sample_scale_adaptation_samples=AdaptationSamples(128),
+  recursive_coarsening_ratio=RecursiveInteger(4), recursive_base_init_threshold=RecursiveInteger(1024),
+  recursive_n_embedding_epochs=RecursiveInteger(50), recursive_hub_selection="degree",
+  recursive_anchor_sample_size=RecursiveInteger(16384)))]
 #[allow(clippy::too_many_arguments)]
 fn fit_umap(
     py: Python<'_>,
@@ -389,6 +744,18 @@ fn fit_umap(
     neighbor_search: &str,
     unique: bool,
     memory_limit_bytes: Option<&Bound<'_, PyAny>>,
+    init_rescale: &str,
+    init_scale_factor: f32,
+    optimizer: &str,
+    negative_selection_range: NegativeSelectionRange,
+    negative_sample_scale: Option<&Bound<'_, PyAny>>,
+    exclude_graph_neighbors: StrictBool,
+    negative_sample_scale_adaptation_samples: AdaptationSamples,
+    recursive_coarsening_ratio: RecursiveInteger,
+    recursive_base_init_threshold: RecursiveInteger,
+    recursive_n_embedding_epochs: RecursiveInteger,
+    recursive_hub_selection: &str,
+    recursive_anchor_sample_size: RecursiveInteger,
 ) -> PyResult<FittedUMAP> {
     let memory_limit_bytes = memory_limit_bytes
         .map(optional_memory_limit)
@@ -397,7 +764,13 @@ fn fit_umap(
     let init = match init {
         "spectral" => Init::Spectral,
         "random" => Init::Random,
-        _ => return Err(PyValueError::new_err("init must be 'spectral' or 'random'")),
+        "recursive" => Init::Recursive,
+        "auto" => Init::Auto,
+        _ => {
+            return Err(PyValueError::new_err(
+                "init must be 'spectral', 'random', 'recursive', or 'auto'",
+            ));
+        }
     };
     let backend = match backend {
         "auto" => BackendChoice::Auto,
@@ -430,13 +803,31 @@ fn fit_umap(
         learning_rate,
         negative_sample_rate,
         repulsion_strength,
+        optimizer: parse_optimizer(optimizer)?,
+        negative_selection_range: negative_selection_range.0,
+        negative_sample_scale: negative_sample_scale
+            .map(optional_negative_sample_scale)
+            .transpose()?
+            .flatten(),
+        exclude_graph_neighbors: exclude_graph_neighbors.0,
+        negative_sample_scale_adaptation_samples: negative_sample_scale_adaptation_samples.0,
         init,
+        recursive_init: RecursiveInitConfig {
+            coarsening_ratio: recursive_coarsening_ratio.0,
+            base_init_threshold: recursive_base_init_threshold.0,
+            n_embedding_epochs: recursive_n_embedding_epochs.0,
+            hub_selection: parse_hub_selection(recursive_hub_selection)?,
+            anchor_sample_size: recursive_anchor_sample_size.0,
+        },
+        init_rescale: parse_init_rescale(init_rescale)?,
+        init_scale_factor,
         random_state,
         transform_seed,
         transform_queue_size,
         unique,
         memory_limit_bytes,
     };
+    config.validate().map_err(map_umap_error)?;
     let data: Vec<Vec<f32>> = x
         .as_array()
         .rows()
@@ -446,6 +837,17 @@ fn fit_umap(
     py.detach(|| UMAP::new(config, backend, search).fit(&data))
         .map(|inner| FittedUMAP { inner })
         .map_err(map_umap_error)
+}
+
+fn parse_init_rescale(value: &str) -> PyResult<InitRescale> {
+    match value {
+        "isotropic" => Ok(InitRescale::Isotropic),
+        "per_axis" => Ok(InitRescale::PerAxis),
+        "graph_edge" => Ok(InitRescale::GraphEdge),
+        _ => Err(PyValueError::new_err(
+            "init_rescale must be 'isotropic', 'per_axis', or 'graph_edge'",
+        )),
+    }
 }
 
 pub(crate) fn optional_memory_limit(value: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {

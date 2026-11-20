@@ -10,6 +10,24 @@ use faer::{Accum, ColRef, Conj, Mat, MatRef, Par, Side};
 use rand::rngs::StdRng;
 
 const BLOCK_SIZE: usize = 2;
+
+/// Check the reserved basis and projected matrices before block solver allocation.
+pub(super) fn check_buffer_extents(n: usize, max_dim: usize) -> crate::Result<()> {
+    let basis = max_dim.min(n.saturating_sub(1 + BLOCK_SIZE));
+    super::check_faer_matrix(n, basis, "spectral block basis")?;
+    super::check_faer_matrix(basis, basis, "spectral projected matrix")?;
+    super::check_host_array(n, basis, size_of::<f64>(), "spectral packed block")?;
+    if basis != 0 {
+        let req = faer::linalg::evd::self_adjoint_evd_scratch::<f64>(
+            basis,
+            faer::linalg::evd::ComputeEigenvectors::Yes,
+            faer::get_global_parallelism(),
+            faer::Spec::<faer::linalg::evd::SelfAdjointEvdParams, f64>::default(),
+        );
+        super::evd_scratch_bytes(req, "projected EVD scratch")?;
+    }
+    Ok(())
+}
 const MAX_CYCLES: usize = 300;
 const MAX_RANDOM_REDRAWS: usize = 3;
 const RANK_THRESHOLD: f64 = 1.0e-12;
@@ -656,18 +674,31 @@ pub(super) fn solve(
         rng,
         &mut stats,
     )?;
-    q.reserve(n, max_basis);
+    q.try_reserve(n, max_basis)
+        .map_err(|error| UmapError::Memory(format!("spectral basis: {error:?}")))?;
     let mut aq = Mat::zeros(n, 0);
-    aq.reserve(n, max_basis);
+    aq.try_reserve(n, max_basis)
+        .map_err(|error| UmapError::Memory(format!("spectral applied basis: {error:?}")))?;
     let mut q_rotation_scratch = Mat::zeros(n, 0);
-    q_rotation_scratch.reserve(n, max_basis);
+    q_rotation_scratch
+        .try_reserve(n, max_basis)
+        .map_err(|error| UmapError::Memory(format!("spectral rotation scratch: {error:?}")))?;
     let mut aq_rotation_scratch = Mat::zeros(n, 0);
-    aq_rotation_scratch.reserve(n, max_basis);
+    aq_rotation_scratch
+        .try_reserve(n, max_basis)
+        .map_err(|error| {
+            UmapError::Memory(format!("spectral applied rotation scratch: {error:?}"))
+        })?;
     let mut applied_scratch = Mat::zeros(n, 0);
-    applied_scratch.reserve(n, BLOCK_SIZE);
+    applied_scratch
+        .try_reserve(n, max_basis)
+        .map_err(|error| UmapError::Memory(format!("spectral applied scratch: {error:?}")))?;
     let mut rayleigh = Mat::zeros(0, 0);
-    let mut packed_input = Vec::with_capacity(n * BLOCK_SIZE);
-    let mut packed_output = Vec::with_capacity(n * BLOCK_SIZE);
+    let packed_len = n
+        .checked_mul(max_basis)
+        .ok_or(UmapError::Overflow("spectral packed block"))?;
+    let mut packed_input = super::reserved_vec(packed_len, "spectral packed input")?;
+    let mut packed_output = super::reserved_vec(packed_len, "spectral packed output")?;
     #[cfg(all(test, feature = "tracing"))]
     {
         stats.orthogonalization_seconds += started.elapsed().as_secs_f64();

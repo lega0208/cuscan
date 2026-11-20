@@ -33,6 +33,7 @@ _DTYPES = {
 }
 _META = {"n_features", "n_finite", "min_samples", "cluster_nodes", "cores_status", "cores_rank"}
 _MAX_INTP = int(np.iinfo(np.intp).max)
+_VERSION = 1
 
 
 def _deps() -> tuple[Any, Any]:
@@ -127,7 +128,7 @@ def save_model(
     def write(file: Any, _h5py: Any, plugin: Any) -> None:
         from . import _cuscan
 
-        _common._write_root(file, _cuscan.__version__, "hdbscan_predictor")
+        _common._write_root(file, _cuscan.__version__, "hdbscan_predictor", schema_version=_VERSION)
         state = file.create_group("state")
         for name in ("n_features", "n_finite", "min_samples", "cluster_nodes", "cores_rank"):
             state.attrs[name] = np.uint64(values[name])
@@ -156,7 +157,7 @@ def load_model(
     arrays: dict[str, Any] = {}
     with h5py.File(path, "r") as file:
         clevel = _common._validate_root(
-            file, h5py, model_kind="hdbscan_predictor", groups={"state"}
+            file, h5py, model_kind="hdbscan_predictor", groups={"state"}, schema_version=_VERSION
         )
         if clevel != 1:
             raise ValueError("unsupported compression level")

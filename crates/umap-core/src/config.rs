@@ -13,7 +13,17 @@ pub struct UMAPConfig {
     pub learning_rate: f32,
     pub negative_sample_rate: usize,
     pub repulsion_strength: f32,
+    pub optimizer: Optimizer,
+    pub negative_selection_range: usize,
+    pub negative_sample_scale: Option<f32>,
+    /// Exclude each head's graph neighbors from modern negative samples.
+    pub exclude_graph_neighbors: bool,
+    /// Samples used to adapt the automatic negative-sample scale; at most `i32::MAX`.
+    pub negative_sample_scale_adaptation_samples: usize,
     pub init: Init,
+    pub recursive_init: RecursiveInitConfig,
+    pub init_rescale: InitRescale,
+    pub init_scale_factor: f32,
     pub random_state: Option<u64>,
     pub transform_seed: u64,
     pub transform_queue_size: f64,
@@ -37,7 +47,15 @@ impl Default for UMAPConfig {
             learning_rate: 1.0,
             negative_sample_rate: 5,
             repulsion_strength: 1.0,
-            init: Init::Spectral,
+            optimizer: Optimizer::Adam,
+            negative_selection_range: 200_000,
+            negative_sample_scale: None,
+            exclude_graph_neighbors: false,
+            negative_sample_scale_adaptation_samples: 128,
+            init: Init::Auto,
+            recursive_init: RecursiveInitConfig::default(),
+            init_rescale: InitRescale::Isotropic,
+            init_scale_factor: 1.0,
             random_state: None,
             transform_seed: 42,
             transform_queue_size: 4.0,
@@ -50,6 +68,32 @@ impl Default for UMAPConfig {
 impl UMAPConfig {
     /// Validate controls that do not depend on a particular input matrix.
     pub fn validate(&self) -> Result<()> {
+        self.recursive_init.validate()?;
+        if self.negative_selection_range == 0
+            || i32::try_from(self.negative_selection_range).is_err()
+        {
+            return Err(UmapError::InvalidConfig(
+                "negative_selection_range must be positive and fit in i32".into(),
+            ));
+        }
+        if self
+            .negative_sample_scale
+            .is_some_and(|scale| !scale.is_finite() || scale < 0.0)
+        {
+            return Err(UmapError::InvalidConfig(
+                "negative_sample_scale must be finite and nonnegative".into(),
+            ));
+        }
+        if i32::try_from(self.negative_sample_scale_adaptation_samples).is_err() {
+            return Err(UmapError::InvalidConfig(
+                "negative_sample_scale_adaptation_samples must fit in i32".into(),
+            ));
+        }
+        if !self.init_scale_factor.is_finite() || self.init_scale_factor <= 0.0 {
+            return Err(UmapError::InvalidConfig(
+                "init_scale_factor must be finite and positive".into(),
+            ));
+        }
         if self.memory_limit_bytes == Some(0) {
             return Err(UmapError::InvalidInput(
                 "memory_limit_bytes must be greater than zero".into(),
@@ -113,7 +157,7 @@ impl UMAPConfig {
     }
 }
 
-/// Fit the low-dimensional UMAP curve to the pinned 0.5.12 offset exponential target.
+/// Fit the low-dimensional UMAP curve to the pinned 0.6.0 offset exponential target.
 ///
 /// This uses the reference's 300 inclusive samples over `[0, 3 * spread]` and
 /// minimizes unweighted squared residuals for `1 / (1 + a * x^(2b))`.
@@ -287,6 +331,14 @@ fn curve_value(x: f64, a: f64, b: f64) -> f64 {
     }
 }
 
+/// Coordinate optimizer. Adam is the default; Compatibility uses classic SGD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Optimizer {
+    Compatibility,
+    Adam,
+    Momentum,
+}
+
 /// Select the neighbor-search implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeighborSearch {
@@ -298,8 +350,90 @@ pub enum NeighborSearch {
 /// Initialization strategy for the eventual embedding optimizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Init {
+    /// Initialize coordinates randomly.
     Random,
+    /// Initialize from spectral modes; connected graphs need at least
+    /// `n_components + 2` samples.
     Spectral,
+    /// Initialize by recursively coarsening the graph.
+    Recursive,
+    /// Default fit strategy; resolves to [`Init::Recursive`].
+    Auto,
+}
+
+impl Init {
+    /// Resolve the requested strategy without changing the stored configuration.
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto => Self::Recursive,
+            other => other,
+        }
+    }
+}
+
+/// Selection strategy for recursive coarsening hubs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubSelection {
+    Degree,
+    Diverse,
+    Random,
+}
+
+/// Controls recursive initialization and its coarse embeddings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveInitConfig {
+    pub coarsening_ratio: usize,
+    pub base_init_threshold: usize,
+    pub n_embedding_epochs: usize,
+    pub hub_selection: HubSelection,
+    pub anchor_sample_size: usize,
+}
+
+impl Default for RecursiveInitConfig {
+    fn default() -> Self {
+        Self {
+            coarsening_ratio: 4,
+            base_init_threshold: 1024,
+            n_embedding_epochs: 50,
+            hub_selection: HubSelection::Degree,
+            anchor_sample_size: 16384,
+        }
+    }
+}
+
+impl RecursiveInitConfig {
+    /// Validate controls independently of the selected initialization strategy.
+    pub fn validate(&self) -> Result<()> {
+        if !(2..=4).contains(&self.coarsening_ratio) {
+            return Err(UmapError::InvalidConfig(
+                "coarsening_ratio must be 2, 3 or 4".into(),
+            ));
+        }
+        if self.base_init_threshold < 2 || i32::try_from(self.base_init_threshold).is_err() {
+            return Err(UmapError::InvalidConfig(
+                "base_init_threshold must be at least 2 and fit in i32".into(),
+            ));
+        }
+        if self.n_embedding_epochs == 0 {
+            return Err(UmapError::InvalidConfig(
+                "n_embedding_epochs must be at least 1".into(),
+            ));
+        }
+        if self.anchor_sample_size == 0 || i32::try_from(self.anchor_sample_size).is_err() {
+            return Err(UmapError::InvalidConfig(
+                "anchor_sample_size must be at least 1 and fit in i32".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Scaling applied to centered initialization coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitRescale {
+    Isotropic,
+    PerAxis,
+    GraphEdge,
 }
 
 /// Validate input shape, optional fitted feature width, and every feature value.
@@ -461,8 +595,152 @@ fn validate_queue_size(queue_size: f64) -> Result<()> {
 }
 
 #[cfg(test)]
+mod recursive_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_init_resolution() {
+        let mut config = UMAPConfig::default();
+        assert_eq!(config.init, Init::Auto);
+        assert_eq!(config.optimizer, Optimizer::Adam);
+        assert_eq!(
+            config.recursive_init,
+            RecursiveInitConfig {
+                coarsening_ratio: 4,
+                base_init_threshold: 1024,
+                n_embedding_epochs: 50,
+                hub_selection: HubSelection::Degree,
+                anchor_sample_size: 16384,
+            }
+        );
+        config.init = Init::Auto;
+        for optimizer in [
+            Optimizer::Compatibility,
+            Optimizer::Adam,
+            Optimizer::Momentum,
+        ] {
+            config.optimizer = optimizer;
+            assert_eq!(config.init.resolve(), Init::Recursive);
+            assert_eq!(config.init, Init::Auto);
+        }
+        for init in [Init::Random, Init::Spectral, Init::Recursive] {
+            assert_eq!(init.resolve(), init);
+        }
+    }
+
+    #[test]
+    fn recursive_config_bounds_are_validated_even_for_spectral() {
+        let mut config = UMAPConfig {
+            init: Init::Spectral,
+            optimizer: Optimizer::Compatibility,
+            ..UMAPConfig::default()
+        };
+        for ratio in [2, 3, 4] {
+            config.recursive_init.coarsening_ratio = ratio;
+            assert!(config.validate().is_ok());
+        }
+        for ratio in [0, 1, 5, usize::MAX] {
+            config.recursive_init.coarsening_ratio = ratio;
+            assert!(matches!(
+                config.validate(),
+                Err(UmapError::InvalidConfig(_))
+            ));
+        }
+        config.recursive_init.coarsening_ratio = 4;
+        for threshold in [2, i32::MAX as usize] {
+            config.recursive_init.base_init_threshold = threshold;
+            assert!(config.validate().is_ok());
+        }
+        for threshold in [0, 1, i32::MAX as usize + 1] {
+            config.recursive_init.base_init_threshold = threshold;
+            assert!(matches!(
+                config.validate(),
+                Err(UmapError::InvalidConfig(_))
+            ));
+        }
+        config.recursive_init.base_init_threshold = 2;
+        config.recursive_init.n_embedding_epochs = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(UmapError::InvalidConfig(_))
+        ));
+        config.recursive_init.n_embedding_epochs = 1;
+        for size in [1, i32::MAX as usize] {
+            config.recursive_init.anchor_sample_size = size;
+            assert!(config.validate().is_ok());
+        }
+        for size in [0, i32::MAX as usize + 1] {
+            config.recursive_init.anchor_sample_size = size;
+            assert!(matches!(
+                config.validate(),
+                Err(UmapError::InvalidConfig(_))
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod memory_limit_tests {
     use super::*;
+
+    #[test]
+    fn validates_modern_controls_even_for_compatibility() {
+        for optimizer in [
+            Optimizer::Compatibility,
+            Optimizer::Adam,
+            Optimizer::Momentum,
+        ] {
+            let mut config = UMAPConfig {
+                optimizer,
+                ..Default::default()
+            };
+            for range in [1, 199, 200_000, i32::MAX as usize] {
+                config.negative_selection_range = range;
+                assert!(config.validate().is_ok());
+            }
+            for range in [0, i32::MAX as usize + 1, usize::MAX] {
+                config.negative_selection_range = range;
+                assert!(matches!(
+                    config.validate(),
+                    Err(UmapError::InvalidConfig(_))
+                ));
+            }
+            config.negative_selection_range = 200_000;
+            for scale in [None, Some(0.0), Some(0.25), Some(f32::MAX)] {
+                config.negative_sample_scale = scale;
+                assert!(config.validate().is_ok());
+            }
+            for scale in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                config.negative_sample_scale = Some(scale);
+                assert!(matches!(
+                    config.validate(),
+                    Err(UmapError::InvalidConfig(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn validates_phase4_negative_sampling_controls() {
+        let mut config = UMAPConfig::default();
+        assert!(!config.exclude_graph_neighbors);
+        assert_eq!(config.negative_sample_scale_adaptation_samples, 128);
+        for exclude in [false, true] {
+            config.exclude_graph_neighbors = exclude;
+            for samples in [0, 1, 128, i32::MAX as usize] {
+                config.negative_sample_scale_adaptation_samples = samples;
+                assert!(config.validate().is_ok());
+            }
+            for samples in [i32::MAX as usize + 1, usize::MAX] {
+                config.negative_sample_scale_adaptation_samples = samples;
+                assert!(matches!(
+                    config.validate(),
+                    Err(UmapError::InvalidConfig(_))
+                ));
+            }
+            config.negative_sample_scale_adaptation_samples = 128;
+        }
+    }
 
     #[test]
     fn validates_memory_limit() {

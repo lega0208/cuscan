@@ -40,6 +40,17 @@ impl MemoryBudget {
     }
 }
 
+/// Current host headroom, using the same safety reserve as device admission.
+pub fn host_usable_memory() -> Result<u64, BackendError> {
+    let free = cpu_free_memory()?;
+    Ok(MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: free,
+        limit_bytes: None,
+    }
+    .usable_bytes(0))
+}
+
 pub fn resolve_memory_budget(
     device: &Device,
     limit_bytes: Option<u64>,

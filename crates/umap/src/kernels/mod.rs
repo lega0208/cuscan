@@ -3,6 +3,11 @@ use burn_cubecl::CubeBackend;
 
 mod standard_umap;
 
+pub(crate) use standard_umap::modern_layout::{
+    modern_project, modern_projection_ranks, modern_query_projection_status,
+    modern_sample_resultants,
+};
+
 #[cfg(test)]
 pub(crate) use standard_umap::layout::INJECT_BAD_LAYOUT_LAUNCH;
 
@@ -83,6 +88,76 @@ impl crate::backend::StandardUmapOps for CubeBackend {
             set_op_mix_ratio,
             bipartite,
             n_reference,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn modern_epoch(
+        head: FloatTensor<Self>,
+        fixed_tail: FloatTensor<Self>,
+        offsets: IntTensor<Self>,
+        indices: IntTensor<Self>,
+        source_order: IntTensor<Self>,
+        negative_order: IntTensor<Self>,
+        source_ranks: IntTensor<Self>,
+        periods: FloatTensor<Self>,
+        next_positive: FloatTensor<Self>,
+        negative_periods: FloatTensor<Self>,
+        next_negative: FloatTensor<Self>,
+        updates: FloatTensor<Self>,
+        m: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        epoch: u32,
+        a: f32,
+        b: f32,
+        gamma: f32,
+        scale: f32,
+        negative_range: u32,
+        alpha: f32,
+        mu: f32,
+        correction1: f32,
+        correction2: f32,
+        momentum: bool,
+        shared: bool,
+        negatives: bool,
+        exclude_graph_neighbors: bool,
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
+        standard_umap::modern_epoch(
+            head,
+            fixed_tail,
+            offsets,
+            indices,
+            source_order,
+            negative_order,
+            source_ranks,
+            periods,
+            next_positive,
+            negative_periods,
+            next_negative,
+            updates,
+            m,
+            v,
+            epoch,
+            a,
+            b,
+            gamma,
+            scale,
+            negative_range,
+            alpha,
+            mu,
+            correction1,
+            correction2,
+            momentum,
+            shared,
+            negatives,
+            exclude_graph_neighbors,
         )
     }
 

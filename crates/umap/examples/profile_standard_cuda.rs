@@ -22,7 +22,7 @@ use std::{
 };
 use tracing_subscriber::layer::SubscriberExt;
 use umap::{
-    BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig, backend::StandardUmapOps,
+    BackendChoice, Init, NeighborSearch, Optimizer, UMAP, UMAPConfig, backend::StandardUmapOps,
     standard_umap::approximate_query_budget,
 };
 
@@ -214,11 +214,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let features: usize = args[3].parse()?;
     let epochs: usize = args[4].parse()?;
     let out_dir = PathBuf::from(&args[5]);
+    let mut n_components = 2usize;
     let mut search = None;
     let mut warmups = 1usize;
     let mut runs = 1usize;
     let mut neighbors = 15usize;
     let mut init = Init::Spectral;
+    let mut optimizer = UMAPConfig::default().optimizer;
     let mut seed = 42u64;
     let mut min_dist = 0.0f32;
     let mut trace = None;
@@ -228,6 +230,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(flag) = rest.next() {
         let value = rest.next().ok_or(format!("{flag} requires a value"))?;
         match flag.as_str() {
+            "--n-components" => {
+                n_components = value.parse()?;
+            }
             "--search" => {
                 search = Some(match value.as_str() {
                     "exact" => NeighborSearch::Exact,
@@ -244,8 +249,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 init = match value.as_str() {
                     "random" => Init::Random,
                     "spectral" => Init::Spectral,
+                    "recursive" => Init::Recursive,
                     other => return Err(format!("unknown initialization {other}").into()),
                 }
+            }
+            "--optimizer" => {
+                optimizer = match value.as_str() {
+                    "adam" => Optimizer::Adam,
+                    "momentum" => Optimizer::Momentum,
+                    "compatibility" => Optimizer::Compatibility,
+                    other => return Err(format!("unknown optimizer {other}").into()),
+                };
             }
             "--query" => {
                 if pending_query.replace(PathBuf::from(value)).is_some() {
@@ -308,10 +322,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         UMAP::new(
             UMAPConfig {
                 n_neighbors: neighbors,
-                n_components: 2,
+                n_components,
                 n_epochs: Some(epochs),
                 min_dist,
                 init,
+                optimizer,
                 random_state: Some(run_seed),
                 transform_seed: run_seed,
                 ..UMAPConfig::default()

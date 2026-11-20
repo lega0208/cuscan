@@ -1,7 +1,135 @@
-use umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
+use umap::{BackendChoice, Init, InitRescale, NeighborSearch, UMAP, UMAPConfig};
 
 fn estimator_test_backend() -> BackendChoice {
     BackendChoice::Cpu
+}
+
+fn assert_overflow_error<T>(result: umap::Result<T>) {
+    let Err(umap::UmapError::Numerical(message)) = result else {
+        panic!("expected Numerical overflow error");
+    };
+    assert_eq!(
+        message,
+        "fuzzy graph contains missing or invalid neighbor indices (for example, a squared feature distance overflowed float32)"
+    );
+}
+
+#[test]
+fn transform_rejects_overflowing_query_for_both_searches() {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(42);
+    // Box-Muller gives seeded normal input without another dependency.
+    let rows: Vec<Vec<f32>> = (0..300)
+        .map(|_| {
+            (0..4)
+                .map(|_| {
+                    let u = rng.random_range(f32::MIN_POSITIVE..1.0);
+                    let v = rng.random_range(0.0..1.0);
+                    (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
+                })
+                .collect()
+        })
+        .collect();
+    let mut query = rows[..3].to_vec();
+    query.push(vec![1e20; 4]);
+    for backend in spectral_underflow_backends() {
+        for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
+            let fitted = UMAP::new(
+                UMAPConfig {
+                    n_neighbors: 10,
+                    n_epochs: Some(50),
+                    init: Init::Random,
+                    optimizer: umap::Optimizer::Compatibility,
+                    random_state: Some(42),
+                    ..Default::default()
+                },
+                backend,
+                search,
+            )
+            .fit(&rows)
+            .unwrap();
+            assert_overflow_error(fitted.transform(&query));
+            assert!(
+                fitted
+                    .transform(&rows[..3])
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .all(|x| x.is_finite())
+            );
+        }
+    }
+}
+
+#[test]
+fn fit_rejects_neighbors_with_overflowing_distances() {
+    let rows: Vec<Vec<f32>> = [-1e20, 1e20]
+        .into_iter()
+        .flat_map(|x| (0..3).map(move |i| vec![x, i as f32]))
+        .collect();
+    for backend in spectral_underflow_backends() {
+        for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
+            assert_overflow_error(
+                UMAP::new(
+                    UMAPConfig {
+                        n_neighbors: 5,
+                        n_epochs: Some(50),
+                        init: Init::Random,
+                        optimizer: umap::Optimizer::Compatibility,
+                        random_state: Some(42),
+                        ..Default::default()
+                    },
+                    backend,
+                    search,
+                )
+                .fit(&rows),
+            );
+        }
+    }
+}
+
+#[test]
+fn connected_tiny_graph_spectral_error_has_random_remedy() {
+    // Nearest-neighbor links are 0--1 and 3--1, hence the fuzzy union is connected.
+    let rows = vec![vec![0.0], vec![1.0], vec![3.0]];
+    for backend in spectral_underflow_backends() {
+        for n_components in [1, 2, 3] {
+            for init in [Init::Spectral, Init::Random] {
+                let result = UMAP::new(
+                    UMAPConfig {
+                        n_components,
+                        n_neighbors: 2,
+                        init,
+                        optimizer: umap::Optimizer::Compatibility,
+                        n_epochs: Some(0),
+                        random_state: Some(42),
+                        ..Default::default()
+                    },
+                    backend,
+                    NeighborSearch::Exact,
+                )
+                .fit(&rows);
+                if init == Init::Spectral && n_components >= 2 {
+                    let Err(umap::UmapError::Numerical(message)) = result else {
+                        panic!("expected connected tiny-graph error");
+                    };
+                    assert!(message.contains(&format!(
+                        "connected graph with 3 vertices cannot provide {n_components}"
+                    )));
+                    assert!(message.contains("n_components + 2"));
+                } else {
+                    assert!(
+                        result
+                            .unwrap()
+                            .embedding()
+                            .iter()
+                            .flatten()
+                            .all(|x| x.is_finite())
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -144,6 +272,7 @@ fn config() -> UMAPConfig {
         n_neighbors: 8,
         n_epochs: Some(0),
         init: Init::Spectral,
+        optimizer: umap::Optimizer::Compatibility,
         random_state: Some(17),
         ..Default::default()
     }
@@ -252,12 +381,14 @@ fn transform_uses_fitted_embedding_and_search_settings() {
         .fit_transform(&clustered_data())
         .unwrap();
     assert_eq!(embedding.len(), 60);
-    assert!(embedding.iter().all(|row| {
-        row.len() == 2
-            && row
-                .iter()
-                .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
-    }));
+    assert!(
+        embedding
+            .iter()
+            .all(|row| row.len() == 2 && row.iter().all(|value| value.is_finite()))
+    );
+    for axis in 0..2 {
+        assert!(embedding.iter().map(|row| row[axis]).sum::<f32>().abs() < 1e-4);
+    }
     assert_eq!(fitted.embedding(), &embedding);
     let auto = fit(NeighborSearch::Auto, config()).unwrap();
     assert_eq!(auto.embedding(), fitted.embedding());
@@ -329,6 +460,7 @@ fn transform_q1_and_65_are_finite_and_repeatable_for_explicit_search_modes() {
         n_neighbors: 15,
         n_epochs: Some(0),
         init: Init::Random,
+        optimizer: umap::Optimizer::Compatibility,
         random_state: Some(41),
         ..Default::default()
     };
@@ -369,6 +501,59 @@ fn transform_q1_and_65_are_finite_and_repeatable_for_explicit_search_modes() {
 }
 
 #[test]
+fn zero_epoch_transform_copies_an_identical_training_row() {
+    let rows: Vec<Vec<f32>> = (0..16)
+        .map(|i| vec![i as f32, (i as f32 * 0.3).sin()])
+        .collect();
+    for backend in spectral_underflow_backends() {
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 5,
+                n_epochs: Some(0),
+                init: Init::Random,
+                optimizer: umap::Optimizer::Compatibility,
+                random_state: Some(42),
+                ..Default::default()
+            },
+            backend,
+            NeighborSearch::Exact,
+        )
+        .fit(&rows)
+        .unwrap();
+        let transformed = fitted.transform(&[rows[7].clone()]).unwrap();
+        assert_eq!(transformed[0], fitted.embedding()[7]);
+    }
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn positive_distance_exact_membership_copies_smallest_id() {
+    let rows: Vec<Vec<f32>> = (0..12).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+    for backend in spectral_underflow_backends() {
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 5,
+                n_epochs: Some(0),
+                init: Init::Random,
+                optimizer: umap::Optimizer::Compatibility,
+                random_state: Some(42),
+                ..Default::default()
+            },
+            backend,
+            NeighborSearch::Exact,
+        )
+        .fit(&rows)
+        .unwrap();
+        let replay = fitted
+            .replay_transform_graph(1, &[3, 1, 2, 4, 5], &[1e-30, 1e-30, 1.0, 2.0, 3.0])
+            .unwrap();
+        assert_eq!(&replay.memberships[..2], &[1.0, 1.0]);
+        assert_eq!(replay.initial, fitted.embedding()[1]);
+        assert_eq!(replay.embedding, replay.initial);
+    }
+}
+
+#[test]
 fn fit_and_transform_run_sgd_epochs() {
     let data: Vec<Vec<f32>> = (0..12)
         .map(|row| {
@@ -380,6 +565,7 @@ fn fit_and_transform_run_sgd_epochs() {
         n_neighbors: 4,
         n_epochs: Some(3),
         init: Init::Random,
+        optimizer: umap::Optimizer::Compatibility,
         random_state: Some(31),
         ..Default::default()
     };
@@ -395,6 +581,65 @@ fn fit_and_transform_run_sgd_epochs() {
     );
     let transformed = fitted.transform(&[vec![0.1, 0.0], vec![5.1, 0.0]]).unwrap();
     assert!(transformed.iter().flatten().all(|value| value.is_finite()));
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn injected_transform_schedule_matches_upstream_short_epoch_pruning() {
+    // The same COO graph is injected for each epoch count. The small positive
+    // weights distinguish transform's actual-epoch divisor from fit's fallback.
+    let heads = [0, 0, 0, 0, 0, 0];
+    let tails = [0, 1, 2, 3, 4, 5];
+    let weights = [1.0_f32, 0.25, 0.125, 0.0625, 0.015625, 0.0];
+    let rows: Vec<Vec<f32>> = (0..12).map(|i| vec![i as f32, (i as f32).sin()]).collect();
+    for epochs in [0_usize, 5, 10, 11] {
+        let fitted = UMAP::new(
+            UMAPConfig {
+                n_neighbors: 5,
+                n_epochs: Some(epochs * 3),
+                init: Init::Random,
+                optimizer: umap::Optimizer::Compatibility,
+                random_state: Some(42),
+                ..Default::default()
+            },
+            estimator_test_backend(),
+            NeighborSearch::Exact,
+        )
+        .fit(&rows)
+        .unwrap();
+        let replay = fitted
+            .replay_transform_layout(1, &heads, &tails, &weights, &[0.0, 0.0])
+            .unwrap();
+        assert_eq!(replay.epochs as usize, epochs);
+        // Upstream divides max(weight) by n_epochs, eliminates zero weights,
+        // then makes periods max(weight)/weight and negative periods / 5.
+        // Division by zero yields infinity, so no positive edges survive.
+        let threshold = 1.0_f32 / epochs as f32;
+        let expected: Vec<_> = weights
+            .iter()
+            .enumerate()
+            .filter(|(_, weight)| **weight > 0.0 && **weight >= threshold)
+            .map(|(i, &weight)| (heads[i], tails[i], weight, 1.0 / f64::from(weight)))
+            .collect();
+        let actual: Vec<_> = replay
+            .edge_weights
+            .iter()
+            .enumerate()
+            .filter(|(_, weight)| **weight > 0.0)
+            .map(|(i, &weight)| {
+                assert_eq!(replay.periods[i], replay.next_positive[i]);
+                assert_eq!(replay.negative_periods[i], replay.next_negative[i]);
+                assert_eq!(replay.negative_periods[i], replay.periods[i] / 5.0);
+                (
+                    replay.edge_heads[i],
+                    replay.edge_tails[i],
+                    weight,
+                    replay.periods[i],
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "transform epochs {epochs}");
+    }
 }
 
 #[cfg(feature = "tracing")]
@@ -495,6 +740,7 @@ mod seeded_drift {
             n_components: COMPONENTS,
             n_neighbors: NEIGHBORS,
             n_epochs: Some(EPOCHS),
+            optimizer: umap::Optimizer::Compatibility,
             init: Init::Random,
             random_state: Some(SEED),
             transform_seed: SEED,
@@ -815,6 +1061,274 @@ fn spectral_underflow_backends() -> Vec<BackendChoice> {
 }
 
 #[test]
+fn initialization_modes_are_centered_before_layout_on_each_backend() {
+    let data: Vec<Vec<f32>> = (0..12)
+        .map(|i| vec![i as f32, ((i * i + 3 * i) % 17) as f32])
+        .collect();
+    for backend in spectral_underflow_backends() {
+        for search in [NeighborSearch::Exact, NeighborSearch::Approximate] {
+            for init in [Init::Random, Init::Spectral] {
+                for mode in [
+                    InitRescale::Isotropic,
+                    InitRescale::PerAxis,
+                    InitRescale::GraphEdge,
+                ] {
+                    let settings = UMAPConfig {
+                        n_neighbors: 5,
+                        n_epochs: Some(0),
+                        init,
+                        optimizer: umap::Optimizer::Compatibility,
+                        init_rescale: mode,
+                        init_scale_factor: 1.7,
+                        random_state: Some(17),
+                        ..Default::default()
+                    };
+                    let fit = || {
+                        UMAP::new(settings.clone(), backend, search)
+                            .fit(&data)
+                            .unwrap()
+                    };
+                    let first = fit();
+                    let second = fit();
+                    assert_eq!(first.embedding(), second.embedding());
+                    assert_eq!(first.embedding().len(), data.len());
+                    for axis in 0..settings.n_components {
+                        let values: Vec<f32> =
+                            first.embedding().iter().map(|row| row[axis]).collect();
+                        assert!(values.iter().all(|value| value.is_finite()));
+                        assert!(values.iter().sum::<f32>().abs() < 1e-4);
+                    }
+                    // Random robust modes do not consume the fuzzy graph.
+                    if init == Init::Random && mode != InitRescale::GraphEdge {
+                        let expected =
+                            umap::standard_umap::initialize(&data, &[], &[], &[], &settings, 17)
+                                .unwrap();
+                        let actual: Vec<f32> =
+                            first.embedding().iter().flatten().copied().collect();
+                        assert_eq!(actual, expected);
+                        let no_motion = UMAPConfig {
+                            n_epochs: Some(11),
+                            learning_rate: 0.0,
+                            ..settings.clone()
+                        };
+                        let fitted = UMAP::new(no_motion, backend, search).fit(&data).unwrap();
+                        assert_eq!(fitted.embedding(), first.embedding());
+                    }
+                    let doubled = UMAPConfig {
+                        init_scale_factor: 3.4,
+                        ..settings.clone()
+                    };
+                    let scaled = UMAP::new(doubled, backend, search).fit(&data).unwrap();
+                    for (&a, &b) in first
+                        .embedding()
+                        .iter()
+                        .flatten()
+                        .zip(scaled.embedding().iter().flatten())
+                    {
+                        assert!((b - 2.0 * a).abs() <= 1e-5 + 1e-5 * b.abs());
+                    }
+                    let mut duplicates = data.clone();
+                    duplicates.push(data[2].clone());
+                    let unique = UMAPConfig {
+                        unique: true,
+                        ..settings
+                    };
+                    let fitted = UMAP::new(unique, backend, search).fit(&duplicates).unwrap();
+                    assert_eq!(fitted.embedding().len(), duplicates.len());
+                    assert_eq!(fitted.embedding()[2], fitted.embedding()[data.len()]);
+                }
+            }
+        }
+    }
+}
+
+/// 8 clusters x 6 features, centres uniform in [-30, 30), unit jitter; row `i` is in cluster `i % 8`.
+fn default_clustered(rows: usize) -> Vec<Vec<f32>> {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let mut random = StdRng::seed_from_u64(1024);
+    let centres: Vec<Vec<f32>> = (0..8)
+        .map(|_| {
+            (0..6)
+                .map(|_| random.random_range(-30.0_f32..30.0))
+                .collect()
+        })
+        .collect();
+    (0..rows)
+        .map(|row| {
+            centres[row % 8]
+                .iter()
+                .map(|&centre| centre + random.random_range(-1.0_f32..1.0))
+                .collect()
+        })
+        .collect()
+}
+
+fn seeded_rows(rows: usize, features: usize, seed: u64) -> Vec<Vec<f32>> {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let mut random = StdRng::seed_from_u64(seed);
+    (0..rows)
+        .map(|_| {
+            (0..features)
+                .map(|_| random.random_range(-1.0_f32..1.0))
+                .collect()
+        })
+        .collect()
+}
+
+fn assert_finite(embedding: &[Vec<f32>], rows: usize, width: usize, label: &str) {
+    assert_eq!(embedding.len(), rows, "{label}");
+    assert!(
+        embedding
+            .iter()
+            .all(|row| row.len() == width && row.iter().all(|value| value.is_finite())),
+        "{label}: non-finite or misshaped embedding"
+    );
+}
+
+#[test]
+fn default_fit_matches_explicit_adam_auto_and_recursive() {
+    // 600 rows stay in the recursive base case; 1500 rows add one coarse level.
+    let base = UMAPConfig::default().recursive_init.base_init_threshold;
+    for rows in [600, 1500] {
+        assert_eq!(rows > base, rows == 1500);
+        let data = default_clustered(rows);
+        let query = &data[..20];
+        for backend in spectral_underflow_backends() {
+            let run = |config: UMAPConfig| {
+                let fitted = UMAP::new(config, backend, NeighborSearch::Exact)
+                    .fit(&data)
+                    .unwrap();
+                let transformed = fitted.transform(query).unwrap();
+                (fitted, transformed)
+            };
+            let settings = UMAPConfig {
+                n_epochs: Some(30),
+                random_state: Some(11),
+                transform_seed: 11,
+                ..UMAPConfig::default()
+            };
+            let (default_fit, default_transform) = run(settings.clone());
+            let state = default_fit.export_state().unwrap();
+            assert_eq!(state.config.init, Init::Auto);
+            assert_eq!(state.config.optimizer, umap::Optimizer::Adam);
+            assert_finite(default_fit.embedding(), rows, 2, "default fit");
+            assert_finite(&default_transform, query.len(), 2, "default transform");
+            for init in [Init::Auto, Init::Recursive] {
+                let (explicit, transformed) = run(UMAPConfig {
+                    optimizer: umap::Optimizer::Adam,
+                    init,
+                    ..settings.clone()
+                });
+                assert_eq!(
+                    explicit.embedding(),
+                    default_fit.embedding(),
+                    "{rows} rows {backend:?} {init:?}: fit"
+                );
+                assert_eq!(
+                    transformed, default_transform,
+                    "{rows} rows {backend:?} {init:?}: transform"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn default_edge_cases() {
+    let default_case = |overrides: UMAPConfig, backend: BackendChoice, data: &[Vec<f32>]| {
+        UMAP::new(overrides, backend, NeighborSearch::Exact).fit(data)
+    };
+    let settings = UMAPConfig {
+        random_state: Some(7),
+        transform_seed: 7,
+        ..UMAPConfig::default()
+    };
+    let succeeds = |config: UMAPConfig, backend: BackendChoice, data: &[Vec<f32>], label: &str| {
+        let width = config.n_components;
+        let fitted = default_case(config, backend, data)
+            .unwrap_or_else(|error| panic!("{label} {backend:?}: {error}"));
+        assert_finite(fitted.embedding(), data.len(), width, label);
+        let query = &data[..data.len().min(3)];
+        let transformed = fitted
+            .transform(query)
+            .unwrap_or_else(|error| panic!("{label} {backend:?} transform: {error}"));
+        assert_finite(&transformed, query.len(), width, label);
+    };
+    for backend in spectral_underflow_backends() {
+        // 1: one row fits to zeros and cannot transform.
+        let singleton = default_case(settings.clone(), backend, &[vec![2.0, 3.0]]).unwrap();
+        assert_eq!(singleton.embedding(), &[vec![0.0, 0.0]]);
+        assert_eq!(
+            singleton
+                .transform(&[vec![2.0, 3.0]])
+                .unwrap_err()
+                .to_string(),
+            "Transform unavailable when model was fit with only a single data sample."
+        );
+        // 2: two rows keep the explicit empty-graph error.
+        let error = default_case(
+            UMAPConfig {
+                n_neighbors: 8,
+                ..settings.clone()
+            },
+            backend,
+            &[vec![0.0], vec![1.0]],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("graph is empty"), "{error}");
+        // 3: the connected tiny graph that spectral init rejects for 2 and 3 components.
+        let tiny = vec![vec![0.0], vec![1.0], vec![3.0]];
+        for n_components in [1, 2, 3] {
+            succeeds(
+                UMAPConfig {
+                    n_neighbors: 2,
+                    n_components,
+                    ..settings.clone()
+                },
+                backend,
+                &tiny,
+                &format!("case 3 c{n_components}"),
+            );
+        }
+        // 4: six separated blobs, which spectral init rejects as underflowing.
+        let blobs = separated_blobs();
+        for n_components in [1, 2] {
+            succeeds(
+                UMAPConfig {
+                    n_components,
+                    ..settings.clone()
+                },
+                backend,
+                &blobs,
+                &format!("case 4 c{n_components}"),
+            );
+        }
+        // 5: three components from two features (anchor padding).
+        succeeds(
+            UMAPConfig {
+                n_components: 3,
+                ..settings.clone()
+            },
+            backend,
+            &seeded_rows(300, 2, 5),
+            "case 5",
+        );
+        // 6: zero epochs; the Rust estimator accepts it (the Python wrapper rejects it).
+        succeeds(
+            UMAPConfig {
+                n_epochs: Some(0),
+                ..settings.clone()
+            },
+            backend,
+            &seeded_rows(300, 4, 6),
+            "case 6",
+        );
+        // 9: identical rows.
+        succeeds(settings.clone(), backend, &vec![vec![1.0; 3]; 50], "case 9");
+    }
+}
+
+#[test]
 fn spectral_fit_on_separated_blobs_returns_actionable_error() {
     let data = separated_blobs();
     for backend in spectral_underflow_backends() {
@@ -824,6 +1338,7 @@ fn spectral_fit_on_separated_blobs_returns_actionable_error() {
                     n_neighbors: 10,
                     n_components,
                     init: Init::Spectral,
+                    optimizer: umap::Optimizer::Compatibility,
                     random_state: Some(7),
                     ..Default::default()
                 },
@@ -843,6 +1358,7 @@ fn spectral_fit_on_separated_blobs_returns_actionable_error() {
                 n_neighbors: 10,
                 n_components: 1,
                 init: Init::Random,
+                optimizer: umap::Optimizer::Compatibility,
                 random_state: Some(7),
                 ..Default::default()
             },

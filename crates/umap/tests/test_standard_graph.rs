@@ -492,6 +492,71 @@ fn standard_fuzzy_graph_global_mean_cases_match_f64_oracle_on_cuda() {
     verify_global_mean_oracle_cases(&device);
 }
 
+fn verify_fuzzy_graph_stays_finite_at_maximum_representable_distance(device: &Device) {
+    let max_distance = f32::MAX.sqrt();
+    for bipartite in [false, true] {
+        let graph = run_graph(
+            device,
+            vec![0, 1, 2, 1, 2, 0, 2, 0, 1],
+            vec![
+                0.0,
+                1.0,
+                max_distance,
+                0.0,
+                max_distance,
+                2.0,
+                0.0,
+                3.0,
+                max_distance,
+            ],
+            3,
+            3,
+            1.0,
+            1.0,
+            1.0,
+            bipartite,
+            3,
+        );
+        for values in [&graph.rho, &graph.sigma, &graph.directed, &graph.weights] {
+            assert!(
+                values.iter().all(|value| value.is_finite()),
+                "bipartite={bipartite}: {values:?}"
+            );
+        }
+        assert!(
+            graph
+                .directed
+                .iter()
+                .all(|value| (0.0..=1.0).contains(value))
+        );
+        assert!(
+            graph
+                .weights
+                .iter()
+                .all(|value| (0.0..=1.0).contains(value))
+        );
+        assert!(!graph.heads.contains(&-2));
+        assert!(!graph.tails.contains(&-2));
+    }
+}
+
+#[test]
+fn fuzzy_graph_stays_finite_at_maximum_representable_distance_on_cpu() {
+    verify_fuzzy_graph_stays_finite_at_maximum_representable_distance(&Device::cpu());
+}
+
+#[test]
+fn fuzzy_graph_stays_finite_at_maximum_representable_distance_on_cuda() {
+    let Some(device) = umap::cuda_backend::device(0) else {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUDA is required"
+        );
+        return;
+    };
+    verify_fuzzy_graph_stays_finite_at_maximum_representable_distance(&device);
+}
+
 #[test]
 fn standard_fuzzy_graph_keeps_equal_index_bipartite_neighbors() {
     let device = Device::cpu();
@@ -730,4 +795,65 @@ fn standard_fuzzy_graph_matches_reference_fixtures_on_cuda() {
         return;
     };
     verify_reference_cases(&device);
+}
+
+#[test]
+fn adversarial_fuzzy_graph_positive_projection_is_csr_ordered() {
+    let mut devices = vec![Device::cpu()];
+    if let Some(device) = umap::cuda_backend::device(0) {
+        devices.push(device);
+    } else if std::env::var_os("CUSCAN_REQUIRE_CUDA").is_some() {
+        panic!("CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available");
+    }
+    // Unsorted tail IDs, ties, reverse edges and repeated (0,3)/(2,0) slots.
+    // Distances retain the neighbor search's sorted-row precondition: upstream
+    // smooth_knn_dist chooses the first nonzero entry, not the minimum.
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let oracle = &fixture["init_rescale"]["fuzzy_graph"];
+    let indices = ints(&oracle["indices"]);
+    let distances = floats(&oracle["distances"]);
+    let symmetric = floats(&oracle["symmetric"]);
+    let expected: Vec<_> = symmetric
+        .into_iter()
+        .enumerate()
+        .filter_map(|(slot, weight)| {
+            (weight > 0.0).then_some((((slot / 4) as i32, (slot % 4) as i32), weight))
+        })
+        .collect();
+    for device in devices {
+        let graph = run_graph(
+            &device,
+            indices.clone(),
+            distances.clone(),
+            4,
+            5,
+            1.0,
+            1.0,
+            1.0,
+            false,
+            4,
+        );
+        let actual: Vec<_> = graph
+            .heads
+            .iter()
+            .zip(&graph.tails)
+            .zip(&graph.weights)
+            .filter_map(|((&head, &tail), &weight)| {
+                (weight > 0.0).then_some(((head, tail), weight))
+            })
+            .collect();
+        assert!(graph.weights.contains(&0.0), "fixture exercises padding");
+        assert_eq!(actual.len(), expected.len());
+        for (((head, tail), weight), &((expected_head, expected_tail), expected_weight)) in
+            actual.into_iter().zip(&expected)
+        {
+            assert_eq!((head, tail), (expected_head, expected_tail));
+            assert!(
+                (weight - expected_weight).abs() <= 1e-5 + 1e-5 * expected_weight.abs(),
+                "edge ({head},{tail}) actual {weight}, upstream {expected_weight}; rho={:?} sigma={:?}",
+                graph.rho,
+                graph.sigma
+            );
+        }
+    }
 }

@@ -67,7 +67,11 @@ def test_umap_ann_memory_error(backend: Literal["cpu", "cuda"]) -> None:
     x = np.random.default_rng(42).normal(size=(64, 4)).astype(np.float32)
     with pytest.raises(MemoryError):
         UMAP(
-            backend=backend, neighbor_search="approximate", init="random", memory_limit_bytes=1
+            backend=backend,
+            neighbor_search="approximate",
+            init="random",
+            optimizer="compatibility",
+            memory_limit_bytes=1,
         ).fit(x)
 
 
@@ -83,7 +87,12 @@ def test_umap_saved_memory_limit_snapshot(tmp_path: Path, limit: int | None) -> 
     pytest.importorskip("hdf5plugin")
     x = np.random.default_rng(42).normal(size=(32, 4)).astype(np.float32)
     model = UMAP(
-        backend="cpu", neighbor_search="exact", init="random", n_epochs=10, memory_limit_bytes=limit
+        backend="cpu",
+        neighbor_search="exact",
+        init="random",
+        optimizer="compatibility",
+        n_epochs=10,
+        memory_limit_bytes=limit,
     ).fit(x)
     model.memory_limit_bytes = 1
     path = tmp_path / "model.h5"

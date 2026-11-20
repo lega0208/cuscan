@@ -29,6 +29,16 @@ artifacts/cubecl_kernels_perf
 artifacts/hdbscan_core_investigation
 artifacts/approx_query_cpu
 artifacts/umap_perf
+artifacts/umap06_p0
+artifacts/umap06_p2
+artifacts/umap06_p4
+artifacts/umap06
+artifacts/umap06_phase3_final
+artifacts/umap06_phase3_predecessor
+artifacts/umap06_p5
+artifacts/umap06_p6
+artifacts/umap06_p7
+crates/umap/artifacts/umap06_phase3_debug
 
 analyze/hdbscan_hotspots
 

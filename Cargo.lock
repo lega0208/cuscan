@@ -7475,6 +7475,7 @@ version = "0.1.2"
 dependencies = [
  "faer",
  "rand 0.10.3",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

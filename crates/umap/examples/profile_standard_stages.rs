@@ -2,8 +2,9 @@
 //!
 //! usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS
 //!        [--backend cpu|cuda] [--search exact|approximate] [--runs R]
-//!        [--neighbors K] [--init random|spectral] [--seed S] [--min-dist D]
+//!        [--neighbors K] [--init random|spectral|recursive|auto] [--seed S] [--min-dist D]
 //!        [--trace PATH] [--components N] [--embedding-out PATH]
+//!        [--optimizer compatibility|adam|momentum]
 //!
 //! `--components` sets `n_components` (default 2). `--embedding-out PATH` writes
 //! each run's fitted embedding as raw little-endian f32 row-major bytes to
@@ -16,10 +17,18 @@
 //! Stderr run markers use Unix nanoseconds. Calibrate realtime against perf's
 //! monotonic clock before and after recording to select warm sample windows;
 //! summary durations are not timestamps.
+//! Modern order spans measure host wall time: shuffle includes copying the previous
+//! order, while upload completion includes CPU mapped copies or CUDA submission,
+//! synchronization and pinned-buffer return, not pure DMA. Source and reference
+//! spans run in the producer thread and can overlap device work. Fit momentum
+//! shares the two orders, so it has no separate reference spans. These spans are
+//! not kernel durations. CubeCL's `CUBECL_DEBUG_LOG=stderr` and
+//! `CUBECL_DEBUG_OPTION=profile` enable its own profiling logger; interpret its
+//! timing method and backend support independently, and account for its overhead.
 
 use std::{collections::BTreeMap, error::Error, path::Path, time::Instant};
 use tracing_subscriber::layer::SubscriberExt;
-use umap::{BackendChoice, Init, NeighborSearch, UMAP, UMAPConfig};
+use umap::{BackendChoice, Init, NeighborSearch, Optimizer, UMAP, UMAPConfig};
 
 const STAGES: [&str; 6] = [
     "neighbor_search",
@@ -78,20 +87,21 @@ fn stage_seconds(events: &[serde_json::Value]) -> Result<BTreeMap<String, Vec<f6
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        return Err("usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS [--backend cpu|cuda] [--search exact|approximate] [--runs R] [--neighbors K] [--init random|spectral] [--seed S] [--min-dist D] [--trace PATH] [--components N] [--embedding-out PATH]".into());
+        return Err("usage: profile_standard_stages INPUT_RAW ROWS FEATURES EPOCHS [--backend cpu|cuda] [--search exact|approximate] [--optimizer compatibility|adam|momentum] [--runs R] [--neighbors K] [--init random|spectral|recursive|auto] [--seed S] [--min-dist D] [--trace PATH] [--components N] [--embedding-out PATH]".into());
     }
     let rows: usize = args[2].parse()?;
     let features: usize = args[3].parse()?;
     let epochs: usize = args[4].parse()?;
     let mut backend = BackendChoice::Cpu;
     let mut search = NeighborSearch::Approximate;
-    let mut runs = 3usize;
+    let mut optimizer = Optimizer::Adam;
+    let mut runs = 2usize;
     let mut neighbors = 15usize;
-    let mut init = Init::Spectral;
+    let mut init = Init::Recursive;
     let mut seed = 42u64;
     let mut min_dist = 0.1f32;
     let mut trace = None;
-    let mut components = 2usize;
+    let mut n_components = 2usize;
     let mut embedding_out: Option<String> = None;
     let mut rest = args[5..].iter();
     while let Some(flag) = rest.next() {
@@ -111,10 +121,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     other => return Err(format!("unknown search mode {other}").into()),
                 }
             }
+            "--optimizer" => {
+                optimizer = match value.as_str() {
+                    "compatibility" => Optimizer::Compatibility,
+                    "adam" => Optimizer::Adam,
+                    "momentum" => Optimizer::Momentum,
+                    other => return Err(format!("unknown optimizer {other}").into()),
+                }
+            }
             "--init" => {
                 init = match value.as_str() {
                     "random" => Init::Random,
                     "spectral" => Init::Spectral,
+                    "recursive" => Init::Recursive,
+                    "auto" => Init::Auto,
                     other => return Err(format!("unknown initialization {other}").into()),
                 }
             }
@@ -123,7 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--seed" => seed = value.parse()?,
             "--min-dist" => min_dist = value.parse()?,
             "--trace" => trace = Some(value.clone()),
-            "--components" => components = value.parse()?,
+            "--n-components" => n_components = value.parse()?,
             "--embedding-out" => embedding_out = Some(value.clone()),
             other => return Err(format!("unknown flag {other}").into()),
         }
@@ -155,9 +175,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let model = UMAP::new(
             UMAPConfig {
                 n_neighbors: neighbors,
-                n_components: components,
+                n_components,
                 n_epochs: Some(epochs),
                 min_dist,
+                optimizer,
                 init,
                 random_state: Some(seed + run as u64),
                 transform_seed: seed + run as u64,
@@ -196,6 +217,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     drop(guard);
     let events: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&trace_path)?)?;
+    if optimizer != Optimizer::Compatibility {
+        let mut main_windows = Vec::new();
+        let mut start = None;
+        for event in &events {
+            if event["name"].as_str() != Some("optimization") {
+                continue;
+            }
+            match event["ph"].as_str() {
+                Some("B") => start = event["ts"].as_f64(),
+                Some("E") => {
+                    if let (Some(start), Some(end)) = (start.take(), event["ts"].as_f64()) {
+                        main_windows.push(start..=end);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let preparations = events
+            .iter()
+            .filter(|event| {
+                event["name"].as_str() == Some("modern_source_shuffle_copy")
+                    && event["ph"].as_str() == Some("B")
+                    && event["ts"]
+                        .as_f64()
+                        .is_some_and(|ts| main_windows.iter().any(|window| window.contains(&ts)))
+            })
+            .count();
+        if main_windows.len() != runs || Some(preparations) != runs.checked_mul(epochs) {
+            return Err("modern optimizer producer span count does not match runs × epochs; refusing fallback or incomplete trace".into());
+        }
+    }
     let stages = stage_seconds(&events)?;
     if stages.values().any(|values| values.len() != runs) {
         return Err("stage span count does not match run count".into());
@@ -206,11 +258,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             "fit_seconds": fit_seconds,
             "stage_seconds": stages,
             "backend": format!("{backend:?}"),
+            "optimizer": format!("{optimizer:?}"),
             "search": format!("{search:?}"),
             "init": format!("{init:?}"),
             "neighbors": neighbors,
             "epochs": epochs,
-            "components": components,
+            "components": n_components,
+            "rows": rows,
+            "features": features,
+            "runs": runs,
+            "seed": seed,
+            "min_dist": min_dist,
+            "trace": trace_path,
+            "environment": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "cwd": std::env::current_dir()?.display().to_string(),
+                "cubecl_debug_log": std::env::var("CUBECL_DEBUG_LOG").ok(),
+                "cubecl_debug_option": std::env::var("CUBECL_DEBUG_OPTION").ok(),
+                "cuda_visible_devices": std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+            },
         })
     );
     Ok(())

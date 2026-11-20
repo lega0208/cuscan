@@ -4,6 +4,9 @@
 //! filename (for example `CUSCAN_TRACE=umap.json`). `RUST_LOG` controls the
 //! tracing filter. Tracing setup is compiled only with the `tracing` feature and
 //! no subscriber is installed unless `CUSCAN_TRACE` is set.
+//!
+//! Every workload runs two variants: `_random_` (pre-flip pin: `Init::Random` with
+//! `Optimizer::Compatibility`, historical IDs) and `_default_` (library defaults).
 
 mod support;
 

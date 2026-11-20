@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --no-sync
-"""Per-stage fit timing: cuscan Standard UMAP (CPU by default) vs umap-learn 0.5.12.
+"""Per-stage fit timing: cuscan Standard UMAP (CPU by default) vs umap-learn 0.6.0.
 
 Build the Rust companion first (build time is not measured):
 
@@ -25,7 +25,9 @@ Rust stages come from the library's `tracing` spans (with device barriers). Pyth
 stages are measured by wrapping the umap-learn module functions that `UMAP.fit` calls:
 nearest_neighbors, fuzzy_simplicial_set, make_epochs_per_sample, spectral_layout
 (or the random init path, which is then counted in "other") and
-optimize_layout_euclidean. "other" is total fit time minus the measured stages.
+optimize_layout_euclidean. "other" is total fit time minus the measured stages,
+including CSR conversion, embedding rescaling, and random initialization. Uncalled
+stages are reported as unavailable, not zero.
 umap-learn has no separate spectral graph export step.
 """
 
@@ -43,6 +45,11 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .umap_reference import REFERENCE_VERSION, reference_kwargs, require_reference
+else:
+    from umap_reference import REFERENCE_VERSION, reference_kwargs, require_reference
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "target" / "release" / "examples" / "profile_standard_stages"
@@ -98,8 +105,7 @@ def _python_worker(args: argparse.Namespace) -> None:
     import umap.umap_ as umap_module
     from sklearn.neighbors import NearestNeighbors
 
-    if umap.__version__ != "0.5.12":
-        raise SystemExit(f"requires umap-learn 0.5.12, got {umap.__version__}")
+    require_reference()
     matrix = np.fromfile(args.input, dtype="<f4").reshape(args.rows, args.features)
     current: dict[str, float] = {}
 
@@ -127,9 +133,11 @@ def _python_worker(args: argparse.Namespace) -> None:
         precomputed = (indices, distances, None)
     umap.UMAP(
         n_neighbors=args.neighbors,
-        n_components=2,
+        n_components=args.n_components,
         n_epochs=args.epochs,
-        init=args.init,
+        **reference_kwargs(
+            optimizer=args.optimizer, init=args.init, nearest_neighbor_backend="rinnd"
+        ),
         min_dist=args.min_dist,
         random_state=args.seed if args.seeded_python else None,
         metric="euclidean",
@@ -139,7 +147,13 @@ def _python_worker(args: argparse.Namespace) -> None:
         verbose=False,
     ).fit(matrix)
     fit_seconds = [time.perf_counter() - start]
-    stage_seconds = {stage: [current.get(stage, 0.0)] for stage in PYTHON_STAGE_FUNCTIONS.values()}
+    required = {"neighbor_search", "fuzzy_graph", "schedule", "optimization"}
+    if args.init == "spectral":
+        required.add("initialization")
+    missing = required - current.keys()
+    if missing:
+        raise RuntimeError(f"expected upstream stage functions were not called: {sorted(missing)}")
+    stage_seconds = {stage: [seconds] for stage, seconds in current.items()}
     print(json.dumps({"fit_seconds": fit_seconds, "stage_seconds": stage_seconds}))
 
 
@@ -296,12 +310,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--rows", type=int, default=50_000)
+    parser.add_argument("--rows", type=int, default=150_000)
     parser.add_argument("--features", type=int, default=32)
+    parser.add_argument("--n-components", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=200, help="200 = library default for n>10k")
     parser.add_argument("--neighbors", type=int, default=15)
     parser.add_argument("--min-dist", type=float, default=0.1)
-    parser.add_argument("--init", choices=["spectral", "random"], default="spectral")
+    parser.add_argument("--init", choices=["recursive", "spectral", "random"], default="recursive")
+    parser.add_argument(
+        "--optimizer", choices=["adam", "momentum", "compatibility"], default="adam"
+    )
     parser.add_argument("--search", choices=["approximate", "exact"], default="approximate")
     parser.add_argument("--backend", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument(
@@ -338,8 +356,16 @@ def main() -> int:
         input_path = Path(temp) / "input.f32le"
         make_clustered_input(args.rows, args.features, args.center_scale, args.noise, input_path)
         input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
-        shared = ["--neighbors", str(args.neighbors), "--seed", str(args.seed)]
-        shared += ["--min-dist", str(args.min_dist)]
+        shared = [
+            "--n-components",
+            str(args.n_components),
+            "--neighbors",
+            str(args.neighbors),
+            "--seed",
+            str(args.seed),
+            "--min-dist",
+            str(args.min_dist),
+        ]
         rust = _run(
             [
                 str(args.binary),
@@ -356,13 +382,23 @@ def main() -> int:
                 args.search,
                 "--init",
                 args.init,
+                "--optimizer",
+                args.optimizer,
             ],
             "cuscan",
         )
         python_command = [sys.executable, str(Path(__file__).resolve())]
         python_command += ["--_python-worker", str(input_path), "--rows", str(args.rows)]
         python_command += ["--features", str(args.features), "--epochs", str(args.epochs)]
-        python_command += ["--search", args.search, "--init", args.init, *shared]
+        python_command += [
+            "--search",
+            args.search,
+            "--init",
+            args.init,
+            "--optimizer",
+            args.optimizer,
+            *shared,
+        ]
         if args.seeded_python:
             python_command.append("--seeded-python")
         python = _run(python_command, "umap-learn")
@@ -370,7 +406,7 @@ def main() -> int:
     comparison_runs = range(1, args.rust_runs) if args.rust_runs >= 2 else range(1)
     rows = _rows(_summarize(rust, comparison_runs), _summarize(python))
     title = (
-        f"cuscan {args.backend} vs umap-learn 0.5.12: {args.rows:,}x{args.features}, "
+        f"cuscan {args.backend} vs umap-learn {REFERENCE_VERSION}: {args.rows:,}x{args.features}, "
         f"{args.epochs} epochs, k={args.neighbors}, {args.search} search, {args.init} init, "
         f"{os.cpu_count()} CPUs"
     )
@@ -401,6 +437,11 @@ def main() -> int:
             "noise": args.noise,
             "rust_runs": args.rust_runs,
             "seeded_python": args.seeded_python,
+            "umap_learn_version": REFERENCE_VERSION,
+            "compatibility_layout": False,
+            "optimizer": args.optimizer,
+            "nearest_neighbor_backend": "rinnd",
+            "neighbor_source": "precomputed exact" if args.search == "exact" else "rinnd",
         }
         args.json.write_text(
             json.dumps(
