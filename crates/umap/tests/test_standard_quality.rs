@@ -6,7 +6,13 @@ use cuscan_common::{
     ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
 };
 use serde_json::Value;
-use std::{collections::HashSet, fs::File, io::Read};
+use std::{
+    collections::HashSet,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    process::Command,
+};
 use umap::{
     backend::StandardUmapOps,
     standard_umap::{
@@ -145,6 +151,73 @@ fn fixture() -> (Value, Vec<(String, Matrix, Matrix)>) {
     (reference, cases)
 }
 
+fn export_fixture_rows(cases: &[(String, Matrix, Matrix)]) {
+    let Some(directory) = std::env::var_os("CUSCAN_EXPORT_STANDARD_QUALITY_FIXTURE") else {
+        return;
+    };
+    let directory = Path::new(&directory);
+    fs::create_dir_all(directory).unwrap_or_else(|error| {
+        panic!(
+            "cannot create fixture export directory {}: {error}",
+            directory.display()
+        )
+    });
+    for (name, train, _) in cases {
+        let path = directory.join(format!("{name}_train.f32le"));
+        let mut bytes = Vec::with_capacity(train.values.len() * 4);
+        for value in &train.values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&path, &bytes)
+            .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+        let output = Command::new("sha256sum")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("cannot hash {} with sha256sum: {error}", path.display())
+            });
+        assert!(
+            output.status.success(),
+            "sha256sum failed for {}",
+            path.display()
+        );
+        let digest = String::from_utf8(output.stdout).unwrap();
+        eprintln!(
+            "QUALITY_FIXTURE_EXPORT {{\"case\":\"{name}\",\"path\":\"{}\",\"shape\":[{},{}],\"dtype\":\"f32le\",\"sha256\":\"{}\"}}",
+            path.display(),
+            train.rows,
+            train.cols,
+            digest.split_whitespace().next().unwrap()
+        );
+    }
+}
+
+fn export_neighbor_ids(directory: &Path, name: &str, ids: &[i32]) {
+    let path = directory.join(format!("{name}_fit_ids.i32le"));
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    fs::write(&path, &bytes)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+    let output = Command::new("sha256sum")
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot hash {} with sha256sum: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "sha256sum failed for {}",
+        path.display()
+    );
+    let digest = String::from_utf8(output.stdout).unwrap();
+    eprintln!(
+        "QUALITY_NEIGHBOR_EXPORT {{\"case\":\"{name}\",\"path\":\"{}\",\"rows\":{},\"width\":14,\"dtype\":\"i32le\",\"sha256\":\"{}\"}}",
+        path.display(),
+        ids.len() / 14,
+        digest.split_whitespace().next().unwrap()
+    );
+}
+
 fn device_for_cuda() -> Option<Device> {
     let Some(device) = umap::cuda_backend::device(0) else {
         assert!(
@@ -204,7 +277,7 @@ fn run_cluster_quality(
     }
     let mean = scores.iter().sum::<f64>() / scores.len() as f64;
     eprintln!(
-        "{n_components}-component cluster quality {:?} {pinned:?}: scores={scores:?}, mean={mean:.6}, elapsed={:?}",
+        "QUALITY_CLUSTER {{\"backend\":\"{:?}\",\"components\":{n_components},\"optimizer\":\"{pinned:?}\",\"scores\":{scores:?},\"mean_trustworthiness_at_15\":{mean:.9},\"threshold\":0.900000000,\"elapsed\":\"{:?}\"}}",
         backend(device),
         start.elapsed()
     );
@@ -430,7 +503,7 @@ fn assert_approximate_fit_quality(
     seeds: &[u64],
     quality_config: (usize, usize, usize),
     reference_trust: &[f64],
-) {
+) -> Vec<String> {
     let (n_neighbors, trust_k, fit_epochs) = quality_config;
     assert_eq!(
         reference_trust.len(),
@@ -549,19 +622,23 @@ fn assert_approximate_fit_quality(
         .map(|(reference, candidate)| reference - candidate)
         .sum::<f64>()
         / seeds.len() as f64;
-    assert!(
-        recall_mean >= RECALL_LIMIT,
-        "{name}: mean recall@{} {recall_mean:.6} below {RECALL_LIMIT}",
-        n_neighbors - 1
-    );
-    assert!(
-        trust_loss_mean <= TRUST_GAP_LIMIT,
-        "{name}: one-sided mean reference-minus-candidate trustworthiness@{trust_k} {trust_loss_mean:.6} exceeds {TRUST_GAP_LIMIT}"
-    );
     eprintln!(
-        "QUALITY_CASE_MEAN {{\"case\":\"{name}\",\"mean_recall_at_{}\":{recall_mean:.9},\"mean_reference_minus_candidate_trustworthiness_at_{trust_k}\":{trust_loss_mean:.9}}}",
+        "QUALITY_CASE_MEAN {{\"case\":\"{name}\",\"mean_recall_at_{}\":{recall_mean:.9},\"recall_threshold\":{RECALL_LIMIT:.9},\"mean_reference_minus_candidate_trustworthiness_at_{trust_k}\":{trust_loss_mean:.9},\"trustworthiness_gap_threshold\":{TRUST_GAP_LIMIT:.9}}}",
         n_neighbors - 1
     );
+    let mut misses = Vec::new();
+    if !(recall_mean >= RECALL_LIMIT) {
+        misses.push(format!(
+            "{name}: mean recall@{} {recall_mean:.6} below {RECALL_LIMIT}",
+            n_neighbors - 1
+        ));
+    }
+    if !(trust_loss_mean <= TRUST_GAP_LIMIT) {
+        misses.push(format!(
+            "{name}: one-sided mean reference-minus-candidate trustworthiness@{trust_k} {trust_loss_mean:.6} exceeds {TRUST_GAP_LIMIT}"
+        ));
+    }
+    misses
 }
 
 fn run_quality(device: Device) {
@@ -677,7 +754,7 @@ fn run_quality(device: Device) {
         / pooled_transform_expected.len() as f64
         - pooled_transform_actual.iter().sum::<f64>() / pooled_transform_actual.len() as f64;
     eprintln!(
-        "{} pooled fit trustworthiness@{trust_k} signed mean gap reference-minus-candidate (acceptance gate): {fit_gap:.6}; absolute diagnostic: {:.6}",
+        "{} pooled fit trustworthiness@{trust_k} signed mean gap reference-minus-candidate (acceptance gate): {fit_gap:.6}; threshold: {TRUST_GAP_LIMIT:.6}; absolute diagnostic: {:.6}",
         if matches!(backend, BackendChoice::Cpu) {
             "CPU"
         } else {
@@ -686,7 +763,7 @@ fn run_quality(device: Device) {
         fit_gap.abs()
     );
     eprintln!(
-        "{} pooled transform trustworthiness@{trust_k} signed mean gap reference-minus-candidate (acceptance gate): {transform_gap:.6}; absolute diagnostic: {:.6}",
+        "{} pooled transform trustworthiness@{trust_k} signed mean gap reference-minus-candidate (acceptance gate): {transform_gap:.6}; threshold: {TRUST_GAP_LIMIT:.6}; absolute diagnostic: {:.6}",
         if matches!(backend, BackendChoice::Cpu) {
             "CPU"
         } else {
@@ -728,11 +805,14 @@ fn cached_trustworthiness_matches_bounded_with_ties() {
 
 fn run_recall(device: Device) {
     let (_, cases) = fixture();
+    export_fixture_rows(&cases);
     let mut fit_weighted_hits = 0usize;
     let mut fit_weighted_rows = 0usize;
     let mut query_weighted_hits = 0usize;
     let mut query_weighted_rows = 0usize;
-    for (_, train, heldout) in &cases {
+    let export_directory =
+        std::env::var_os("CUSCAN_EXPORT_STANDARD_QUALITY_FIXTURE").map(std::path::PathBuf::from);
+    for (name, train, heldout) in &cases {
         let train_tensor = Tensor::<2>::from_data(
             TensorData::new(train.values.clone(), [train.rows, train.cols]),
             &device,
@@ -751,6 +831,17 @@ fn run_recall(device: Device) {
         .unwrap();
         let approximate_fit = graph.clone().to_data().try_to_vec::<i32>().unwrap();
         let fit_recall = tie_aware_recall(&approximate_fit, train, train, fit_k, true);
+        if let Some(directory) = &export_directory {
+            export_neighbor_ids(directory, name, &approximate_fit);
+        }
+        eprintln!(
+            "QUALITY_RECALL_CASE {{\"backend\":\"{}\",\"case\":\"{name}\",\"metric\":\"fit_ann_recall_at_14\",\"value\":{fit_recall:.12}}}",
+            if device == Device::cpu() {
+                "CPU"
+            } else {
+                "CUDA"
+            }
+        );
         fit_weighted_hits += (fit_recall * (train.rows * fit_k) as f64).round() as usize;
         fit_weighted_rows += train.rows * fit_k;
 
@@ -782,6 +873,14 @@ fn run_recall(device: Device) {
                 .all(|&value| value >= 0)
         );
         let recall = tie_aware_recall(&query_ids, heldout, train, 15, false);
+        eprintln!(
+            "QUALITY_RECALL_CASE {{\"backend\":\"{}\",\"case\":\"{name}\",\"metric\":\"transform_query_ann_recall_at_15\",\"value\":{recall:.12}}}",
+            if device == Device::cpu() {
+                "CPU"
+            } else {
+                "CUDA"
+            }
+        );
         query_weighted_hits += (recall * (heldout.rows * 15) as f64).round() as usize;
         query_weighted_rows += heldout.rows * 15;
     }
@@ -793,15 +892,26 @@ fn run_recall(device: Device) {
         "CUDA"
     };
     eprintln!(
-        "{device_name} ANN tie-aware recall: fit@14={fit_recall:.6}, transform-query@15={query_recall:.6}"
+        "QUALITY_RECALL {{\"backend\":\"{device_name}\",\"metric\":\"fit_ann_recall_at_14\",\"value\":{fit_recall:.9},\"threshold\":{RECALL_LIMIT:.9}}}"
     );
-    assert!(
-        fit_recall >= RECALL_LIMIT,
-        "fit ANN recall {fit_recall:.6} below {RECALL_LIMIT}"
+    eprintln!(
+        "QUALITY_RECALL {{\"backend\":\"{device_name}\",\"metric\":\"transform_query_ann_recall_at_15\",\"value\":{query_recall:.9},\"threshold\":{RECALL_LIMIT:.9}}}"
     );
+    let mut misses = Vec::new();
+    if !(fit_recall >= RECALL_LIMIT) {
+        misses.push(format!(
+            "fit ANN recall {fit_recall:.6} below {RECALL_LIMIT}"
+        ));
+    }
+    if !(query_recall >= RECALL_LIMIT) {
+        misses.push(format!(
+            "transform-query ANN recall {query_recall:.6} below {RECALL_LIMIT}"
+        ));
+    }
     assert!(
-        query_recall >= RECALL_LIMIT,
-        "transform-query ANN recall {query_recall:.6} below {RECALL_LIMIT}"
+        misses.is_empty(),
+        "{device_name} ANN quality threshold misses: {}",
+        misses.join("; ")
     );
 }
 
@@ -842,6 +952,7 @@ fn run_approximate_fit_quality_per_frozen_fixture_case(device: &Device) {
     let n_neighbors = reference["controls"]["n_neighbors"].as_u64().unwrap() as usize;
     let trust_k = reference["controls"]["trustworthiness_k"].as_u64().unwrap() as usize;
     let fit_epochs = reference["controls"]["fit"]["n_epochs"].as_u64().unwrap() as usize;
+    let mut misses = Vec::new();
     for (name, train, _) in cases {
         let seed_scores = reference["quality"]["scores"][name.as_str()]
             .as_array()
@@ -851,15 +962,20 @@ fn run_approximate_fit_quality_per_frozen_fixture_case(device: &Device) {
             .iter()
             .map(|score| score["fit_trustworthiness_at_15"].as_f64().unwrap())
             .collect::<Vec<_>>();
-        assert_approximate_fit_quality(
+        misses.extend(assert_approximate_fit_quality(
             device,
             &name,
             &train,
             &seeds,
             (n_neighbors, trust_k, fit_epochs),
             &reference_trust,
-        );
+        ));
     }
+    assert!(
+        misses.is_empty(),
+        "approximate-fit quality threshold misses: {}",
+        misses.join("; ")
+    );
 }
 
 #[test]
@@ -939,15 +1055,23 @@ fn run_long_run_quality(device: &Device) {
     let fit_gap = fit_reference - fit_trust;
     let transform_gap = transform_reference - transform_trust;
     eprintln!(
-        "LONG_QUALITY {{\"case\":\"{name}\",\"seed\":{seed},\"fit_trustworthiness_at_15\":{fit_trust:.9},\"transform_trustworthiness_at_15\":{transform_trust:.9}}}"
+        "LONG_QUALITY {{\"case\":\"{name}\",\"seed\":{seed},\"fit_trustworthiness_at_15\":{fit_trust:.9},\"fit_reference_trustworthiness_at_15\":{fit_reference:.9},\"fit_reference_minus_candidate\":{fit_gap:.9},\"fit_gap_threshold\":{TRUST_GAP_LIMIT:.9},\"transform_trustworthiness_at_15\":{transform_trust:.9},\"transform_reference_trustworthiness_at_15\":{transform_reference:.9},\"transform_reference_minus_candidate\":{transform_gap:.9},\"transform_gap_threshold\":{TRUST_GAP_LIMIT:.9}}}"
     );
+    let mut misses = Vec::new();
+    if !(fit_gap <= TRUST_GAP_LIMIT) {
+        misses.push(format!(
+            "{name}: long-run fit reference-minus-candidate trustworthiness gap {fit_gap:.6} exceeds {TRUST_GAP_LIMIT}"
+        ));
+    }
+    if !(transform_gap <= TRUST_GAP_LIMIT) {
+        misses.push(format!(
+            "{name}: long-run transform reference-minus-candidate trustworthiness gap {transform_gap:.6} exceeds {TRUST_GAP_LIMIT}"
+        ));
+    }
     assert!(
-        fit_gap <= TRUST_GAP_LIMIT,
-        "{name}: long-run fit reference-minus-candidate trustworthiness gap {fit_gap:.6} exceeds {TRUST_GAP_LIMIT}"
-    );
-    assert!(
-        transform_gap <= TRUST_GAP_LIMIT,
-        "{name}: long-run transform reference-minus-candidate trustworthiness gap {transform_gap:.6} exceeds {TRUST_GAP_LIMIT}"
+        misses.is_empty(),
+        "long-run quality threshold misses: {}",
+        misses.join("; ")
     );
 }
 
@@ -1020,7 +1144,7 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
             "campaign score seed order"
         );
     }
-    assert_approximate_fit_quality(
+    let mut misses = assert_approximate_fit_quality(
         device,
         "campaign",
         &train,
@@ -1048,12 +1172,20 @@ fn run_approximate_fit_quality_campaign(device: &Device) {
         let ids = ids.to_data().try_to_vec::<i32>().unwrap();
         let nonself = tie_aware_recall(&ids, &train, &train, 14, true);
         let self_inclusive = (1.0 + 14.0 * nonself) / 15.0;
-        eprintln!("PHASE2_CAMPAIGN_RECALL seed={seed} self_inclusive_at15={self_inclusive:.9}");
-        assert!(
-            self_inclusive >= 0.958,
-            "campaign seed {seed}: additional self-inclusive recall@15 {self_inclusive:.9} below 0.958"
+        eprintln!(
+            "PHASE2_CAMPAIGN_RECALL {{\"seed\":{seed},\"self_inclusive_at15\":{self_inclusive:.9},\"threshold\":0.958}}"
         );
+        if self_inclusive < 0.958 {
+            misses.push(format!(
+                "campaign seed {seed}: additional self-inclusive recall@15 {self_inclusive:.9} below 0.958"
+            ));
+        }
     }
+    assert!(
+        misses.is_empty(),
+        "campaign quality threshold misses: {}",
+        misses.join("; ")
+    );
 }
 
 #[test]

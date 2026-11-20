@@ -46,7 +46,7 @@ fn lifetime_allocator() -> AnnAllocator {
         2,
         3,
         plan.host.width,
-        plan.host.capacity,
+        plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         plan.tile_slots,
     )
@@ -183,7 +183,7 @@ fn cpu_combined_budget_rejects_before_forest_readback() {
         features,
         k,
         plan.host.width,
-        plan.host.capacity,
+        plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         slots,
     )
@@ -295,7 +295,7 @@ fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
         features,
         k,
         plan.host.width,
-        plan.host.capacity,
+        plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         plan.tile_slots,
     )
@@ -824,6 +824,7 @@ fn filtered_pipeline_fixture(device: CubeDevice) {
                     &client,
                     count.clone(),
                     dim,
+                    1 as VectorSize,
                     data.clone().into_tensor_arg(),
                     forest_rows.clone().into_tensor_arg(),
                     leaf_rows.clone().into_tensor_arg(),
@@ -834,8 +835,11 @@ fn filtered_pipeline_fixture(device: CubeDevice) {
                     right.clone().into_tensor_arg(),
                     pair_distances.clone().into_tensor_arg(),
                     valid.clone().into_tensor_arg(),
+                    n as u32,
+                    1u32,
                     offset as u64,
                     slots as u32,
+                    1usize,
                     [
                         dtype_to_storage_type(DType::F32),
                         dtype_to_storage_type(DType::I32),
@@ -1230,6 +1234,7 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         &client,
         count,
         dim,
+        1 as VectorSize,
         data.clone().into_tensor_arg(),
         sampled_ids.into_tensor_arg(),
         pool_sizes.into_tensor_arg(),
@@ -1240,9 +1245,12 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
         valid.clone().into_tensor_arg(),
+        5u32,
+        1u32,
         0,
         slots as u32,
         2,
+        1usize,
         [
             dtype_to_storage_type(DType::F32),
             dtype_to_storage_type(DType::I32),
@@ -1273,6 +1281,7 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         &client,
         count,
         dim,
+        1 as VectorSize,
         data.into_tensor_arg(),
         sampled_ids.into_tensor_arg(),
         pool_sizes.into_tensor_arg(),
@@ -1283,9 +1292,12 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
         valid.clone().into_tensor_arg(),
+        5u32,
+        1u32,
         1,
         slots as u32,
         2,
+        1usize,
         [
             dtype_to_storage_type(DType::F32),
             dtype_to_storage_type(DType::I32),
@@ -1316,6 +1328,7 @@ fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
         &client,
         count.clone(),
         dim,
+        1 as VectorSize,
         data.into_tensor_arg(),
         forest_rows.into_tensor_arg(),
         leaf_rows.into_tensor_arg(),
@@ -1326,8 +1339,11 @@ fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
         right.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
         valid.clone().into_tensor_arg(),
+        4u32,
+        1u32,
         1,
         slots as u32,
+        1usize,
         [
             dtype_to_storage_type(DType::F32),
             dtype_to_storage_type(DType::I32),
@@ -1371,6 +1387,33 @@ fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
         .collect::<Vec<_>>();
     center_two.sort_unstable_by_key(|&(id, _)| id);
     assert_eq!(center_two, [(0, 4.0), (1, 1.0)]);
+}
+
+#[test]
+fn local_pair_enumeration_matches_exhaustive_contract() {
+    for new_count in 0..=60usize {
+        for old_count in 0..=60usize {
+            let pools = SampledPools {
+                new: (0..new_count).collect(),
+                old: (new_count..new_count + old_count).collect(),
+            };
+            let actual = local_pairs(&pools, usize::MAX, usize::MAX);
+            let mut expected = Vec::with_capacity(
+                new_count * new_count.saturating_sub(1) / 2 + new_count * old_count,
+            );
+            for left in 0..new_count {
+                for right in left + 1..new_count {
+                    expected.push((left, right));
+                }
+            }
+            for left in 0..new_count {
+                for right in new_count..new_count + old_count {
+                    expected.push((left, right));
+                }
+            }
+            assert_eq!(actual, expected, "new={new_count}, old={old_count}");
+        }
+    }
 }
 
 /// Padding contract for the large-offset fixtures: offsets are monotone, padding
@@ -1422,6 +1465,7 @@ fn sampled_pair_slots_large_offset_fixture(device: CubeDevice) {
             &client,
             count,
             dim,
+            1 as VectorSize,
             data.clone().into_tensor_arg(),
             sampled_ids.clone().into_tensor_arg(),
             pool_sizes.clone().into_tensor_arg(),
@@ -1432,9 +1476,12 @@ fn sampled_pair_slots_large_offset_fixture(device: CubeDevice) {
             right.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
             valid.clone().into_tensor_arg(),
+            5u32,
+            1u32,
             start as u64,
             slots as u32,
             2,
+            1usize,
             [
                 dtype_to_storage_type(DType::F32),
                 dtype_to_storage_type(DType::I32),
@@ -1493,6 +1540,7 @@ fn forest_pair_slots_large_offset_fixture(device: CubeDevice) {
             &client,
             count,
             dim,
+            1 as VectorSize,
             data.clone().into_tensor_arg(),
             forest_rows.clone().into_tensor_arg(),
             leaf_rows.clone().into_tensor_arg(),
@@ -1503,8 +1551,11 @@ fn forest_pair_slots_large_offset_fixture(device: CubeDevice) {
             right.clone().into_tensor_arg(),
             distances.clone().into_tensor_arg(),
             valid.clone().into_tensor_arg(),
+            12u32,
+            1u32,
             start as u64,
             slots as u32,
+            1usize,
             [
                 dtype_to_storage_type(DType::F32),
                 dtype_to_storage_type(DType::I32),
@@ -2146,6 +2197,250 @@ fn run_kernel_fixtures(device: CubeDevice) {
     sampled_pool_width_edge_fixture(device.clone());
     hub_pool_fixture(device.clone());
     flag_transition_fixture(device);
+}
+
+fn run_squared_ann_mode_fixture(
+    device: CubeDevice,
+    squared: bool,
+    force_scalar: bool,
+) -> (Vec<i32>, Vec<u32>) {
+    let n = 12usize;
+    let features = 256usize;
+    let k = 5usize;
+    let values: Vec<f32> = (0..n * features)
+        .map(|index| ((index * 37 + index * index * 11) % 4093) as f32 / 29.0 + 0.125)
+        .collect();
+    let input = f32_tensor(&device, &[n, features], values);
+    let dispatch_device = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let mut plan =
+        super::super::orchestration::ann_preflight(&dispatch_device, n, features, k, &budget)
+            .unwrap();
+    if force_scalar {
+        plan.vector_widths = &[];
+    }
+    let (ids, distances) = super::approximate_neighbors(input, k, 42, 2, squared, plan).unwrap();
+    let id_values = read_i32(&ids);
+    let distance_bits = read_f32(&distances).into_iter().map(f32::to_bits).collect();
+    (id_values, distance_bits)
+}
+
+fn vector_binding_resolution_fixture(device: CubeDevice) {
+    let n = 8usize;
+    let features = 32usize;
+    let policy = &[8usize, 4];
+    let values: Vec<f32> = (0..n * features)
+        .map(|index| (index * 17 % 97) as f32 / 11.0 + 0.125)
+        .collect();
+    let contiguous = f32_tensor(&device, &[n, features], values.clone());
+    assert_eq!(resolve_vector_width(&contiguous, n, features, policy), 8);
+
+    let wrong_dtype = i32_tensor(&device, &[n, features], vec![0; n * features]);
+    assert_eq!(resolve_vector_width(&wrong_dtype, n, features, policy), 1);
+
+    let mut short_span = f32_tensor(&device, &[n * features + 1], vec![0.0; n * features + 1]);
+    short_span.handle = short_span.handle.clone().offset_end(8);
+    short_span.meta.shape = Shape::new([n, features]);
+    short_span.meta.strides = [features, 1].into();
+    assert_eq!(resolve_vector_width(&short_span, n, features, policy), 1);
+
+    let mut aligned_values = vec![-99.0; 4];
+    aligned_values.extend_from_slice(&values);
+    let mut aligned = f32_tensor(&device, &[n * features + 4], aligned_values);
+    aligned.handle = aligned.handle.clone().offset_start(16);
+    aligned.meta.shape = Shape::new([n, features]);
+    aligned.meta.strides = [features, 1].into();
+    assert_eq!(resolve_vector_width(&aligned, n, features, policy), 4);
+
+    let mut aligned8_values = vec![-99.0; 8];
+    aligned8_values.extend_from_slice(&values);
+    let mut aligned8 = f32_tensor(&device, &[n * features + 8], aligned8_values);
+    aligned8.handle = aligned8.handle.clone().offset_start(32);
+    aligned8.meta.shape = Shape::new([n, features]);
+    aligned8.meta.strides = [features, 1].into();
+    assert_eq!(resolve_vector_width(&aligned8, n, features, policy), 8);
+
+    let mut misaligned_values = vec![-99.0];
+    misaligned_values.extend_from_slice(&values);
+    let mut misaligned = f32_tensor(&device, &[n * features + 1], misaligned_values);
+    misaligned.handle = misaligned.handle.clone().offset_start(4);
+    misaligned.meta.shape = Shape::new([n, features]);
+    misaligned.meta.strides = [features, 1].into();
+    assert_eq!(resolve_vector_width(&misaligned, n, features, policy), 1);
+    assert_eq!(resolve_vector_width(&contiguous, n, 30, policy), 1);
+
+    let mut strided = contiguous.clone();
+    strided.meta.strides = [1, n].into();
+    assert_eq!(resolve_vector_width(&strided, n, features, policy), 1);
+    // InputCopy produces contiguous row-major storage before resolution.
+    let copied = f32_tensor(&device, &[n, features], values.clone());
+    assert_eq!(resolve_vector_width(&copied, n, features, policy), 8);
+    for input in [contiguous.clone(), aligned, aligned8, misaligned, strided] {
+        let actual = run_binding_graph(device.clone(), input.clone(), false);
+        let expected = run_binding_graph(device.clone(), input, true);
+        assert_eq!(
+            actual, expected,
+            "vector binding graph differs from scalar graph"
+        );
+    }
+    let transposed_values: Vec<f32> = (0..features)
+        .flat_map(|column| {
+            let values = &values;
+            (0..n).map(move |row| values[row * features + column])
+        })
+        .collect();
+    let mut transposed = f32_tensor(&device, &[features, n], transposed_values);
+    transposed.meta.shape = Shape::new([n, features]);
+    transposed.meta.strides = [1, n].into();
+    let actual = run_binding_graph(device.clone(), transposed.clone(), false);
+    let expected = run_binding_graph(device.clone(), transposed, true);
+    assert_eq!(
+        actual, expected,
+        "InputCopy vector graph differs from scalar graph"
+    );
+
+    let data = burn::tensor::TensorData::new(values.clone(), Shape::new([n, features]));
+    let (bytes, shape, dtype) = data.into_parts();
+    let client = contiguous.client.clone();
+    let allocation = client.create_tensor(bytes, shape, dtype.size());
+    let mut pitched = contiguous.clone();
+    pitched.handle = allocation.memory;
+    pitched.meta.strides = allocation.strides;
+    if !pitched.is_contiguous() {
+        let actual = run_binding_graph(device.clone(), pitched.clone(), false);
+        let expected = run_binding_graph(device.clone(), pitched, true);
+        assert_eq!(
+            actual, expected,
+            "pitched InputCopy vector graph differs from scalar graph"
+        );
+    }
+
+    let non_divisible_values: Vec<f32> = (0..n * 30)
+        .map(|index| (index * 13 % 71) as f32 / 7.0 + 0.25)
+        .collect();
+    let non_divisible = f32_tensor(&device, &[n, 30], non_divisible_values);
+    assert_eq!(resolve_vector_width(&non_divisible, n, 30, policy), 1);
+    let actual = run_binding_graph(device.clone(), non_divisible.clone(), false);
+    let expected = run_binding_graph(device.clone(), non_divisible, true);
+    assert_eq!(
+        actual, expected,
+        "non-divisible vector graph differs from scalar graph"
+    );
+
+    let dispatch_device =
+        burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device.clone()));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let plan =
+        super::super::orchestration::ann_preflight(&dispatch_device, n, features, 4, &budget)
+            .unwrap();
+    let client = device.client();
+    let malformed = CubeTensor::new_contiguous(
+        client.clone(),
+        device,
+        Shape::new([n, features]),
+        client.empty(4),
+        DType::F32,
+    );
+    assert!(matches!(
+        super::super::orchestration::approximate_neighbors_planned(malformed, &plan, 42, 1, false),
+        Err(AnnError::Workspace(_))
+    ));
+}
+
+fn run_binding_graph(
+    device: CubeDevice,
+    input: CubeTensor,
+    force_scalar: bool,
+) -> (Vec<i32>, Vec<u32>) {
+    let [n, features] = input.shape().dims::<2>();
+    let k = 4usize;
+    let dispatch_device = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let mut plan =
+        super::super::orchestration::ann_preflight(&dispatch_device, n, features, k, &budget)
+            .unwrap();
+    if force_scalar {
+        plan.vector_widths = &[];
+    }
+    let (ids, distances) = super::approximate_neighbors(input, k, 42, 2, false, plan).unwrap();
+    (
+        read_i32(&ids),
+        read_f32(&distances).into_iter().map(f32::to_bits).collect(),
+    )
+}
+
+#[test]
+fn ann_vector_binding_resolution_contract_cpu() {
+    vector_binding_resolution_fixture(CubeDevice::Cpu(Default::default()));
+}
+
+#[test]
+fn ann_vector_binding_resolution_contract_cuda() {
+    let count = crate::cuda_backend::try_device_count()
+        .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+    if count == 0 {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+        );
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    vector_binding_resolution_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
+}
+
+#[test]
+fn full_ann_squared_and_unsquared_cpu_cuda_match_bits() {
+    let cpu = CubeDevice::Cpu(Default::default());
+    let cpu_squared = run_squared_ann_mode_fixture(cpu.clone(), true, false);
+    let cpu_unsquared = run_squared_ann_mode_fixture(cpu.clone(), false, false);
+    let cpu_squared_scalar = run_squared_ann_mode_fixture(cpu.clone(), true, true);
+    let cpu_unsquared_scalar = run_squared_ann_mode_fixture(cpu, false, true);
+    assert_eq!(
+        cpu_squared, cpu_squared_scalar,
+        "CPU squared vector/scalar outputs"
+    );
+    assert_eq!(
+        cpu_unsquared, cpu_unsquared_scalar,
+        "CPU unsquared vector/scalar outputs"
+    );
+    let count = crate::cuda_backend::try_device_count()
+        .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+    if count == 0 {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+        );
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    let cuda = CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 });
+    let cuda_squared = run_squared_ann_mode_fixture(cuda.clone(), true, false);
+    let cuda_unsquared = run_squared_ann_mode_fixture(cuda.clone(), false, false);
+    let cuda_squared_scalar = run_squared_ann_mode_fixture(cuda.clone(), true, true);
+    let cuda_unsquared_scalar = run_squared_ann_mode_fixture(cuda, false, true);
+    assert_eq!(
+        cuda_squared, cuda_squared_scalar,
+        "CUDA squared vector/scalar outputs"
+    );
+    assert_eq!(
+        cuda_unsquared, cuda_unsquared_scalar,
+        "CUDA unsquared vector/scalar outputs"
+    );
+    assert_eq!(cpu_squared, cuda_squared, "squared ANN output bits");
+    assert_eq!(cpu_unsquared, cuda_unsquared, "unsquared ANN output bits");
 }
 
 #[test]

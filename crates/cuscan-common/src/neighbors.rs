@@ -198,14 +198,14 @@ mod tests {
                 let fused = (data * 1.0).try_into_primitive::<Cube>().unwrap();
                 let client = fused.client.clone();
                 let raw = client.resolve_tensor_float::<CubeBackend>(fused);
-                // This equals the default shape-only tile for n=64, capacity=60.
+                // The join dominates for 64 centers and nine candidates per class.
                 let (ids, distances) = crate::approximate_neighbors_with_tile_slots(
                     raw,
                     k as usize,
                     seed,
                     iterations,
                     squared,
-                    64 * (60 * 59 / 2 + 60 * 60),
+                    plan.tile_slots,
                 )
                 .unwrap();
 

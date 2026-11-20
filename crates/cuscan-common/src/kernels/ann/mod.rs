@@ -1,5 +1,6 @@
 //! Bounded sampled NN-descent ANN: launch plan, forest, and shared CPU/CUDA kernels.
 
+mod ann_distance;
 mod ann_forest;
 mod ann_sampled;
 #[path = "ann.rs"]

@@ -1,7 +1,8 @@
 //! Shared launch geometry, workspace planning and output conversion for sampled NN-descent.
 
+pub(super) use super::ann_forest::candidate_width;
 use super::ann_forest::{
-    MAX_CANDIDATES, WorkspaceError, WorkspacePlan, forest_leaf_limit, plan_workspace, tree_count,
+    NnDescentParams, WorkspaceError, WorkspacePlan, nn_descent_params, plan_workspace,
 };
 use super::ann_sampled;
 use crate::error::AnnError;
@@ -107,20 +108,11 @@ fn plan_tiles(caps: TileCaps, request: TileRequest) -> Result<usize, AnnError> {
     }
 }
 
-// The k-only graph lost exact neighbors on the small nonlinear regression
-// (213/240 hits). A four-edge margin preserves alternative paths for refinement.
-const HEAP_MARGIN: usize = 4;
-
-#[inline]
-pub(super) fn candidate_width(n: usize, k: usize) -> usize {
-    k.saturating_add(HEAP_MARGIN).min(n - 1)
-}
-
 /// Client-independent shape decisions for one ANN call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct HostPlan {
     pub(super) width: usize,
-    pub(super) capacity: usize,
+    pub(super) params: NnDescentParams,
     pub(super) workspace: WorkspacePlan,
 }
 
@@ -148,6 +140,7 @@ impl LaunchShape {
 pub struct AnnPlan {
     pub(super) host: HostPlan,
     merge: LaunchShape,
+    pub(super) vector_widths: &'static [usize],
     pub n: usize,
     pub features: usize,
     pub k: usize,
@@ -411,7 +404,7 @@ fn ann_allocation_bytes(
         features,
         k,
         host.width,
-        host.capacity,
+        host.workspace.max_candidates_per_class,
         &host.workspace,
         tile_slots,
     )
@@ -453,12 +446,15 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
         )));
     }
     let width = candidate_width(n, k);
-    let capacity = MAX_CANDIDATES.min(n - 1);
-    let trees = tree_count(n)
-        .map_err(|error| with_shape(workspace_error("tree count", error), &base_shape))?;
-    let leaf_limit = forest_leaf_limit(n, width);
-    let shape = format!("{base_shape}, width={width}, trees={trees}, leaf limit={leaf_limit}");
-    let workspace = plan_workspace(n, width, capacity, features, trees)
+    let params = nn_descent_params(n, k).map_err(|error| {
+        with_shape(workspace_error("NN-descent parameters", error), &base_shape)
+    })?;
+    let capacity = params.candidates;
+    let shape = format!(
+        "{base_shape}, width={width}, trees={}, leaf limit={}",
+        params.trees, params.leaf_limit
+    );
+    let workspace = plan_workspace(n, width, params, features)
         .map_err(|error| with_shape(workspace_error("workspace plan", error), &shape))?;
     // n <= i32::MAX was checked above; width < n and capacity < n follow.
     debug_assert!(u32::try_from(width).is_ok() && u32::try_from(capacity).is_ok());
@@ -495,7 +491,7 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
     }
     Ok(HostPlan {
         width,
-        capacity,
+        params,
         workspace,
     })
 }
@@ -654,6 +650,7 @@ fn plan_with_host(
         .map_err(|_| AnnError::Capability("device alignment exceeds usize".into()))?;
     let n_u32 = u32::try_from(n).expect("ANN row count validated by host_plan");
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
+    let vector_widths = ann_vector_width_policy(client);
     for (stage, bytes) in ann_allocation_bytes(n, features, k, &host, tile_slots, merge.cpu_merge)?
     {
         check_page_limit(&stage, bytes, max_page, alignment)?;
@@ -677,6 +674,7 @@ fn plan_with_host(
     Ok(AnnPlan {
         host,
         merge,
+        vector_widths,
         n,
         features,
         k,
@@ -689,6 +687,23 @@ fn plan_with_host(
                 .ok_or_else(|| AnnError::Overflow("ANN planned memory overflows u64".into()))?,
         },
     })
+}
+
+fn ann_vector_width_policy(client: &cubecl::client::Client) -> &'static [usize] {
+    if client.properties().hardware.num_cpu_cores.is_some() {
+        return &[];
+    }
+    let has_eight = client.io_optimized_vector_sizes(4).any(|width| width == 8);
+    let has_four = client.io_optimized_vector_sizes(4).any(|width| width == 4);
+    if has_eight && has_four {
+        &[8, 4]
+    } else if has_eight {
+        &[8]
+    } else if has_four {
+        &[4]
+    } else {
+        &[]
+    }
 }
 
 fn aligned_bytes(bytes: usize, alignment: usize) -> Result<u64, AnnError> {
@@ -718,7 +733,7 @@ fn fixed_memory(
         features,
         k,
         host.width,
-        host.capacity,
+        host.workspace.max_candidates_per_class,
         &host.workspace,
         0,
     )
@@ -910,8 +925,9 @@ pub struct AnnPhaseBytes {
 pub struct AnnEstimate {
     /// Retained/output candidate width, `min(k + 4, n - 1)`.
     pub retained_width: usize,
-    /// Sampling budget per new/old class, `min(60, n - 1)`. Not the output width.
+    /// Sampling budget per new/old class, `min(k + 1, 60, n - 1)`. Not the output width.
     pub sample_capacity: usize,
+    /// Projection forest trees, `min(8, 5 + round_ties_even(sqrt(n) / 20))`.
     pub trees: usize,
     /// Output edges, `n * k`.
     pub directed_edges: usize,
@@ -953,7 +969,7 @@ fn estimate_from_plan(
     let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
     let ws = host.workspace;
     let w = host.width;
-    let c = host.capacity;
+    let c = host.workspace.max_candidates_per_class;
     let slots = default_tile_slots(n, &ws)?;
     let table = ann_buffer_table(n, features, k, w, c, &ws, slots).ok_or_else(overflow)?;
     let mut runtime = [0usize; 4];
@@ -981,7 +997,7 @@ fn estimate_from_plan(
         .find(|entry| entry.buffer == Buffer::Input)
         .and_then(BufferEntry::bytes)
         .ok_or_else(overflow)?;
-    let trees = tree_count(n).map_err(|error| workspace_error("tree count", error))?;
+    let trees = host.params.trees;
     let phases = [
         AnnPhaseBytes {
             phase: AnnPhase::Input,
@@ -1440,11 +1456,22 @@ mod tests {
 
     #[test]
     fn host_plan_accepts_forest_prefix_above_i32() {
-        // 36 trees x 74_072_640 pairs per tree = 2_666_615_040 forest pairs, above
-        // i32::MAX, carried by the I64 forest pair prefix (ann_forest.rs plan test).
-        let host = host_plan(390_000, 2, 256).unwrap();
-        assert_eq!(host.workspace.forest_pair_count, 2_666_615_040);
-        assert!(ann_host_estimate(390_000, 2, 256).is_ok());
+        // P1 has 8 trees and 256-row leaves here. The independent midpoint
+        // recurrence in ann_forest.rs establishes that this is the first n
+        // whose forest pair prefix exceeds i32::MAX.
+        let host = host_plan(2_974_013, 2, 51).unwrap();
+        assert_eq!(host.workspace.forest_pair_count, 2_147_483_912);
+        assert!(ann_host_estimate(2_974_013, 2, 51).is_ok());
+    }
+
+    #[test]
+    fn host_estimate_recipe_matches_nn_descent_params() {
+        for (n, features, k) in [(67, 3, 5), (1_000, 32, 75), (2_501, 8, 29)] {
+            let params = nn_descent_params(n, k).unwrap();
+            let estimate = ann_host_estimate(n, features, k).unwrap();
+            assert_eq!(estimate.trees, params.trees);
+            assert_eq!(estimate.sample_capacity, params.candidates);
+        }
     }
 
     fn overflow_message(n: usize, features: usize, k: usize) -> String {
@@ -1456,14 +1483,14 @@ mod tests {
 
     #[test]
     fn host_estimate_accepts_former_join_ceiling_shapes() {
-        // n * 5370 = 8_055_000_000 join slots are carried by the I64 join prefix.
+        // P1's shape-derived join totals are carried by the I64 join prefix.
         for k in [14, 29] {
             let estimate = ann_host_estimate(1_500_000, 256, k).unwrap();
-            assert_eq!(estimate.trees, 64);
+            assert_eq!(estimate.trees, 8);
             let host = host_plan(1_500_000, 256, k).unwrap();
             let n = 1_500_000usize;
             let width = k + 4;
-            let c = 60usize;
+            let c = k + 1;
             let chunks = n.div_ceil(128);
             let input = 2 * 4 * n * 256;
             let staging = 32 * (1 << 22);
@@ -1485,16 +1512,52 @@ mod tests {
 
     #[test]
     fn membership_gate_is_exact_at_its_boundary() {
-        // 64 trees x 33_554_431 = 2_147_483_584 <= i32::MAX; one more row exceeds it.
-        assert!(ann_host_estimate(33_554_431, 1, 14).is_ok());
-        let message = overflow_message(33_554_432, 1, 14);
+        // 8 trees x 268_435_455 = 2_147_483_640 <= i32::MAX; one more row exceeds it.
+        assert!(ann_host_estimate(268_435_455, 1, 1).is_ok());
+        let message = overflow_message(268_435_456, 1, 1);
         for part in [
             "forest membership",
             "2147483648",
             "2147483647",
-            "n=33554432",
+            "n=268435456",
         ] {
             assert!(message.contains(part), "{part} missing: {message}");
+        }
+    }
+
+    #[test]
+    fn host_capacity_limits_match_independent_buffer_boundaries() {
+        let i32_limit = i32::MAX as usize;
+        let u32_limit = u32::MAX as usize;
+        for k in [1usize, 14, 29, 59, 255] {
+            for features in [1usize, 32, 256] {
+                let width = k + 4;
+                let candidates = (k + 1).min(60);
+                // Independently bound every relevant I32/U32-addressed shape:
+                // rows, forest membership, reverse/heap rows, input, sampled IDs,
+                // and output.  All resulting n exceed k+4, so width and capacity
+                // are constant at both adjacent boundary points.
+                let limit = [
+                    i32_limit,
+                    i32_limit / 8,
+                    i32_limit / width,
+                    u32_limit / features,
+                    u32_limit / (2 * candidates),
+                    u32_limit / k,
+                ]
+                .into_iter()
+                .min()
+                .unwrap();
+                assert!(
+                    host_plan(limit, features, k).is_ok(),
+                    "expected n={limit} to fit for features={features}, k={k}"
+                );
+                assert!(
+                    host_plan(limit + 1, features, k).is_err(),
+                    "expected n={} to exceed a checked limit for features={features}, k={k}",
+                    limit + 1
+                );
+            }
         }
     }
 
@@ -1527,8 +1590,11 @@ mod tests {
             let plan = ann_preflight(device, 1_500_000, 256, k, &ample_budget()).unwrap();
             let shape = host_plan(1_500_000, 256, k).unwrap();
             assert_eq!(
-                (plan.host.width, plan.host.capacity),
-                (shape.width, shape.capacity)
+                (
+                    plan.host.width,
+                    plan.host.workspace.max_candidates_per_class
+                ),
+                (shape.width, shape.workspace.max_candidates_per_class)
             );
             assert!(plan.tile_slots >= 1 << 20);
             assert_eq!(
@@ -1578,22 +1644,32 @@ mod tests {
 
     #[test]
     fn host_estimate_counts_forest_terminal_metadata_and_phase_totals() {
-        // n=11, d=2, k=3: width 7, capacity 10, 5 trees, one leaf per tree.
+        // n=11, d=2, k=3: width 7, capacity 4, 5 trees, one leaf per tree.
         let estimate = ann_host_estimate(11, 2, 3).unwrap();
         assert_eq!(estimate.retained_width, 7);
-        assert_eq!(estimate.sample_capacity, 10);
+        assert_eq!(estimate.sample_capacity, 4);
         assert_eq!(estimate.trees, 5);
         assert_eq!(estimate.directed_edges, 33);
         let [input, forest_init, refinement, output] = estimate.phases;
         // Original input plus the conservatively reserved contiguous copy: 2*11*2*4.
         assert_eq!(input.runtime_bytes, 176);
-        assert_eq!(forest_init.runtime_bytes, 53_276);
-        assert_eq!(refinement.runtime_bytes, 55_216);
+        // The P1 forest pair prefix is 5*C(11, 2)=275 slots, larger than
+        // the 242 join slots. Six staging buffers therefore add 275*32 bytes.
+        assert_eq!(forest_init.runtime_bytes, 11_036);
+        assert_eq!(refinement.runtime_bytes, 12_448);
         assert_eq!(output.runtime_bytes, 1_056);
         let host = host_plan(11, 2, 3).unwrap();
-        let table =
-            ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
-        for (phase, expected) in [(2, 52_660), (4, 54_600)] {
+        let table = ann_buffer_table(
+            11,
+            2,
+            3,
+            host.width,
+            host.workspace.max_candidates_per_class,
+            &host.workspace,
+            275,
+        )
+        .unwrap();
+        for (phase, expected) in [(2, 10_420), (4, 11_832)] {
             let cpu: usize = table
                 .iter()
                 .filter(|entry| entry.route == BufferRoute::Both && entry.phases & phase != 0)
@@ -1644,13 +1720,13 @@ mod tests {
 
     #[test]
     fn allocation_list_covers_largest_buffer_for_small_shape() {
-        // n=11, d=2, k=3: width 7, capacity 10, one leaf per tree, 5 trees.
-        // Endpoint staging is 2 * (11 * 145) = 3190 i32/f32 elements = 12760 bytes,
-        // the largest entry (pair staging 6380, membership 220, output 132).
+        // n=11, d=2, k=3: width 7, capacity 4, one leaf per tree, 5 trees.
+        // The forest pair prefix selects the 275-slot default tile. Each endpoint
+        // buffer has 2*275 elements = 2200 bytes, the largest single allocation.
         let host = host_plan(11, 2, 3).unwrap();
-        let entries = ann_allocation_bytes(11, 2, 3, &host, 1_595, false).unwrap();
+        let entries = ann_allocation_bytes(11, 2, 3, &host, 275, false).unwrap();
         let largest = entries.iter().map(|(_, bytes)| *bytes).max().unwrap();
-        assert_eq!(largest, 12_760);
+        assert_eq!(largest, 2_200);
         assert!(
             entries
                 .iter()
@@ -1668,8 +1744,16 @@ mod tests {
     #[test]
     fn allocation_table_is_unique_and_matches_estimate_phases() {
         let host = host_plan(11, 2, 3).unwrap();
-        let table =
-            ann_buffer_table(11, 2, 3, host.width, host.capacity, &host.workspace, 1_595).unwrap();
+        let table = ann_buffer_table(
+            11,
+            2,
+            3,
+            host.width,
+            host.workspace.max_candidates_per_class,
+            &host.workspace,
+            275,
+        )
+        .unwrap();
         assert_eq!(table.len(), 39);
         let mut seen = std::collections::HashSet::new();
         for entry in &table {
@@ -1903,7 +1987,19 @@ mod tests {
         bad_launch.merge.cubes += 1;
         let mut bad_width = plan;
         bad_width.host.width += 1;
-        for bad in [bad_shape, bad_tile, bad_launch, bad_width] {
+        let mut bad_vector_widths = plan;
+        bad_vector_widths.vector_widths = if plan.vector_widths.is_empty() {
+            &[4]
+        } else {
+            &[]
+        };
+        for bad in [
+            bad_shape,
+            bad_tile,
+            bad_launch,
+            bad_width,
+            bad_vector_widths,
+        ] {
             assert!(matches!(
                 approximate_neighbors_planned(data.clone(), &bad, 42, 1, false),
                 Err(AnnError::InvalidInput(_))

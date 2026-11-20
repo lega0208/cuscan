@@ -15,8 +15,14 @@
 
 use rayon::prelude::*;
 
-pub(super) const MAX_TREES: usize = 64;
+pub(super) const MAX_TREES: usize = 8;
 pub(super) const MAX_CANDIDATES: usize = 60;
+const HEAP_MARGIN: usize = 4;
+
+#[inline]
+pub(super) fn candidate_width(n: usize, k: usize) -> usize {
+    k.saturating_add(HEAP_MARGIN).min(n - 1)
+}
 
 /// Node size, in feature bytes, above which a level is built row-major.
 const TOP_NODE_BYTES: usize = 2 << 20;
@@ -45,7 +51,7 @@ pub(super) struct WorkspacePlan {
     pub(super) pair_slots_per_center: usize,
     /// Peak host-only phase: feature copy plus forest and recursion scratch.
     pub(super) host_peak_bytes: usize,
-    /// Leaf size limit used by the forest builder (`min(max(10, 2H), n)`).
+    /// P1 leaf size limit: `min(clamp(5 * (k + 1), 60, 256), n)`.
     pub(super) forest_leaf_limit: usize,
     /// Total membership entries across all trees (`trees * n`).
     pub(super) forest_membership_len: usize,
@@ -67,14 +73,28 @@ pub(super) enum WorkspaceError {
     },
 }
 
-/// Plan `n_trees = min(64, 5 + round(sqrt(n)/20))`.
-pub(super) fn tree_count(n: usize) -> Result<usize, WorkspaceError> {
-    if n == 0 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NnDescentParams {
+    pub(super) trees: usize,
+    pub(super) leaf_limit: usize,
+    pub(super) candidates: usize,
+}
+
+/// Derive the current NN-descent recipe once for both planning and execution.
+pub(super) fn nn_descent_params(n: usize, k: usize) -> Result<NnDescentParams, WorkspaceError> {
+    if n < 2 || k == 0 || k >= n {
         return Err(WorkspaceError::InvalidDimensions);
     }
-    let extra = ((n as f64).sqrt() / 20.0).round();
+    let extra = ((n as f64).sqrt() / 20.0).round_ties_even();
     let extra = usize::try_from(extra as u64).map_err(|_| WorkspaceError::ArithmeticOverflow)?;
-    Ok(5usize.saturating_add(extra).min(MAX_TREES))
+    let trees = 5usize.saturating_add(extra).min(MAX_TREES);
+    let k_ref = k.saturating_add(1);
+    let leaf_limit = k_ref.saturating_mul(5).clamp(60, 256).min(n);
+    Ok(NnDescentParams {
+        trees,
+        leaf_limit,
+        candidates: k_ref.min(MAX_CANDIDATES).min(n - 1),
+    })
 }
 
 /// Build a deterministic forest. Each node uses a seed derived from its tree
@@ -603,21 +623,21 @@ pub(super) fn reference_build_forest(
 pub(super) fn plan_workspace(
     n: usize,
     heap_width: usize,
-    max_candidates: usize,
+    params: NnDescentParams,
     features: usize,
-    trees: usize,
 ) -> Result<WorkspacePlan, WorkspaceError> {
     if n < 2
-        || heap_width == 0
-        || max_candidates == 0
+        || params.candidates == 0
         || features == 0
-        || trees == 0
-        || trees > MAX_TREES
+        || params.trees == 0
+        || params.trees > MAX_TREES
+        || params.leaf_limit == 0
+        || params.leaf_limit > n
     {
         return Err(WorkspaceError::InvalidDimensions);
     }
-    let forest = forest_totals(n, forest_leaf_limit(n, heap_width), trees)?;
-    let c = max_candidates.min(n - 1);
+    let forest = forest_totals(n, params.leaf_limit, params.trees)?;
+    let c = params.candidates.min(n - 1);
     let pairs_per_center = c
         .checked_mul(c.checked_sub(1).ok_or(WorkspaceError::InvalidDimensions)?)
         .and_then(|v| v.checked_div(2))
@@ -629,14 +649,14 @@ pub(super) fn plan_workspace(
     // copies, selection scratch, the row-major level buffers and the heap
     // seed/upload buffers. All phases are summed, which bounds the peak.
     let membership_bytes = n
-        .checked_mul(trees)
+        .checked_mul(params.trees)
         .and_then(|v| v.checked_mul(4))
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
     let leaf_bytes = forest
         .leaf_count
         .checked_add(1)
         .and_then(|v| v.checked_mul(8 + 4 + 8))
-        .and_then(|v| v.checked_add(trees.checked_add(1)?.checked_mul(8)?))
+        .and_then(|v| v.checked_add(params.trees.checked_add(1)?.checked_mul(8)?))
         .ok_or(WorkspaceError::ArithmeticOverflow)?;
     let feature_copy_bytes = n
         .checked_mul(features)
@@ -646,7 +666,7 @@ pub(super) fn plan_workspace(
     // make the public estimate depend on the host machine, so the bound is the
     // tree count, which is shape-only and never underestimates the parallel build.
     // Each tree holds at most `n` 24-byte selection entries and one normal.
-    let concurrent_trees = trees;
+    let concurrent_trees = params.trees;
     let recursion_scratch_bytes = n
         .checked_mul(24)
         .and_then(|v| v.checked_add(features.checked_mul(4)?))
@@ -659,11 +679,12 @@ pub(super) fn plan_workspace(
         0
     } else {
         let widest_nodes = 1usize << (levels - 1);
-        n.checked_mul(trees)
+        n.checked_mul(params.trees)
             .and_then(|v| v.checked_mul(8 + 2))
             .and_then(|v| {
                 v.checked_add(
-                    trees
+                    params
+                        .trees
                         .checked_mul(widest_nodes)?
                         .checked_mul(features)?
                         .checked_mul(4)?,
@@ -693,11 +714,6 @@ pub(super) fn plan_workspace(
         forest_leaf_count: forest.leaf_count,
         forest_pair_count: forest.pair_count,
     })
-}
-
-/// Leaf size limit shared by the forest planner and `forest_seed`.
-pub(super) fn forest_leaf_limit(n: usize, heap_width: usize) -> usize {
-    10usize.max(heap_width.saturating_mul(2)).min(n)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -744,10 +760,8 @@ fn forest_totals(
     // The forest pair prefix is I64, so the total is bounded only by the checked
     // usize arithmetic above. Within a leaf the kernel narrows the local pair to u32
     // and walks it in O(L), so one leaf's pairs must stay within i32. For every shape
-    // `host_plan` accepts this is implied by its reverse gate (n * width <= i32::MAX):
-    // L = 2w <= n gives L(L-1)/2 < 2w^2 <= n*w; L = n gives w >= n/2 and
-    // L(L-1)/2 < n^2/2 <= n*w; L = 10 is trivially small. It is kept here because this
-    // function takes an arbitrary leaf limit.
+    // The P1 leaf limit is `min(clamp(5 * (k + 1), 60, 256), n)`. Keep the
+    // explicit check because this function also accepts arbitrary leaf limits.
     let max_leaf = leaf_limit.min(n);
     let leaf_pairs = max_leaf
         .checked_mul(max_leaf - 1)
@@ -975,7 +989,12 @@ mod tests {
     #[test]
     fn forest_totals_reach_plan_for_small_shape() {
         // 3 trees over 11 rows with limit 10 -> 6 leaves, 75 pairs.
-        let plan = plan_workspace(11, 4, 10, 2, 3).unwrap();
+        let params = NnDescentParams {
+            trees: 3,
+            leaf_limit: 10,
+            candidates: 10,
+        };
+        let plan = plan_workspace(11, 4, params, 2).unwrap();
         assert_eq!(plan.forest_leaf_limit, 10);
         assert_eq!(plan.forest_membership_len, 33);
         assert_eq!(plan.forest_leaf_count, 6);
@@ -984,13 +1003,37 @@ mod tests {
 
     #[test]
     fn plan_workspace_accepts_forest_prefix_above_i32() {
-        assert_eq!(tree_count(390_000).unwrap(), 36);
-        // Leaf limit min(max(10, 2*260), n) = 520 gives 1024 leaves per tree:
-        // 390000 = 1024*380 + 880, so 880 leaves of 381 rows and 144 of 380:
-        // 880*72390 + 144*72010 = 74_072_640 pairs per tree; x36 = 2_666_615_040,
-        // above i32::MAX and carried by the I64 forest pair prefix.
-        let plan = plan_workspace(390_000, 260, MAX_CANDIDATES, 2, 36).unwrap();
-        assert_eq!(plan.forest_pair_count, 2_666_615_040);
+        let params = nn_descent_params(2_974_013, 51).unwrap();
+        assert_eq!(params.trees, 8);
+        assert_eq!(params.leaf_limit, 256);
+        assert_eq!(params.candidates, 52);
+        // Independently evaluate the split recurrence with a stack: each node
+        // at or below 256 contributes m*(m-1)/2; larger nodes split at floor(m/2).
+        fn midpoint_pairs(n: usize, leaf_limit: usize) -> usize {
+            let mut pending = vec![n];
+            let mut pairs = 0usize;
+            while let Some(m) = pending.pop() {
+                if m <= leaf_limit {
+                    pairs += m * (m - 1) / 2;
+                } else {
+                    let left = m / 2;
+                    pending.push(left);
+                    pending.push(m - left);
+                }
+            }
+            pairs
+        }
+        let boundary = (2_974_012usize, 2_974_013usize);
+        assert!(8 * midpoint_pairs(boundary.0, params.leaf_limit) <= i32::MAX as usize);
+        assert!(8 * midpoint_pairs(boundary.1, params.leaf_limit) > i32::MAX as usize);
+        assert_eq!(
+            forest_totals(boundary.0, params.leaf_limit, 8)
+                .unwrap()
+                .pair_count,
+            2_147_482_464
+        );
+        let plan = plan_workspace(boundary.1, 55, params, 2).unwrap();
+        assert_eq!(plan.forest_pair_count, 2_147_483_912);
     }
 
     #[test]
@@ -1068,26 +1111,43 @@ mod tests {
 
     #[test]
     fn workspace_plan_reports_shape_and_host_peak() {
-        let plan = plan_workspace(50_000, 14, MAX_CANDIDATES, 32, 16).unwrap();
-        assert_eq!(plan.max_candidates_per_class, 60);
-        assert_eq!(plan.pair_slots_per_center, 5_370);
-        // Leaf limit 28 gives 2048 leaves per tree (50000 / 2^11 = 24.4) and two
-        // row-major levels: membership 3_200_000 + leaves 32_769*20 + 17*8 =
-        // 655_516 + row-major 50_000*16*10 + 16*2*32*4 = 8_004_096 + features
-        // 12_800_000 + scratch (1_200_000 + 128)*16 = 19_202_048 + heaps
-        // 50_000*14*28 = 19_600_000.
-        assert_eq!(plan.host_peak_bytes, 63_461_660);
-        assert_eq!(
-            plan_workspace(50_000, 14, MAX_CANDIDATES, 32, 16).unwrap(),
-            plan
-        );
+        let params = nn_descent_params(50_000, 10).unwrap();
+        let plan = plan_workspace(50_000, 14, params, 32).unwrap();
+        assert_eq!(plan.max_candidates_per_class, 11);
+        assert_eq!(plan.pair_slots_per_center, 176);
+        // P1 leaf limit 60 gives 1024 leaves per tree and two row-major levels:
+        // membership 1_600_000 + leaves 8_193*20 + 9*8 = 163_932 + row-major
+        // 50_000*8*10 + 8*2*32*4 = 4_002_048 + features 12_800_000 + scratch
+        // (1_200_000 + 128)*8 = 9_601_024 + heaps 50_000*14*28 = 19_600_000.
+        assert_eq!(plan.host_peak_bytes, 47_767_004);
+        assert_eq!(plan_workspace(50_000, 14, params, 32).unwrap(), plan);
     }
 
     #[test]
     fn workspace_plan_preserves_forest_shape_across_candidate_widths() {
-        let join = plan_workspace(11, 4, 10, 2, 3).unwrap();
+        let join = plan_workspace(
+            11,
+            4,
+            NnDescentParams {
+                trees: 3,
+                leaf_limit: 10,
+                candidates: 10,
+            },
+            2,
+        )
+        .unwrap();
         assert_eq!(join.pair_slots_per_center, 145);
-        let forest = plan_workspace(11, 4, 1, 2, 3).unwrap();
+        let forest = plan_workspace(
+            11,
+            4,
+            NnDescentParams {
+                trees: 3,
+                leaf_limit: 10,
+                candidates: 1,
+            },
+            2,
+        )
+        .unwrap();
         assert_eq!(forest.max_candidates_per_class, 1);
         assert_eq!(forest.pair_slots_per_center, 1);
         assert_eq!(forest.forest_pair_count, 75);
@@ -1098,19 +1158,30 @@ mod tests {
 
     #[test]
     fn workspace_plan_charges_row_major_levels_at_acceptance_shape() {
-        let plan = plan_workspace(1_500_000, 18, MAX_CANDIDATES, 256, 64).unwrap();
-        assert_eq!(plan.forest_leaf_count, 65_536 * 64);
-        // membership 384_000_000 + leaves 4_194_305*20 + 65*8 = 83_886_620
-        // + row-major 1.5M*64*10 + 64*512*256*4 = 993_554_432
-        // + features 3_072_000_000 + scratch (36_000_000 + 1024)*64 = 2_304_065_536
+        let params = nn_descent_params(1_500_000, 14).unwrap();
+        let plan = plan_workspace(1_500_000, 18, params, 256).unwrap();
+        assert_eq!(plan.forest_leaf_count, 32_768 * 8);
+        // P1 leaf limit 75 gives 32768 leaves per tree. Membership 48_000_000
+        // + leaves 262145*20 + 9*8 = 5_242_972 + row-major 1.5M*8*10
+        // + 8*512*256*4 = 124_194_304 + features 3_072_000_000
+        // + scratch (36_000_000 + 1024)*8 = 288_008_192
         // + heaps 1.5M*18*28 = 756_000_000.
-        assert_eq!(plan.host_peak_bytes, 7_593_506_588);
+        assert_eq!(plan.host_peak_bytes, 4_293_445_468);
     }
 
     #[test]
     fn workspace_plan_rejects_shape_overflow() {
         assert_eq!(
-            plan_workspace(usize::MAX, 1, 1, 1, 1),
+            plan_workspace(
+                usize::MAX,
+                1,
+                NnDescentParams {
+                    trees: 1,
+                    leaf_limit: 10,
+                    candidates: 1
+                },
+                1
+            ),
             Err(WorkspaceError::ArithmeticOverflow)
         );
     }
@@ -1118,19 +1189,51 @@ mod tests {
     #[test]
     fn workspace_plan_scales_past_former_fixed_limit() {
         for n in [250_000usize, 1_000_000] {
-            let trees = tree_count(n).unwrap();
-            let plan = plan_workspace(n, 19, MAX_CANDIDATES, 784, trees).unwrap();
-            assert_eq!(plan.pair_slots_per_center, 5_370);
+            let params = nn_descent_params(n, 15).unwrap();
+            let plan = plan_workspace(n, 19, params, 784).unwrap();
+            assert_eq!(plan.pair_slots_per_center, 376);
             assert!(plan.host_peak_bytes > 512 * 1024 * 1024);
         }
     }
 
     #[test]
-    fn tree_count_uses_contract_formula_and_cap() {
-        assert_eq!(tree_count(1).unwrap(), 5);
-        assert_eq!(tree_count(40_000).unwrap(), 15);
-        assert_eq!(tree_count(50_000).unwrap(), 16);
-        assert_eq!(tree_count(100_000_000).unwrap(), MAX_TREES);
-        assert_eq!(tree_count(0), Err(WorkspaceError::InvalidDimensions));
+    fn nn_descent_params_follow_recipe() {
+        for (n, expected) in [
+            (2, 5),
+            (99, 5),
+            (100, 5),
+            (900, 7),
+            (2_500, 7),
+            (2_501, 8),
+            (100_000_000, 8),
+        ] {
+            assert_eq!(nn_descent_params(n, 1).unwrap().trees, expected, "n={n}");
+        }
+        for (k, leaf, candidates) in [
+            (1, 60, 2),
+            (19, 100, 20),
+            (11, 60, 12),
+            (12, 65, 13),
+            (50, 255, 51),
+            (51, 256, 52),
+            (58, 256, 59),
+            (59, 256, 60),
+            (60, 256, 60),
+            (100, 256, 60),
+        ] {
+            let params = nn_descent_params(1_000, k).unwrap();
+            assert_eq!(
+                (params.leaf_limit, params.candidates),
+                (leaf, candidates),
+                "k={k}"
+            );
+        }
+        let small = nn_descent_params(20, 19).unwrap();
+        assert_eq!(small.leaf_limit, 20);
+        assert_eq!(small.candidates, 19);
+        assert_eq!(
+            nn_descent_params(0, 0),
+            Err(WorkspaceError::InvalidDimensions)
+        );
     }
 }

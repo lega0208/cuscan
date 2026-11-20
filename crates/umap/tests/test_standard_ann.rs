@@ -5,6 +5,7 @@ use burn::{
 use cuscan_common::{
     ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
 };
+use std::{collections::HashSet, fs, path::Path, process::Command};
 use umap::backend::StandardUmapOps;
 
 fn points(rows: usize, features: usize, salt: usize) -> Vec<f32> {
@@ -583,29 +584,114 @@ fn sampled_recall_score(
 ) -> f64 {
     let mut hits = 0usize;
     for &row in rows {
+        let query = &values[row * features..(row + 1) * features];
         let mut exact = (0..n)
             .filter(|&other| other != row)
             .map(|other| {
-                let mut squared = 0.0f32;
-                for feature in 0..features {
-                    let delta =
-                        values[row * features + feature] - values[other * features + feature];
-                    squared += delta * delta;
-                }
-                (squared, other)
+                let reference = &values[other * features..(other + 1) * features];
+                let distance = query
+                    .iter()
+                    .zip(reference)
+                    .map(|(&left, &right)| {
+                        let delta = f64::from(left) - f64::from(right);
+                        delta * delta
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                distance
             })
             .collect::<Vec<_>>();
-        exact.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let truth = exact[..k]
-            .iter()
-            .map(|&(_, id)| id as i32)
-            .collect::<std::collections::HashSet<_>>();
+        exact.select_nth_unstable_by(k - 1, f64::total_cmp);
+        let cutoff = exact[k - 1];
+        let mut seen = HashSet::new();
         hits += ids[row * k..(row + 1) * k]
             .iter()
-            .filter(|id| truth.contains(id))
+            .filter(|&&id| {
+                seen.insert(id)
+                    && (0..features)
+                        .map(|feature| {
+                            let delta = f64::from(query[feature])
+                                - f64::from(values[id as usize * features + feature]);
+                            delta * delta
+                        })
+                        .sum::<f64>()
+                        .sqrt()
+                        <= cutoff
+            })
             .count();
     }
     hits as f64 / (rows.len() * k) as f64
+}
+
+fn export_sampled_fixture(
+    values: &[f32],
+    ids: &[i32],
+    rows: &[usize],
+    n: usize,
+    features: usize,
+    k: usize,
+) {
+    let Some(directory) = std::env::var_os("CUSCAN_EXPORT_STANDARD_ANN_FIXTURE") else {
+        return;
+    };
+    let directory = Path::new(&directory);
+    fs::create_dir_all(directory).unwrap_or_else(|error| {
+        panic!(
+            "cannot create fixture export directory {}: {error}",
+            directory.display()
+        )
+    });
+    let input = directory.join("blob_420k_train.f32le");
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(&input, &bytes)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", input.display()));
+    let neighbors = directory.join("blob_420k_graph_ids.i32le");
+    fs::write(
+        &neighbors,
+        ids.iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|error| panic!("cannot write {}: {error}", neighbors.display()));
+    let sampled_rows = directory.join("blob_420k_sample_rows.u64le");
+    fs::write(
+        &sampled_rows,
+        rows.iter()
+            .flat_map(|row| (*row as u64).to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|error| panic!("cannot write {}: {error}", sampled_rows.display()));
+    for (kind, path, shape, dtype) in [
+        ("rows", &input, format!("[{n},{features}]"), "f32le"),
+        ("graph_ids", &neighbors, format!("[{n},{k}]"), "i32le"),
+        (
+            "sample_rows",
+            &sampled_rows,
+            format!("[{}]", rows.len()),
+            "u64le",
+        ),
+    ] {
+        let output = Command::new("sha256sum")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("cannot hash {} with sha256sum: {error}", path.display())
+            });
+        assert!(
+            output.status.success(),
+            "sha256sum failed for {}",
+            path.display()
+        );
+        let digest = String::from_utf8(output.stdout).unwrap();
+        eprintln!(
+            "ANN_FIXTURE_EXPORT {{\"kind\":\"{kind}\",\"path\":\"{}\",\"shape\":{shape},\"dtype\":\"{dtype}\",\"sha256\":\"{}\"}}",
+            path.display(),
+            digest.split_whitespace().next().unwrap()
+        );
+    }
 }
 
 /// Large-shape row contract: valid unique non-self ids, finite distances within a
@@ -680,8 +766,9 @@ fn run_above_former_join_ceiling(device: &Device) {
     let rows: Vec<usize> = (0..256)
         .map(|_| (random.next_u64() % n as u64) as usize)
         .collect();
+    export_sampled_fixture(&values, &ids, &rows, n, features, k);
     let recall = sampled_recall_score(&ids, &values, n, features, k, &rows);
-    eprintln!("ANN n={n} sampled recall {recall:.4}");
+    eprintln!("ANN n={n} sampled recall {recall:.12}");
     assert!(recall >= 0.95, "sampled recall {recall} below 0.95");
 }
 

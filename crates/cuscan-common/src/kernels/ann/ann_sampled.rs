@@ -2,7 +2,8 @@
 //!
 //! Kernels share the candidate, pair, endpoint-CSR, and merge algorithm across
 //! CPU/CUDA; only row geometry and endpoint merge execution differ. Launch
-//! orchestration remains in `ann.rs`.
+//! orchestration remains in `ann.rs`. Pair distances use the canonical R8
+//! accumulation order, independent of feature count and backend.
 
 #[cfg(test)]
 #[path = "ann_sampled_tests.rs"]
@@ -11,9 +12,9 @@ mod injected_kernel_tests;
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::ann_distance::squared_l2_r8;
 use super::ann_forest::{
-    ForestLeaves, MAX_CANDIDATES, WorkspaceError, build_forest, forest_leaf_limit, plan_workspace,
-    tree_count,
+    ForestLeaves, MAX_CANDIDATES, NnDescentParams, WorkspaceError, WorkspacePlan, build_forest,
 };
 use super::orchestration::{
     AnnPlan, Buffer, BufferEntry, BufferRoute, REVERSE_NEW_BIT, ann_buffer_table,
@@ -55,13 +56,13 @@ pub(super) fn forest_seed(
     n: usize,
     features: usize,
     heap_width: usize,
-    max_candidates: usize,
+    params: NnDescentParams,
+    workspace: WorkspacePlan,
     seed: u64,
     profile: bool,
 ) -> Result<ForestSeed, WorkspaceError> {
-    let trees = tree_count(n)?;
-    let leaf_size = forest_leaf_limit(n, heap_width);
-    let workspace = plan_workspace(n, heap_width, max_candidates, features, trees)?;
+    let trees = params.trees;
+    let leaf_size = params.leaf_limit;
     let readback_start = profile.then(std::time::Instant::now);
     let input_bytes = data.client.read_one_unchecked(data.handle.clone());
     if let Some(start) = readback_start {
@@ -513,7 +514,7 @@ pub(super) fn approximate_neighbors(
     assert_eq!(data.dtype, DType::F32);
     let client = data.client.clone();
     let width = plan.host.width;
-    let capacity = plan.host.capacity;
+    let capacity = plan.host.workspace.max_candidates_per_class;
     // `sampled_pool_kernel` sizes its local priority array for this bound.
     assert!(
         capacity <= MAX_CANDIDATES,
@@ -546,6 +547,7 @@ pub(super) fn approximate_neighbors(
         copy
     };
     let n_u32 = u32::try_from(n).expect("ANN row count validated by plan");
+    let features_u32 = u32::try_from(features).expect("ANN feature count validated by plan");
     let width_u32 = u32::try_from(width).expect("ANN width validated by plan");
     let cap_u32 = u32::try_from(capacity).expect("ANN sample capacity validated by plan");
     let pair_slots = plan.tile_slots;
@@ -570,11 +572,14 @@ pub(super) fn approximate_neighbors(
         n,
         features,
         width,
-        capacity,
+        plan.host.params,
+        plan.host.workspace,
         seed,
         profile,
     )
     .map_err(|error| workspace_error("RP forest initialization", error))?;
+    let vector_width = resolve_vector_width(&data, n, features, plan.vector_widths);
+    let vector_size = vector_width as VectorSize;
     let pair_left = allocator.empty(Buffer::PairLeft, Shape::new([pair_elements]), DType::I32);
     let pair_right = allocator.empty(Buffer::PairRight, Shape::new([pair_elements]), DType::I32);
     let pair_distances = allocator.empty(
@@ -672,7 +677,8 @@ pub(super) fn approximate_neighbors(
             &client,
             pair_count.clone(),
             pair_dim,
-            data.clone().into_tensor_arg(),
+            vector_size,
+            ann_data_arg(&data, n, features, vector_width),
             forest_rows.clone().into_tensor_arg(),
             forest_leaf_rows.clone().into_tensor_arg(),
             forest_pair_prefix.clone().into_tensor_arg(),
@@ -682,8 +688,11 @@ pub(super) fn approximate_neighbors(
             pair_right.clone().into_tensor_arg(),
             pair_distances.clone().into_tensor_arg(),
             pair_valid.clone().into_tensor_arg(),
+            n_u32,
+            features_u32,
             u64::try_from(forest_offset).expect("ANN forest offset exceeds u64"),
             slots_u32,
+            vector_width,
             [
                 dtype_to_storage_type(DType::F32),
                 dtype_to_storage_type(DType::I32),
@@ -792,13 +801,16 @@ pub(super) fn approximate_neighbors(
         &client,
         row_count.clone(),
         row_dim,
-        data.clone().into_tensor_arg(),
+        vector_size,
+        ann_data_arg(&data, n, features, vector_width),
         candidates.clone().into_tensor_arg(),
         distances.clone().into_tensor_arg(),
         flags.clone().into_tensor_arg(),
         n_u32,
         width_u32,
         (seed % 2_147_483_646) as u32 + 1,
+        features_u32,
+        vector_width,
         [
             dtype_to_storage_type(DType::F32),
             dtype_to_storage_type(DType::I32),
@@ -962,7 +974,8 @@ pub(super) fn approximate_neighbors(
                 &client,
                 pair_count.clone(),
                 pair_dim,
-                data.clone().into_tensor_arg(),
+                vector_size,
+                ann_data_arg(&data, n, features, vector_width),
                 sampled_ids.clone().into_tensor_arg(),
                 pool_sizes.clone().into_tensor_arg(),
                 center_offsets.clone().into_tensor_arg(),
@@ -972,9 +985,12 @@ pub(super) fn approximate_neighbors(
                 pair_right.clone().into_tensor_arg(),
                 pair_distances.clone().into_tensor_arg(),
                 pair_valid.clone().into_tensor_arg(),
+                n_u32,
+                features_u32,
                 u64::try_from(slot_offset).expect("ANN pair offset exceeds u64"),
                 slots_u32,
                 cap_u32,
+                vector_width,
                 [
                     dtype_to_storage_type(DType::F32),
                     dtype_to_storage_type(DType::I32),
@@ -1181,6 +1197,62 @@ pub(super) fn approximate_neighbors(
         ],
     );
     Ok((output_indices, output_distances))
+}
+
+fn resolve_vector_width(data: &CubeTensor, n: usize, features: usize, policy: &[usize]) -> usize {
+    if data.dtype != DType::F32 {
+        return 1;
+    }
+    let Some(required_bytes) = n
+        .checked_mul(features)
+        .and_then(|elements| elements.checked_mul(DType::F32.size()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return 1;
+    };
+    let Some(available_bytes) = data
+        .handle
+        .size()
+        .checked_sub(data.handle.offset_start.unwrap_or(0))
+        .and_then(|bytes| bytes.checked_sub(data.handle.offset_end.unwrap_or(0)))
+    else {
+        return 1;
+    };
+    if available_bytes < required_bytes {
+        return 1;
+    }
+    policy
+        .iter()
+        .copied()
+        .filter(|&width| matches!(width, 4 | 8) && features.is_multiple_of(width))
+        .find(|&width| {
+            let alignment = 4 * width;
+            data.meta.strides == [features, 1].into()
+                && data.handle.offset_start.unwrap_or(0) % alignment as u64 == 0
+        })
+        .unwrap_or(1)
+}
+
+fn ann_data_arg(data: &CubeTensor, n: usize, features: usize, width: usize) -> TensorArg {
+    if width == 1 {
+        data.clone().into_tensor_arg()
+    } else {
+        let vector_count = n
+            .checked_mul(features / width)
+            .expect("ANN vector view size overflow");
+        assert_eq!(data.meta.strides, [features, 1].into());
+        assert_eq!(features % width, 0);
+        assert_eq!(
+            data.handle.offset_start.unwrap_or(0) % (4 * width) as u64,
+            0
+        );
+        // SAFETY: input normalization guarantees row-major F32 storage; width
+        // resolution checks dtype, feature divisibility, effective byte
+        // alignment, and that the handle's offset-adjusted span covers all
+        // logical elements. The kernel bounds every vector index by scalar
+        // n/features, not the view shape.
+        unsafe { TensorArg::from_raw_parts(data.handle.clone(), [1].into(), [vector_count].into()) }
+    }
 }
 
 /// Parallel exclusive prefix of `values[0..len]` into `offsets[0..=len]` in `dtype`,
@@ -1393,14 +1465,16 @@ fn sampled_insert<I: Int>(
 }
 
 #[cube(launch)]
-pub(super) fn random_fill_kernel<F: Float, I: Int>(
-    data: &Tensor<F>,
+pub(super) fn random_fill_kernel<F: Float, I: Int, N: Size>(
+    data: &Tensor<Vector<F, N>>,
     ids: &mut Tensor<I>,
     distances: &mut Tensor<F>,
     flags: &mut Tensor<I>,
     n: u32,
     width: u32,
     seed: u32,
+    features: u32,
+    #[comptime] vector_width: usize,
     #[define(F, I)] _dtypes: [ElemType; 2],
 ) {
     let row = ABSOLUTE_POS_X as usize;
@@ -1428,13 +1502,8 @@ pub(super) fn random_fill_kernel<F: Float, I: Int>(
                 }
             }
             if !duplicate {
-                let features = data.shape(1);
-                let mut squared = F::new(0.0f32);
-                for feature in 0..features {
-                    let difference =
-                        data[row * features + feature] - data[candidate * features + feature];
-                    squared += difference * difference;
-                }
+                let squared =
+                    squared_l2_r8::<F, N>(data, row, candidate, features as usize, vector_width);
                 // +inf is a real overflowed squared distance; NaN and negatives are rejected.
                 let distance_valid = squared >= F::new(0.0f32);
                 if distance_valid {
@@ -1742,8 +1811,8 @@ pub(super) fn endpoint_mask_probe<F: Float, I: Int>(
 /// tables have `leaves + 1` entries. `slot_offset` is the 64-bit tile start.
 /// `local_pair` narrows to u32 after subtraction: it is below the leaf's pair count,
 /// which `forest_totals` bounds by `i32::MAX`.
-pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
-    data: &Tensor<F>,
+pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
+    data: &Tensor<Vector<F, N>>,
     forest_rows: &Tensor<I>,
     leaf_rows: &Tensor<I>,
     pair_prefix: &Tensor<P>,
@@ -1753,8 +1822,11 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
     pair_valid: &mut Tensor<I>,
+    n: u32,
+    features: u32,
     slot_offset: u64,
     slots: u32,
+    #[comptime] vector_width: usize,
     #[define(F, I, P)] _dtypes: [ElemType; 3],
 ) {
     let slot = ABSOLUTE_POS_X as usize;
@@ -1785,17 +1857,12 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
             let right_slot = left_slot + 1 + local_pair;
             let left = u32::cast_from(forest_rows[start + left_slot]) as usize;
             let right = u32::cast_from(forest_rows[start + right_slot]) as usize;
-            let features = data.shape(1);
-            let mut squared = F::new(0.0f32);
-            for feature in 0..features {
-                let difference = data[left * features + feature] - data[right * features + feature];
-                squared += difference * difference;
-            }
+            let squared = squared_l2_r8::<F, N>(data, left, right, features as usize, vector_width);
             let mask = endpoint_mask::<F, I>(
                 left,
                 right,
                 squared,
-                data.shape(0),
+                n as usize,
                 row_worst_ids,
                 row_worst_distances,
             );
@@ -1803,8 +1870,7 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int>(
             pair_right[slot] = I::cast_from(right as i32);
             pair_distances[slot] = squared;
             pair_valid[slot] = I::cast_from(mask);
-        }
-        if !found {
+        } else {
             pair_left[slot] = I::cast_from(0i32);
             pair_right[slot] = I::cast_from(0i32);
             pair_distances[slot] = F::new(0.0f32);
@@ -1924,8 +1990,8 @@ pub(super) fn chunk_scatter_kernel<I: Int>(
 /// `slot_offset` the 64-bit tile start. `local` narrows to u32 after subtraction:
 /// it is below `pair_counts[center] <= C(C-1)/2 + C^2` (5370 at C=60).
 #[cube(launch)]
-pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
-    data: &Tensor<F>,
+pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
+    data: &Tensor<Vector<F, N>>,
     sampled_ids: &Tensor<I>,
     pool_sizes: &Tensor<I>,
     center_offsets: &Tensor<P>,
@@ -1935,16 +2001,19 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
     pair_right: &mut Tensor<I>,
     pair_distances: &mut Tensor<F>,
     pair_valid: &mut Tensor<I>,
+    n: u32,
+    features: u32,
     slot_offset: u64,
     slots: u32,
     capacity: u32,
+    #[comptime] vector_width: usize,
     #[define(F, I, P)] _dtypes: [ElemType; 3],
 ) {
-    let slot = ABSOLUTE_POS_X as usize;
     let capacity = capacity as usize;
+    let slot = ABSOLUTE_POS_X as usize;
     if slot < slots as usize {
-        let n = data.shape(0);
-        let features = data.shape(1);
+        let n = n as usize;
+        let features = features as usize;
         let flattened = P::cast_from(slot_offset) + P::cast_from(slot as u32);
         // Largest center with center_offsets[center] <= flattened.
         let mut low = 0usize;
@@ -1991,14 +2060,11 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int>(
         let valid = left_id < n && right_id < n && left_id != right_id;
         pair_left[slot] = left;
         pair_right[slot] = right;
-        let mut squared = F::new(0.0f32);
-        if valid {
-            for feature in 0..features {
-                let difference =
-                    data[left_id * features + feature] - data[right_id * features + feature];
-                squared += difference * difference;
-            }
-        }
+        let squared = if valid {
+            squared_l2_r8::<F, N>(data, left_id, right_id, features, vector_width)
+        } else {
+            F::new(0.0f32)
+        };
         let mask = endpoint_mask::<F, I>(
             left_id,
             right_id,

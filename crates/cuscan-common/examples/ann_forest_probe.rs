@@ -46,9 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (z >> 40) as f32 / (1u32 << 24) as f32
         })
         .collect();
-    let trees = ann_forest::tree_count(rows).map_err(|e| format!("tree count: {e:?}"))?;
     // k=14 uses a four-edge heap margin, as in the ANN acceptance campaign.
-    let leaf_size = ann_forest::forest_leaf_limit(rows, 18.min(rows - 1));
+    let params = ann_forest::nn_descent_params(rows, 14)
+        .map_err(|e| format!("NN-descent parameters: {e:?}"))?;
+    let trees = params.trees;
+    let leaf_size = params.leaf_limit;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()?;

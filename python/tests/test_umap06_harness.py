@@ -79,7 +79,6 @@ def test_reference_options_are_explicit(optimizer):
         {"optimizer": "unknown", "init": "spectral"},
         {"optimizer": "adam", "init": "auto"},
         {"optimizer": "adam", "init": "spectral", "compatibility_layout": False},
-        {"optimizer": "adam", "init": "spectral", "nearest_neighbor_backend": "pynndescent"},
     ],
 )
 def test_reference_rejects_implicit_or_overridden_options(options):
@@ -99,10 +98,11 @@ def test_reference_rejects_wrong_versions(monkeypatch, package):
         reference.require_reference()
 
 
-def test_reference_rejects_rinnd(monkeypatch):
-    monkeypatch.setattr(reference.util, "find_spec", lambda name: object())
-    with pytest.raises(RuntimeError, match="RINND"):
-        reference.require_reference()
+def test_reference_preserves_explicit_rinnd_backend():
+    options = reference.reference_kwargs(
+        optimizer="adam", init="spectral", nearest_neighbor_backend="rinnd"
+    )
+    assert options["nearest_neighbor_backend"] == "rinnd"
 
 
 def test_exact_trustworthiness_matches_sklearn():

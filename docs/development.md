@@ -597,15 +597,26 @@ projected = model.transform(X_new)
   prefixes are 64-bit, so the total number of candidate pairs is not limited to
   i32. The remaining limits come from 32-bit ids, offsets and kernel addressing:
   - rows `n <= i32::MAX`;
-  - forest membership `trees x n <= i32::MAX`; the tree count reaches 64 at
-    1,368,900 rows, so this allows at most 33,554,431 rows;
+  - forest membership `trees x n <= i32::MAX`; at the eight-tree cap this
+    allows at most 268,435,455 rows;
   - reverse prefix `n x min(k + 4, n - 1) <= i32::MAX`;
   - pairs within one forest leaf `L(L-1)/2 <= i32::MAX`; every shape that passes
     the reverse-prefix limit already satisfies this;
   - every ANN buffer `<= u32::MAX` elements, because kernels use 32-bit
-    addressing. In practice only the input copy `n x features` binds: at 256
-    features at most 16,777,215 rows. Above 128 features this is the tightest
-    limit.
+    addressing. This includes the input copy `n x features` (at 256 features,
+    at most 16,777,215 rows) and the sampled IDs `n x 2C`. The tightest limit
+    depends on the search width and feature count.
+
+  For example, at 1 or 32 features the membership limit binds for `k = 1`,
+  and the reverse prefix binds for `k = 14, 29, 59, 255`. At 256 features
+  the input copy binds for the first four widths, and the reverse prefix
+  binds for `k = 255`.
+
+  The shared NN-descent recipe uses `k_ref = k + 1`, where `k` is the
+  non-self search width (the ANN graph width for HDBSCAN). It uses
+  `min(8, 5 + round_ties_even(sqrt(n) / 20))` trees, leaf size at most
+  `min(clamp(5 * k_ref, 60, 256), n)`, and `C = min(k_ref, 60, n - 1)`
+  sampled candidates per new/old class.
 
   A rejected shape returns `UmapError::Capacity` or `HdbscanError::Capacity`. The
   message names the quantity, its value, the limit and the shape.
@@ -622,6 +633,14 @@ projected = model.transform(X_new)
   IDs and distance bits. Exact tile overrides exist only in the common crate's
   `test-support` APIs, not the estimator APIs.
 
+  ANN squared distances use eight FMA accumulation chains indexed by feature
+  modulo eight, followed by a fixed pairwise reduction. CPU uses scalar loads;
+  CUDA uses supported four- or eight-wide loads when feature count and binding
+  alignment permit, otherwise scalar loads. The arithmetic order is unchanged
+  across these routes. CPU/CUDA bit identity was verified on FMA-capable x86-64
+  and the tested NVIDIA CUDA device; it is not guaranteed on hosts without FMA.
+  This order does not apply to exact search or HDBSCAN KD-tree distances.
+
   `UMAPConfig::memory_limit_bytes` and `HdbscanConfig::memory_limit_bytes`, and
   the Python `memory_limit_bytes` argument, accept an optional positive byte
   limit. It caps the estimated ANN working set including the input, before the
@@ -634,7 +653,7 @@ projected = model.transform(X_new)
   budgeted by it.
 
   **Estimates:** `ann_host_estimate` returns `AnnEstimate`: `retained_width`
-  is `min(k + 4, n - 1)`, `sample_capacity` is `min(60, n - 1)` per new/old
+  is `min(k + 4, n - 1)`, `sample_capacity` is `min(k + 1, 60, n - 1)` per new/old
   class, `trees` is the forest tree count, and `directed_edges` is `n * k`.
   `phases` contains `phase`, `host_bytes` and CUDA-conservative `runtime_bytes`
   including input for Input, ForestInit, Refinement and Output. `host_peak_bytes`
@@ -858,7 +877,8 @@ the exact complete mutual-reachability graph. Above 30 features it builds a kNN 
 The graph width is `min(max(knn_k or max(3 * min_samples, 15), min_samples), n_finite - 1)`.
 It uses exact neighbors when `n_finite <= 4096`. Above 4096 finite rows it uses approximate
 neighbors at the resolved width (CubeCL ANN, fixed seed 42, squared distances,
-`max(5, round(log2(n)))` iterations); the width is not separately capped. ANN
+`max(5, round(log2(n)))` iterations); the width is not separately capped. The shared
+ANN recipe tunes construction without changing the requested neighbor semantics. ANN
 shape limits are listed under ANN capacity limits in the UMAP section; a rejected
 shape returns `HdbscanError::Capacity`, which Python raises as `OverflowError` with
 the precise message. Kruskal runs over the kNN edges. Components left

@@ -1,6 +1,6 @@
 """Explicit, version-checked upstream reference configuration."""
 
-from importlib import metadata, util
+from importlib import metadata
 
 REFERENCE_VERSION = "0.6.0"
 OPTIMIZERS = ("compatibility", "adam", "momentum")

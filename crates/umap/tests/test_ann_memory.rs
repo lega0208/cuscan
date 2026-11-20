@@ -10,7 +10,9 @@ fn fixture(rows: usize, features: usize) -> Vec<f32> {
 }
 
 fn limit_invariance(device: Device) {
-    let (rows, features, k) = (512, 8, 14);
+    // P1 yields 330 join slots per row. Exceed the minimum tile so a
+    // tighter budget selects a genuinely different execution plan.
+    let (rows, features, k) = (4_000, 8, 14);
     let input = Tensor::<2>::from_data(
         TensorData::new(fixture(rows, features), [rows, features]),
         &device,
@@ -20,11 +22,11 @@ fn limit_invariance(device: Device) {
         free_bytes: 2 << 30,
         limit_bytes: None,
     };
+    let full_plan = ann_preflight(&device, rows, features, k, &unlimited).unwrap();
     let limited = MemoryBudget {
-        limit_bytes: Some(128 << 20),
+        limit_bytes: Some(full_plan.memory.fixed_peak_bytes + (64 << 20) + 32 * (1 << 20)),
         ..unlimited
     };
-    let full_plan = ann_preflight(&device, rows, features, k, &unlimited).unwrap();
     let small_plan = ann_preflight(&device, rows, features, k, &limited).unwrap();
     assert!(small_plan.tile_slots < full_plan.tile_slots);
     let (expected_ids, expected_distances) =
@@ -98,7 +100,9 @@ fn memory_admission_and_limit_invariance_cuda() {
 }
 
 fn large_tile_invariance(device: Device) {
-    let (rows, features, k) = (40_000, 32, 14);
+    // P1's 15 candidates produce 330 join slots per row, so 60,000 rows make
+    // the join range 19.8M slots and keep the 2^24 tile distinct.
+    let (rows, features, k) = (60_000, 32, 14);
     let input = Tensor::<2>::from_data(
         TensorData::new(fixture(rows, features), [rows, features]),
         &device,
@@ -113,6 +117,7 @@ fn large_tile_invariance(device: Device) {
         .memory
         .fixed_peak_bytes;
     let mut expected = None;
+    let mut planned_slots = Vec::new();
     for slots in [1 << 20, 1 << 22, 1 << 24] {
         // All six staging lengths are alignment multiples at these tile sizes.
         // Cap usable memory at exactly fixed + 32 bytes per pair slot.
@@ -122,6 +127,7 @@ fn large_tile_invariance(device: Device) {
         };
         let plan = ann_preflight(&device, rows, features, k, &limited).unwrap();
         assert_eq!(plan.tile_slots, slots);
+        planned_slots.push(plan.tile_slots);
         let (ids, distances) = approximate_neighbors(input.clone(), &plan, 42, 15, false).unwrap();
         let result = (
             ids.into_data().try_to_vec::<i32>().unwrap(),
@@ -142,6 +148,7 @@ fn large_tile_invariance(device: Device) {
             expected = Some(result);
         }
     }
+    assert_eq!(planned_slots, [1 << 20, 1 << 22, 1 << 24]);
 }
 
 #[test]

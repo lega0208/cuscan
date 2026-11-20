@@ -1,7 +1,7 @@
 //! Persistent CUDA ANN construction worker for construction-only campaigns.
 //!
 //! Build with `cargo build --release --example ann_construction_worker`. Invoke as
-//! `ann_construction_worker INPUT.f32le ROWS FEATURES [DEVICE_INDEX]`; it reads
+//! `ann_construction_worker INPUT.f32le ROWS FEATURES [cpu|cuda:<index>]`; it reads
 //! one JSON command per stdin line and emits one JSON response per command.
 
 use burn::tensor::{Tensor, TensorData};
@@ -82,6 +82,11 @@ fn perform(
         .as_u64()
         .ok_or("command cap must be an unsigned integer")?
         .try_into()?;
+    let squared = match command.get("squared") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("command squared must be a boolean".into()),
+    };
     if k == 0 || k as usize >= rows {
         return Err(format!("k must be in 1..{rows}").into());
     }
@@ -93,7 +98,10 @@ fn perform(
     );
     let budget = resolve_memory_budget(device, None)?;
     let plan = ann_preflight(device, rows, features, k as usize, &budget)?;
-    let (indices, distances) = approximate_neighbors(input, &plan, seed, cap, false)?;
+    let ann_started = Instant::now();
+    let (indices, distances) = approximate_neighbors(input, &plan, seed, cap, squared)?;
+    device.sync()?;
+    let ann_ms = ann_started.elapsed().as_secs_f64() * 1000.0;
     let ids = indices.to_data().try_to_vec::<i32>()?;
     let distances = distances.to_data().try_to_vec::<f32>()?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -146,6 +154,7 @@ fn perform(
         "ok": true,
         "kind": if is_warmup { "warmup" } else { "build" },
         "elapsed_ms": elapsed_ms,
+        "ann_ms": ann_ms,
         "rows": rows,
         "features": features,
         "k_nonself": k,
@@ -173,16 +182,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     if !(4..=5).contains(&args.len()) {
         return Err(
-            "usage: ann_construction_worker INPUT.f32le ROWS FEATURES [DEVICE_INDEX]".into(),
+            "usage: ann_construction_worker INPUT.f32le ROWS FEATURES [cpu|cuda:<index>]".into(),
         );
     }
     let rows: usize = args[2].parse()?;
     let features: usize = args[3].parse()?;
-    let device_index: usize = args.get(4).map_or(Ok(0), |value| value.parse())?;
     let host_features = read_features(Path::new(&args[1]), rows, features)?;
-    let device = umap::cuda_backend::device(device_index).ok_or_else(|| {
-        format!("CUDA device {device_index} unavailable; CPU fallback is forbidden")
-    })?;
+    let device = match args.get(4).map(String::as_str).unwrap_or("cuda:0") {
+        "cpu" => burn::tensor::Device::cpu(),
+        backend if backend.starts_with("cuda:") => {
+            let index = &backend[5..];
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(
+                    format!("invalid CUDA backend {backend:?}; expected cuda:<index>").into(),
+                );
+            }
+            let device_index: usize = index.parse()?;
+            umap::cuda_backend::device(device_index).ok_or_else(|| {
+                format!("CUDA device {device_index} unavailable; CPU fallback is forbidden")
+            })?
+        }
+        backend => {
+            return Err(
+                format!("unsupported backend {backend:?}; expected cpu or cuda:<index>").into(),
+            );
+        }
+    };
 
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());

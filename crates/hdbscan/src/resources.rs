@@ -825,6 +825,8 @@ mod tests {
         .unwrap();
         let cpu = scenario_of(knn_of(&plan), ResourceBackend::Cpu);
         let ann = ann_host_estimate(1000, 3, 75).unwrap();
+        // P1: round_ties_even(sqrt(1000)/20) = 2, so the estimate uses 7 trees.
+        assert_eq!(ann.trees, 7);
         let expected = [
             (
                 ResourcePhase::AnnInput,

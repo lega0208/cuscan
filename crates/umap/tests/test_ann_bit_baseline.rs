@@ -1,4 +1,4 @@
-//! Bit-exact ANN baselines, captured on the pre-move HEAD tree and compared after the move.
+//! Bit-exact ANN baselines recording the fixed R8 distance accumulation order.
 //!
 //! Files live in `CUSCAN_ANN_BASELINE_DIR` (relative paths resolve against the workspace
 //! root). Every file is raw little-endian words, one file per artifact.
@@ -13,9 +13,9 @@
 //!   k=14, iterations=9, seed 42. Files `{label}-estimator-ids.bin` (i32) and
 //!   `{label}-estimator-distance-bits.bin` (u32).
 //! - MultiTile (`capture_multitile_{cpu,cuda}`, `compare_multitile_{cpu,cuda}`): n=40,000,
-//!   features=8, k=14, seed 42, iterations `round(log2 n)` = 15. Both forest seeding and
-//!   refinement span more than one 4,194,304-slot staging tile, so the tile loop and nonzero
-//!   slot offsets are covered bit-exactly. Files `{label}-multitile-{ids,distance-bits}.bin`.
+//!   features=8, k=14, seed 42, iterations `round(log2 n)` = 15, with an explicit legal
+//!   2^20-slot staging tile. An independent midpoint-split recurrence asserts that forest
+//!   seeding spans multiple tiles; files `{label}-multitile-{ids,distance-bits}.bin`.
 //! - Ties, Wide, Hub: n=512, k=14, 9 iterations, seed 42. Ties contains repeated
 //!   binary vectors and exact equidistant neighbors; Wide uses 256-feature blobs; Hub
 //!   has an origin row nearest to 511 distinct signed unit vectors in 256 dimensions.
@@ -23,13 +23,14 @@
 //!
 //! Capture refuses to overwrite existing files; delete a file deliberately to recapture it.
 //! Compare fails on a missing or changed file and prints the capture command.
-//! The estimator baseline must be captured from the pristine HEAD worktree
-//! (`target/m2-ann-baseline`). Its copy of this file calls `StandardUmapOps`, so the baseline
-//! is not produced by relocated code. This live file uses the current ANN entry point.
+//! The pristine-HEAD capture note applies only to pre-R8 baseline directories (for example,
+//! `target/m2-ann-baseline`): that copy calls `StandardUmapOps`, not relocated code. Current
+//! R8 baselines are captured by this live file through the current ANN entry point.
 
 use burn::tensor::{Device, Tensor, TensorData};
 use cuscan_common::{
-    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
+    ann_host_estimate, ann_preflight, ann_preflight_with_tile_slots, memory::resolve_memory_budget,
+    neighbors::approximate_neighbors,
 };
 use std::{
     fs,
@@ -57,6 +58,22 @@ const ESTIMATOR_ITERATIONS: u32 = 9;
 const MULTITILE_ROWS: usize = 40_000;
 const MULTITILE_K: usize = 14;
 const MULTITILE_ITERATIONS: u32 = 15;
+const MULTITILE_TILE_SLOTS: usize = 1 << 20;
+
+/// Independent shape-only forest pair count using the midpoint-split recurrence.
+fn midpoint_forest_pairs(rows: usize, leaf_limit: usize, trees: usize) -> usize {
+    fn node_pairs(rows: usize, leaf_limit: usize) -> usize {
+        if rows <= leaf_limit {
+            rows * rows.saturating_sub(1) / 2
+        } else {
+            let left = rows / 2;
+            let right = rows - left;
+            node_pairs(left, leaf_limit) + node_pairs(right, leaf_limit)
+        }
+    }
+
+    node_pairs(rows, leaf_limit) * trees
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Target {
@@ -225,10 +242,23 @@ fn ann_neighbors(
     features: usize,
     k: usize,
     iterations: u32,
+    family: Family,
 ) -> (Vec<i32>, Vec<u32>) {
     let data = Tensor::<2>::from_data(TensorData::new(values.to_vec(), [n_rows, features]), device);
-    let budget = resolve_memory_budget(device, None).unwrap();
-    let plan = ann_preflight(device, n_rows, features, k, &budget).unwrap();
+    let plan = if matches!(family, Family::MultiTile) {
+        let estimate = ann_host_estimate(n_rows, features, k).unwrap();
+        let k_ref = k.saturating_add(1);
+        let leaf_limit = k_ref.saturating_mul(5).clamp(60, 256).min(n_rows);
+        let forest_pairs = midpoint_forest_pairs(n_rows, leaf_limit, estimate.trees);
+        assert!(
+            forest_pairs > MULTITILE_TILE_SLOTS,
+            "multi-tile forest has {forest_pairs} pairs, not more than tile size {MULTITILE_TILE_SLOTS}"
+        );
+        ann_preflight_with_tile_slots(device, n_rows, features, k, MULTITILE_TILE_SLOTS).unwrap()
+    } else {
+        let budget = resolve_memory_budget(device, None).unwrap();
+        ann_preflight(device, n_rows, features, k, &budget).unwrap()
+    };
     let (ids, distances) = approximate_neighbors(data, &plan, SEED, iterations, false).unwrap();
     let ids = ids.to_data().try_to_vec::<i32>().unwrap();
     let distance_bits = distances
@@ -382,6 +412,7 @@ fn run(target: Target, family: Family, mode: Mode) {
         family.features(),
         family.k(),
         family.iterations(),
+        family,
     );
     let mut artifacts = vec![
         ("ids.bin", to_le_bytes_i32(&ids)),

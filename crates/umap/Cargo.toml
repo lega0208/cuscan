@@ -23,6 +23,7 @@ rayon = { workspace = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+cuscan-common = { workspace = true, features = ["test-support"] }
 serde = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
