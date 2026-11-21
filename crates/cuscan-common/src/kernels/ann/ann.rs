@@ -12,6 +12,22 @@ use burn_cubecl::tensor::CubeTensor;
 
 const ANN_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 const BUDGET_TILE_CEILING_SLOTS: usize = 1 << 24;
+pub(super) const OWNER_CH: usize = 64;
+pub(super) const OWNER_CH_LEAF: usize = 1;
+pub(super) const OWNER_D_MAX: usize = 64;
+
+/// Join implementation selected at preflight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnJoinRoute {
+    Owner,
+    Slots,
+}
+
+impl AnnJoinRoute {
+    fn for_cpu(cpu: bool) -> Self {
+        if cpu { Self::Owner } else { Self::Slots }
+    }
+}
 
 /// Bounds used by the budgeted tile planner, independent of runtime handles.
 #[derive(Clone, Copy, Debug)]
@@ -32,9 +48,13 @@ pub(super) enum TileRequest {
     Budget { usable_bytes: u64, fixed_bytes: u64 },
 }
 
-/// Sum the actual six staging allocations after individual alignment.
-fn tile_staging_bytes(slots: usize, alignment: usize) -> Result<u64, AnnError> {
-    staging_entries(slots)
+/// Sum the route's staging allocations after individual alignment.
+fn tile_staging_bytes(
+    slots: usize,
+    alignment: usize,
+    route: AnnJoinRoute,
+) -> Result<u64, AnnError> {
+    staging_entries(slots, route)
         .ok_or_else(|| AnnError::Overflow("ANN staging shape overflows usize".into()))?
         .iter()
         .try_fold(0u64, |sum, entry| {
@@ -82,7 +102,11 @@ fn plan_tiles(caps: TileCaps, request: TileRequest) -> Result<usize, AnnError> {
             usable_bytes,
             fixed_bytes,
         } => {
-            let minimum_bytes = tile_staging_bytes(minimum, caps.alignment)?;
+            let minimum_bytes = tile_staging_bytes(
+                minimum,
+                caps.alignment,
+                AnnJoinRoute::for_cpu(caps.cpu_merge),
+            )?;
             let required = fixed_bytes
                 .checked_add(minimum_bytes)
                 .ok_or_else(|| AnnError::Overflow("ANN minimum memory exceeds u64".into()))?;
@@ -97,7 +121,9 @@ fn plan_tiles(caps: TileCaps, request: TileRequest) -> Result<usize, AnnError> {
             let (mut low, mut high) = (minimum, upper.min(caps.budget_ceiling_slots));
             while low < high {
                 let mid = low + (high - low).div_ceil(2);
-                if tile_staging_bytes(mid, caps.alignment)? <= elastic {
+                if tile_staging_bytes(mid, caps.alignment, AnnJoinRoute::for_cpu(caps.cpu_merge))?
+                    <= elastic
+                {
                     low = mid;
                 } else {
                     high = mid - 1;
@@ -141,11 +167,14 @@ pub struct AnnPlan {
     pub(super) host: HostPlan,
     merge: LaunchShape,
     pub(super) vector_widths: &'static [usize],
+    pub(crate) join_route: AnnJoinRoute,
     pub n: usize,
     pub features: usize,
     pub k: usize,
     pub tile_slots: usize,
     pub memory: PlannedMemory,
+    #[cfg(test)]
+    pub(super) owner_test_geometry: Option<(usize, u32, usize)>,
 }
 
 /// Immutable admission numbers; executable validation does not query availability again.
@@ -258,12 +287,20 @@ pub(super) enum Buffer {
     OutputDistances,
     ProfileCounts,
     SurvivalCounts,
+    OwnerRecordRows,
+    OwnerRecordIds,
+    OwnerRecordDistances,
+    OwnerRecordOrder,
+    OwnerChunkOffsets,
+    OwnerProfile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BufferRoute {
     Both,
     Cuda,
+    Slots,
+    Owner,
     /// Allocated only when profiling; not part of the memory plan.
     Profile,
 }
@@ -289,30 +326,45 @@ impl BufferEntry {
     }
 }
 
-fn staging_entries(slots: usize) -> Option<[BufferEntry; 6]> {
+fn staging_entries(slots: usize, route: AnnJoinRoute) -> Option<Vec<BufferEntry>> {
     use Buffer::*;
     let endpoints = slots.checked_mul(2)?;
-    Some(
-        [
+    let entries = match route {
+        AnnJoinRoute::Slots => vec![
             (PairLeft, DType::I32, slots),
             (PairRight, DType::I32, slots),
             (PairDistances, DType::F32, slots),
             (PairValid, DType::I32, slots),
             (EndpointIds, DType::I32, endpoints),
             (EndpointDistances, DType::F32, endpoints),
-        ]
-        .map(|(buffer, dtype, count)| BufferEntry {
-            buffer,
-            shape: vec![count],
-            dtype,
-            phases: 6,
-            route: BufferRoute::Both,
-            staging: true,
-        }),
+        ],
+        AnnJoinRoute::Owner => vec![
+            (OwnerRecordRows, DType::I32, endpoints),
+            (OwnerRecordIds, DType::I32, endpoints),
+            (OwnerRecordDistances, DType::F32, endpoints),
+            (OwnerRecordOrder, DType::I32, endpoints),
+        ],
+    };
+    Some(
+        entries
+            .into_iter()
+            .map(|(buffer, dtype, count)| BufferEntry {
+                buffer,
+                shape: vec![count],
+                dtype,
+                phases: 6,
+                route: match route {
+                    AnnJoinRoute::Owner => BufferRoute::Owner,
+                    AnnJoinRoute::Slots => BufferRoute::Slots,
+                },
+                staging: true,
+            })
+            .collect(),
     )
 }
 
 /// The driver's allocations and their live phases, including caller-owned input.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn ann_buffer_table(
     n: usize,
     features: usize,
@@ -321,6 +373,7 @@ pub(super) fn ann_buffer_table(
     capacity: usize,
     ws: &WorkspacePlan,
     tile_slots: usize,
+    route: AnnJoinRoute,
 ) -> Option<Vec<BufferEntry>> {
     use Buffer::*;
     let chunks = n.div_ceil(ann_sampled::PREFIX_CHUNK);
@@ -345,10 +398,30 @@ pub(super) fn ann_buffer_table(
     entry!(RowWorstIds, I32, 6, false, n);
     entry!(RowWorstDistances, F32, 6, false, n);
     entry!(Flags, I32, 6, false, n, width);
-    entries.extend(staging_entries(tile_slots)?);
-    entry!(EndpointCounts, I32, 6, false, n);
-    entry!(EndpointOffsets, I32, 6, false, row_entries);
-    entry!(EndpointCursors, I32, 6, false, n);
+    entries.extend(staging_entries(tile_slots, route)?);
+    if route == AnnJoinRoute::Slots {
+        entry!(EndpointCounts, I32, 6, false, n);
+        entries.last_mut()?.route = BufferRoute::Slots;
+        entry!(EndpointOffsets, I32, 6, false, row_entries);
+        entries.last_mut()?.route = BufferRoute::Slots;
+        entry!(EndpointCursors, I32, 6, false, n);
+        entries.last_mut()?.route = BufferRoute::Slots;
+    } else {
+        let owner_chunks = n
+            .div_ceil(OWNER_CH)
+            .max(ws.forest_leaf_count.div_ceil(OWNER_CH_LEAF));
+        entry!(
+            OwnerChunkOffsets,
+            I32,
+            6,
+            false,
+            owner_chunks,
+            OWNER_D_MAX + 1
+        );
+        entries.last_mut()?.route = BufferRoute::Owner;
+        entry!(OwnerProfile, U64, 6, false, 2);
+        entries.last_mut()?.route = BufferRoute::Owner;
+    }
     entry!(ReverseCounts, I32, 4, false, n);
     entry!(ReverseOffsets, I32, 4, false, row_entries);
     entry!(ReverseCursors, I32, 4, false, n);
@@ -393,6 +466,7 @@ fn ann_allocation_bytes(
     host: &HostPlan,
     tile_slots: usize,
     cpu: bool,
+    route: AnnJoinRoute,
 ) -> Result<Vec<(String, usize)>, AnnError> {
     let overflow = || {
         AnnError::Overflow(format!(
@@ -407,6 +481,7 @@ fn ann_allocation_bytes(
         host.workspace.max_candidates_per_class,
         &host.workspace,
         tile_slots,
+        route,
     )
     .ok_or_else(overflow)?;
     table
@@ -467,16 +542,45 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
             i32::MAX
         )));
     }
-    // Kernels address buffers with 32-bit `usize` (CubeCL's default U32 address
-    // type), so every buffer must stay within u32::MAX elements. Only the input copy
-    // is independently reachable; the other entries are implied by the gates above.
+    let host = HostPlan {
+        width,
+        params,
+        workspace,
+    };
     let tile_slots = default_tile_slots(n, &workspace)?;
-    let table = ann_buffer_table(n, features, k, width, capacity, &workspace, tile_slots)
-        .ok_or_else(|| {
-            AnnError::Overflow(format!(
-                "ANN buffer element count overflows usize ({shape})"
-            ))
-        })?;
+    check_buffer_elements(n, features, k, &host, tile_slots, AnnJoinRoute::Slots)?;
+    Ok(host)
+}
+
+// CubeCL addresses buffers with U32 elements. Check only the selected route;
+// the device-free shape gate uses the original slot route.
+fn check_buffer_elements(
+    n: usize,
+    features: usize,
+    k: usize,
+    host: &HostPlan,
+    tile_slots: usize,
+    route: AnnJoinRoute,
+) -> Result<(), AnnError> {
+    let shape = format!(
+        "n={n}, features={features}, k={k}, width={}, trees={}, leaf limit={}",
+        host.width, host.params.trees, host.params.leaf_limit
+    );
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        host.width,
+        host.workspace.max_candidates_per_class,
+        &host.workspace,
+        tile_slots,
+        route,
+    )
+    .ok_or_else(|| {
+        AnnError::Overflow(format!(
+            "ANN buffer element count overflows usize ({shape})"
+        ))
+    })?;
     for entry in table {
         let elements = entry
             .elements()
@@ -489,11 +593,7 @@ fn host_plan(n: usize, features: usize, k: usize) -> Result<HostPlan, AnnError> 
             )));
         }
     }
-    Ok(HostPlan {
-        width,
-        params,
-        workspace,
-    })
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -635,13 +735,14 @@ fn ann_independent_cube_count(
     Ok(count)
 }
 
-fn plan_with_host(
+fn plan_with_host_route(
     client: &cubecl::client::Client,
     n: usize,
     features: usize,
     k: usize,
     host: HostPlan,
     tile_slots: usize,
+    override_route: Option<AnnJoinRoute>,
 ) -> Result<AnnPlan, AnnError> {
     let memory = &client.properties().memory;
     let max_page = usize::try_from(memory.max_page_size)
@@ -650,9 +751,29 @@ fn plan_with_host(
         .map_err(|_| AnnError::Capability("device alignment exceeds usize".into()))?;
     let n_u32 = u32::try_from(n).expect("ANN row count validated by host_plan");
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
+    let join_route = override_route.unwrap_or_else(|| AnnJoinRoute::for_cpu(merge.cpu_merge));
+    if !merge.cpu_merge && join_route == AnnJoinRoute::Owner {
+        return Err(AnnError::InvalidInput("ANN owner join requires CPU".into()));
+    }
+    #[cfg(not(feature = "test-support"))]
+    if join_route != AnnJoinRoute::for_cpu(merge.cpu_merge) {
+        return Err(AnnError::InvalidInput(
+            "ANN join route does not match device".into(),
+        ));
+    }
+    if join_route == AnnJoinRoute::Owner {
+        check_buffer_elements(n, features, k, &host, tile_slots, join_route)?;
+    }
     let vector_widths = ann_vector_width_policy(client);
-    for (stage, bytes) in ann_allocation_bytes(n, features, k, &host, tile_slots, merge.cpu_merge)?
-    {
+    for (stage, bytes) in ann_allocation_bytes(
+        n,
+        features,
+        k,
+        &host,
+        tile_slots,
+        merge.cpu_merge,
+        join_route,
+    )? {
         check_page_limit(&stage, bytes, max_page, alignment)?;
     }
     // The ID copy covers n * width elements; pair launches cover one tile.
@@ -669,16 +790,27 @@ fn plan_with_host(
         units_per_cube,
         client.properties().hardware.max_cube_count.0,
     )?;
-    let (fixed_peak_bytes, _) = fixed_memory(n, features, k, &host, alignment, merge.cpu_merge)?;
-    let staging_bytes = tile_staging_bytes(tile_slots, alignment)?;
+    let (fixed_peak_bytes, _) = fixed_memory_route(
+        n,
+        features,
+        k,
+        &host,
+        alignment,
+        merge.cpu_merge,
+        join_route,
+    )?;
+    let staging_bytes = tile_staging_bytes(tile_slots, alignment, join_route)?;
     Ok(AnnPlan {
         host,
         merge,
         vector_widths,
+        join_route,
         n,
         features,
         k,
         tile_slots,
+        #[cfg(test)]
+        owner_test_geometry: None,
         memory: PlannedMemory {
             fixed_peak_bytes,
             staging_bytes,
@@ -687,6 +819,90 @@ fn plan_with_host(
                 .ok_or_else(|| AnnError::Overflow("ANN planned memory overflows u64".into()))?,
         },
     })
+}
+
+fn plan_with_host(
+    client: &cubecl::client::Client,
+    n: usize,
+    features: usize,
+    k: usize,
+    host: HostPlan,
+    tile_slots: usize,
+) -> Result<AnnPlan, AnnError> {
+    plan_with_host_route(client, n, features, k, host, tile_slots, None)
+}
+
+#[cfg(test)]
+pub(super) fn owner_test_plan(
+    client: &cubecl::client::Client,
+    n: usize,
+    features: usize,
+    k: usize,
+    tile: Option<usize>,
+    ch: usize,
+    partitions: u32,
+    width: usize,
+) -> Result<AnnPlan, AnnError> {
+    let host = host_plan(n, features, k)?;
+    let caps = tile_caps(client, n, &host)?;
+    let tile_slots = plan_tiles(caps, tile.map_or(TileRequest::Default, TileRequest::Exact))?;
+    let hw = &client.properties().hardware;
+    let units = (std::thread::available_parallelism().map_or(1, |v| v.get()) as u32)
+        .min(hw.max_cube_dim.0)
+        .min(hw.max_units_per_cube);
+    if client.name() != "cpu"
+        || ch == 0
+        || partitions == 0
+        || partitions > units.min(OWNER_D_MAX as u32).min(n as u32)
+        || ![1, 4, 8].contains(&width)
+        || features % width != 0
+    {
+        return Err(AnnError::InvalidInput("invalid owner test geometry".into()));
+    }
+    let mut plan = plan_with_host_route(
+        client,
+        n,
+        features,
+        k,
+        host,
+        tile_slots,
+        Some(AnnJoinRoute::Owner),
+    )?;
+    let chunks = n
+        .div_ceil(ch)
+        .max(host.workspace.forest_leaf_count.div_ceil(OWNER_CH_LEAF));
+    let launch_chunks = u32::try_from(chunks)
+        .map_err(|_| AnnError::Overflow("owner test chunk count exceeds u32".into()))?;
+    ann_independent_cube_count(launch_chunks, units, hw.max_cube_count.0)?;
+    let elements = chunks
+        .checked_mul(OWNER_D_MAX + 1)
+        .ok_or_else(|| AnnError::Overflow("owner test offsets overflow".into()))?;
+    if elements > u32::MAX as usize {
+        return Err(AnnError::Overflow("owner test offsets exceed u32".into()));
+    }
+    let bytes = elements
+        .checked_mul(DType::I32.size())
+        .ok_or_else(|| AnnError::Overflow("owner test offsets overflow".into()))?;
+    check_page_limit("owner test offsets", bytes, caps.max_page, caps.alignment)?;
+    let old = n
+        .div_ceil(OWNER_CH)
+        .max(host.workspace.forest_leaf_count.div_ceil(OWNER_CH_LEAF))
+        * (OWNER_D_MAX + 1)
+        * DType::I32.size();
+    let extra =
+        aligned_bytes(bytes, caps.alignment)?.saturating_sub(aligned_bytes(old, caps.alignment)?);
+    plan.memory.fixed_peak_bytes = plan
+        .memory
+        .fixed_peak_bytes
+        .checked_add(extra)
+        .ok_or_else(|| AnnError::Overflow("owner test memory overflow".into()))?;
+    plan.memory.usable_bytes = plan
+        .memory
+        .fixed_peak_bytes
+        .checked_add(plan.memory.staging_bytes)
+        .ok_or_else(|| AnnError::Overflow("owner test memory overflow".into()))?;
+    plan.owner_test_geometry = Some((ch, partitions, width));
+    Ok(plan)
 }
 
 fn ann_vector_width_policy(client: &cubecl::client::Client) -> &'static [usize] {
@@ -727,6 +943,26 @@ fn fixed_memory(
     alignment: usize,
     cpu: bool,
 ) -> Result<(u64, Vec<(String, u64)>), AnnError> {
+    fixed_memory_route(
+        n,
+        features,
+        k,
+        host,
+        alignment,
+        cpu,
+        AnnJoinRoute::for_cpu(cpu),
+    )
+}
+
+fn fixed_memory_route(
+    n: usize,
+    features: usize,
+    k: usize,
+    host: &HostPlan,
+    alignment: usize,
+    cpu: bool,
+    route: AnnJoinRoute,
+) -> Result<(u64, Vec<(String, u64)>), AnnError> {
     let overflow = || AnnError::Overflow("ANN fixed memory overflows address space".into());
     let table = ann_buffer_table(
         n,
@@ -736,6 +972,7 @@ fn fixed_memory(
         host.workspace.max_candidates_per_class,
         &host.workspace,
         0,
+        route,
     )
     .ok_or_else(overflow)?;
     let mut phases = [0u64; 4];
@@ -763,6 +1000,26 @@ fn fixed_memory(
             "host forest/readback/scratch".into(),
             host.workspace.host_peak_bytes as u64,
         ));
+        if route == AnnJoinRoute::Owner {
+            let forest_prefix = host
+                .workspace
+                .forest_leaf_count
+                .checked_add(1)
+                .and_then(|v| v.checked_mul(8))
+                .and_then(|v| u64::try_from(v).ok())
+                .ok_or_else(overflow)?;
+            let refinement_prefix = n
+                .checked_add(1)
+                .and_then(|v| v.checked_mul(8))
+                .and_then(|v| u64::try_from(v).ok())
+                .ok_or_else(overflow)?;
+            phases[1] = phases[1].checked_add(forest_prefix).ok_or_else(overflow)?;
+            phases[2] = phases[2]
+                .checked_add(refinement_prefix)
+                .ok_or_else(overflow)?;
+            contributors.push(("host forest prefix".into(), forest_prefix));
+            contributors.push(("host refinement prefix".into(), refinement_prefix));
+        }
     }
     contributors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok((
@@ -912,8 +1169,7 @@ pub struct AnnPhaseBytes {
     pub phase: AnnPhase,
     /// Host RAM allocated by ANN itself during this phase.
     pub host_bytes: usize,
-    /// CUDA-conservative runtime phase estimate, including the input tensor.
-    /// CPU uses the same phase layout but does not allocate CUDA merge workspaces.
+    /// Component-wise maximum of owner CPU and slot CUDA runtime, including input.
     pub runtime_bytes: usize,
 }
 
@@ -971,7 +1227,10 @@ fn estimate_from_plan(
     let w = host.width;
     let c = host.workspace.max_candidates_per_class;
     let slots = default_tile_slots(n, &ws)?;
-    let table = ann_buffer_table(n, features, k, w, c, &ws, slots).ok_or_else(overflow)?;
+    let table = ann_buffer_table(n, features, k, w, c, &ws, slots, AnnJoinRoute::Slots)
+        .ok_or_else(overflow)?;
+    let owner_table = ann_buffer_table(n, features, k, w, c, &ws, slots, AnnJoinRoute::Owner)
+        .ok_or_else(overflow)?;
     let mut runtime = [0usize; 4];
     let mut cpu_runtime = [0usize; 4];
     let mut fixed = [0usize; 4];
@@ -983,15 +1242,25 @@ fn estimate_from_plan(
         for phase in 0..4 {
             if entry.phases & (1 << phase) != 0 {
                 runtime[phase] = add(runtime[phase], bytes)?;
-                if entry.route != BufferRoute::Cuda {
-                    cpu_runtime[phase] = add(cpu_runtime[phase], bytes)?;
-                }
                 if !entry.staging {
                     fixed[phase] = add(fixed[phase], bytes)?;
                 }
             }
         }
     }
+    for entry in &owner_table {
+        if matches!(entry.route, BufferRoute::Profile | BufferRoute::Cuda) {
+            continue;
+        }
+        let bytes = entry.bytes().ok_or_else(overflow)?;
+        for (phase, runtime) in cpu_runtime.iter_mut().enumerate() {
+            if entry.phases & (1 << phase) != 0 {
+                *runtime = add(*runtime, bytes)?;
+            }
+        }
+    }
+    let owner_forest_host = add(ws.host_peak_bytes, mul(add(ws.forest_leaf_count, 1)?, 8)?)?;
+    let owner_refinement_host = mul(add(n, 1)?, 8)?;
     let input = table
         .iter()
         .find(|entry| entry.buffer == Buffer::Input)
@@ -1002,22 +1271,22 @@ fn estimate_from_plan(
         AnnPhaseBytes {
             phase: AnnPhase::Input,
             host_bytes: mul(input, 2)?,
-            runtime_bytes: runtime[0],
+            runtime_bytes: runtime[0].max(cpu_runtime[0]),
         },
         AnnPhaseBytes {
             phase: AnnPhase::ForestInit,
-            host_bytes: ws.host_peak_bytes,
-            runtime_bytes: runtime[1],
+            host_bytes: owner_forest_host,
+            runtime_bytes: runtime[1].max(cpu_runtime[1]),
         },
         AnnPhaseBytes {
             phase: AnnPhase::Refinement,
-            host_bytes: 0,
-            runtime_bytes: runtime[2],
+            host_bytes: owner_refinement_host,
+            runtime_bytes: runtime[2].max(cpu_runtime[2]),
         },
         AnnPhaseBytes {
             phase: AnnPhase::Output,
             host_bytes: 0,
-            runtime_bytes: runtime[3],
+            runtime_bytes: runtime[3].max(cpu_runtime[3]),
         },
     ];
     let host_peak_bytes = phases.iter().map(|p| p.host_bytes).max().unwrap_or(0);
@@ -1035,7 +1304,7 @@ fn estimate_from_plan(
         runtime_peak_bytes,
         cpu_combined_peak_bytes,
         fixed_runtime_peak_bytes: *fixed.iter().max().unwrap(),
-        staging_bytes_per_slot: usize::try_from(tile_staging_bytes(1, 1)?)
+        staging_bytes_per_slot: usize::try_from(tile_staging_bytes(1, 1, AnnJoinRoute::Slots)?)
             .map_err(|_| overflow())?,
         min_runtime_bytes: add(
             *fixed.iter().max().unwrap(),
@@ -1045,6 +1314,7 @@ fn estimate_from_plan(
                     .max(ws.forest_pair_count)
                     .min(1 << 20),
                 1,
+                AnnJoinRoute::Slots,
             )?)
             .map_err(|_| overflow())?,
         )?,
@@ -1206,13 +1476,14 @@ pub fn approximate_neighbors_planned(
         tile_caps(&data.client, plan.n, &host)?,
         TileRequest::Exact(plan.tile_slots),
     )?;
-    let mut checked = plan_with_host(
+    let mut checked = plan_with_host_route(
         &data.client,
         plan.n,
         plan.features,
         plan.k,
         host,
         plan.tile_slots,
+        Some(plan.join_route),
     )?;
     checked.memory = plan.memory;
     if checked != *plan {
@@ -1226,6 +1497,82 @@ pub fn approximate_neighbors_planned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_route_table_and_estimate_cover_both_routes() {
+        assert_eq!(AnnJoinRoute::for_cpu(true), AnnJoinRoute::Owner);
+        assert_eq!(AnnJoinRoute::for_cpu(false), AnnJoinRoute::Slots);
+        for (n, features, k) in [(11, 2, 3), (4096, 8, 15)] {
+            let host = host_plan(n, features, k).unwrap();
+            let slots = default_tile_slots(n, &host.workspace).unwrap();
+            let table = |route| {
+                ann_buffer_table(
+                    n,
+                    features,
+                    k,
+                    host.width,
+                    host.workspace.max_candidates_per_class,
+                    &host.workspace,
+                    slots,
+                    route,
+                )
+                .unwrap()
+            };
+            let owner = table(AnnJoinRoute::Owner);
+            let slot = table(AnnJoinRoute::Slots);
+            assert!(!owner.iter().any(|e| e.route == BufferRoute::Slots));
+            assert!(
+                !slot
+                    .iter()
+                    .any(|e| e.route == BufferRoute::Owner || e.buffer == Buffer::OwnerProfile)
+            );
+            assert_eq!(owner.iter().filter(|e| e.staging).count(), 4);
+            assert_eq!(slot.iter().filter(|e| e.staging).count(), 6);
+            let chunks = n
+                .div_ceil(OWNER_CH)
+                .max(host.workspace.forest_leaf_count.div_ceil(OWNER_CH_LEAF));
+            assert_eq!(
+                owner
+                    .iter()
+                    .find(|e| e.buffer == Buffer::OwnerChunkOffsets)
+                    .unwrap()
+                    .elements(),
+                Some(chunks * (OWNER_D_MAX + 1))
+            );
+            assert_eq!(
+                tile_staging_bytes(slots, 1, AnnJoinRoute::Owner).unwrap(),
+                (slots * 32) as u64
+            );
+            assert_eq!(
+                tile_staging_bytes(slots, 1, AnnJoinRoute::Slots).unwrap(),
+                (slots * 32) as u64
+            );
+            let estimate = ann_host_estimate(n, features, k).unwrap();
+            for (index, phase) in estimate.phases.iter().enumerate() {
+                let bytes = [(&owner, true), (&slot, false)].map(|(entries, cpu)| {
+                    let bytes: usize = entries
+                        .iter()
+                        .filter(|e| {
+                            e.route != BufferRoute::Profile
+                                && (!cpu || e.route != BufferRoute::Cuda)
+                                && e.phases & (1 << index) != 0
+                        })
+                        .map(|e| e.bytes().unwrap())
+                        .sum();
+                    bytes
+                });
+                assert_eq!(phase.runtime_bytes, bytes[0].max(bytes[1]));
+            }
+            assert_eq!(
+                estimate.phases[1].host_bytes,
+                host.workspace.host_peak_bytes + (host.workspace.forest_leaf_count + 1) * 8
+            );
+            assert_eq!(estimate.phases[2].host_bytes, (n + 1) * 8);
+            assert_eq!(estimate.phases[0].host_bytes, 2 * n * features * 4);
+            assert_eq!(estimate.phases[3].host_bytes, 0);
+        }
+        assert!(staging_entries(usize::MAX, AnnJoinRoute::Owner).is_none());
+    }
 
     fn ample_budget() -> crate::memory::MemoryBudget {
         crate::memory::MemoryBudget {
@@ -1255,7 +1602,12 @@ mod tests {
         let cpu_fixed = fixed_memory(n, features, k, &host, caps.alignment, true)
             .unwrap()
             .0;
-        let staging = tile_staging_bytes(caps.max_slots.min(1 << 20), caps.alignment).unwrap();
+        let staging = tile_staging_bytes(
+            caps.max_slots.min(1 << 20),
+            caps.alignment,
+            AnnJoinRoute::Owner,
+        )
+        .unwrap();
         let runtime_min = runtime_fixed + staging;
         let cpu_min = cpu_fixed + staging;
         assert!(cpu_min > runtime_min);
@@ -1303,7 +1655,8 @@ mod tests {
         };
         let minimum = 1 << 20;
         let fixed_bytes = 123;
-        let minimum_bytes = tile_staging_bytes(minimum, caps.alignment).unwrap();
+        let minimum_bytes =
+            tile_staging_bytes(minimum, caps.alignment, AnnJoinRoute::Slots).unwrap();
         assert!(matches!(
             plan_tiles(
                 caps,
@@ -1326,7 +1679,7 @@ mod tests {
             minimum
         );
         let q = minimum + 129;
-        let bytes = tile_staging_bytes(q, caps.alignment).unwrap();
+        let bytes = tile_staging_bytes(q, caps.alignment, AnnJoinRoute::Slots).unwrap();
         assert!(
             plan_tiles(
                 caps,
@@ -1380,8 +1733,8 @@ mod tests {
         assert_eq!(plan_tiles(cuda, ample).unwrap(), BUDGET_TILE_CEILING_SLOTS);
 
         let q = (1 << 22) + 129;
-        let bytes = tile_staging_bytes(q, cuda.alignment).unwrap();
-        assert!(tile_staging_bytes(q + 1, cuda.alignment).unwrap() > bytes);
+        let bytes = tile_staging_bytes(q, cuda.alignment, AnnJoinRoute::Slots).unwrap();
+        assert!(tile_staging_bytes(q + 1, cuda.alignment, AnnJoinRoute::Slots).unwrap() > bytes);
         assert_eq!(
             plan_tiles(
                 cuda,
@@ -1433,7 +1786,9 @@ mod tests {
             plan_tiles(caps, TileRequest::Exact(1 << 24)).unwrap(),
             1 << 24
         );
-        let allocations = ann_allocation_bytes(40_000, 32, 14, &host, 1 << 24, false).unwrap();
+        let allocations =
+            ann_allocation_bytes(40_000, 32, 14, &host, 1 << 24, false, AnnJoinRoute::Slots)
+                .unwrap();
         let (_, endpoint_bytes) = allocations
             .iter()
             .find(|(name, _)| *name == "EndpointIds")
@@ -1513,7 +1868,10 @@ mod tests {
     #[test]
     fn membership_gate_is_exact_at_its_boundary() {
         // 8 trees x 268_435_455 = 2_147_483_640 <= i32::MAX; one more row exceeds it.
-        assert!(ann_host_estimate(268_435_455, 1, 1).is_ok());
+        let n = 268_435_455;
+        let params = nn_descent_params(n, 1).unwrap();
+        assert!(plan_workspace(n, candidate_width(n, 1), params, 1).is_ok());
+        assert!(ann_host_estimate(n, 1, 1).is_ok());
         let message = overflow_message(268_435_456, 1, 1);
         for part in [
             "forest membership",
@@ -1523,6 +1881,34 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part} missing: {message}");
         }
+    }
+
+    #[test]
+    fn owner_element_limit_does_not_restrict_device_free_estimate() {
+        let fits = |n| {
+            let host = host_plan(n, 1, 1).unwrap();
+            let slots = default_tile_slots(n, &host.workspace).unwrap();
+            check_buffer_elements(n, 1, 1, &host, slots, AnnJoinRoute::Owner).is_ok()
+        };
+        let (mut low, mut high) = (2usize, 268_435_455usize);
+        assert!(fits(low));
+        assert!(!fits(high));
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let host = host_plan(low + 1, 1, 1).unwrap();
+        let slots = default_tile_slots(low + 1, &host.workspace).unwrap();
+        let error =
+            check_buffer_elements(low + 1, 1, 1, &host, slots, AnnJoinRoute::Owner).unwrap_err();
+        assert!(format!("{error:?}").contains("OwnerChunkOffsets"));
+        assert!(ann_host_estimate(low, 1, 1).is_ok());
+        assert!(ann_host_estimate(low + 1, 1, 1).is_ok());
+        assert!(check_buffer_elements(low + 1, 1, 1, &host, slots, AnnJoinRoute::Slots).is_ok());
     }
 
     #[test]
@@ -1653,10 +2039,8 @@ mod tests {
         let [input, forest_init, refinement, output] = estimate.phases;
         // Original input plus the conservatively reserved contiguous copy: 2*11*2*4.
         assert_eq!(input.runtime_bytes, 176);
-        // The P1 forest pair prefix is 5*C(11, 2)=275 slots, larger than
-        // the 242 join slots. Six staging buffers therefore add 275*32 bytes.
-        assert_eq!(forest_init.runtime_bytes, 11_036);
-        assert_eq!(refinement.runtime_bytes, 12_448);
+        assert_eq!(forest_init.runtime_bytes, 11_600);
+        assert_eq!(refinement.runtime_bytes, 13_012);
         assert_eq!(output.runtime_bytes, 1_056);
         let host = host_plan(11, 2, 3).unwrap();
         let table = ann_buffer_table(
@@ -1667,16 +2051,10 @@ mod tests {
             host.workspace.max_candidates_per_class,
             &host.workspace,
             275,
+            AnnJoinRoute::Slots,
         )
         .unwrap();
-        for (phase, expected) in [(2, 10_420), (4, 11_832)] {
-            let cpu: usize = table
-                .iter()
-                .filter(|entry| entry.route == BufferRoute::Both && entry.phases & phase != 0)
-                .map(|entry| entry.bytes().unwrap())
-                .sum();
-            assert_eq!(cpu, expected);
-        }
+        assert_eq!(table.iter().filter(|entry| entry.staging).count(), 6);
         assert!(
             estimate.cpu_combined_peak_bytes
                 <= estimate
@@ -1724,7 +2102,8 @@ mod tests {
         // The forest pair prefix selects the 275-slot default tile. Each endpoint
         // buffer has 2*275 elements = 2200 bytes, the largest single allocation.
         let host = host_plan(11, 2, 3).unwrap();
-        let entries = ann_allocation_bytes(11, 2, 3, &host, 275, false).unwrap();
+        let entries =
+            ann_allocation_bytes(11, 2, 3, &host, 275, false, AnnJoinRoute::Slots).unwrap();
         let largest = entries.iter().map(|(_, bytes)| *bytes).max().unwrap();
         assert_eq!(largest, 2_200);
         assert!(
@@ -1752,6 +2131,7 @@ mod tests {
             host.workspace.max_candidates_per_class,
             &host.workspace,
             275,
+            AnnJoinRoute::Slots,
         )
         .unwrap();
         assert_eq!(table.len(), 39);
@@ -1775,6 +2155,17 @@ mod tests {
         }
         assert_eq!(table.iter().filter(|entry| entry.staging).count(), 6);
         let estimate = estimate_from_plan(11, 2, 3, &host).unwrap();
+        let owner_table = ann_buffer_table(
+            11,
+            2,
+            3,
+            host.width,
+            host.workspace.max_candidates_per_class,
+            &host.workspace,
+            275,
+            AnnJoinRoute::Owner,
+        )
+        .unwrap();
         for (index, phase) in estimate.phases.iter().enumerate() {
             let expected: usize = table
                 .iter()
@@ -1783,15 +2174,15 @@ mod tests {
                 })
                 .map(|entry| entry.bytes().unwrap())
                 .sum();
-            assert_eq!(phase.runtime_bytes, expected);
-            let cpu: usize = table
+            let cpu: usize = owner_table
                 .iter()
                 .filter(|entry| {
-                    entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                    !matches!(entry.route, BufferRoute::Cuda | BufferRoute::Profile)
+                        && entry.phases & (1 << index) != 0
                 })
                 .map(|entry| entry.bytes().unwrap())
                 .sum();
-            assert!(phase.runtime_bytes >= cpu);
+            assert_eq!(phase.runtime_bytes, expected.max(cpu));
         }
         assert_eq!(estimate.phases[0].runtime_bytes, 176);
         let cpu_peak = estimate
@@ -1800,10 +2191,11 @@ mod tests {
             .enumerate()
             .map(|(index, phase)| {
                 phase.host_bytes
-                    + table
+                    + owner_table
                         .iter()
                         .filter(|entry| {
-                            entry.route == BufferRoute::Both && entry.phases & (1 << index) != 0
+                            !matches!(entry.route, BufferRoute::Cuda | BufferRoute::Profile)
+                                && entry.phases & (1 << index) != 0
                         })
                         .map(|entry| entry.bytes().unwrap())
                         .sum::<usize>()

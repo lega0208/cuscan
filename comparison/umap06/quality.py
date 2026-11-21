@@ -447,8 +447,6 @@ def _evaluation_ids(n):
 
 def verify_cache(root: Path, name: str) -> list[str]:
     """Return cache integrity errors, including missing or untracked caches."""
-    if name == "mix_10m":
-        return []
     from . import datasets
 
     root = Path(root)
@@ -506,8 +504,6 @@ def build_cache(root: Path, name: str) -> Path:
     """Build fixture-keyed exact evaluation neighbors and the 50k precomputed graph."""
     from . import datasets
 
-    if name == "mix_10m":
-        raise ValueError("mix_10m is a fit-timing-only fixture and has no evaluation cache")
     root = Path(root)
     path = root / name / "eval.npz"
     sidecar = path.with_suffix(".npz.sha256")

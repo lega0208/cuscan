@@ -207,11 +207,13 @@ def write_input(path: Path, matrix: np.ndarray) -> dict[str, Any]:
 def fixture_inputs(
     out: Path, data_root: Path, fixtures: tuple[str, ...]
 ) -> dict[str, dict[str, Any]]:
-    """Materialize the five plan datasets as immutable, hashed f32le benchmark inputs."""
+    """Materialize the requested datasets as immutable, hashed f32le benchmark inputs."""
     inputs_dir = out / "inputs"
     generated: dict[str, dict[str, Any]] = {}
     if "S1" in fixtures:
         generated["S1"] = make_s1(inputs_dir / "S1.f32le")
+    if "S3" in fixtures:
+        generated["S3"] = make_s1(inputs_dir / "S3.f32le", features=50)
     umap06_names = [
         name for name, fixture in (("S2", "mix_200k"), ("R3", "digits")) if name in fixtures
     ]
@@ -240,6 +242,7 @@ def fixture_inputs(
     expected_shapes = {
         "S1": (250_000, 256),
         "S2": (200_000, 32),
+        "S3": (250_000, 50),
         "R1": (272_383, 128),
         "R2": (500_000, 256),
         "R3": (1_497, 64),
@@ -252,10 +255,10 @@ def fixture_inputs(
     return generated
 
 
-def make_s1(destination: Path) -> dict[str, Any]:
+def make_s1(destination: Path, *, features: int = 256) -> dict[str, Any]:
     """Match compare_stages.py's clustered generator (eight centers, seed 42)."""
     rng = np.random.default_rng(42)
-    rows, features = 250_000, 256
+    rows = 250_000
     centers = rng.normal(0.0, 1.0, size=(8, features)).astype(np.float32)
     labels = np.arange(rows) % 8
     rng.shuffle(labels)
@@ -470,13 +473,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixtures",
         nargs="+",
-        choices=("S1", "S2", "R1", "R2", "R3"),
+        choices=("S1", "S2", "S3", "R1", "R2", "R3"),
         default=["S1", "S2", "R1", "R2", "R3"],
     )
     parser.add_argument("--cap", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--squared", action="store_true")
     parser.add_argument("--timing-only", action="store_true", help="defer recall scoring")
+    parser.add_argument(
+        "--no-profile", action="store_true", help="reuse a separate profile receipt"
+    )
+    parser.add_argument("--k", type=int, help="override the non-self width for all selected inputs")
     return parser.parse_args()
 
 
@@ -540,7 +547,11 @@ def main() -> None:
                 require_source_chain="R2" in args.fixtures,
             ),
         }
-    k_by_fixture = {"S1": 29, "S2": 14, "R1": 29, "R2": 29, "R3": 29}
+    k_by_fixture = {"S1": 29, "S2": 14, "S3": 29, "R1": 29, "R2": 29, "R3": 29}
+    if args.k is not None:
+        if args.k <= 0:
+            raise ValueError("--k must be positive")
+        k_by_fixture = dict.fromkeys(k_by_fixture, args.k)
     manifest = {
         "schema": "cuscan-ann-rinnd-bench-v1",
         "source": {"arms": source_identities},
@@ -561,7 +572,7 @@ def main() -> None:
             "query_seed": QUERY_SEED,
             "timing_order": list(TIMING_ORDER),
             "timed_commands_per_arm": TIMING_ORDER.count("A"),
-            "profiled_runs_per_arm": 1,
+            "profiled_runs_per_arm": 0 if args.no_profile else 1,
             "recall_deferred": args.timing_only,
         },
         "receipts": [],
@@ -692,7 +703,7 @@ def main() -> None:
                     if not args.timing_only:
                         receipt["recall"] = exact_tie_aware_recall(matrix, prefix, k)
                     manifest["receipts"].append(receipt)
-                for arm, binary in arm_binaries.items():
+                for arm, binary in () if args.no_profile else arm_binaries.items():
                     stage = run_worker(
                         arm=arm,
                         binary=binary,
@@ -712,7 +723,7 @@ def main() -> None:
                     stage["protocol"] = "profiled_stage_only"
                     stage["stage_only"] = True
                     manifest["receipts"].append(stage)
-            if len(arm_binaries) == 1:
+            if len(arm_binaries) == 1 and not args.no_profile:
                 arm, binary = next(iter(arm_binaries.items()))
                 stage = run_worker(
                     arm=arm,

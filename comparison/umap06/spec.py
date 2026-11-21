@@ -29,7 +29,6 @@ FIXTURES = {
         Fixture("mix_50k", 50_000, 32, (512, 4_096), _SEEDS),
         Fixture("mix_200k", 200_000, 32, (512, 10_000), _SEEDS),
         Fixture("mix_1m", 1_000_000, 32, (512, 10_000), _SEEDS),
-        Fixture("mix_10m", 10_000_000, 32, (), _SEEDS),
     )
 }
 CONFIGS = {
@@ -73,8 +72,6 @@ def expected_runs(role: str, backend: str | None = None) -> list[dict]:
                 runs.append(run)
 
         for fixture in FIXTURES.values():
-            if fixture.name == "mix_10m":
-                continue
             configs = CONFIGS if role == "upstream" else ("classic_spectral", "classic_random")
             for config in configs:
                 if config == "classic_random" and fixture.name in ("mix_200k", "mix_1m"):

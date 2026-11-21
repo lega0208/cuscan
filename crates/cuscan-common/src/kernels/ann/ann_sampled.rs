@@ -9,6 +9,9 @@
 #[path = "ann_sampled_tests.rs"]
 mod injected_kernel_tests;
 
+#[path = "ann_owner.rs"]
+mod owner;
+
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,9 +20,9 @@ use super::ann_forest::{
     ForestLeaves, MAX_CANDIDATES, NnDescentParams, WorkspaceError, WorkspacePlan, build_forest,
 };
 use super::orchestration::{
-    AnnPlan, Buffer, BufferEntry, BufferRoute, REVERSE_NEW_BIT, ann_buffer_table,
-    ann_independent_launch, ann_output, ann_should_stop, reverse_count, reverse_scatter,
-    reverse_zero, workspace_error,
+    AnnJoinRoute, AnnPlan, Buffer, BufferEntry, BufferRoute, OWNER_CH, OWNER_CH_LEAF, OWNER_D_MAX,
+    REVERSE_NEW_BIT, ann_buffer_table, ann_independent_launch, ann_output, ann_should_stop,
+    reverse_count, reverse_scatter, reverse_zero, workspace_error,
 };
 use crate::error::AnnError;
 use burn::{
@@ -46,6 +49,7 @@ pub(super) struct ForestSeed {
     pub(super) rows: CubeTensor,
     pub(super) leaf_rows: CubeTensor,
     pub(super) pair_prefix: CubeTensor,
+    pub(super) host_pair_prefix: Option<Vec<i64>>,
     pub(super) pair_count: usize,
 }
 
@@ -180,6 +184,8 @@ pub(super) fn forest_seed(
         DType::I32,
         leaf_rows,
     );
+    let host_pair_prefix = (allocator.plan.join_route == super::orchestration::AnnJoinRoute::Owner)
+        .then(|| leaf_pair_prefix.clone());
     let pair_prefix_tensor = allocator.upload(
         Buffer::ForestPairPrefix,
         Shape::new([leaf_pair_prefix.len()]),
@@ -203,6 +209,7 @@ pub(super) fn forest_seed(
         rows: rows_tensor,
         leaf_rows: leaf_rows_tensor,
         pair_prefix: pair_prefix_tensor,
+        host_pair_prefix,
         pair_count: forest_pair_slots,
     })
 }
@@ -352,6 +359,10 @@ impl AnnAllocator {
             if entry.buffer != Buffer::Input
                 && entry.buffer != Buffer::InputCopy
                 && (entry.route == BufferRoute::Both
+                    || (entry.route == BufferRoute::Owner
+                        && self.plan.join_route == AnnJoinRoute::Owner)
+                    || (entry.route == BufferRoute::Slots
+                        && self.plan.join_route == AnnJoinRoute::Slots)
                     || (entry.route == BufferRoute::Cuda && !self.plan.merge_geometry().0))
                 && entry.phases & phase != 0
             {
@@ -438,6 +449,7 @@ fn launch_endpoint_merge(
         dtype_to_storage_type(DType::F32),
         dtype_to_storage_type(DType::I32),
     ];
+    #[cfg(any(test, feature = "test-support"))]
     if cpu {
         endpoint_merge_cpu::launch(
             client,
@@ -453,7 +465,10 @@ fn launch_endpoint_merge(
             width,
             dtypes,
         );
-    } else {
+        return;
+    }
+    assert!(!cpu, "production CPU ANN uses owner merge");
+    {
         let (workspace_ids, workspace_distances) =
             workspace.as_ref().expect("CUDA merge workspace");
         endpoint_merge_cuda::launch(
@@ -521,8 +536,33 @@ pub(super) fn approximate_neighbors(
         "ANN sample capacity exceeds MAX_CANDIDATES"
     );
     let workspace = plan.host.workspace;
-    let table = ann_buffer_table(n, features, k, width, capacity, &workspace, plan.tile_slots)
-        .ok_or_else(|| AnnError::Overflow("ANN allocation table overflow".into()))?;
+    let table = ann_buffer_table(
+        n,
+        features,
+        k,
+        width,
+        capacity,
+        &workspace,
+        plan.tile_slots,
+        plan.join_route,
+    )
+    .ok_or_else(|| AnnError::Overflow("ANN allocation table overflow".into()))?;
+    #[cfg(test)]
+    let table = {
+        let mut table = table;
+        if let Some((ch, _, _)) = plan.owner_test_geometry {
+            let entry = table
+                .iter_mut()
+                .find(|entry| entry.buffer == Buffer::OwnerChunkOffsets)
+                .expect("owner offset allocation");
+            entry.shape = vec![
+                n.div_ceil(ch)
+                    .max(workspace.forest_leaf_count.div_ceil(OWNER_CH_LEAF)),
+                OWNER_D_MAX + 1,
+            ];
+        }
+        table
+    };
     let mut allocator = AnnAllocator {
         table,
         allocated: Vec::new(),
@@ -565,6 +605,7 @@ pub(super) fn approximate_neighbors(
         rows: forest_rows,
         leaf_rows: forest_leaf_rows,
         pair_prefix: forest_pair_prefix,
+        host_pair_prefix,
         pair_count: forest_pairs,
     } = forest_seed(
         &data,
@@ -580,31 +621,49 @@ pub(super) fn approximate_neighbors(
     .map_err(|error| workspace_error("RP forest initialization", error))?;
     let vector_width = resolve_vector_width(&data, n, features, plan.vector_widths);
     let vector_size = vector_width as VectorSize;
-    let pair_left = allocator.empty(Buffer::PairLeft, Shape::new([pair_elements]), DType::I32);
-    let pair_right = allocator.empty(Buffer::PairRight, Shape::new([pair_elements]), DType::I32);
-    let pair_distances = allocator.empty(
-        Buffer::PairDistances,
-        Shape::new([pair_elements]),
-        DType::F32,
-    );
-    let pair_valid = allocator.empty(Buffer::PairValid, Shape::new([pair_elements]), DType::I32);
     let row_worst_ids = allocator.empty(Buffer::RowWorstIds, Shape::new([n]), DType::I32);
     let row_worst_distances =
         allocator.empty(Buffer::RowWorstDistances, Shape::new([n]), DType::F32);
-    let endpoint_counts = allocator.empty(Buffer::EndpointCounts, Shape::new([n]), DType::I32);
-    let endpoint_offsets =
-        allocator.empty(Buffer::EndpointOffsets, Shape::new([n + 1]), DType::I32);
-    let endpoint_cursors = allocator.empty(Buffer::EndpointCursors, Shape::new([n]), DType::I32);
-    let endpoint_ids = allocator.empty(
-        Buffer::EndpointIds,
-        Shape::new([endpoint_elements]),
-        DType::I32,
-    );
-    let endpoint_distances = allocator.empty(
-        Buffer::EndpointDistances,
-        Shape::new([endpoint_elements]),
-        DType::F32,
-    );
+    let owner_enabled = plan.join_route == AnnJoinRoute::Owner;
+    let slot_buffers = (!owner_enabled).then(|| {
+        let pair_left = allocator.empty(Buffer::PairLeft, Shape::new([pair_elements]), DType::I32);
+        let pair_right =
+            allocator.empty(Buffer::PairRight, Shape::new([pair_elements]), DType::I32);
+        let pair_distances = allocator.empty(
+            Buffer::PairDistances,
+            Shape::new([pair_elements]),
+            DType::F32,
+        );
+        let pair_valid =
+            allocator.empty(Buffer::PairValid, Shape::new([pair_elements]), DType::I32);
+        let endpoint_counts = allocator.empty(Buffer::EndpointCounts, Shape::new([n]), DType::I32);
+        let endpoint_offsets =
+            allocator.empty(Buffer::EndpointOffsets, Shape::new([n + 1]), DType::I32);
+        let endpoint_cursors =
+            allocator.empty(Buffer::EndpointCursors, Shape::new([n]), DType::I32);
+        let endpoint_ids = allocator.empty(
+            Buffer::EndpointIds,
+            Shape::new([endpoint_elements]),
+            DType::I32,
+        );
+        let endpoint_distances = allocator.empty(
+            Buffer::EndpointDistances,
+            Shape::new([endpoint_elements]),
+            DType::F32,
+        );
+        (
+            pair_left,
+            pair_right,
+            pair_distances,
+            pair_valid,
+            endpoint_counts,
+            endpoint_offsets,
+            endpoint_cursors,
+            endpoint_ids,
+            endpoint_distances,
+        )
+    });
+    let owner_buffers = owner_enabled.then(|| OwnerBuffers::new(&mut allocator));
     let merge_workspace = if plan.merge_geometry().0 {
         None
     } else {
@@ -669,7 +728,40 @@ pub(super) fn approximate_neighbors(
     allocator.check(2)?;
     // The heap holds the initial `(n, +inf)` rows: every row starts not full.
     refresh_row_worst(&candidates);
+    if let Some(buffers) = &owner_buffers {
+        let prefix = host_pair_prefix.as_ref().expect("owner forest prefix");
+        run_owner_stage(
+            &data,
+            buffers,
+            &forest_rows,
+            &forest_leaf_rows,
+            &forest_pair_prefix,
+            |i| prefix[i],
+            prefix.len() - 1,
+            &candidates,
+            &distances,
+            &row_worst_ids,
+            &row_worst_distances,
+            capacity,
+            pair_slots,
+            None,
+            profile,
+            &plan,
+        );
+        forest_offset = forest_pairs;
+    }
     while forest_offset < forest_pairs {
+        let (
+            pair_left,
+            pair_right,
+            pair_distances,
+            pair_valid,
+            endpoint_counts,
+            endpoint_offsets,
+            endpoint_cursors,
+            endpoint_ids,
+            endpoint_distances,
+        ) = slot_buffers.as_ref().expect("slot forest buffers");
         let slots = (forest_pairs - forest_offset).min(pair_slots);
         let slots_u32 = u32::try_from(slots).expect("ANN forest tile exceeds CubeCL range");
         let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
@@ -704,10 +796,10 @@ pub(super) fn approximate_neighbors(
             let (produced, predicted) = profile_tile_survival(
                 &client,
                 counts,
-                &pair_left,
-                &pair_right,
-                &pair_distances,
-                &pair_valid,
+                pair_left,
+                pair_right,
+                pair_distances,
+                pair_valid,
                 &candidates,
                 &distances,
                 n_u32,
@@ -735,16 +827,10 @@ pub(super) fn approximate_neighbors(
             slots_u32,
             dtype_to_storage_type(DType::I32),
         );
-        prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+        prefix_i32(endpoint_counts, endpoint_offsets, endpoint_cursors)?;
         if let Some(counts) = &profile_counts {
-            let (produced, kept) = profile_tile_records(
-                &client,
-                counts,
-                &pair_valid,
-                &endpoint_offsets,
-                n,
-                slots_u32,
-            )?;
+            let (produced, kept) =
+                profile_tile_records(&client, counts, pair_valid, endpoint_offsets, n, slots_u32)?;
             forest_records.0 += produced;
             forest_records.1 += kept;
         }
@@ -768,9 +854,9 @@ pub(super) fn approximate_neighbors(
         launch_endpoint_merge(
             &client,
             &plan,
-            &endpoint_offsets,
-            &endpoint_ids,
-            &endpoint_distances,
+            endpoint_offsets,
+            endpoint_ids,
+            endpoint_distances,
             &candidates,
             &distances,
             &row_worst_ids,
@@ -796,6 +882,7 @@ pub(super) fn approximate_neighbors(
     drop(forest_rows);
     drop(forest_leaf_rows);
     drop(forest_pair_prefix);
+    drop(host_pair_prefix);
     allocator.release_except(4);
     random_fill_kernel::launch(
         &client,
@@ -966,7 +1053,40 @@ pub(super) fn approximate_neighbors(
                 dtype_to_storage_type(DType::I32),
             );
         }
+        if let Some(buffers) = &owner_buffers {
+            let bytes = client.read_one_unchecked(center_offsets.handle.clone());
+            run_owner_stage(
+                &data,
+                buffers,
+                &sampled_ids,
+                &pool_sizes,
+                &center_offsets,
+                |i| i64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()),
+                n,
+                &working_ids,
+                &distances,
+                &row_worst_ids,
+                &row_worst_distances,
+                capacity,
+                pair_slots,
+                Some(iteration),
+                profile,
+                &plan,
+            );
+            slot_offset = total_slots;
+        }
         while slot_offset < total_slots {
+            let (
+                pair_left,
+                pair_right,
+                pair_distances,
+                pair_valid,
+                endpoint_counts,
+                endpoint_offsets,
+                endpoint_cursors,
+                endpoint_ids,
+                endpoint_distances,
+            ) = slot_buffers.as_ref().expect("slot join buffers");
             let slots = (total_slots - slot_offset).min(pair_slots);
             let slots_u32 = u32::try_from(slots).expect("ANN pair tile exceeds CubeCL range");
             let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
@@ -1002,10 +1122,10 @@ pub(super) fn approximate_neighbors(
                 let (produced, predicted) = profile_tile_survival(
                     &client,
                     counts,
-                    &pair_left,
-                    &pair_right,
-                    &pair_distances,
-                    &pair_valid,
+                    pair_left,
+                    pair_right,
+                    pair_distances,
+                    pair_valid,
                     &working_ids,
                     &distances,
                     n_u32,
@@ -1033,13 +1153,13 @@ pub(super) fn approximate_neighbors(
                 slots_u32,
                 dtype_to_storage_type(DType::I32),
             );
-            prefix_i32(&endpoint_counts, &endpoint_offsets, &endpoint_cursors)?;
+            prefix_i32(endpoint_counts, endpoint_offsets, endpoint_cursors)?;
             if let Some(counts) = &profile_counts {
                 let (produced, kept) = profile_tile_records(
                     &client,
                     counts,
-                    &pair_valid,
-                    &endpoint_offsets,
+                    pair_valid,
+                    endpoint_offsets,
                     n,
                     slots_u32,
                 )?;
@@ -1066,9 +1186,9 @@ pub(super) fn approximate_neighbors(
             launch_endpoint_merge(
                 &client,
                 &plan,
-                &endpoint_offsets,
-                &endpoint_ids,
-                &endpoint_distances,
+                endpoint_offsets,
+                endpoint_ids,
+                endpoint_distances,
                 &working_ids,
                 &distances,
                 &row_worst_ids,
@@ -1078,7 +1198,7 @@ pub(super) fn approximate_neighbors(
             );
             slot_offset += slots;
         }
-        if profile {
+        if profile && !owner_enabled {
             let _ = client.read_one_unchecked(if total_slots > 0 {
                 working_ids.handle.clone()
             } else {
@@ -1144,18 +1264,11 @@ pub(super) fn approximate_neighbors(
             "ANN_PROFILE stop reason={stop_reason} iterations={iterations_run} max_iterations={max_iterations} final_new_count={last_new_count:?} capacity={capacity} width={width}"
         );
     }
-    drop(pair_left);
-    drop(pair_right);
-    drop(pair_distances);
-    drop(pair_valid);
+    drop(slot_buffers);
+    drop(owner_buffers);
     drop(row_worst_ids);
     drop(row_worst_distances);
     drop(profile_counts);
-    drop(endpoint_counts);
-    drop(endpoint_offsets);
-    drop(endpoint_cursors);
-    drop(endpoint_ids);
-    drop(endpoint_distances);
     drop(merge_workspace);
     drop(reverse_counts);
     drop(reverse_offsets);
@@ -1199,6 +1312,227 @@ pub(super) fn approximate_neighbors(
     Ok((output_indices, output_distances))
 }
 
+struct OwnerBuffers {
+    record_rows: CubeTensor,
+    record_ids: CubeTensor,
+    record_distances: CubeTensor,
+    record_order: CubeTensor,
+    chunk_offsets: CubeTensor,
+    profile_counts: CubeTensor,
+}
+
+impl OwnerBuffers {
+    fn new(allocator: &mut AnnAllocator) -> Self {
+        let mut allocate = |key| {
+            let entry = allocator
+                .table
+                .iter()
+                .find(|entry| entry.buffer == key)
+                .expect("planned owner buffer");
+            allocator.empty(key, Shape::from(entry.shape.as_slice()), entry.dtype)
+        };
+        Self {
+            record_rows: allocate(Buffer::OwnerRecordRows),
+            record_ids: allocate(Buffer::OwnerRecordIds),
+            record_distances: allocate(Buffer::OwnerRecordDistances),
+            record_order: allocate(Buffer::OwnerRecordOrder),
+            chunk_offsets: allocate(Buffer::OwnerChunkOffsets),
+            profile_counts: allocate(Buffer::OwnerProfile),
+        }
+    }
+}
+
+#[cube(launch)]
+fn owner_profile_zero(counts: &mut Tensor<u64>) {
+    counts[0] = 0;
+    counts[1] = 0;
+}
+
+fn owner_launch(items: u32, cores: u32, max_x: u32, max_units: u32) -> (CubeCount, CubeDim) {
+    let units = cores.min(max_x).min(max_units);
+    assert!(units > 0);
+    (
+        CubeCount::new_1d(items.div_ceil(units)),
+        CubeDim::new_1d(units),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_REFINEMENT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_owner_stage(
+    data: &CubeTensor,
+    buffers: &OwnerBuffers,
+    sampled_ids: &CubeTensor,
+    pool_sizes: &CubeTensor,
+    center_offsets: &CubeTensor,
+    offset: impl Fn(usize) -> i64,
+    items: usize,
+    working_ids: &CubeTensor,
+    distances: &CubeTensor,
+    row_worst_ids: &CubeTensor,
+    row_worst_distances: &CubeTensor,
+    capacity: usize,
+    block_slots: usize,
+    iteration: Option<u32>,
+    profile: bool,
+    _plan: &AnnPlan,
+) {
+    let client = &data.client;
+    let [n, features] = data.shape().dims::<2>();
+    let n_u32 = n as u32;
+    let cap_u32 = capacity as u32;
+    let features_u32 = features as u32;
+    let width_u32 = working_ids.shape()[1] as u32;
+    let total_slots = offset(items);
+    let forest = iteration.is_none();
+    let owner_ch = if forest { OWNER_CH_LEAF } else { OWNER_CH };
+    let owner_width = resolve_vector_width(data, n, features, &[8, 4]);
+    #[cfg(test)]
+    let (owner_ch, owner_width) = if let Some((ch, _, width)) = _plan.owner_test_geometry {
+        let resolved = resolve_vector_width(data, n, features, &[width]);
+        assert_eq!(resolved, width, "requested owner width is not admitted");
+        (if forest { OWNER_CH_LEAF } else { ch }, resolved)
+    } else {
+        (owner_ch, owner_width)
+    };
+    let OwnerBuffers {
+        record_rows,
+        record_ids: endpoint_ids,
+        record_distances: endpoint_distances,
+        record_order,
+        chunk_offsets,
+        profile_counts,
+    } = buffers;
+    let (stage, label) = match iteration {
+        Some(i) => (format!("iteration={i}"), ""),
+        None => (String::new(), "forest_"),
+    };
+    if profile {
+        owner_profile_zero::launch(
+            client,
+            CubeCount::new_1d(1),
+            CubeDim::new_1d(1),
+            profile_counts.clone().into_tensor_arg(),
+        );
+    }
+    let hw = &client.properties().hardware;
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+    let launch = |items| owner_launch(items, cores, hw.max_cube_dim.0, hw.max_units_per_cube);
+    let (_, dim) = launch(1);
+    let partitions = dim.x.min(OWNER_D_MAX as u32).min(n_u32);
+    #[cfg(test)]
+    let partitions = _plan
+        .owner_test_geometry
+        .map_or(partitions, |(_, requested, _)| requested);
+    let geometry = |items| launch(items).0;
+    let dtypes = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+    ];
+    let sync = || cubecl::future::block_on(client.sync()).expect("owner profile sync");
+    if profile {
+        sync();
+    }
+    let mut c0 = 0;
+    let mut blocks = 0;
+    let mut generate = std::time::Duration::ZERO;
+    let mut apply = std::time::Duration::ZERO;
+    while offset(c0) < total_slots {
+        let mut lo = c0;
+        let mut hi = items + 1;
+        let limit = offset(c0) + block_slots as i64;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if offset(mid) <= limit {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let c1 = lo;
+        assert!(c1 > c0);
+        let chunks = (c1 - c0).div_ceil(owner_ch) as u32;
+        let start = profile.then(std::time::Instant::now);
+        owner::owner_join_generate::launch(
+            client,
+            geometry(chunks),
+            dim,
+            owner_width as VectorSize,
+            ann_data_arg(data, n, features, owner_width),
+            sampled_ids.clone().into_tensor_arg(),
+            pool_sizes.clone().into_tensor_arg(),
+            center_offsets.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
+            record_rows.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            record_order.clone().into_tensor_arg(),
+            chunk_offsets.clone().into_tensor_arg(),
+            profile_counts.clone().into_tensor_arg(),
+            n_u32,
+            cap_u32,
+            features_u32,
+            c0 as u32,
+            c1 as u32,
+            partitions,
+            owner_ch,
+            owner_width,
+            forest,
+            profile,
+            [dtypes[0], dtypes[1], dtype_to_storage_type(DType::I64)],
+        );
+        if let Some(start) = start {
+            sync();
+            generate += start.elapsed();
+        }
+        let start = profile.then(std::time::Instant::now);
+        owner::owner_join_apply::launch(
+            client,
+            geometry(partitions),
+            dim,
+            record_rows.clone().into_tensor_arg(),
+            endpoint_ids.clone().into_tensor_arg(),
+            endpoint_distances.clone().into_tensor_arg(),
+            record_order.clone().into_tensor_arg(),
+            chunk_offsets.clone().into_tensor_arg(),
+            working_ids.clone().into_tensor_arg(),
+            distances.clone().into_tensor_arg(),
+            row_worst_ids.clone().into_tensor_arg(),
+            row_worst_distances.clone().into_tensor_arg(),
+            n_u32,
+            width_u32,
+            chunks,
+            partitions,
+            dtypes,
+        );
+        if let Some(start) = start {
+            sync();
+            apply += start.elapsed();
+        }
+        c0 = c1;
+        blocks += 1;
+    }
+    #[cfg(test)]
+    if iteration.is_some() {
+        TEST_REFINEMENT_BLOCKS.with(|count| count.set(count.get().max(blocks)));
+    }
+    if profile {
+        let bytes = client.read_one_unchecked(profile_counts.handle.clone());
+        let produced = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        let kept = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+        eprintln!(
+            "ANN_PROFILE {stage} {label}generate_ms={:.3} {label}apply_ms={:.3} blocks={blocks} slots={total_slots} produced_records={produced} kept_records={kept}",
+            generate.as_secs_f64() * 1000.0,
+            apply.as_secs_f64() * 1000.0
+        );
+    }
+}
+
 fn resolve_vector_width(data: &CubeTensor, n: usize, features: usize, policy: &[usize]) -> usize {
     if data.dtype != DType::F32 {
         return 1;
@@ -1228,7 +1562,11 @@ fn resolve_vector_width(data: &CubeTensor, n: usize, features: usize, policy: &[
         .find(|&width| {
             let alignment = 4 * width;
             data.meta.strides == [features, 1].into()
-                && data.handle.offset_start.unwrap_or(0) % alignment as u64 == 0
+                && data
+                    .handle
+                    .offset_start
+                    .unwrap_or(0)
+                    .is_multiple_of(alignment as u64)
         })
         .unwrap_or(1)
 }
@@ -1465,8 +1803,8 @@ fn sampled_insert<I: Int>(
 }
 
 #[cube(launch)]
-pub(super) fn random_fill_kernel<F: Float, I: Int, N: Size>(
-    data: &Tensor<Vector<F, N>>,
+pub(super) fn random_fill_kernel<F: Float, I: Int, Lanes: Size>(
+    data: &Tensor<Vector<F, Lanes>>,
     ids: &mut Tensor<I>,
     distances: &mut Tensor<F>,
     flags: &mut Tensor<I>,
@@ -1502,8 +1840,13 @@ pub(super) fn random_fill_kernel<F: Float, I: Int, N: Size>(
                 }
             }
             if !duplicate {
-                let squared =
-                    squared_l2_r8::<F, N>(data, row, candidate, features as usize, vector_width);
+                let squared = squared_l2_r8::<F, Lanes>(
+                    data,
+                    row,
+                    candidate,
+                    features as usize,
+                    vector_width,
+                );
                 // +inf is a real overflowed squared distance; NaN and negatives are rejected.
                 let distance_valid = squared >= F::new(0.0f32);
                 if distance_valid {
@@ -1544,6 +1887,8 @@ pub(super) fn random_fill_kernel<F: Float, I: Int, N: Size>(
 /// Build bounded priority-sampled new and old pools from frozen forward and
 /// reverse adjacency. New-class membership takes precedence across both
 /// directions; reverse CSR order does not influence the retained sample.
+/// When the new pool is empty, the old pool remains sentinel-filled because
+/// the centre cannot produce any join pairs.
 ///
 /// `reverse_sources` entries carry the source id with [`REVERSE_NEW_BIT`] set when
 /// the source's edge to this row is new (a source row holds each valid target at
@@ -1640,6 +1985,10 @@ pub(super) fn sampled_pool_kernel<I: Int>(
                     );
                 }
             }
+        }
+        // An inactive centre has no join pairs; the old region is already sentinel-filled.
+        if new_len == 0 {
+            terminate!();
         }
         // Old forward edges, excluding any id that occurs in the new class.
         for slot in 0..width {
@@ -1811,8 +2160,8 @@ pub(super) fn endpoint_mask_probe<F: Float, I: Int>(
 /// tables have `leaves + 1` entries. `slot_offset` is the 64-bit tile start.
 /// `local_pair` narrows to u32 after subtraction: it is below the leaf's pair count,
 /// which `forest_totals` bounds by `i32::MAX`.
-pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
-    data: &Tensor<Vector<F, N>>,
+pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int, Lanes: Size>(
+    data: &Tensor<Vector<F, Lanes>>,
     forest_rows: &Tensor<I>,
     leaf_rows: &Tensor<I>,
     pair_prefix: &Tensor<P>,
@@ -1857,7 +2206,8 @@ pub(super) fn forest_pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
             let right_slot = left_slot + 1 + local_pair;
             let left = u32::cast_from(forest_rows[start + left_slot]) as usize;
             let right = u32::cast_from(forest_rows[start + right_slot]) as usize;
-            let squared = squared_l2_r8::<F, N>(data, left, right, features as usize, vector_width);
+            let squared =
+                squared_l2_r8::<F, Lanes>(data, left, right, features as usize, vector_width);
             let mask = endpoint_mask::<F, I>(
                 left,
                 right,
@@ -1990,8 +2340,8 @@ pub(super) fn chunk_scatter_kernel<I: Int>(
 /// `slot_offset` the 64-bit tile start. `local` narrows to u32 after subtraction:
 /// it is below `pair_counts[center] <= C(C-1)/2 + C^2` (5370 at C=60).
 #[cube(launch)]
-pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
-    data: &Tensor<Vector<F, N>>,
+pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int, Lanes: Size>(
+    data: &Tensor<Vector<F, Lanes>>,
     sampled_ids: &Tensor<I>,
     pool_sizes: &Tensor<I>,
     center_offsets: &Tensor<P>,
@@ -2061,7 +2411,7 @@ pub(super) fn pair_slots_kernel<F: Float, I: Int, P: Int, N: Size>(
         pair_left[slot] = left;
         pair_right[slot] = right;
         let squared = if valid {
-            squared_l2_r8::<F, N>(data, left_id, right_id, features, vector_width)
+            squared_l2_r8::<F, Lanes>(data, left_id, right_id, features, vector_width)
         } else {
             F::new(0.0f32)
         };
@@ -2160,6 +2510,7 @@ fn survival_probe<F: Float, I: Int>(
 }
 
 #[cfg(feature = "test-support")]
+#[allow(clippy::too_many_arguments)]
 fn profile_tile_survival(
     client: &cubecl::client::Client,
     counts: &CubeTensor,
@@ -2547,7 +2898,37 @@ fn cooperative_endpoint_insert<F: Float, I: Int>(
     }
 }
 
+#[cube]
+fn cpu_row_apply<F: Float, I: Int>(
+    row: usize,
+    n: usize,
+    width: usize,
+    id: I,
+    distance: F,
+    output_ids: &mut Tensor<I>,
+    output_distances: &mut Tensor<F>,
+    worst_id: I,
+    worst_distance: F,
+) -> (I, F) {
+    let id_value = u32::cast_from(id) as usize;
+    let worst_index = u32::cast_from(worst_id) as usize;
+    let improves = worst_index >= n
+        || distance < worst_distance
+        || (distance == worst_distance && id_value < worst_index);
+    let mut result_id = worst_id;
+    let mut result_distance = worst_distance;
+    if improves && id_value < n && id_value != row && distance >= F::new(0.0f32) {
+        let base = row * width;
+        serial_endpoint_insert::<F, I>(n, width, id, distance, output_ids, output_distances, base);
+        let last = base + width - 1;
+        result_id = output_ids[last];
+        result_distance = output_distances[last];
+    }
+    (result_id, result_distance)
+}
+
 /// CPU owns each row and updates its heap directly.
+#[cfg(any(test, feature = "test-support"))]
 #[cube(launch)]
 pub(super) fn endpoint_merge_cpu<F: Float, I: Int>(
     endpoint_offsets: &Tensor<I>,
@@ -2575,25 +2956,19 @@ pub(super) fn endpoint_merge_cpu<F: Float, I: Int>(
         for position in start..end {
             let id = endpoint_ids[position];
             let distance = endpoint_distances[position];
-            let id_value = u32::cast_from(id) as usize;
-            let worst_index = u32::cast_from(worst_id) as usize;
-            // A full heap cannot change for a record not better than its worst entry.
-            let improves = worst_index >= n
-                || distance < worst_distance
-                || (distance == worst_distance && id_value < worst_index);
-            if improves && id_value < n && id_value != row && distance >= F::new(0.0f32) {
-                serial_endpoint_insert::<F, I>(
-                    n,
-                    width,
-                    id,
-                    distance,
-                    output_ids,
-                    output_distances,
-                    base,
-                );
-                worst_id = output_ids[last];
-                worst_distance = output_distances[last];
-            }
+            let (next_id, next_distance) = cpu_row_apply::<F, I>(
+                row,
+                n,
+                width,
+                id,
+                distance,
+                output_ids,
+                output_distances,
+                worst_id,
+                worst_distance,
+            );
+            worst_id = next_id;
+            worst_distance = next_distance;
         }
         if start < end {
             row_worst_ids[row] = worst_id;
@@ -2841,15 +3216,18 @@ pub(super) fn sample_pools(
             old.push((priority, id));
         }
     }
-    let trim = |values: &mut Vec<(u64, usize)>| {
+    let trim = |values: &mut Vec<(u64, usize)>| -> Vec<usize> {
         values.sort_unstable();
         values.truncate(capacity);
         values.iter().map(|&(_, id)| id).collect()
     };
-    SampledPools {
-        new: trim(&mut new),
-        old: trim(&mut old),
-    }
+    let new = trim(&mut new);
+    let old = if new.is_empty() {
+        Vec::new()
+    } else {
+        trim(&mut old)
+    };
+    SampledPools { new, old }
 }
 
 /// Enumerate local-join pair slots: new×new with `i<j`, then new×old.

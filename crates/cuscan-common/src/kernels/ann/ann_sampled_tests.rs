@@ -49,6 +49,7 @@ fn lifetime_allocator() -> AnnAllocator {
         plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         plan.tile_slots,
+        plan.join_route,
     )
     .unwrap();
     AnnAllocator {
@@ -186,13 +187,14 @@ fn cpu_combined_budget_rejects_before_forest_readback() {
         plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         slots,
+        plan.join_route,
     )
     .unwrap();
     let mut fixed = [0u64; 4];
     let mut staging = 0u64;
     for entry in table
         .iter()
-        .filter(|entry| entry.route == BufferRoute::Both)
+        .filter(|entry| matches!(entry.route, BufferRoute::Both | BufferRoute::Owner))
     {
         let bytes = (entry.bytes().unwrap().div_ceil(alignment) * alignment) as u64;
         if entry.staging {
@@ -206,7 +208,9 @@ fn cpu_combined_budget_rejects_before_forest_readback() {
         }
     }
     let runtime_min = *fixed.iter().max().unwrap() + staging;
-    fixed[1] += plan.host.workspace.host_peak_bytes as u64;
+    fixed[1] += plan.host.workspace.host_peak_bytes as u64
+        + (plan.host.workspace.forest_leaf_count as u64 + 1) * 8;
+    fixed[2] += (n as u64 + 1) * 8;
     let cpu_min = *fixed.iter().max().unwrap() + staging;
     assert!(cpu_min > runtime_min);
     let usable = runtime_min + (cpu_min - runtime_min) / 2;
@@ -242,6 +246,39 @@ fn cpu_combined_budget_rejects_before_forest_readback() {
         other => panic!("expected combined CPU memory rejection, got {other:?}"),
     }
     ALLOCATION_LOG.with(|log| assert!(log.borrow().is_empty()));
+}
+
+#[cube(launch)]
+fn owner_schedule_probe(out: &mut Tensor<i32>, items: u32) {
+    let item = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    if item < items {
+        out[item as usize] = UNIT_POS_X as i32;
+    }
+}
+
+#[test]
+fn owner_launch_interleaves_items_across_units() {
+    let device = CubeDevice::cpu().unwrap();
+    let client = device.client();
+    let hw = &client.properties().hardware;
+    let (_, dim) = owner_launch(1, 7, hw.max_cube_dim.0, hw.max_units_per_cube);
+    let units = dim.x;
+    for items in [
+        1,
+        units.saturating_sub(1).max(1),
+        units,
+        units + 1,
+        3 * units + 1,
+    ] {
+        let (count, dim) = owner_launch(items, 7, hw.max_cube_dim.0, hw.max_units_per_cube);
+        assert!(matches!(count, CubeCount::Static(x, 1, 1) if x == items.div_ceil(units)));
+        let output = i32_tensor(&device, &[items as usize], vec![-1; items as usize]);
+        owner_schedule_probe::launch(&client, count, dim, output.clone().into_tensor_arg(), items);
+        assert_eq!(
+            read_i32(&output),
+            (0..items).map(|i| (i % units) as i32).collect::<Vec<_>>()
+        );
+    }
 }
 
 fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
@@ -298,6 +335,7 @@ fn driver_allocation_fixture(device: CubeDevice, pitched: bool) {
         plan.host.workspace.max_candidates_per_class,
         &plan.host.workspace,
         plan.tile_slots,
+        plan.join_route,
     )
     .unwrap();
     let mut outputs = Vec::new();
@@ -1167,6 +1205,7 @@ fn tiled_and_zero_slot_iteration_fixture(device: CubeDevice) {
         let plan = super::super::orchestration::ann_preflight(&dispatch, n, 1, k, &budget).unwrap();
         let mut tiled = plan;
         tiled.tile_slots = 1;
+        tiled.join_route = AnnJoinRoute::Slots;
         let (expected_ids, expected_distances) = approximate_neighbors(
             f32_tensor(&device, &[n, 1], values.clone()),
             k,
@@ -1212,6 +1251,132 @@ fn tiled_and_zero_slot_iteration_fixture(device: CubeDevice) {
                     .iter()
                     .map(|x| x.to_bits())
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn many_leaf_full_ann_owner_matches_slots() {
+    let device = CubeDevice::Cpu(Default::default());
+    let dispatch = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device.clone()));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let n = 1000usize;
+    let k = 3usize;
+    let values: Vec<f32> = (0..n).map(|i| ((i * 37) % n) as f32).collect();
+    let plan = super::super::orchestration::ann_preflight(&dispatch, n, 1, k, &budget).unwrap();
+    assert!(plan.host.workspace.forest_leaf_count > n.div_ceil(OWNER_CH));
+    assert!(plan.host.workspace.forest_pair_count <= plan.tile_slots);
+    let mut slots = plan;
+    slots.join_route = AnnJoinRoute::Slots;
+    let run = |plan| {
+        let (ids, distances) = approximate_neighbors(
+            f32_tensor(&device, &[n, 1], values.clone()),
+            k,
+            42,
+            2,
+            true,
+            plan,
+        )
+        .unwrap();
+        (
+            read_i32(&ids),
+            read_f32(&distances)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(run(plan), run(slots));
+}
+
+#[test]
+fn full_ann_owner_execution_parameter_invariance() {
+    use super::super::orchestration::owner_test_plan;
+
+    let device = CubeDevice::Cpu(Default::default());
+    let client = device.client();
+    let hw = &client.properties().hardware;
+    let units = (std::thread::available_parallelism().map_or(1, |v| v.get()) as u32)
+        .min(hw.max_cube_dim.0)
+        .min(hw.max_units_per_cube)
+        .min(OWNER_D_MAX as u32);
+    for (label, n, k) in [
+        ("multi-block", 40_000usize, 29usize),
+        ("ties", 128, 8),
+        ("hub", 128, 8),
+        ("many-leaf", 1_000, 3),
+    ] {
+        let features = 8;
+        let values: Vec<f32> = (0..n * features)
+            .map(|i| {
+                let row = i / features;
+                let column = i % features;
+                match label {
+                    "ties" => ((row % 7 + column % 2) as f32) * 0.25,
+                    "hub" if row == 0 => 0.0,
+                    "hub" => ((row * (column + 3) % 97) as f32 - 48.0) * 0.03125,
+                    _ => ((row * 37 + column * 71 + row * column * 13) % 997) as f32 * 0.03125,
+                }
+            })
+            .collect();
+        let probe = f32_tensor(&device, &[n, features], values.clone());
+        let widths: Vec<usize> = [1, 4, 8]
+            .into_iter()
+            .filter(|&w| resolve_vector_width(&probe, n, features, &[w]) == w)
+            .collect();
+        let baseline = owner_test_plan(&client, n, features, k, None, 64, units, 1).unwrap();
+        let minimum = (n * baseline.host.workspace.pair_slots_per_center)
+            .max(baseline.host.workspace.forest_pair_count)
+            .min(1 << 20);
+        if label == "many-leaf" {
+            assert!(baseline.host.workspace.forest_leaf_count > n.div_ceil(OWNER_CH));
+            assert!(baseline.host.workspace.forest_pair_count <= baseline.tile_slots);
+        }
+        let run = |ch, d, width, tile| {
+            let plan = owner_test_plan(&client, n, features, k, tile, ch, d, width).unwrap();
+            TEST_REFINEMENT_BLOCKS.with(|v| v.set(0));
+            let (ids, distances) = approximate_neighbors(
+                f32_tensor(&device, &[n, features], values.clone()),
+                k,
+                42,
+                2,
+                true,
+                plan,
+            )
+            .unwrap();
+            let blocks = TEST_REFINEMENT_BLOCKS.with(|v| v.get());
+            (
+                (
+                    read_i32(&ids),
+                    read_f32(&distances)
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                ),
+                blocks,
+            )
+        };
+        let expected = run(64, units, 1, None).0;
+        for ch in [1, 7, 16, 64] {
+            assert_eq!(run(ch, units, 1, None).0, expected, "{label} CH={ch}");
+        }
+        for d in [1, units.min(3), units] {
+            assert_eq!(run(64, d, 1, None).0, expected, "{label} D={d}");
+        }
+        for width in widths {
+            assert_eq!(run(64, units, width, None).0, expected, "{label} W={width}");
+        }
+        let (actual, blocks) = run(64, units, 1, Some(minimum));
+        assert_eq!(actual, expected, "{label} T_min");
+        if label == "multi-block" {
+            assert!(
+                blocks > 1,
+                "refinement did not cross T_min: {blocks} blocks"
             );
         }
     }
@@ -1736,6 +1901,78 @@ fn sampled_pool_fixture(device: CubeDevice) {
     );
 }
 
+fn inactive_pool_early_exit_fixture(device: CubeDevice) {
+    let client = device.client();
+    let n = 3usize;
+    let candidates = i32_tensor(&device, &[n, 1], vec![1, 2, 0]);
+    let flags = i32_tensor(&device, &[n, 1], vec![1, 0, 1]);
+    let sampled = i32_tensor(&device, &[n, 2], vec![-1; n * 2]);
+    let (count, dim) = launch_units(&client, n);
+    sampled_pool_kernel::launch(
+        &client,
+        count.clone(),
+        dim,
+        candidates.clone().into_tensor_arg(),
+        flags.clone().into_tensor_arg(),
+        i32_tensor(&device, &[n + 1], vec![0; n + 1]).into_tensor_arg(),
+        i32_tensor(&device, &[1], vec![0]).into_tensor_arg(),
+        sampled.clone().into_tensor_arg(),
+        n as u32,
+        1,
+        1,
+        43,
+        7,
+        dtype_to_storage_type(DType::I32),
+    );
+    let actual = read_i32(&sampled);
+    assert_eq!(actual, [3, 3, 2, 3, 3, 3]);
+    // The old implementation populated inactive old regions, but generated no pairs.
+    let before = i32_tensor(&device, &[n, 2], vec![3, 1, 2, 3, 3, 0]);
+    let mut results = Vec::new();
+    for pools in [sampled, before] {
+        let sizes = i32_tensor(&device, &[n, 2], vec![-1; n * 2]);
+        let pairs = i64_tensor(&device, &[n], vec![-1; n]);
+        pool_pair_count_kernel::launch(
+            &client,
+            count.clone(),
+            dim,
+            pools.clone().into_tensor_arg(),
+            sizes.into_tensor_arg(),
+            pairs.clone().into_tensor_arg(),
+            n as u32,
+            1,
+            [
+                dtype_to_storage_type(DType::I32),
+                dtype_to_storage_type(DType::I64),
+            ],
+        );
+        let output_flags = i32_tensor(&device, &[n, 1], vec![-1; n]);
+        let new_count = i32_tensor(&device, &[1], vec![0]);
+        finalize_flags_kernel::launch(
+            &client,
+            count.clone(),
+            dim,
+            candidates.clone().into_tensor_arg(),
+            flags.clone().into_tensor_arg(),
+            pools.into_tensor_arg(),
+            candidates.clone().into_tensor_arg(),
+            output_flags.clone().into_tensor_arg(),
+            new_count.clone().into_tensor_arg(),
+            n as u32,
+            1,
+            1,
+            dtype_to_storage_type(DType::I32),
+        );
+        results.push((
+            read_i64(&pairs),
+            read_i32(&output_flags),
+            read_i32(&new_count),
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0], (vec![0, 0, 0], vec![1, 1, 1], vec![0]));
+}
+
 /// Sampled-pool scalar agreement at candidate widths straddling the sampling budget.
 /// Capacity is the production `MAX_CANDIDATES` budget; widths 59..65 and 120/256 exercise
 /// both pool-saturated and pool-sparse rows, with some padding ids.
@@ -2194,6 +2431,7 @@ fn run_kernel_fixtures(device: CubeDevice) {
     sampled_pair_slots_large_offset_fixture(device.clone());
     forest_pair_slots_large_offset_fixture(device.clone());
     sampled_pool_fixture(device.clone());
+    inactive_pool_early_exit_fixture(device.clone());
     sampled_pool_width_edge_fixture(device.clone());
     hub_pool_fixture(device.clone());
     flag_transition_fixture(device);

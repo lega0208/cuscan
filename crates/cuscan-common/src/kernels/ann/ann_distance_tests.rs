@@ -23,6 +23,35 @@ fn distance_probe<F: Float, N: Size>(
     }
 }
 
+#[cube(launch)]
+fn distance_x4_probe<F: Float, N: Size>(
+    data: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<F>,
+    features: u32,
+    #[comptime] vector_width: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let group = ABSOLUTE_POS_X as usize;
+    if group < 2 {
+        let left = group * 4;
+        let (a, b, c, d) = squared_l2_r8_x4::<F, N>(
+            data,
+            left,
+            left + 1,
+            left + 2,
+            left,
+            left + 1,
+            features as usize,
+            vector_width,
+        );
+        let offset = group * 4;
+        output[offset] = a;
+        output[offset + 1] = b;
+        output[offset + 2] = c;
+        output[offset + 3] = d;
+    }
+}
+
 fn tensor<T: burn::tensor::Element>(
     device: &CubeDevice,
     shape: &[usize],
@@ -193,6 +222,47 @@ fn distance_fixture(device: CubeDevice) {
                     difference.mul_add(difference, 1.0).to_bits(),
                     "fusion witness, features={features}, width={width}"
                 );
+            }
+            let x4 = tensor(&device, &[8], vec![0.0f32; 8], DType::F32);
+            let data_arg = if width == 1 {
+                input.clone().into_tensor_arg()
+            } else {
+                // SAFETY: identical contiguous vector view to the single-pair probe.
+                unsafe {
+                    cubecl::prelude::TensorArg::from_raw_parts(
+                        input.handle.clone(),
+                        [1].into(),
+                        [8 * features / width].into(),
+                    )
+                }
+            };
+            distance_x4_probe::launch(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(32),
+                width as VectorSize,
+                data_arg,
+                x4.clone().into_tensor_arg(),
+                features as u32,
+                width,
+                dtype_to_storage_type(DType::F32),
+            );
+            let x4 = read_f32(&x4);
+            for group in 0..2 {
+                let left = group * 4;
+                for (slot, right) in [left + 1, left + 2, left, left + 1].into_iter().enumerate() {
+                    let oracle = host_squared_l2_r8(rows[left], rows[right]);
+                    let value = x4[group * 4 + slot];
+                    if oracle.is_nan() {
+                        assert!(value.is_nan());
+                    } else {
+                        assert_eq!(
+                            value.to_bits(),
+                            oracle.to_bits(),
+                            "x4 features={features}, width={width}, group={group}, slot={slot}"
+                        );
+                    }
+                }
             }
         }
     }

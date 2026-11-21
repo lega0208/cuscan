@@ -205,8 +205,8 @@ uv run --no-sync python -m comparison.umap06.run check
 
 The small pilot is not a complete reference. Run seed 11 of every `mix_1m`
 configuration before its remaining seeds; each pilot must finish warm-up, fit and
-transforms within 4.8 hours. The full reference has 122 ordinary upstream runs,
-plus separate determinism checks. The checker fails on missing evidence rather
+transforms within 4.8 hours. The historical Phase 0 reference has 122 ordinary
+upstream runs, plus separate determinism checks. The checker fails on missing evidence rather
 than treating a partial campaign as complete. Raw runs are retained under
 `artifacts/umap06_p0/`; generated inputs and hash-verified evaluation caches live
 under `data/umap06/`. Existing mismatched files are never overwritten.
@@ -217,8 +217,13 @@ and `cuscan --backend cuda` separately, followed by `determinism` and `stages`.
 Offline `score` shares input-space ranks and exact query neighbors across runs;
 completed per-fixture score shards are reusable after an interrupted invocation.
 Use `summarize --freeze` only when all evidence is complete; ordinary `summarize`
-writes an artifact summary without publishing a frozen reference. The final
-`check` validates the frozen files. Measurement-defining source changes invalidate
+writes an artifact summary without publishing a frozen reference. `check` compares
+complete current evidence exactly with the reference files. The frozen Phase 0
+references include the retired `mix_10m` fixture, while the active harness does
+not: their fixture hashes and stage attribution therefore cannot pass this exact
+comparison. Keep those references unchanged as historical evidence; a current
+exact validation needs separately authorized, complete matching references and
+evidence, not a rewritten Phase 0 baseline. Measurement-defining source changes invalidate
 timings; metric-source changes invalidate scores, not otherwise unchanged fits.
 Upstream recall reports the 14 non-self neighbors in its self-inclusive 15-slot
 graph, with a tie-inclusive boundary and explicit missing-neighbor counts.
@@ -245,6 +250,13 @@ not the configuration means. Timings, scale and diagnostics are not gates.
 Applying this rule to Phase 0 cuscan is diagnostic only, while the regenerated
 Rust quality tests remain blocking. Record any required per-section or 1M-budget
 user decisions with their observed values; never silently shrink a fixture.
+
+The standalone `profile_recursive_init` Rust example remains available with the
+`tracing` feature for the historical synthetic 10M recursive-init protocol. It
+requires a separate 32-feature little-endian f32 input and is only appropriate
+after the real 10M fit fails with the documented ANN admission error; it is not
+an end-to-end fit or an active harness fixture. Its command-line usage is in
+`crates/umap/examples/profile_recursive_init.rs`.
 
 The local parquet datasets under `comparison/` are gitignored and are not shipped.
 Commands using them require user-provided schema-compatible parquet files. For the
@@ -626,19 +638,35 @@ projected = model.transform(X_new)
   bytes are `min(floor(0.9 * free) + aligned_live_input, limit, total) - 64 MiB`,
   saturating at zero; an absent limit is unbounded in that minimum. The live
   input is included in both the budget and estimated working set. The planner
-  chooses the largest pair-staging tile fitting the aligned fixed peak and six
-  staging allocations, subject to shape, page and launch limits and a budgeted
-  ceiling of 2^24 pair slots. The CPU hardware cap is 2^26 slots. The minimum is
+  chooses the largest pair-staging tile fitting the aligned fixed peak and the
+  selected route's staging allocations, subject to shape, page and launch
+  limits and a budgeted ceiling of 2^24 pair slots. The CPU hardware cap is 2^26 slots. The minimum is
   the lesser of the total pair slots and 2^20. Tile sizes preserve ANN neighbor
   IDs and distance bits. Exact tile overrides exist only in the common crate's
   `test-support` APIs, not the estimator APIs.
 
+  CPU ANN uses the owner route for forest and refinement joins; CUDA uses the
+  slot route. The owner route divides contiguous centers or forest leaves into
+  blocks bounded by the tile's pair slots, then chunks of 64 centers or one
+  leaf. Generation writes at most two records per pair into disjoint chunk
+  regions, grouped by destination partition; apply exclusively owns each row
+  partition and consumes the chunk slices in order. The partition count is at
+  most the CPU launch width, 64, and the row count. There are no generation or
+  apply atomics in unprofiled owner execution. Its four record allocations cost
+  32 bytes per slot, plus fixed chunk offsets; the slot route uses six staging
+  allocations and endpoint arrays. Both routes retain sorted rows and the same
+  distance/id tie-break; their order-independent bounded insertion is intended
+  to preserve graph bits across routes. An inactive sampled center skips its old
+  pool scans on both backends because it has no join pairs.
+
   ANN squared distances use eight FMA accumulation chains indexed by feature
-  modulo eight, followed by a fixed pairwise reduction. CPU uses scalar loads;
-  CUDA uses supported four- or eight-wide loads when feature count and binding
-  alignment permit, otherwise scalar loads. The arithmetic order is unchanged
-  across these routes. CPU/CUDA bit identity was verified on FMA-capable x86-64
-  and the tested NVIDIA CUDA device; it is not guaranteed on hosts without FMA.
+  modulo eight, followed by a fixed pairwise reduction. The CPU owner generator
+  selects eight- or four-wide loads when the feature count and binding alignment
+  permit, otherwise scalar loads. The CUDA slot route likewise uses supported
+  four- or eight-wide loads when permitted, otherwise scalar loads. The arithmetic
+  order is unchanged across these routes. The R8 CPU/CUDA distance identity was
+  previously verified on FMA-capable x86-64 and the tested NVIDIA CUDA device;
+  it is not guaranteed on hosts without FMA.
   This order does not apply to exact search or HDBSCAN KD-tree distances.
 
   `UMAPConfig::memory_limit_bytes` and `HdbscanConfig::memory_limit_bytes`, and
@@ -655,21 +683,28 @@ projected = model.transform(X_new)
   **Estimates:** `ann_host_estimate` returns `AnnEstimate`: `retained_width`
   is `min(k + 4, n - 1)`, `sample_capacity` is `min(k + 1, 60, n - 1)` per new/old
   class, `trees` is the forest tree count, and `directed_edges` is `n * k`.
-  `phases` contains `phase`, `host_bytes` and CUDA-conservative `runtime_bytes`
-  including input for Input, ForestInit, Refinement and Output. `host_peak_bytes`
+  `phases` contains `phase`, `host_bytes` and `runtime_bytes` including input
+  for Input, ForestInit, Refinement and Output. Runtime bytes are the per-phase
+  maximum of CPU owner and CUDA slot estimates; host bytes include owner-route
+  prefix storage. `host_peak_bytes`
   and `runtime_peak_bytes` are their respective maxima; `cpu_combined_peak_bytes`
-  is the maximum per-phase host plus CPU-route runtime. `fixed_runtime_peak_bytes`
-  excludes staging, `staging_bytes_per_slot` is the unaligned six-buffer cost,
-  and `min_runtime_bytes` adds the minimum tile without alignment. Estimates are
+  is the maximum per-phase host plus CPU owner runtime. `fixed_runtime_peak_bytes`
+  is the slot-route estimate excluding staging, `staging_bytes_per_slot` is the
+  unaligned six-buffer slot cost, and `min_runtime_bytes` adds the minimum tile
+  without alignment. Estimates are
   advisory, not reservations or total process memory.
 
   **Profiling:** setting `CUSCAN_ANN_PROFILE=1` emits `ANN_PROFILE` lines to
   stderr: `forest_readback_ms`/`bytes`, `forest_feature_copy_decoded`,
   `forest_build_ms`, `forest_upload_enqueue_ms`; `init_ms`, `forest_pairs`,
   `forest_tiles`, `H`, `C`, `tile_slots`, `fixed_peak_bytes`, `staging_bytes`,
-  `usable_bytes`; per-`iteration` `pools_ms` and `pair_merge_ms` with
-  `pair_slots`/`pair_tiles`; `records phase=forest|join produced kept`; and
+  `usable_bytes`; per-`iteration` `pools_ms`; and
   `stop reason iterations max_iterations final_new_count capacity width`.
+  The slot route reports per-iteration `pair_merge_ms` with `pair_slots` and
+  `pair_tiles`, and `records phase=forest|join produced kept`.
+  Owner-route lines additionally report `forest_generate_ms`/`forest_apply_ms`
+  or per-iteration `generate_ms`/`apply_ms`, with `blocks`, `slots`,
+  `produced_records` and `kept_records`; these timings synchronize the client.
   With `test-support` and `CUSCAN_ANN_SURVIVAL_PROFILE` also set, `survival`
   lines report `phase`, `produced` and `predicted_surviving`; these are
   timing-sensitive tile-start predictions, not insertion counts. Profiling

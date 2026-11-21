@@ -9,6 +9,8 @@ use cubecl::prelude::*;
 /// Accumulate features in eight independent chains and reduce them in the
 /// fixed R8 tree. Width one uses scalar chains; widths four/eight load vector
 /// chunks and preserve the same per-lane R8 order.
+// Keep compile-time width specialization separate from runtime chunk parity.
+#[allow(clippy::if_same_then_else)]
 #[cube]
 pub(super) fn squared_l2_r8<F: Float, N: Size>(
     data: &Tensor<Vector<F, N>>,
@@ -127,6 +129,84 @@ pub(super) fn squared_l2_r8<F: Float, N: Size>(
         }
     }
     ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))
+}
+
+/// Four independent fixed-R8 distances. Width one deliberately repeats the
+/// scalar pair kernel; vector widths share the left-hand vector loads.
+// Keep compile-time width specialization separate from runtime chunk parity.
+#[allow(clippy::if_same_then_else)]
+#[cube]
+pub(super) fn squared_l2_r8_x4<F: Float, N: Size>(
+    data: &Tensor<Vector<F, N>>,
+    left: usize,
+    right0: usize,
+    right1: usize,
+    right2: usize,
+    right3: usize,
+    features: usize,
+    #[comptime] vector_width: usize,
+) -> (F, F, F, F) {
+    if comptime![vector_width == 1] {
+        (
+            squared_l2_r8::<F, N>(data, left, right0, features, vector_width),
+            squared_l2_r8::<F, N>(data, left, right1, features, vector_width),
+            squared_l2_r8::<F, N>(data, left, right2, features, vector_width),
+            squared_l2_r8::<F, N>(data, left, right3, features, vector_width),
+        )
+    } else {
+        let mut a0 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut a1 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut a2 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut a3 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut b0 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut b1 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut b2 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut b3 = Vector::<F, N>::new(F::new(0.0f32));
+        let row_vectors = features / vector_width;
+        for chunk in 0..row_vectors {
+            let value = data[left * row_vectors + chunk];
+            let d0 = value - data[right0 * row_vectors + chunk];
+            let d1 = value - data[right1 * row_vectors + chunk];
+            let d2 = value - data[right2 * row_vectors + chunk];
+            let d3 = value - data[right3 * row_vectors + chunk];
+            if comptime![vector_width == 8] {
+                a0 = fma(d0, d0, a0);
+                a1 = fma(d1, d1, a1);
+                a2 = fma(d2, d2, a2);
+                a3 = fma(d3, d3, a3);
+            } else if chunk % 2 == 0 {
+                a0 = fma(d0, d0, a0);
+                a1 = fma(d1, d1, a1);
+                a2 = fma(d2, d2, a2);
+                a3 = fma(d3, d3, a3);
+            } else {
+                b0 = fma(d0, d0, b0);
+                b1 = fma(d1, d1, b1);
+                b2 = fma(d2, d2, b2);
+                b3 = fma(d3, d3, b3);
+            }
+        }
+        (
+            reduce_r8_vectors::<F, N>(a0, b0, vector_width),
+            reduce_r8_vectors::<F, N>(a1, b1, vector_width),
+            reduce_r8_vectors::<F, N>(a2, b2, vector_width),
+            reduce_r8_vectors::<F, N>(a3, b3, vector_width),
+        )
+    }
+}
+
+#[cube]
+fn reduce_r8_vectors<F: Float, N: Size>(
+    a: Vector<F, N>,
+    b: Vector<F, N>,
+    #[comptime] width: usize,
+) -> F {
+    let low = (a.extract(0usize) + a.extract(1usize)) + (a.extract(2usize) + a.extract(3usize));
+    if comptime![width == 8] {
+        low + ((a.extract(4usize) + a.extract(5usize)) + (a.extract(6usize) + a.extract(7usize)))
+    } else {
+        low + ((b.extract(0usize) + b.extract(1usize)) + (b.extract(2usize) + b.extract(3usize)))
+    }
 }
 
 #[cfg(test)]

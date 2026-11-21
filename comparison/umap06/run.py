@@ -1013,8 +1013,6 @@ def generate(args):
     )
     datasets.generate(args.data, args.fixtures)
     for name in args.fixtures or list(FIXTURES):
-        if name == "mix_10m":
-            continue
         path = args.data / name / "eval.npz"
         if path.exists():
             errors = quality.verify_cache(args.data, name)
@@ -1086,8 +1084,7 @@ def stages(args):
     extension_record = require_extension(args.artifacts)
     run = new_run(args.artifacts, "stages")
     fixture_hashes = {
-        name: datasets.fixture_hash(args.data, name)
-        for name in ("mix_50k", "mix_200k", "mix_1m", "mix_10m")
+        name: datasets.fixture_hash(args.data, name) for name in ("mix_50k", "mix_200k", "mix_1m")
     }
     write_new(
         run / "provenance.json",
@@ -1111,7 +1108,7 @@ def stages(args):
     )
     if build["returncode"] != 0:
         raise RuntimeError(f"Stage build failed: {run / 'build'}")
-    for fixture in ("mix_50k", "mix_200k", "mix_1m", "mix_10m"):
+    for fixture in ("mix_50k", "mix_200k", "mix_1m"):
         for backend in ("cpu", "cuda"):
             dest = run / "stages" / f"{fixture}-{backend}"
             cmd = [
@@ -1129,12 +1126,12 @@ def stages(args):
                 "--seed",
                 "11",
                 "--runs",
-                "2" if fixture == "mix_10m" else "3",
+                "3",
                 "--trace",
                 str((dest / "trace.json").resolve()),
             ]
             result = child(cmd, dest, 21600)
-            if result["returncode"] != 0 and fixture != "mix_10m":
+            if result["returncode"] != 0:
                 raise RuntimeError(f"Stage failed: {dest}")
     print(run)
 
@@ -1404,7 +1401,7 @@ def stage_evidence(artifacts):
             continue
         child_record = read_json(directory / "child.json")
         name, backend = directory.name.rsplit("-", 1)
-        if name not in ("mix_50k", "mix_200k", "mix_1m", "mix_10m") or backend not in (
+        if name not in ("mix_50k", "mix_200k", "mix_1m") or backend not in (
             "cpu",
             "cuda",
         ):
@@ -1420,7 +1417,7 @@ def stage_evidence(artifacts):
             "--seed",
             "11",
             "--runs",
-            "2" if name == "mix_10m" else "3",
+            "3",
             "--trace",
         ]
         if (
@@ -1453,7 +1450,7 @@ def stage_evidence(artifacts):
                 or output["backend"].split()[0].lower() != backend
                 or output.get("epochs") != 200
                 or output.get("neighbors") != 15
-                or len(output.get("fit_seconds", [])) != (2 if name == "mix_10m" else 3)
+                or len(output.get("fit_seconds", [])) != 3
             ):
                 raise ValueError(f"Stage output mismatch: {directory}")
             if not output.get("stage_seconds") or any(
@@ -1461,10 +1458,6 @@ def stage_evidence(artifacts):
                 for samples in output["stage_seconds"].values()
             ):
                 raise ValueError(f"Missing or zero stage timing: {directory}")
-        elif directory.name.startswith("mix_10m-") and any(
-            word in error.lower() for word in ("memory", "alloc", "planning", "preflight")
-        ):
-            output, trace = None, None
         else:
             attempts.setdefault(directory.name, []).append(
                 {
@@ -1657,7 +1650,6 @@ def summary_data(args):
             "Cuscan worker epochs are calculated from default rules, not observed optimizer calls."
         ),
         "stage_attribution": stage_results,
-        "ten_million_outcome": {k: v for k, v in stage_results.items() if k.startswith("mix_10m-")},
         "cpu_cuda_agreement": agreement,
         "build_provenance": current_provenance,
         "extension": require_extension(args.artifacts),
@@ -2798,8 +2790,6 @@ def evidence_errors(args):
     except (OSError, ValueError, KeyError, RuntimeError, ImportError) as exc:
         errors.append(f"run records: {exc}")
     for fixture in FIXTURES:
-        if fixture == "mix_10m":
-            continue
         try:
             errors.extend(quality.verify_cache(args.data, fixture))
         except (OSError, ValueError, KeyError) as exc:
@@ -2816,10 +2806,10 @@ def evidence_errors(args):
         errors.append(f"determinism: {exc}")
     try:
         stages_data = stage_evidence(args.artifacts)
-        for fixture in ("mix_50k", "mix_200k", "mix_1m", "mix_10m"):
+        for fixture in ("mix_50k", "mix_200k", "mix_1m"):
             for backend in ("cpu", "cuda"):
                 if f"{fixture}-{backend}" not in stages_data:
-                    errors.append(f"missing stage/10M evidence: {fixture}-{backend}")
+                    errors.append(f"missing stage evidence: {fixture}-{backend}")
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         errors.append(f"stage evidence: {exc}")
     cuscan_groups = {}
@@ -2843,6 +2833,7 @@ def evidence_errors(args):
 
 
 def check(args):
+    """Compare complete current evidence exactly; retired-fixture baselines cannot match."""
     run = new_run(args.artifacts, "check")
     errors = evidence_errors(args)
     try:
@@ -2881,7 +2872,6 @@ def check(args):
                 "schema",
                 "backends",
                 "stage_attribution",
-                "ten_million_outcome",
                 "cpu_cuda_agreement",
                 "diagnostic_acceptance",
                 "extension",
@@ -2989,7 +2979,7 @@ def main():
     command.add_argument(
         "--evidence-fixtures",
         nargs="+",
-        choices=[name for name in FIXTURES if name != "mix_10m"],
+        choices=list(FIXTURES),
         help="evaluate only these fixtures; any omitted fixture leaves the receipt incomplete",
     )
     add_settings_arguments(command)
@@ -3000,9 +2990,7 @@ def main():
     command.add_argument("--artifacts", type=Path, required=True)
     command.add_argument("--upstream-reference", type=Path, required=True)
     command.add_argument("--upstream-sha256", required=True)
-    command.add_argument(
-        "--evidence-fixtures", nargs="+", choices=[name for name in FIXTURES if name != "mix_10m"]
-    )
+    command.add_argument("--evidence-fixtures", nargs="+", choices=list(FIXTURES))
     command.add_argument("--scope", choices=("halved-fit",))
     command.add_argument("--full-seeds", action="store_true")
     add_settings_arguments(command)
@@ -3014,9 +3002,7 @@ def main():
     command.add_argument("--upstream-sha256", required=True)
     command.add_argument("--query-reference", type=Path, default=None)
     command.add_argument("--query-reference-sha256", default=None)
-    command.add_argument(
-        "--evidence-fixtures", nargs="+", choices=[name for name in FIXTURES if name != "mix_10m"]
-    )
+    command.add_argument("--evidence-fixtures", nargs="+", choices=list(FIXTURES))
     seed_scope = command.add_mutually_exclusive_group()
     seed_scope.add_argument("--full-seeds", action="store_true")
     seed_scope.add_argument("--seed-11-no-mix-1m", action="store_true")
