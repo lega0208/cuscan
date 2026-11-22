@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -16,9 +17,11 @@ from typing import Any
 import numpy as np
 
 if __package__:
+    from comparison import native_provenance
     from comparison.umap06.datasets import generate as generate_umap06
     from comparison.umap06.datasets import load_fixture
 else:
+    import native_provenance
     from umap06.datasets import generate as generate_umap06
     from umap06.datasets import load_fixture
 
@@ -42,6 +45,82 @@ SOURCE_PROVENANCE_FIELDS = (
     "arm_patch_sha256",
     "extension_sha256",
 )
+
+
+IDENTITY_SCHEMA = "cuscan-rinnd4-head-graphs-v1"
+
+
+class IdentityMismatch(RuntimeError):
+    """A K1 event: a response's graph hashes differ from the immutable identity reference."""
+
+
+def load_identity_reference(path: Path) -> dict[str, Any]:
+    reference = json.loads(path.read_text(encoding="utf-8"))
+    if reference.get("schema") != IDENTITY_SCHEMA or not isinstance(
+        reference.get("fixtures"), dict
+    ):
+        raise ValueError(f"{path} is not a {IDENTITY_SCHEMA} identity reference")
+    return reference
+
+
+def check_identity(
+    reference: dict[str, Any] | None,
+    *,
+    fixture: str,
+    backend: str,
+    input_sha256: str,
+    k_nonself: int,
+    seed: int,
+    cap: int,
+    squared: bool,
+    response: dict[str, Any],
+) -> None:
+    """Raise `IdentityMismatch` unless `response` reproduces the reference graph exactly."""
+    if reference is None:
+        return
+    entry = reference["fixtures"].get(fixture)
+    if entry is None:
+        raise ValueError(f"identity reference has no entry for fixture {fixture}")
+    expected_settings = {
+        "backend": backend,
+        "input_sha256": input_sha256,
+        "k_nonself": k_nonself,
+        "seed": seed,
+        "cap": cap,
+        "squared": squared,
+    }
+    for key, value in expected_settings.items():
+        if entry.get(key) != value:
+            raise ValueError(
+                f"identity reference {fixture} {key}={entry.get(key)!r} does not match {value!r}"
+            )
+    mismatches = {
+        key: {"observed": response.get(key), "reference": entry[key]}
+        for key in ("ids_hash_fnv1a64", "distances_hash_fnv1a64")
+        if response.get(key) != entry[key]
+    }
+    if not response.get("ok") or mismatches:
+        event = {
+            "event": "K1",
+            "fixture": fixture,
+            "backend": backend,
+            "kind": response.get("kind"),
+            "error": response.get("error"),
+            "mismatches": mismatches,
+        }
+        event_path = reference.get("k1_event_path")
+        if event_path is not None:
+            with Path(event_path).open("x", encoding="utf-8") as stream:
+                json.dump(event, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+        raise IdentityMismatch(f"K1 identity event: {json.dumps(event, sort_keys=True)}")
+
+
+def checked_response(
+    reference: dict[str, Any] | None, response: dict[str, Any], **settings: Any
+) -> dict[str, Any]:
+    check_identity(reference, response=response, **settings)
+    return response
 
 
 class Worker:
@@ -127,6 +206,21 @@ def source_identity(
     binary_hash = sha256(binary)
     if provenance_path is not None:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        if provenance.get("schema") == native_provenance.SCHEMA:
+            # Worker-only chain: base/tree plus the full build-input hash, re-checked against
+            # the binary at use time. Source roots are not consulted for this schema.
+            native = native_provenance.load_receipt(provenance_path, binary)
+            return {
+                "head": native["base_sha"],
+                "product_diff_sha256": native["source_sha256"],
+                "identity_source": "native-provenance-v1",
+                "provenance_path": str(provenance_path.resolve()),
+                "provenance_schema": native_provenance.SCHEMA,
+                "base_sha": native["base_sha"],
+                "tree_id": native["tree_id"],
+                "source_sha256": native["source_sha256"],
+                "binary_sha256": binary_hash,
+            }
         if provenance.get("binary_sha256") != binary_hash:
             raise ValueError(f"provenance binary_sha256 does not match {binary}: {provenance_path}")
         head = provenance.get("head")
@@ -385,8 +479,24 @@ def run_worker(
     profile: bool,
     runs: int,
     source: dict[str, Any],
+    identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     input_path = Path(input_info["path"])
+
+    def checked(response: dict[str, Any]) -> dict[str, Any]:
+        check_identity(
+            identity,
+            fixture=fixture,
+            backend=backend,
+            input_sha256=input_info["sha256"],
+            k_nonself=k,
+            seed=seed,
+            cap=cap,
+            squared=squared,
+            response=response,
+        )
+        return response
+
     rows, features = input_info["rows"], input_info["features"]
     prefix = out / "graphs" / protocol / fixture / backend / arm
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -395,8 +505,10 @@ def run_worker(
     try:
         warmup = None
         if not profile:
-            warmup = worker.command(
-                {"op": "warmup", "k": k, "seed": seed, "cap": cap, "squared": squared}
+            warmup = checked(
+                worker.command(
+                    {"op": "warmup", "k": k, "seed": seed, "cap": cap, "squared": squared}
+                )
             )
         responses = []
         for index in range(runs):
@@ -411,7 +523,7 @@ def run_worker(
                     "graph_prefix": graph_prefix,
                 }
             )
-            responses.append(response)
+            responses.append(checked(response))
     finally:
         worker.close()
     result: dict[str, Any] = {
@@ -484,6 +596,11 @@ def parse_args() -> argparse.Namespace:
         "--no-profile", action="store_true", help="reuse a separate profile receipt"
     )
     parser.add_argument("--k", type=int, help="override the non-self width for all selected inputs")
+    parser.add_argument(
+        "--identity-reference",
+        type=Path,
+        help="head-graphs.json; every response (warm-ups and timed runs) must match it",
+    )
     return parser.parse_args()
 
 
@@ -528,6 +645,13 @@ def main() -> None:
             raise ValueError(
                 "R2 performance replay requires --predecessor-provenance and --candidate-provenance"
             )
+    identity = (
+        None
+        if args.identity_reference is None
+        else load_identity_reference(args.identity_reference.resolve())
+    )
+    if identity is not None:
+        identity["k1_event_path"] = str(out / "k1-event.json")
     input_info = fixture_inputs(out, args.data.resolve(), tuple(args.fixtures))
     if len(arm_binaries) == 1:
         arm = next(iter(arm_binaries))
@@ -574,6 +698,12 @@ def main() -> None:
             "timed_commands_per_arm": TIMING_ORDER.count("A"),
             "profiled_runs_per_arm": 0 if args.no_profile else 1,
             "recall_deferred": args.timing_only,
+            "identity_reference": None
+            if args.identity_reference is None
+            else {
+                "path": str(args.identity_reference.resolve()),
+                "sha256": sha256(args.identity_reference.resolve()),
+            },
         },
         "receipts": [],
     }
@@ -601,6 +731,7 @@ def main() -> None:
                     profile=False,
                     runs=TIMING_ORDER.count("A"),
                     source=source_identities[arm],
+                    identity=identity,
                 )
                 times = [response["ann_ms"] for response in receipt["responses"]]
                 receipt["ann_ms"] = times
@@ -631,16 +762,31 @@ def main() -> None:
                     )
                     for arm, binary in arm_binaries.items()
                 }
+
+                checked = functools.partial(
+                    checked_response,
+                    identity,
+                    fixture=fixture,
+                    backend=backend,
+                    input_sha256=info["sha256"],
+                    k_nonself=k,
+                    seed=args.seed,
+                    cap=args.cap,
+                    squared=args.squared,
+                )
+
                 try:
                     warmups = {
-                        arm: worker.command(
-                            {
-                                "op": "warmup",
-                                "k": k,
-                                "seed": args.seed,
-                                "cap": args.cap,
-                                "squared": args.squared,
-                            }
+                        arm: checked(
+                            worker.command(
+                                {
+                                    "op": "warmup",
+                                    "k": k,
+                                    "seed": args.seed,
+                                    "cap": args.cap,
+                                    "squared": args.squared,
+                                }
+                            )
                         )
                         for arm, worker in workers.items()
                     }
@@ -665,7 +811,7 @@ def main() -> None:
                                 "graph_prefix": graph_prefix,
                             }
                         )
-                        responses[arm].append(response)
+                        responses[arm].append(checked(response))
                         timings[arm].append(response["ann_ms"])
                 finally:
                     for worker in workers.values():
@@ -719,6 +865,7 @@ def main() -> None:
                         profile=True,
                         runs=1,
                         source=source_identities[arm],
+                        identity=identity,
                     )
                     stage["protocol"] = "profiled_stage_only"
                     stage["stage_only"] = True
@@ -740,6 +887,7 @@ def main() -> None:
                     profile=True,
                     runs=1,
                     source=source_identities[arm],
+                    identity=identity,
                 )
                 stage["protocol"] = "profiled_stage_only"
                 stage["stage_only"] = True

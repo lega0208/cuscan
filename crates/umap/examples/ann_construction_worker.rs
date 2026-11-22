@@ -3,6 +3,12 @@
 //! Build with `cargo build --release --example ann_construction_worker`. Invoke as
 //! `ann_construction_worker INPUT.f32le ROWS FEATURES [cpu|cuda:<index>]`; it reads
 //! one JSON command per stdin line and emits one JSON response per command.
+//!
+//! With `--features nvtx`, each command runs inside a process-wide NVTX range named
+//! `ann:warmup:<ordinal>` or `ann:build:<ordinal>` (one ordinal sequence across both kinds),
+//! bracketed by device synchronization so every launch of a command falls inside its range.
+//! The optional `slot_policy` field accepts only the per-slot policy
+//! `wide:per_slot,scalar:per_slot`; other values are rejected.
 
 use burn::tensor::{Tensor, TensorData};
 use cuscan_common::{
@@ -15,6 +21,9 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+
+/// The only slot policy that exists: both binding classes use the per-slot kernels.
+const PER_SLOT_POLICY: &str = "wide:per_slot,scalar:per_slot";
 
 fn read_features(path: &Path, rows: usize, features: usize) -> Result<Vec<f32>, Box<dyn Error>> {
     let bytes = std::fs::read(path)?;
@@ -70,6 +79,7 @@ fn perform(
     features: usize,
     device: &burn::tensor::Device,
     is_warmup: bool,
+    ordinal: usize,
 ) -> Result<Value, Box<dyn Error>> {
     let k: u32 = command["k"]
         .as_u64()
@@ -87,10 +97,23 @@ fn perform(
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err("command squared must be a boolean".into()),
     };
+    let slot_policy = match command.get("slot_policy") {
+        None => None,
+        Some(Value::String(value)) if value == PER_SLOT_POLICY => Some(value.clone()),
+        Some(_) => {
+            return Err(format!("command slot_policy must be {PER_SLOT_POLICY:?}").into());
+        }
+    };
     if k == 0 || k as usize >= rows {
         return Err(format!("k must be in 1..{rows}").into());
     }
 
+    device.sync()?;
+    #[cfg(feature = "nvtx")]
+    let range = nvtx::Range::new(nvtx::Str::from_str_lossy(&format!(
+        "ann:{}:{ordinal}",
+        if is_warmup { "warmup" } else { "build" }
+    )));
     let started = Instant::now();
     let input = Tensor::<2>::from_data(
         TensorData::new(host_features.to_vec(), [rows, features]),
@@ -105,6 +128,9 @@ fn perform(
     let ids = indices.to_data().try_to_vec::<i32>()?;
     let distances = distances.to_data().try_to_vec::<f32>()?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    device.sync()?;
+    #[cfg(feature = "nvtx")]
+    drop(range);
     if ids.len() != rows * k as usize || distances.len() != ids.len() {
         return Err(format!(
             "materialized graph has {} IDs and {} distances; expected {}",
@@ -153,6 +179,12 @@ fn perform(
     Ok(json!({
         "ok": true,
         "kind": if is_warmup { "warmup" } else { "build" },
+        "ordinal": ordinal,
+        "nvtx_range": cfg!(feature = "nvtx").then(|| format!(
+            "ann:{}:{ordinal}",
+            if is_warmup { "warmup" } else { "build" }
+        )),
+        "slot_policy": slot_policy,
         "elapsed_ms": elapsed_ms,
         "ann_ms": ann_ms,
         "rows": rows,
@@ -211,6 +243,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut ordinal = 0usize;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -229,8 +262,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         features,
                         &device,
                         op == "warmup",
+                        ordinal,
                     ) {
-                        Ok(result) => result,
+                        Ok(result) => {
+                            ordinal += 1;
+                            result
+                        }
                         Err(error) => json!({ "ok": false, "error": error.to_string() }),
                     }
                 }

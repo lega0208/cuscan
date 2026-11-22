@@ -907,8 +907,17 @@ pub(super) fn approximate_neighbors(
     refresh_row_worst(&candidates);
     if profile {
         let _ = client.read_one_unchecked(candidates.handle.clone());
+        // Slot-route fields: binding-class policy and the recipe/binding resolved at launch.
+        // Only the per-slot recipe exists, so its binding width is the resolved width.
+        let slot_fields = if owner_enabled {
+            String::new()
+        } else {
+            format!(
+                " slot_policy=wide:per_slot,scalar:per_slot vector_width={vector_width} slot_recipe=per_slot binding_width={vector_width}"
+            )
+        };
         eprintln!(
-            "ANN_PROFILE init_ms={:.3} forest_pairs={forest_pairs} forest_tiles={} H={width} C={capacity} tile_slots={} fixed_peak_bytes={} staging_bytes={} usable_bytes={}",
+            "ANN_PROFILE init_ms={:.3} forest_pairs={forest_pairs} forest_tiles={} H={width} C={capacity} tile_slots={} fixed_peak_bytes={} staging_bytes={} usable_bytes={}{slot_fields}",
             init_start.elapsed().as_secs_f64() * 1000.0,
             forest_pairs.div_ceil(pair_slots),
             plan.tile_slots,
