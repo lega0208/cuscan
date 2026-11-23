@@ -3,7 +3,7 @@
 
 Build the native companion before running (the backend must match --backend):
 
-    cargo build -p hdbscan --release --features tracing \\
+    cargo build -p hdbscan --release --features tracing \
         --example profile_hdbscan_stages
 
 Then run, for example:
@@ -205,7 +205,7 @@ def make_input(
     matrix.astype("<f4", copy=False).tofile(path)
 
 
-def load_parquet(path: Path, sample_size: int, cluster_on: str, seed: int) -> Any:
+def load_parquet(path: Path, sample_size: int | None, cluster_on: str, seed: int) -> Any:
     import numpy as np
     import polars as pl
 
@@ -216,7 +216,7 @@ def load_parquet(path: Path, sample_size: int, cluster_on: str, seed: int) -> An
         raise ValueError(f"could not read {column!r} from parquet {path}: {error}") from error
     if data.height == 0:
         raise ValueError("input parquet must contain rows")
-    if sample_size < data.height:
+    if sample_size is not None and sample_size < data.height:
         data = data.sample(n=sample_size, seed=seed, shuffle=True)
     try:
         matrix = np.asarray(data.get_column(column).to_list(), dtype=np.float32)
@@ -572,7 +572,11 @@ def main() -> int:
         "--input", type=Path, help="optional parquet with embedding_2d or embedding_16d column"
     )
     parser.add_argument("--cluster-on", choices=("2d", "16d"), default="16d")
-    parser.add_argument("--sample-size", type=positive_int, default=1_000_000)
+    parser.add_argument(
+        "--sample-size",
+        type=positive_int,
+        help="maximum parquet rows to sample (default: all rows)",
+    )
     parser.add_argument("--backend", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--rust-runs", type=positive_int, default=1)
     parser.add_argument("--python-runs", type=positive_int, default=1)

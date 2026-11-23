@@ -26,7 +26,7 @@ config_16d = {
 
 df = pl.read_parquet(DEFAULT_INPUT)
 
-embeddings = df["embedding"].to_numpy()
+embeddings = df["embeddings"].to_numpy()
 
 start_2d = datetime.now()
 print("Computing 2D embeddings...")
