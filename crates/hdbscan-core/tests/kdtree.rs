@@ -238,3 +238,187 @@ fn build_rejects_invalid_dimensions_and_non_finite_values() {
         ));
     }
 }
+
+/// The pre-parallel serial builder, kept as an exact reference for node layout, leaf point
+/// order and bound bits.
+fn reference_build(data: &[f32], n: usize, d: usize) -> KdTree {
+    let quotient = (n.saturating_sub(1) / LEAF_SIZE).max(1);
+    let n_levels = (usize::BITS - quotient.leading_zeros()) as usize;
+    let n_nodes = (1usize << n_levels) - 1;
+    let mut tree = KdTree {
+        indices: (0..n as i32).collect(),
+        starts: vec![0; n_nodes],
+        ends: vec![0; n_nodes],
+        is_leaf: vec![0; n_nodes],
+        bounds_min: vec![0.0; n_nodes * d],
+        bounds_max: vec![0.0; n_nodes * d],
+        n_levels,
+        n_features: d,
+    };
+    let feature_bounds = |indices: &[i32], feature: usize| {
+        let first = data[indices[0] as usize * d + feature];
+        indices[1..]
+            .iter()
+            .fold((first, first), |(min, max), &point| {
+                let value = data[point as usize * d + feature];
+                (
+                    if value.total_cmp(&min).is_lt() {
+                        value
+                    } else {
+                        min
+                    },
+                    if value.total_cmp(&max).is_gt() {
+                        value
+                    } else {
+                        max
+                    },
+                )
+            })
+    };
+    let mut stack = vec![(0usize, 0usize, n)];
+    while let Some((node, start, end)) = stack.pop() {
+        let child = 2 * node + 1;
+        tree.starts[node] = start as i32;
+        tree.ends[node] = end as i32;
+        for feature in 0..d {
+            let (min, max) = feature_bounds(&tree.indices[start..end], feature);
+            tree.bounds_min[node * d + feature] = min;
+            tree.bounds_max[node * d + feature] = max;
+        }
+        if child >= n_nodes || end - start < 2 {
+            tree.is_leaf[node] = 1;
+            continue;
+        }
+        let mut axis = 0;
+        let mut best_spread = -1.0f64;
+        for feature in 0..d {
+            let (min, max) = feature_bounds(&tree.indices[start..end], feature);
+            let spread = f64::from(max) - f64::from(min);
+            if spread > best_spread {
+                best_spread = spread;
+                axis = feature;
+            }
+        }
+        let mid = start + (end - start) / 2;
+        tree.indices[start..end].select_nth_unstable_by(mid - start, |&left, &right| {
+            data[left as usize * d + axis]
+                .total_cmp(&data[right as usize * d + axis])
+                .then(left.cmp(&right))
+        });
+        stack.push((child + 1, mid, end));
+        stack.push((child, start, mid));
+    }
+    tree
+}
+
+/// Deterministic values with heavy duplication, signed zeros and negatives.
+fn make_tricky_data(n: usize, d: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    (0..n * d)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = (state >> 33) as u32;
+            match bits % 8 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => (bits % 5) as f32 - 2.0,
+                _ => (bits % 20_011) as f32 * 0.001 - 10.0,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn parallel_build_matches_serial_reference_bit_for_bit() {
+    // 100_003 rows cross the parallel split threshold at several levels.
+    for (n, d) in [
+        (1, 1),
+        (81, 1),
+        (5_000, 2),
+        (100_003, 2),
+        (20_000, 16),
+        (3_001, 33),
+    ] {
+        let data = make_tricky_data(n, d, (n * 31 + d) as u64);
+        let tree = KdTree::build(&data, n, d).unwrap();
+        let expected = reference_build(&data, n, d);
+        assert_eq!(tree.starts, expected.starts, "n={n} d={d}");
+        assert_eq!(tree.ends, expected.ends, "n={n} d={d}");
+        assert_eq!(tree.is_leaf, expected.is_leaf, "n={n} d={d}");
+        assert_eq!(tree.indices, expected.indices, "n={n} d={d}");
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&tree.bounds_min),
+            bits(&expected.bounds_min),
+            "n={n} d={d}"
+        );
+        assert_eq!(
+            bits(&tree.bounds_max),
+            bits(&expected.bounds_max),
+            "n={n} d={d}"
+        );
+        assert_eq!((tree.n_levels, tree.n_features), (expected.n_levels, d));
+        assert_invariants(&tree, &data, n, d);
+    }
+}
+
+#[test]
+fn sequential_and_pool_sizes_build_identical_trees() {
+    let (n, d) = (100_003, 3);
+    let data = make_tricky_data(n, d, 7);
+    let expected = reference_build(&data, n, d);
+    let bits = |tree: &KdTree| {
+        let mut bits: Vec<u32> = tree
+            .bounds_min
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        bits.extend(tree.bounds_max.iter().map(|value| value.to_bits()));
+        (
+            (tree.n_levels, tree.n_features),
+            tree.indices.clone(),
+            tree.starts.clone(),
+            tree.ends.clone(),
+            tree.is_leaf.clone(),
+            bits,
+        )
+    };
+    assert_eq!(
+        bits(&KdTree::build_sequential(&data, n, d).unwrap()),
+        bits(&expected)
+    );
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let tree = pool.install(|| KdTree::build(&data, n, d).unwrap());
+        assert_eq!(bits(&tree), bits(&expected), "threads={threads}");
+    }
+}
+
+#[test]
+fn signed_zero_extrema_keep_their_bits_in_leaves_and_ancestors() {
+    // 81 rows: a root over two leaves. Feature 0 splits; feature 1 holds only signed zeros, with
+    // -0.0 only in the low half and +0.0 only in the high half.
+    let n = 81;
+    let data: Vec<f32> = (0..n)
+        .flat_map(|row| [row as f32, if row < 40 { -0.0 } else { 0.0 }])
+        .collect();
+    let tree = KdTree::build(&data, n, 2).unwrap();
+    assert_eq!(tree.n_levels, 2);
+    let feature = |values: &[f32], node: usize| values[node * 2 + 1].to_bits();
+    assert_eq!(feature(&tree.bounds_min, 1), (-0.0f32).to_bits());
+    assert_eq!(feature(&tree.bounds_max, 1), (-0.0f32).to_bits());
+    assert_eq!(feature(&tree.bounds_min, 2), 0.0f32.to_bits());
+    assert_eq!(feature(&tree.bounds_max, 2), 0.0f32.to_bits());
+    assert_eq!(feature(&tree.bounds_min, 0), (-0.0f32).to_bits());
+    assert_eq!(feature(&tree.bounds_max, 0), 0.0f32.to_bits());
+}

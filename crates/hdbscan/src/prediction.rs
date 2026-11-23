@@ -518,7 +518,9 @@ impl PredictionRuntime {
         tests::maybe_fail(tests::Injection::Tree)?;
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!("prediction_tree_build").entered();
-        let tree = Arc::new(KdTree::build(
+        // Sequential: `init` is held, and a Rayon join here could steal another prediction
+        // task that blocks on `init` on this same worker.
+        let tree = Arc::new(KdTree::build_sequential(
             &state.geometry,
             state.n_finite(),
             state.n_features,

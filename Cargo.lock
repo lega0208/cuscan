@@ -3523,6 +3523,7 @@ dependencies = [
 name = "hdbscan-core"
 version = "0.1.2"
 dependencies = [
+ "rayon",
  "serde_json",
  "tempfile",
  "tracing",

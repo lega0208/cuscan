@@ -1,6 +1,7 @@
 //! Deterministic, backend-free host KD-tree construction for HDBSCAN.
 
 use crate::error::{HdbscanError, Result};
+use rayon::prelude::*;
 
 pub const LEAF_SIZE: usize = 40;
 /// Maximum number of levels accepted by fixed-stack device traversals.
@@ -24,7 +25,20 @@ pub struct KdTree {
 
 impl KdTree {
     /// Build a deterministic implicit heap, splitting nodes only when a child level exists.
+    ///
+    /// Large builds run on the current Rayon pool. Callers holding a lock that other Rayon
+    /// tasks may wait on must use [`KdTree::build_sequential`] instead: a worker blocked in
+    /// `rayon::join` can steal such a task and deadlock on the held lock.
     pub fn build(data: &[f32], n: usize, d: usize) -> Result<Self> {
+        Self::build_with(data, n, d, true)
+    }
+
+    /// Build the same tree as [`KdTree::build`] on the calling thread, without Rayon.
+    pub fn build_sequential(data: &[f32], n: usize, d: usize) -> Result<Self> {
+        Self::build_with(data, n, d, false)
+    }
+
+    fn build_with(data: &[f32], n: usize, d: usize, parallel: bool) -> Result<Self> {
         if n == 0 || d == 0 {
             return Err(HdbscanError::InvalidInput(
                 "KD-tree input must have nonzero rows and features".into(),
@@ -89,41 +103,41 @@ impl KdTree {
                 i32::try_from(index).map_err(|_| HdbscanError::Overflow("KD-tree point index"))?;
         }
 
+        let scratch_len = d
+            .checked_mul(2)
+            .ok_or(HdbscanError::Overflow("KD-tree split scratch"))?;
+        if n_nodes > 1 {
+            let ctx = BuildContext {
+                data,
+                d,
+                n_nodes,
+                scratch_len,
+                parallel,
+            };
+            let mut bounds = try_filled(scratch_len, 0.0f32, "KD-tree split scratch")?;
+            split_subtree(&ctx, 0, &mut tree.indices, &mut bounds)?;
+        }
+
         let mut stack = Vec::new();
         stack
-            .try_reserve_exact(n_levels)
+            .try_reserve_exact(n_levels + 1)
             .map_err(|_| HdbscanError::Overflow("KD-tree build stack allocation"))?;
         stack.push((0usize, 0usize, n));
         while let Some((node, start, end)) = stack.pop() {
-            let child = node
-                .checked_mul(2)
-                .and_then(|value| value.checked_add(1))
-                .ok_or(HdbscanError::Overflow("KD-tree child index"))?;
+            let child = node * 2 + 1;
             tree.starts[node] =
                 i32::try_from(start).map_err(|_| HdbscanError::Overflow("KD-tree range start"))?;
             tree.ends[node] =
                 i32::try_from(end).map_err(|_| HdbscanError::Overflow("KD-tree range end"))?;
-            tree.set_bounds(data, d, node, start, end);
             if child >= n_nodes || end - start < 2 {
                 tree.is_leaf[node] = 1;
                 continue;
             }
-
-            let axis = tree.widest_axis(data, d, start, end);
             let mid = start + (end - start) / 2;
-            tree.indices[start..end].select_nth_unstable_by(mid - start, |&left, &right| {
-                let left_offset = left as usize * d + axis;
-                let right_offset = right as usize * d + axis;
-                data[left_offset]
-                    .total_cmp(&data[right_offset])
-                    .then(left.cmp(&right))
-            });
-            let right = child
-                .checked_add(1)
-                .ok_or(HdbscanError::Overflow("KD-tree child index"))?;
-            stack.push((right, mid, end));
+            stack.push((child + 1, mid, end));
             stack.push((child, start, mid));
         }
+        tree.fill_bounds(data, parallel && n >= PARALLEL_SPLIT_ROWS);
         Ok(tree)
     }
 
@@ -178,49 +192,142 @@ impl KdTree {
         Ok(components)
     }
 
-    fn set_bounds(&mut self, data: &[f32], d: usize, node: usize, start: usize, end: usize) {
-        for feature in 0..d {
-            let first = data[self.indices[start] as usize * d + feature];
-            let mut min = first;
-            let mut max = first;
-            for &point in &self.indices[start + 1..end] {
-                let value = data[point as usize * d + feature];
-                if value.total_cmp(&min).is_lt() {
-                    min = value;
+    /// Bottom-up node bounds: leaves scan their rows, internal nodes union their children.
+    /// Levels run on Rayon only when `parallel` is set and the level has several nodes.
+    fn fill_bounds(&mut self, data: &[f32], parallel: bool) {
+        let d = self.n_features;
+        for level in (0..self.n_levels).rev() {
+            let first = (1usize << level) - 1;
+            let count = 1usize << level;
+            let (lower_min, child_min) = self.bounds_min.split_at_mut((first + count) * d);
+            let (lower_max, child_max) = self.bounds_max.split_at_mut((first + count) * d);
+            let (child_min, child_max) = (&*child_min, &*child_max);
+            let (starts, ends, is_leaf, indices) =
+                (&self.starts, &self.ends, &self.is_leaf, &self.indices);
+            let node_bounds = |(offset, (min, max)): (usize, (&mut [f32], &mut [f32]))| {
+                let node = first + offset;
+                let (start, end) = (starts[node] as usize, ends[node] as usize);
+                if start == end {
+                    return;
                 }
-                if value.total_cmp(&max).is_gt() {
-                    max = value;
+                if is_leaf[node] != 0 {
+                    point_bounds(data, d, &indices[start..end], min, max);
+                } else {
+                    let left = (node * 2 + 1 - (first + count)) * d;
+                    min.copy_from_slice(&child_min[left..left + d]);
+                    max.copy_from_slice(&child_max[left..left + d]);
+                    fold_bounds(&child_min[left + d..left + 2 * d], min, max);
+                    fold_bounds(&child_max[left + d..left + 2 * d], min, max);
                 }
+            };
+            let (level_min, level_max) = (&mut lower_min[first * d..], &mut lower_max[first * d..]);
+            if parallel && count > 1 {
+                level_min
+                    .par_chunks_mut(d)
+                    .zip(level_max.par_chunks_mut(d))
+                    .enumerate()
+                    .for_each(node_bounds);
+            } else {
+                level_min
+                    .chunks_mut(d)
+                    .zip(level_max.chunks_mut(d))
+                    .enumerate()
+                    .for_each(node_bounds);
             }
-            let offset = node * d + feature;
-            self.bounds_min[offset] = min;
-            self.bounds_max[offset] = max;
         }
     }
+}
 
-    fn widest_axis(&self, data: &[f32], d: usize, start: usize, end: usize) -> usize {
-        let mut best_axis = 0;
-        let mut best_spread = -1.0f64;
-        for feature in 0..d {
-            let first = data[self.indices[start] as usize * d + feature];
-            let mut min = first;
-            let mut max = first;
-            for &point in &self.indices[start + 1..end] {
-                let value = data[point as usize * d + feature];
-                if value.total_cmp(&min).is_lt() {
-                    min = value;
-                }
-                if value.total_cmp(&max).is_gt() {
-                    max = value;
-                }
-            }
-            let spread = f64::from(max) - f64::from(min);
-            if spread > best_spread {
-                best_spread = spread;
-                best_axis = feature;
-            }
+/// Rows at or above this count split their children in parallel.
+const PARALLEL_SPLIT_ROWS: usize = 32_768;
+
+struct BuildContext<'a> {
+    data: &'a [f32],
+    d: usize,
+    n_nodes: usize,
+    scratch_len: usize,
+    parallel: bool,
+}
+
+/// Recursively median-split `indices` for `node`; disjoint subtrees run in parallel.
+///
+/// `bounds` is `2 * d` scratch for this node's min/max, reused by the serial recursion.
+/// Every split depends only on its own point set, so the result is independent of scheduling.
+fn split_subtree(
+    ctx: &BuildContext<'_>,
+    node: usize,
+    indices: &mut [i32],
+    bounds: &mut [f32],
+) -> Result<()> {
+    let len = indices.len();
+    let child = node * 2 + 1;
+    if child >= ctx.n_nodes || len < 2 {
+        return Ok(());
+    }
+    let d = ctx.d;
+    let (min, max) = bounds.split_at_mut(d);
+    point_bounds(ctx.data, d, indices, min, max);
+    let mut axis = 0;
+    let mut best_spread = -1.0f64;
+    for feature in 0..d {
+        let spread = f64::from(max[feature]) - f64::from(min[feature]);
+        if spread > best_spread {
+            best_spread = spread;
+            axis = feature;
         }
-        best_axis
+    }
+    let data = ctx.data;
+    let mid = len / 2;
+    indices.select_nth_unstable_by(mid, |&left, &right| {
+        data[left as usize * d + axis]
+            .total_cmp(&data[right as usize * d + axis])
+            .then(left.cmp(&right))
+    });
+    let (left, right) = indices.split_at_mut(mid);
+    if ctx.parallel && len >= PARALLEL_SPLIT_ROWS {
+        let mut right_bounds = try_filled(ctx.scratch_len, 0.0f32, "KD-tree split scratch")?;
+        let (left, right) = rayon::join(
+            || split_subtree(ctx, child, left, bounds),
+            || split_subtree(ctx, child + 1, right, &mut right_bounds),
+        );
+        left.and(right)
+    } else {
+        split_subtree(ctx, child, left, bounds)?;
+        split_subtree(ctx, child + 1, right, bounds)
+    }
+}
+
+/// Monotone `i32` image of `f32::total_cmp`.
+#[inline]
+fn total_order_key(value: f32) -> i32 {
+    let bits = value.to_bits() as i32;
+    bits ^ ((((bits >> 31) as u32) >> 1) as i32)
+}
+
+#[inline]
+fn fold_bounds(row: &[f32], min: &mut [f32], max: &mut [f32]) {
+    for ((lo, hi), &value) in min.iter_mut().zip(max.iter_mut()).zip(row) {
+        let key = total_order_key(value);
+        *lo = if key < total_order_key(*lo) {
+            value
+        } else {
+            *lo
+        };
+        *hi = if key > total_order_key(*hi) {
+            value
+        } else {
+            *hi
+        };
+    }
+}
+
+/// Exact `total_cmp` per-feature bounds of the given points, one row-major pass.
+fn point_bounds(data: &[f32], d: usize, points: &[i32], min: &mut [f32], max: &mut [f32]) {
+    let first = &data[points[0] as usize * d..][..d];
+    min.copy_from_slice(first);
+    max.copy_from_slice(first);
+    for &point in &points[1..] {
+        fold_bounds(&data[point as usize * d..][..d], min, max);
     }
 }
 
