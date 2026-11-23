@@ -57,7 +57,7 @@ checked prediction planning includes its lane-rounded IDs/data and the transient
 padded-row preparation peak. Vector/scalar contraction can change rounding and
 near-tie prediction outputs; exact ordering is under each kernel's own arithmetic.
 
-HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses the Phase 7 F2 flat plane kernel at 16–32 features when plane operations/synchronization and device resources permit: two planes per cube, no row-count gate. Other CUDA cases use the per-query kernel; this is pre-launch routing, not recovery from execution errors. Leaf-ordered packs preserve original IDs/output rows and scalar feature-sum order. Valid builder trees (or equivalent low-level permutation/tree preconditions) are required; no runtime content scan is added. The estimator consumes `kd_neighbor_plan`, `kd_neighbor_pack_bytes` and `kd_neighbor_pack_allocations` for matching checked live-buffer accounting and allocation limits: tile-rounded padded leaf rows replace padded data, padded bounds remain, and staging counters are diagnostics-only. F2 diagnostics report zero node pops, n scanned positions per query (including self), and separately summed staged positions per tile. The historical Phase 7 report describes final-source verification; its raw performance artifacts may be local and unavailable in a distributed checkout. Experimental H1/release/debug gates are not substituted for final-source proof.
+HDBSCAN KD neighbors retain CPU C16 (leaf SoA, leaf-block queries). CUDA uses the per-query traversal kernel at every feature count; routing is selected before launch, not as recovery from execution errors. Leaf-ordered packs preserve original IDs/output rows and scalar feature-sum order. Valid builder trees (or equivalent low-level permutation/tree preconditions) are required; no runtime content scan is added. The estimator consumes `kd_neighbor_plan`, `kd_neighbor_pack_bytes` and `kd_neighbor_pack_allocations` for matching checked live-buffer accounting and allocation limits, including padded data and padded bounds. The historical Phase 7 report and subsequent removal evidence are in the archive; raw performance artifacts may be local and unavailable in a distributed checkout. Experimental gates are not substituted for final-source proof.
 
 ## Key Directories
 
@@ -135,7 +135,7 @@ Burn/CubeCL requirements are declared once in `[workspace.dependencies]`; keep t
 Native HDBSCAN hotspot reproduction (strict CPU/CUDA, Nsight and counter access):
 `bash scripts/analyze_hdbscan_stages.sh --rows 20000`. After relevant changes, require
 `bash scripts/analyze_hdbscan_stages.sh --rows 100000` final validation. The fixed synthetic
-workload and per-child 10s feedback cap include runtime JIT, not Cargo compilation;
+`umap_like_v1` workload and per-child 10s feedback cap include runtime JIT, not Cargo compilation;
 compilation-only or skipped CUDA execution is not validation. See
 [HDBSCAN stage analysis](docs/development.md#hdbscan-stage-analysis) for final-scale limits.
 Offline: `uv run --no-sync python analyze/summarize_hdbscan_stages.py --benchmark RUN/benchmark.json --kernels RUN/cuda_kernels.json --counters RUN/cuda_counters.json`.

@@ -21,6 +21,27 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+@pytest.mark.parametrize(
+    "rows,features,k",
+    [(1, 1, 0), (2, 1, 0), (4, 2, 0), (20, 1, 4), (20, 2, 4), (959, 16, 96), (1024, 16, 96)],
+)
+def test_generator_small_shapes(rows: int, features: int, k: int, tmp_path: Path) -> None:
+    matrix = module.generate_matrix(rows, features, 42)
+    assert matrix.shape == (rows, features)
+    assert matrix.dtype == np.dtype("<f4")
+    assert np.isfinite(matrix).all()
+    assert matrix.tobytes() == module.generate_matrix(rows, features, 42).tobytes()
+    path = tmp_path / "matrix.f32le"
+    module.make_input(rows, features, 42, path)
+    assert path.stat().st_size == rows * features * 4
+    clustered = rows - int(
+        max(0, rows - module.CLUSTERS * module.MIN_CLUSTER_ROWS) * module.BACKGROUND_FRACTION
+    )
+    counts = module._cluster_counts(clustered, np.random.default_rng(42))
+    assert len(counts) == k
+    assert counts.sum() == (clustered if k else 0)
+
+
 def test_measured_summary_uses_per_run_residuals() -> None:
     result = {
         "warmup_seconds": 100,

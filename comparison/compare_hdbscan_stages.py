@@ -192,17 +192,73 @@ def positive_int(value: str) -> int:
     return result
 
 
-def make_input(
-    rows: int, features: int, center_scale: float, noise: float, seed: int, path: Path
-) -> None:
+CLUSTERS = 96
+SUBCLUSTERS = 6
+MIN_CLUSTER_ROWS = 5
+BACKGROUND_FRACTION = 0.10
+DIRICHLET_ALPHA = 0.5
+SUPER_CENTER_RADIUS = 10.0
+CENTER_SPREAD = 2.0
+LATENT_RADIUS = 2.0
+LATENT_MODES = 12
+MIN_MODE_ROWS = 10
+CURVATURE = 0.3
+FREQUENCY = 2.0
+POINT_NOISE = 0.015
+BACKGROUND_RADIUS = 1.0
+
+
+def _cluster_counts(clustered: int, rng: Any) -> Any:
+    import numpy as np
+
+    k = min(CLUSTERS, clustered // MIN_CLUSTER_ROWS)
+    if k == 0:
+        return np.empty(0, dtype=np.int64)
+    quotas = rng.dirichlet(np.full(k, DIRICHLET_ALPHA)) * (clustered - k * MIN_CLUSTER_ROWS)
+    floors = quotas.astype(np.int64)
+    remainder = clustered - k * MIN_CLUSTER_ROWS - int(floors.sum())
+    floors[np.argsort(floors - quotas, kind="stable")[:remainder]] += 1
+    return floors + MIN_CLUSTER_ROWS
+
+
+def generate_matrix(rows: int, features: int, seed: int) -> Any:
+    """Generate the deterministic UMAP-like stage-analysis workload."""
     import numpy as np
 
     rng = np.random.default_rng(seed)
-    centers = rng.normal(0.0, center_scale, size=(8, features)).astype(np.float32)
-    labels = np.arange(rows) % len(centers)
-    rng.shuffle(labels)
-    matrix = centers[labels] + rng.normal(0.0, noise, size=(rows, features)).astype(np.float32)
-    matrix.astype("<f4", copy=False).tofile(path)
+    # Don't spend the minimum cluster budget on background rows.
+    background = int(max(0, rows - CLUSTERS * MIN_CLUSTER_ROWS) * BACKGROUND_FRACTION)
+    clustered = rows - background
+    k = min(CLUSTERS, clustered // MIN_CLUSTER_ROWS)
+    matrix = np.empty((rows, features), dtype="<f4")
+    if k:
+        super_centers = rng.uniform(
+            -SUPER_CENTER_RADIUS, SUPER_CENTER_RADIUS, (CLUSTERS // SUBCLUSTERS, features)
+        )
+        centers = np.repeat(super_centers, SUBCLUSTERS, axis=0)[:k]
+        centers += rng.normal(0, CENTER_SPREAD, centers.shape)
+        start = 0
+        for center, count in zip(centers, _cluster_counts(clustered, rng), strict=True):
+            modes = min(LATENT_MODES, max(1, count // MIN_MODE_ROWS))
+            z = np.linspace(-LATENT_RADIUS, LATENT_RADIUS, modes) if modes > 1 else np.zeros(1)
+            w = min(3, features)
+            latent = np.column_stack((z, CURVATURE * z**2, np.sin(FREQUENCY * z)))
+            q, upper = np.linalg.qr(rng.standard_normal((features, w)))
+            q *= np.where(np.diag(upper) < 0, -1, 1)
+            matrix[start : start + count] = (latent[:, :w] @ q.T + center)[
+                np.arange(count) % modes
+            ] + rng.normal(0, POINT_NOISE, (count, features))
+            start += count
+        matrix[clustered:] = centers[rng.integers(k, size=background)] + rng.uniform(
+            -BACKGROUND_RADIUS, BACKGROUND_RADIUS, (background, features)
+        )
+    else:
+        matrix[:] = rng.uniform(-SUPER_CENTER_RADIUS, SUPER_CENTER_RADIUS, (rows, features))
+    return matrix[rng.permutation(rows)]
+
+
+def make_input(rows: int, features: int, seed: int, path: Path) -> None:
+    generate_matrix(rows, features, seed).tofile(path)
 
 
 def load_parquet(path: Path, sample_size: int | None, cluster_on: str, seed: int) -> Any:
@@ -565,8 +621,6 @@ def main() -> int:
     )
     parser.add_argument("--rows", type=positive_int, default=5000)
     parser.add_argument("--features", type=positive_int, default=16)
-    parser.add_argument("--center-scale", type=float, default=1.0)
-    parser.add_argument("--noise", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--input", type=Path, help="optional parquet with embedding_2d or embedding_16d column"
@@ -631,9 +685,7 @@ def main() -> int:
         else:
             if args.rows < 2:
                 parser.error("--rows must be at least 2")
-            make_input(
-                args.rows, args.features, args.center_scale, args.noise, args.seed, input_path
-            )
+            make_input(args.rows, args.features, args.seed, input_path)
             matrix = validate_matrix(
                 np.fromfile(input_path, dtype="<f4").reshape(args.rows, args.features)
             )
@@ -736,8 +788,6 @@ def main() -> int:
             "cluster_on": args.cluster_on if args.input else None,
             "sample_size": rows if args.input else None,
             "seed": args.seed,
-            "center_scale": args.center_scale,
-            "noise": args.noise,
             "min_cluster_size": args.min_cluster_size,
             "min_samples": resolved_min_samples,
             "cluster_selection_method": args.cluster_selection_method,

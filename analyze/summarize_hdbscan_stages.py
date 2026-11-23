@@ -12,18 +12,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from hdbscan_stages_common import observed_kernel_families, uniform_route
+from hdbscan_stages_common import SCHEMA_VERSION, observed_kernel_families, uniform_route
 
-SCHEMA_VERSION = 1
 EXPECTED_CONFIG = {
     "features": 16,
     "config": {
         "min_samples": 5,
         "min_cluster_size": 5,
         "search": "auto",
-        "centers": 8,
-        "center_scale": 1.0,
-        "noise": 1.0,
+        "generator": "umap_like_v1",
         "seed": 42,
     },
 }

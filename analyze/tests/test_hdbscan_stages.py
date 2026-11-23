@@ -194,9 +194,19 @@ def test_shell_stops_on_profiler_failure_without_running_later_phases(
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": common_tools.SCHEMA_VERSION,
         "run_id": "synthetic-run",
-        "workload": {"rows": 20_000, "features": 16},
+        "workload": {
+            "rows": 20_000,
+            "features": 16,
+            "config": {
+                "min_samples": 5,
+                "min_cluster_size": 5,
+                "search": "auto",
+                "generator": "umap_like_v1",
+                "seed": 42,
+            },
+        },
         "input_sha256": "a" * 64,
         "provenance": {"source": "synthetic test"},
     }
@@ -211,7 +221,7 @@ def synthetic_reports(
     if route == "KdTree":
         families = (neighbor_family, "kd_candidates_kernel")
     identity_fields = {
-        "schema_version": 1,
+        "schema_version": common_tools.SCHEMA_VERSION,
         "run_id": "synthetic-run",
         "workload": {
             "rows": 20_000,
@@ -220,9 +230,7 @@ def synthetic_reports(
                 "min_samples": 5,
                 "min_cluster_size": 5,
                 "search": "auto",
-                "centers": 8,
-                "center_scale": 1.0,
-                "noise": 1.0,
+                "generator": "umap_like_v1",
                 "seed": 42,
             },
         },
@@ -473,8 +481,8 @@ def test_route_kernel_families_cover_both_routes_and_reject_unknown() -> None:
         common_tools.route_kernel_families("Auto")
 
 
-@pytest.mark.parametrize("family", ["kd_neighbors_kernel", "kd_neighbors_tile_kernel"])
-def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel(family: str) -> None:
+def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel() -> None:
+    family = "kd_neighbors_kernel"
     benchmark, kernels, counters = synthetic_reports(route="KdTree", neighbor_family=family)
     families, evidence = common_tools.observed_kernel_families(
         "KdTree", kernels, benchmark, kernels["binary"]
@@ -488,20 +496,12 @@ def test_counter_kernel_selection_uses_dispatched_kd_neighbor_kernel(family: str
 
 @pytest.mark.parametrize(
     "failure",
-    ["missing", "ambiguous", "identity", "provenance", "binary", "route", "capture", "export"],
+    ["missing", "identity", "provenance", "binary", "route", "capture", "export"],
 )
 def test_observed_kd_families_reject_invalid_evidence(failure: str) -> None:
     benchmark, kernels, _ = synthetic_reports(route="KdTree")
     if failure == "missing":
         kernels["profiled_fit"]["kernels"] = []
-    elif failure == "ambiguous":
-        kernels["profiled_fit"]["kernels"].append(
-            {
-                "family": "kd_neighbors_tile_kernel",
-                "name": "kd_neighbors_tile_kernel_hash",
-                "launch_count": 1,
-            }
-        )
     elif failure == "identity":
         kernels["run_id"] = "wrong-run"
     elif failure == "provenance":
@@ -521,6 +521,32 @@ def test_observed_kd_families_reject_invalid_evidence(failure: str) -> None:
         )
 
 
+@pytest.mark.parametrize("retired", ["kd_neighbors_tile_kernel", "pack_leaf_rows_kernel"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("field", ["name", "family"])
+def test_observed_kd_families_reject_retired_rows(retired: str, mixed: bool, field: str) -> None:
+    benchmark, kernels, _ = synthetic_reports(route="KdTree")
+    rows = kernels["profiled_fit"]["kernels"]
+    if not mixed:
+        rows.clear()
+    row = {"family": "unknown", "name": "unknown_hash", "launch_count": 1}
+    row[field] = f"{retired}_hash"
+    rows.append(row)
+    with pytest.raises(ValueError, match="retired KD"):
+        common_tools.observed_kernel_families("KdTree", kernels, benchmark, kernels["binary"])
+
+
+def test_observed_kd_families_accept_unrelated_unknown() -> None:
+    benchmark, kernels, _ = synthetic_reports(route="KdTree")
+    kernels["profiled_fit"]["kernels"].append(
+        {"family": "unknown", "name": "unknown_future_kernel", "launch_count": 1}
+    )
+    families, _ = common_tools.observed_kernel_families(
+        "KdTree", kernels, benchmark, kernels["binary"]
+    )
+    assert families == ("kd_neighbors_kernel", "kd_candidates_kernel")
+
+
 def test_observed_kd_families_require_kernel_report() -> None:
     with pytest.raises(ValueError, match="cuda_kernels must be a JSON object"):
         common_tools.observed_kernel_families("KdTree", None, {}, {})
@@ -528,7 +554,7 @@ def test_observed_kd_families_require_kernel_report() -> None:
 
 def test_summary_rejects_counter_family_evidence_mismatch() -> None:
     reports = synthetic_reports(route="KdTree")
-    reports[2]["family_evidence"]["neighbor_family"] = "kd_neighbors_tile_kernel"
+    reports[2]["family_evidence"]["neighbor_family"] = "unrelated_kernel"
     with pytest.raises(ValueError, match="family evidence"):
         summarize_reports(*reports)
 
@@ -570,7 +596,7 @@ def test_summary_accepts_three_synthetic_reports_and_preserves_caveats() -> None
     [
         (1, lambda report: report.update(run_id="other"), "identity mismatch"),
         (2, lambda report: report.update(input_sha256="c" * 64), "identity mismatch"),
-        (1, lambda report: report.update(schema_version=2), "schema_version"),
+        (1, lambda report: report.update(schema_version=1), "schema_version"),
         (0, lambda report: report["workload"].update(rows=30_000), "workload.rows"),
     ],
 )
@@ -773,23 +799,6 @@ def test_sqlite_kernel_aggregation_aligns_window_excludes_warmup_and_groups_geom
     assert kernels["partial_kernel_hash"]["family"] == "partial_kernel"
     assert kernels["tile_candidates_hash"]["launch_count"] == 1
     assert "future_kernel" not in kernels
-
-
-@pytest.mark.parametrize("family", ["pack_leaf_rows_kernel", "kd_neighbors_tile_kernel"])
-def test_sqlite_kernel_aggregation_recognizes_phase7_families(
-    tmp_path: Path,
-    family: str,
-) -> None:
-    import sqlite3
-
-    path = tmp_path / "phase7.sqlite"
-    synthetic_nsys_db(path)
-    with sqlite3.connect(path) as db:
-        db.execute("UPDATE StringIds SET value = ? WHERE id = 1", (f"{family}_hash",))
-    result = kernel_tools.aggregate_kernels(path, 1100, 1200)
-    matching = [row for row in result["kernels"] if row["family"] == family]
-    assert len(matching) == 1
-    assert matching[0]["launch_count"] == 2
 
 
 @pytest.mark.parametrize(
@@ -1220,16 +1229,32 @@ def test_deterministic_input_matches_existing_generator_shape_bytes_and_hash(
 
     generated = tmp_path / "generated.f32le"
     reference = tmp_path / "reference.f32le"
-    benchmark_tools._generate_input(generated, 256)
-    make_input(256, 16, 1.0, 1.0, 42, reference)
+    benchmark_tools._generate_input(generated, 1024)
+    make_input(1024, 16, 42, reference)
     generated_bytes = generated.read_bytes()
     reference_bytes = reference.read_bytes()
     assert generated_bytes == reference_bytes
-    assert len(generated_bytes) == 256 * 16 * 4
+    assert len(generated_bytes) == 1024 * 16 * 4
     assert (
         __import__("hashlib").sha256(generated_bytes).digest()
         == __import__("hashlib").sha256(reference_bytes).digest()
     )
+    make_input(1024, 16, 42, reference)
+    assert reference.read_bytes() == generated_bytes
+    make_input(1024, 16, 43, reference)
+    assert reference.read_bytes() != generated_bytes
+    import numpy as np
+    from comparison.compare_hdbscan_stages import SUPER_CENTER_RADIUS
+
+    make_input(1, 16, 42, reference)
+    values = np.fromfile(reference, dtype="<f4")
+    assert np.all(values >= -SUPER_CENTER_RADIUS)
+    assert np.all(values <= SUPER_CENTER_RADIUS)
+    for rows, features in ((1, 1), (2, 1), (4, 2), (20, 1), (20, 2), (959, 16), (1024, 16)):
+        make_input(rows, features, 42, reference)
+        values = np.fromfile(reference, dtype="<f4")
+        assert values.size == rows * features
+        assert np.isfinite(values).all()
 
 
 def run_fake_benchmark(
@@ -1363,7 +1388,7 @@ def test_identity_reads_only_valid_shared_manifest(tmp_path: Path) -> None:
     result = identity(run_dir)
     assert result == manifest()
     for changed in (
-        {**manifest(), "schema_version": 2},
+        {**manifest(), "schema_version": 1},
         {**manifest(), "run_id": None},
         {**manifest(), "input_sha256": "not-a-digest"},
         {**manifest(), "workload": []},

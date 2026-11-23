@@ -12,7 +12,6 @@ use burn::{
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 
 use burn_cubecl::ops::into_data_sync;
-use cubecl::features::Plane;
 
 const KD_CUBE_DIM: CubeDim = CubeDim::new_1d(32);
 const KD_NEIGHBORS_CUBE_DIM: CubeDim = CubeDim::new_1d(64);
@@ -26,18 +25,14 @@ type KdVector<F> = Vector<F, Const<4>>;
 
 const KD_QUERY_BLOCK: usize = 64;
 const KD_SOA_MAX_LANES: usize = 16;
-const KD_TILE_PLANES: usize = 2;
-const KD_TILE_MIN_FEATURES: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KdCandidateLayout {
     PaddedRows,
-    LeafRows { tile: usize },
     LeafSoa { lanes: usize },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KdQueryOrder {
     Cyclic,
-    PlaneTiles,
     LeafBlocks,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,10 +40,7 @@ pub(crate) struct KdNeighborPlan {
     pub(crate) layout: KdCandidateLayout,
     pub(crate) order: KdQueryOrder,
 }
-pub(crate) fn kd_neighbor_plan(client: &cubecl::client::Client, features: usize) -> KdNeighborPlan {
-    if let Some(plan) = kd_tile_plan(client, features) {
-        return plan;
-    }
+pub(crate) fn kd_neighbor_plan(client: &cubecl::client::Client) -> KdNeighborPlan {
     if client.properties().hardware.num_cpu_cores.is_none() {
         return KdNeighborPlan {
             layout: KdCandidateLayout::PaddedRows,
@@ -75,85 +67,9 @@ fn kd_soa_slots(rows: usize, lanes: usize) -> Option<usize> {
         .checked_add(usize::from(!rows.is_multiple_of(lanes)))?
         .checked_mul(lanes)
 }
-fn kd_tile_plan(client: &cubecl::client::Client, features: usize) -> Option<KdNeighborPlan> {
-    kd_tile_plan_with_gate(client, features, KD_TILE_MIN_FEATURES)
-}
-fn kd_tile_plan_with_gate(
-    client: &cubecl::client::Client,
-    features: usize,
-    gate: usize,
-) -> Option<KdNeighborPlan> {
-    let hw = &client.properties().hardware;
-    let tile = hw.plane_size_min as usize;
-    if hw.num_cpu_cores.is_some()
-        || !client.features().plane.contains(Plane::Ops)
-        || !client.features().plane.contains(Plane::Sync)
-        || tile == 0
-        || hw.plane_size_min != hw.plane_size_max
-        || features < gate
-        || features > KD_REGISTER_QUERY_MAX_FEATURES
-    {
-        return None;
-    }
-    if !kd_tile_resources_fit(
-        features,
-        tile,
-        hw.max_shared_memory_size,
-        hw.max_units_per_cube as usize,
-        hw.max_cube_dim.0 as usize,
-    ) {
-        return None;
-    }
-    Some(KdNeighborPlan {
-        layout: KdCandidateLayout::LeafRows { tile },
-        order: KdQueryOrder::PlaneTiles,
-    })
-}
-#[cfg(test)]
-fn kd_tile_plan_for_test(
-    client: &cubecl::client::Client,
-    features: usize,
-) -> Option<KdNeighborPlan> {
-    kd_tile_plan_with_gate(client, features, 1)
-}
-fn kd_tile_shared_bytes(features: usize, tile: usize) -> Option<usize> {
-    if tile == 0 {
-        return None;
-    }
-    tile.checked_mul(KD_TILE_PLANES)?
-        .checked_mul(kd_padded_width(features)?.checked_mul(4)?.checked_add(4)?)
-}
-fn kd_tile_resources_fit(
-    features: usize,
-    tile: usize,
-    shared_limit: usize,
-    unit_limit: usize,
-    dim_limit: usize,
-) -> bool {
-    let Some(units) = tile.checked_mul(KD_TILE_PLANES) else {
-        return false;
-    };
-    let Some(shared) = kd_tile_shared_bytes(features, tile) else {
-        return false;
-    };
-    shared <= shared_limit && units <= unit_limit && units <= dim_limit
-}
-
-/// Scalar elements in the data pack and diagnostics-only staging counter allocation.
-/// Bounds and CPU SoA allocations are checked separately by the estimator.
-pub(crate) fn kd_neighbor_pack_allocations(
-    plan: KdNeighborPlan,
-    rows: usize,
-    features: usize,
-) -> Option<[usize; 2]> {
-    let (packed_rows, staged) = match plan.layout {
-        KdCandidateLayout::LeafRows { tile } => (
-            kd_soa_slots(rows, tile)?,
-            kd_tile_diagnostic_bytes(rows, tile, kd_diagnostics_enabled())? / 4,
-        ),
-        _ => (rows, 0),
-    };
-    Some([packed_rows.checked_mul(kd_padded_width(features)?)?, staged])
+/// Scalar elements in the padded data pack; bounds and CPU SoA are checked separately.
+pub(crate) fn kd_neighbor_pack_allocations(rows: usize, features: usize) -> Option<usize> {
+    rows.checked_mul(kd_padded_width(features)?)
 }
 /// Per-call packs for a valid builder-produced tree; no content validation is performed.
 pub(crate) fn kd_neighbor_pack_bytes(
@@ -164,29 +80,12 @@ pub(crate) fn kd_neighbor_pack_bytes(
 ) -> Option<usize> {
     let padded = kd_padded_bytes(rows, nodes, features)?;
     match plan.layout {
-        KdCandidateLayout::LeafRows { tile } => kd_soa_slots(rows, tile)?
-            .checked_add(nodes.checked_mul(2)?)?
-            .checked_mul(kd_padded_width(features)?)?
-            .checked_mul(4)?
-            .checked_add(kd_tile_diagnostic_bytes(
-                rows,
-                tile,
-                kd_diagnostics_enabled(),
-            )?),
         KdCandidateLayout::PaddedRows => Some(padded),
         KdCandidateLayout::LeafSoa { lanes } => padded.checked_add(
             kd_soa_slots(rows, lanes)?
                 .checked_mul(features.checked_add(1)?)?
                 .checked_mul(4)?,
         ),
-    }
-}
-fn kd_tile_diagnostic_bytes(rows: usize, tile: usize, enabled: bool) -> Option<usize> {
-    let slots = kd_soa_slots(rows, tile)?;
-    if enabled {
-        (slots / tile).checked_mul(4)
-    } else {
-        Some(0)
     }
 }
 #[cube(launch)]
@@ -1079,233 +978,6 @@ fn kd_neighbors_kernel<F: Float, I: Int>(
 }
 
 #[cube(launch)]
-fn pack_leaf_rows_kernel<F: Float, I: Int>(
-    data: &Tensor<F>,
-    indices: &Tensor<I>,
-    output: &mut Tensor<F>,
-    n: u32,
-    d: u32,
-    padded_width: u32,
-    len: u32,
-    #[define(F, I)] _dtypes: [ElemType; 2],
-) {
-    let mut at = ABSOLUTE_POS_X;
-    let stride = CUBE_DIM_X * CUBE_COUNT_X;
-    while at < len {
-        let position = at / padded_width;
-        let feature = at % padded_width;
-        let mut value = F::new(0.0f32);
-        if position < n && feature < d {
-            let row = u32::cast_from(indices[position as usize]);
-            value = data[(row * d + feature) as usize];
-        }
-        output[at as usize] = value;
-        at += stride;
-    }
-}
-
-#[cube(launch)]
-fn kd_neighbors_tile_kernel<F: Float, I: Int>(
-    data_v: &Tensor<KdVector<F>>,
-    indices: &Tensor<I>,
-    n: u32,
-    k: u32,
-    #[comptime] reg_features: usize,
-    #[comptime] tile_width: usize,
-    #[comptime] diagnostics_enabled: bool,
-    out_indices: &mut Tensor<I>,
-    out_distances: &mut Tensor<F>,
-    diagnostics: &mut Tensor<I>,
-    staged_positions: &mut Tensor<I>,
-    #[define(F, I)] _dtypes: [ElemType; 2],
-) {
-    let d_chunks = comptime![reg_features.div_ceil(4)];
-    let lane = UNIT_POS_PLANE as usize;
-    let plane = UNIT_POS as usize / tile_width;
-    let candidate_base = plane * tile_width * d_chunks;
-    let id_base = plane * tile_width;
-    let mut candidates = Shared::<[KdVector<F>]>::new_slice(comptime![
-        KD_TILE_PLANES * tile_width * reg_features.div_ceil(4)
-    ]);
-    let mut ids = Shared::<[I]>::new_slice(comptime![KD_TILE_PLANES * tile_width]);
-    let mut tile = CUBE_POS_X as usize * KD_TILE_PLANES + plane;
-    let tile_stride = CUBE_COUNT_X as usize * KD_TILE_PLANES;
-    let tile_count = (n as usize).div_ceil(tile_width);
-    while tile < tile_count {
-        let position = tile * tile_width + lane;
-        let active = position < n as usize;
-        let mut row = 0usize;
-        if active {
-            row = u32::cast_from(indices[position]) as usize;
-        }
-        let width = k as usize;
-        let root = row * width;
-        if active {
-            for slot in 0..width {
-                out_indices[root + slot] = I::cast_from(n);
-                out_distances[root + slot] = F::new(f32::INFINITY);
-            }
-        }
-        let mut query = Array::<KdVector<F>>::new(comptime![reg_features.div_ceil(4)]);
-        load_query::<F>(data_v, position, d_chunks, &mut query, reg_features);
-        let mut worst_distance = F::new(f32::INFINITY);
-        let mut worst_index = n as usize;
-        let mut leaf_positions_scanned = 0i32;
-        let mut staged = 0i32;
-        let mut s = 0usize;
-        let end = n as usize;
-        while s < end {
-            let mut len = end - s;
-            if len > tile_width {
-                len = tile_width;
-            }
-            let mut element = lane;
-            while element < len * d_chunks {
-                candidates[candidate_base + element] = data_v[s * d_chunks + element];
-                element += tile_width;
-            }
-            if lane < len {
-                ids[id_base + lane] = indices[s + lane];
-            }
-            sync_plane();
-            if comptime![diagnostics_enabled] {
-                staged += len as i32;
-            }
-            if active {
-                if comptime![diagnostics_enabled] {
-                    leaf_positions_scanned += len as i32;
-                }
-                for j in 0..len {
-                    let candidate = u32::cast_from(ids[id_base + j]) as usize;
-                    if candidate != row {
-                        let mut distance = F::new(0.0f32);
-                        #[unroll]
-                        for c in 0..comptime![reg_features.div_ceil(4)] {
-                            let lanes = comptime![(reg_features - c * 4).min(4)];
-                            distance = chunk_distance::<F>(
-                                query[c],
-                                candidates[candidate_base + j * d_chunks + c],
-                                distance,
-                                lanes,
-                            );
-                        }
-                        if distance < worst_distance
-                            || (distance == worst_distance && candidate < worst_index)
-                        {
-                            out_distances[root] = distance;
-                            out_indices[root] = I::cast_from(candidate);
-                            let mut parent = 0usize;
-                            let mut heap = true;
-                            while heap && parent < width / 2 {
-                                let left = parent * 2 + 1;
-                                let right = left + 1;
-                                let mut largest = left;
-                                if right < width {
-                                    let left_at = row * width + left;
-                                    let right_at = row * width + right;
-                                    let left_index = u32::cast_from(out_indices[left_at]) as usize;
-                                    let right_index =
-                                        u32::cast_from(out_indices[right_at]) as usize;
-                                    if out_distances[right_at] > out_distances[left_at]
-                                        || (out_distances[right_at] == out_distances[left_at]
-                                            && right_index > left_index)
-                                    {
-                                        largest = right;
-                                    }
-                                }
-                                let parent_at = row * width + parent;
-                                let child_at = row * width + largest;
-                                let parent_index = u32::cast_from(out_indices[parent_at]) as usize;
-                                let child_index = u32::cast_from(out_indices[child_at]) as usize;
-                                if out_distances[parent_at] > out_distances[child_at]
-                                    || (out_distances[parent_at] == out_distances[child_at]
-                                        && parent_index >= child_index)
-                                {
-                                    heap = false;
-                                } else {
-                                    let parent_distance = out_distances[parent_at];
-                                    let parent_index = out_indices[parent_at];
-                                    out_distances[parent_at] = out_distances[child_at];
-                                    out_indices[parent_at] = out_indices[child_at];
-                                    out_distances[child_at] = parent_distance;
-                                    out_indices[child_at] = parent_index;
-                                    parent = largest;
-                                }
-                            }
-                            worst_distance = out_distances[root];
-                            worst_index = u32::cast_from(out_indices[root]) as usize;
-                        }
-                    }
-                }
-            }
-            sync_plane();
-            s += tile_width;
-        }
-        if active {
-            if comptime![diagnostics_enabled] {
-                diagnostics[row * 2] = I::cast_from(0);
-                diagnostics[row * 2 + 1] = I::cast_from(leaf_positions_scanned);
-            }
-            // In-place heapsort turns the output-backed max-heap into ascending order.
-            let mut heap_len = width;
-            while heap_len > 1 {
-                let root = row * width;
-                let last = row * width + heap_len - 1;
-                let root_distance = out_distances[root];
-                let root_index = out_indices[root];
-                out_distances[root] = out_distances[last];
-                out_indices[root] = out_indices[last];
-                out_distances[last] = root_distance;
-                out_indices[last] = root_index;
-                heap_len -= 1;
-
-                let mut parent = 0usize;
-                let mut heap = true;
-                while heap && parent < heap_len / 2 {
-                    let left = parent * 2 + 1;
-                    let right = left + 1;
-                    let mut largest = left;
-                    if right < heap_len {
-                        let left_at = row * width + left;
-                        let right_at = row * width + right;
-                        let left_index = u32::cast_from(out_indices[left_at]) as usize;
-                        let right_index = u32::cast_from(out_indices[right_at]) as usize;
-                        if out_distances[right_at] > out_distances[left_at]
-                            || (out_distances[right_at] == out_distances[left_at]
-                                && right_index > left_index)
-                        {
-                            largest = right;
-                        }
-                    }
-                    let parent_at = row * width + parent;
-                    let child_at = row * width + largest;
-                    let parent_index = u32::cast_from(out_indices[parent_at]) as usize;
-                    let child_index = u32::cast_from(out_indices[child_at]) as usize;
-                    if out_distances[parent_at] > out_distances[child_at]
-                        || (out_distances[parent_at] == out_distances[child_at]
-                            && parent_index >= child_index)
-                    {
-                        heap = false;
-                    } else {
-                        let parent_distance = out_distances[parent_at];
-                        let parent_index = out_indices[parent_at];
-                        out_distances[parent_at] = out_distances[child_at];
-                        out_indices[parent_at] = out_indices[child_at];
-                        out_distances[child_at] = parent_distance;
-                        out_indices[child_at] = parent_index;
-                        parent = largest;
-                    }
-                }
-            }
-        }
-        if comptime![diagnostics_enabled] && lane == 0 {
-            staged_positions[tile] = I::cast_from(staged);
-        }
-        tile += tile_stride;
-    }
-}
-
-#[cube(launch)]
 fn kd_neighbors_cpu_kernel<F: Float, I: Int, Lanes: Size>(
     data_v: &Tensor<KdVector<F>>,
     data: &Tensor<F>,
@@ -1861,7 +1533,6 @@ pub(crate) fn kd_reference_pack_bytes(
                     .checked_mul(features.checked_add(1)?)?
                     .checked_mul(4)?,
             ),
-        KdCandidateLayout::LeafRows { .. } => None,
     }
 }
 
@@ -2179,7 +1850,7 @@ fn launch_kd_neighbors(
     FloatTensor<CubeBackend>,
     IntTensor<CubeBackend>,
 ) {
-    let plan = kd_neighbor_plan(&data.client, data.shape().dims::<2>()[1]);
+    let plan = kd_neighbor_plan(&data.client);
     #[cfg(test)]
     {
         launch_kd_neighbors_impl(
@@ -2254,78 +1925,6 @@ fn launch_kd_neighbors_impl(
     let (d_chunks, reg_features) = kd_vector_chunks(features);
     let bounds_min_padded = pad_rows(&tree.bounds_min, nodes, features);
     let bounds_max_padded = pad_rows(&tree.bounds_max, nodes, features);
-    if plan.order == KdQueryOrder::PlaneTiles {
-        let KdCandidateLayout::LeafRows { tile } = plan.layout else {
-            panic!("tile layout required")
-        };
-        #[cfg(test)]
-        let expected_plan = kd_tile_plan_for_test(&client, features);
-        #[cfg(not(test))]
-        let expected_plan = kd_tile_plan(&client, features);
-        assert_eq!(expected_plan, Some(plan));
-        kd_neighbor_pack_bytes(plan, n, nodes, features).expect("KD leaf rows pack size overflow");
-        let slots = kd_soa_slots(n, tile).expect("KD tile slots overflow");
-        let len = slots
-            .checked_mul(kd_padded_width(features).expect("KD padded width overflow"))
-            .expect("KD leaf rows length overflow");
-        let len_u32 = u32::try_from(len).expect("KD leaf rows elements");
-        let leaf_rows = allocate_float(&data, len);
-        let (pack_count, pack_dim) = kd_launch_geometry(&client, len);
-        pack_leaf_rows_kernel::launch(
-            &client,
-            pack_count,
-            pack_dim,
-            data.clone().into_tensor_arg(),
-            tree.indices.clone().into_tensor_arg(),
-            leaf_rows.clone().into_tensor_arg(),
-            u32::try_from(n).expect("KD rows"),
-            u32::try_from(features).expect("KD features"),
-            u32::try_from(kd_padded_width(features).unwrap()).expect("KD width"),
-            len_u32,
-            [
-                dtype_to_storage_type(DType::F32),
-                dtype_to_storage_type(DType::I32),
-            ],
-        );
-        let tile_count = n.div_ceil(tile);
-        kd_tile_diagnostic_bytes(n, tile, diagnostics_enabled)
-            .expect("KD staged diagnostic size overflow");
-        let staged = if diagnostics_enabled {
-            allocate_int(&data, tile_count)
-        } else {
-            diagnostics.clone()
-        };
-        let dim = CubeDim::new_1d(u32::try_from(tile * KD_TILE_PLANES).expect("KD tile units"));
-        #[cfg(test)]
-        let max_cubes = max_cubes_override.unwrap_or(client.properties().hardware.max_cube_count.0);
-        #[cfg(not(test))]
-        let max_cubes = client.properties().hardware.max_cube_count.0;
-        let count = launch_count(slots, dim.x, max_cubes);
-        kd_neighbors_tile_kernel::launch(
-            &client,
-            CubeCount::Static(count, 1, 1),
-            dim,
-            padded_vector_view(&leaf_rows, slots, d_chunks),
-            tree.indices.clone().into_tensor_arg(),
-            u32::try_from(n).expect("KD rows"),
-            k,
-            reg_features,
-            tile,
-            diagnostics_enabled,
-            output_indices.clone().into_tensor_arg(),
-            output_distances.clone().into_tensor_arg(),
-            diagnostics.clone().into_tensor_arg(),
-            staged.clone().into_tensor_arg(),
-            [
-                dtype_to_storage_type(DType::F32),
-                dtype_to_storage_type(DType::I32),
-            ],
-        );
-        if diagnostics_enabled {
-            emit_tile_staging(staged, n, tile);
-        }
-        return (output_indices, output_distances, diagnostics);
-    }
     let data_padded = pad_rows(&data, n, features);
     if plan
         != (KdNeighborPlan {
@@ -2605,30 +2204,6 @@ fn allocate_diagnostics(
     )
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static TILE_STAGED: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn emit_tile_staging(tensor: IntTensor<CubeBackend>, rows: usize, tile: usize) {
-    let counts = into_data_sync(tensor)
-        .try_to_vec::<i32>()
-        .expect("KD staged counters");
-    assert_eq!(counts.len(), rows.div_ceil(tile));
-    let sum = counts
-        .iter()
-        .try_fold(0u64, |sum, &value| {
-            sum.checked_add(u64::try_from(value).expect("nonnegative staged positions"))
-        })
-        .expect("KD staged total overflow");
-    assert_eq!(sum, rows as u64 * rows.div_ceil(tile) as u64);
-    #[cfg(test)]
-    TILE_STAGED.with(|last| *last.borrow_mut() = counts.clone());
-    eprintln!(
-        "{{\"operation\":\"kd_neighbors_tile_staging\",\"rows\":{rows},\"tile_width\":{tile},\"planes_per_cube\":2,\"traverse\":false,\"staged_positions\":{sum},\"per_tile\":{counts:?},\"nodes_popped_semantics\":\"zero_flat_scan\",\"leaf_positions_scanned_semantics\":\"lane_evaluated_positions_including_self\"}}"
-    );
-}
-
 fn emit_kd_diagnostics(
     operation: &str,
     tensor: IntTensor<CubeBackend>,
@@ -2765,14 +2340,14 @@ mod tests {
     use burn::tensor::TensorData;
     use burn_cubecl::{CubeDevice, ops::into_data_sync};
 
-    fn phase7_cuda() -> Option<CubeDevice> {
+    fn cuda_device() -> Option<CubeDevice> {
         let count = cuscan_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
         if count == 0 {
             assert!(
                 std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
                 "required CUDA unavailable"
             );
-            eprintln!("SKIPPED: phase7 requires CUDA");
+            eprintln!("SKIPPED: KD test requires CUDA");
             None
         } else {
             Some(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }))
@@ -2780,296 +2355,51 @@ mod tests {
     }
 
     #[test]
-    fn phase7_pack_leaf_rows_bits_and_tail_cuda() {
-        let Some(device) = phase7_cuda() else { return };
-        for rows in [1, 31, 33, 257, 1000, 4109] {
-            for features in [1, 2, 3, 4, 5, 8, 16, 29, 30, 32] {
-                let mut values = splitmix_values(rows, features);
-                for i in (0..values.len()).step_by(13) {
-                    values[i] = -0.0;
-                }
-                let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
-                let tile = data.client.properties().hardware.plane_size_min as usize;
-                let slots = kd_soa_slots(rows, tile).unwrap();
-                let width = kd_padded_width(features).unwrap();
-                let len = slots * width;
-                let output = allocate_float(&data, len);
-                let (count, dim) = kd_launch_geometry(&data.client, len);
-                pack_leaf_rows_kernel::launch(
-                    &data.client,
-                    count,
-                    dim,
-                    data.clone().into_tensor_arg(),
-                    tree.indices.clone().into_tensor_arg(),
-                    output.clone().into_tensor_arg(),
-                    rows as u32,
-                    features as u32,
-                    width as u32,
-                    len as u32,
-                    [
-                        dtype_to_storage_type(DType::F32),
-                        dtype_to_storage_type(DType::I32),
-                    ],
-                );
-                let padded = into_data_sync(pad_rows(&data, rows, features))
-                    .try_to_vec::<f32>()
-                    .unwrap();
-                let order = into_data_sync(tree.indices).try_to_vec::<i32>().unwrap();
-                let actual = into_data_sync(output).try_to_vec::<f32>().unwrap();
-                for p in 0..slots {
-                    for f in 0..width {
-                        let expected = if p < rows {
-                            padded[order[p] as usize * width + f]
-                        } else {
-                            0.0
-                        };
-                        assert_eq!(
-                            actual[p * width + f].to_bits(),
-                            expected.to_bits(),
-                            "n={rows}, d={features}, p={p}, f={f}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn phase7_checked_pack_and_diagnostic_sizing() {
-        let plan = KdNeighborPlan {
-            layout: KdCandidateLayout::LeafRows { tile: 32 },
-            order: KdQueryOrder::PlaneTiles,
-        };
-        let expected = (1024 + 126) * 8 * 4
-            + kd_tile_diagnostic_bytes(1000, 32, kd_diagnostics_enabled()).unwrap();
-        assert_eq!(kd_neighbor_pack_bytes(plan, 1000, 63, 5), Some(expected));
-        assert_eq!(
-            kd_neighbor_pack_allocations(plan, 1000, 5),
-            Some([
-                1024 * 8,
-                kd_tile_diagnostic_bytes(1000, 32, kd_diagnostics_enabled()).unwrap() / 4
-            ])
-        );
-        for (n, nodes, d) in [
-            (usize::MAX, 0, 1),
-            (1, usize::MAX, 1),
-            (1, 0, usize::MAX),
-            (usize::MAX / 8, 0, 32),
-        ] {
-            assert_eq!(kd_neighbor_pack_bytes(plan, n, nodes, d), None);
-        }
-        assert_eq!(kd_neighbor_pack_allocations(plan, usize::MAX, 5), None);
-        assert_eq!(kd_neighbor_pack_allocations(plan, 1, usize::MAX), None);
-        assert_eq!(kd_tile_diagnostic_bytes(4109, 32, true), Some(129 * 4));
-        assert_eq!(kd_tile_diagnostic_bytes(4109, 32, false), Some(0));
-        assert_eq!(kd_tile_diagnostic_bytes(usize::MAX, 32, true), None);
-        assert_eq!(kd_tile_diagnostic_bytes(1, 0, true), None);
-    }
-
-    #[test]
-    fn phase7_tile_resource_limits_reject_insufficient_capacity() {
-        for features in [1usize, 16, 32] {
-            let units = 32 * KD_TILE_PLANES;
-            let shared = units * (features.div_ceil(4) * 16 + 4);
-            assert_eq!(kd_tile_shared_bytes(features, 32), Some(shared));
-            assert!(kd_tile_resources_fit(features, 32, shared, units, units));
-            assert!(!kd_tile_resources_fit(
-                features,
-                32,
-                shared - 1,
-                units,
-                units
-            ));
-            assert!(!kd_tile_resources_fit(
-                features,
-                32,
-                shared,
-                units - 1,
-                units
-            ));
-            assert!(!kd_tile_resources_fit(
-                features,
-                32,
-                shared,
-                units,
-                units - 1
-            ));
-        }
-        assert!(!kd_tile_resources_fit(
-            32,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX
-        ));
-        assert!(!kd_tile_resources_fit(
-            usize::MAX,
-            32,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX
-        ));
-        assert!(!kd_tile_resources_fit(
-            16,
-            0,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX
-        ));
-    }
-
-    #[test]
-    fn phase7_routing_cpu_and_cuda() {
+    fn kd_routing_cpu_and_cuda() {
         let (cpu, _) = make_neighbor_inputs(&[0.0], 1, 1, &CubeDevice::Cpu(Default::default()));
-        for d in [1, 2, 8, 15, 16, 32, 33] {
-            assert_eq!(kd_tile_plan(&cpu.client, d), None);
-            assert!(matches!(
-                kd_neighbor_plan(&cpu.client, d).layout,
-                KdCandidateLayout::LeafSoa { .. }
-            ));
+        for _d in [1, 2, 8, 15, 16, 32, 33] {
+            let plan = kd_neighbor_plan(&cpu.client);
+            assert!(matches!(plan.layout, KdCandidateLayout::LeafSoa { .. }));
+            assert_eq!(plan.order, KdQueryOrder::LeafBlocks);
         }
-        let Some(device) = phase7_cuda() else { return };
+        let count = cuscan_common::cuda_backend::try_device_count().expect("CUDA discovery failed");
+        if count == 0 {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "required CUDA unavailable"
+            );
+            eprintln!("SKIPPED: KD routing requires CUDA");
+            return;
+        }
+        let device = CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 });
         let (data, _) = make_neighbor_inputs(&[0.0], 1, 1, &device);
-        for d in [16, 32] {
+        for _d in [1, 2, 8, 15, 16, 32, 33] {
             assert_eq!(
-                kd_neighbor_plan(&data.client, d).order,
-                KdQueryOrder::PlaneTiles
-            );
-        }
-        for d in [1, 2, 8, 15, 33, 40] {
-            assert_eq!(kd_tile_plan(&data.client, d), None);
-            assert_eq!(
-                kd_neighbor_plan(&data.client, d).order,
-                KdQueryOrder::Cyclic
+                kd_neighbor_plan(&data.client),
+                KdNeighborPlan {
+                    layout: KdCandidateLayout::PaddedRows,
+                    order: KdQueryOrder::Cyclic,
+                }
             );
         }
     }
 
-    fn phase7_reference_matrix(features: usize) {
-        let Some(device) = phase7_cuda() else { return };
-        for (rows, pattern, k) in [(257, 0, 1), (257, 1, 16), (4109, 2, 17)] {
-            let mut values = splitmix_values(rows, features);
-            if pattern == 1 {
-                for r in 0..rows {
-                    for f in 0..features {
-                        values[r * features + f] = ((r % 19 + f) % 7) as f32;
-                    }
-                }
-            } else if pattern == 2 {
-                for r in 0..rows {
-                    for f in 0..features {
-                        values[r * features + f] = if r % 7 == 0 {
-                            -0.0
-                        } else {
-                            ((r >> (f % 8)) % 3) as f32 - 1.0
-                        };
-                    }
-                }
-            }
-            let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
-            let tile = data.client.properties().hardware.plane_size_min as usize;
-            if rows == 4109 {
-                assert!(
-                    rows.div_ceil(tile) > 2,
-                    "4109 rows must span more than two tiles"
-                );
-                assert_ne!(rows % tile, 0, "4109 rows must have a partial tile");
-            }
-            let (ref_ids, ref_distances, _) = exact_neighbors_kd_reference(data, tree, k, false);
-            let ref_ids = into_data_sync(ref_ids).try_to_vec::<i32>().unwrap();
-            let ref_bits = into_data_sync(ref_distances)
-                .try_to_vec::<f32>()
-                .unwrap()
-                .into_iter()
-                .map(f32::to_bits)
-                .collect::<Vec<_>>();
-
-            let mut default_staging = None;
-            let variants: &[(Option<u32>, bool)] = if pattern == 2 {
-                &[
-                    (None, true),
-                    (None, false),
-                    (Some(1), false),
-                    (Some(1), true),
-                ]
-            } else {
-                &[(None, true)]
-            };
-            for &(cap, enabled) in variants {
-                let (data, tree) = make_neighbor_inputs(&values, rows, features, &device);
-                let plan = kd_tile_plan_for_test(&data.client, features)
-                    .expect("required tile capability");
-                let (ids, distances, diagnostics) =
-                    launch_kd_neighbors_impl(data, tree, k, enabled, plan, 64, cap);
-                let context = format!(
-                    "n={rows}, d={features}, k={k}, pattern={pattern}, cap={cap:?}, diagnostics={enabled}"
-                );
-                assert_eq!(
-                    into_data_sync(ids).try_to_vec::<i32>().unwrap(),
-                    ref_ids,
-                    "{context}"
-                );
-                assert_eq!(
-                    into_data_sync(distances)
-                        .try_to_vec::<f32>()
-                        .unwrap()
-                        .into_iter()
-                        .map(f32::to_bits)
-                        .collect::<Vec<_>>(),
-                    ref_bits,
-                    "{context}"
-                );
-                if enabled {
-                    let counts = into_data_sync(diagnostics).try_to_vec::<i32>().unwrap();
-                    assert_eq!(counts.len(), rows * 2);
-                    for row in 0..rows {
-                        assert_eq!(
-                            (counts[row * 2], counts[row * 2 + 1]),
-                            (0, rows as i32),
-                            "{context}"
-                        );
-                    }
-                    TILE_STAGED.with(|last| {
-                        let staged = last.borrow();
-                        assert_eq!(staged.len(), rows.div_ceil(tile));
-                        assert!(staged.iter().all(|&v| v >= 0 && v <= rows as i32));
-
-                        assert!(staged.iter().all(|&v| v == rows as i32));
-
-                        if cap.is_none() {
-                            default_staging = Some(staged.clone());
-                        } else {
-                            assert_eq!(
-                                Some(&*staged),
-                                default_staging.as_ref(),
-                                "capped-grid staged positions differ: {context}"
-                            );
-                        }
-                    });
-                }
-            }
-        }
-    }
-
     #[test]
-    fn phase7_reference_d3_cuda() {
-        phase7_reference_matrix(3);
-    }
-    #[test]
-    fn phase7_reference_d5_cuda() {
-        phase7_reference_matrix(5);
-    }
-    #[test]
-    fn phase7_reference_d16_cuda() {
-        phase7_reference_matrix(16);
-    }
-    #[test]
-    fn phase7_reference_d30_cuda() {
-        phase7_reference_matrix(30);
-    }
-    #[test]
-    fn phase7_reference_d32_cuda() {
-        phase7_reference_matrix(32);
+    fn kd_padded_pack_sizing_checked() {
+        let plan = KdNeighborPlan {
+            layout: KdCandidateLayout::PaddedRows,
+            order: KdQueryOrder::Cyclic,
+        };
+        assert_eq!(kd_neighbor_pack_allocations(1001, 17), Some(1001 * 20));
+        assert_eq!(
+            kd_neighbor_pack_bytes(plan, 1001, 63, 17),
+            Some((1001 + 2 * 63) * 20 * 4)
+        );
+        assert_eq!(kd_neighbor_pack_allocations(usize::MAX, 1), None);
+        assert_eq!(kd_neighbor_pack_allocations(1, usize::MAX), None);
+        assert_eq!(kd_neighbor_pack_bytes(plan, usize::MAX, 0, 1), None);
+        assert_eq!(kd_neighbor_pack_bytes(plan, 1, usize::MAX, 1), None);
+        assert_eq!(kd_neighbor_pack_bytes(plan, 1, 0, usize::MAX), None);
     }
 
     #[test]
@@ -3290,7 +2620,7 @@ mod tests {
                 lanes > 0,
                 data.client.properties().hardware.num_cpu_cores.is_some()
             );
-            let fitting_plan = kd_neighbor_plan(&data.client, features);
+            let fitting_plan = kd_neighbor_plan(&data.client);
             if data.client.properties().hardware.num_cpu_cores.is_some() {
                 assert_eq!(fitting_plan.order, KdQueryOrder::LeafBlocks);
             }
@@ -3331,11 +2661,10 @@ mod tests {
                     if diagnostics {
                         let counters = into_data_sync(counters).try_to_vec::<i32>().unwrap();
                         assert_eq!(counters.len(), rows * 2);
-                        // Pruning must skip leaf positions; exhaustive F2 would scan all n.
+                        // Count scanned leaf positions and verify node traversal.
                         let scanned = counters.chunks(2).map(|c| c[1] as usize).sum::<usize>();
                         assert!(counters.chunks(2).all(|c| c[0] > 0));
-                        // Per-row node counters exist only on the traversal kernel (F2 writes
-                        // per-tile staging instead); low-dimensional data must also prune.
+                        // Low-dimensional data must also prune.
                         assert!(scanned <= rows * n);
                         if features == 2 {
                             assert!(scanned < rows * n, "d={features} must prune leaves");
@@ -3535,7 +2864,7 @@ mod tests {
 
     #[test]
     fn kd_reference_rejects_soa_on_cuda() {
-        let Some(device) = phase7_cuda() else { return };
+        let Some(device) = cuda_device() else { return };
         let (data, tree) = make_neighbor_inputs(&[0.0, 1.0], 2, 1, &device);
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_kd_reference(
@@ -3596,7 +2925,7 @@ mod tests {
 
     #[test]
     fn kd_query_pruned_routes_cuda() {
-        let Some(device) = phase7_cuda() else { return };
+        let Some(device) = cuda_device() else { return };
         check_query_routes(&device);
     }
 
@@ -3684,9 +3013,34 @@ mod tests {
                 cases.push((rows, features, 5, Some("valid_special")));
             }
         }
+        if matches!(device, CubeDevice::Cuda(_)) {
+            for features in [3, 5, 16, 30, 32] {
+                cases.push((257, features, 1, None));
+                cases.push((257, features, 16, Some("phase7_pattern1")));
+                cases.push((4109, features, 17, Some("phase7_pattern2")));
+            }
+        }
         for (rows, features, k, special) in cases {
             let mut values = splitmix_values(rows, features);
             match special {
+                Some("phase7_pattern1") => {
+                    for r in 0..rows {
+                        for f in 0..features {
+                            values[r * features + f] = ((r % 19 + f) % 7) as f32;
+                        }
+                    }
+                }
+                Some("phase7_pattern2") => {
+                    for r in 0..rows {
+                        for f in 0..features {
+                            values[r * features + f] = if r % 7 == 0 {
+                                -0.0
+                            } else {
+                                ((r >> (f % 8)) % 3) as f32 - 1.0
+                            };
+                        }
+                    }
+                }
                 Some("duplicates") => {
                     let points = splitmix_values(50, features);
                     for row in 0..rows {
@@ -3763,7 +3117,7 @@ mod tests {
             };
             let mut launches = Vec::new();
             if client.properties().hardware.num_cpu_cores.is_some() {
-                launches.push((64, kd_neighbor_plan(&client, features)));
+                launches.push((64, kd_neighbor_plan(&client)));
                 for lanes in client.io_optimized_vector_sizes(4).filter(|_| all_lanes) {
                     launches.push((
                         64,
@@ -3778,14 +3132,7 @@ mod tests {
                     layout: KdCandidateLayout::PaddedRows,
                     order: KdQueryOrder::Cyclic,
                 };
-                assert_eq!(
-                    kd_neighbor_plan(&client, features).order,
-                    if (16..=32).contains(&features) {
-                        KdQueryOrder::PlaneTiles
-                    } else {
-                        KdQueryOrder::Cyclic
-                    }
-                );
+                assert_eq!(kd_neighbor_plan(&client).order, KdQueryOrder::Cyclic);
                 launches.extend(widths.into_iter().map(|width| (width, plan)));
             }
             for (width, plan) in launches {

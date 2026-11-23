@@ -351,9 +351,11 @@ uv run --no-sync python analyze/summarize_hdbscan_stages.py \
 ```
 
 Explicit output directories must not exist; omitted directories are unique.
-Invocation from another working directory is supported. The fixed workload has
-16 features, eight centers, center scale/noise 1.0, seed 42, min-samples and
-min-cluster-size 5, and Auto search. All captures share identical little-endian
+Invocation from another working directory is supported. The fixed `umap_like_v1`
+synthetic workload has 16 features, seed 42, min-samples and min-cluster-size 5,
+and Auto search. It uses localized microclusters along curved latent coordinates
+with diffuse background. The schema 2 manifest records the generator and its
+parameters. All captures share identical little-endian
 float32 input bytes and record their SHA-256. Native CPU and CUDA each perform
 one excluded warmup and three measured fits, serially, retaining raw samples and
 medians. Exact final-label agreement is required, not proof of external-data
@@ -382,6 +384,19 @@ averages. Synchronization, instrumentation, replay, and cache behavior perturb
 measurements. Counter diagnoses are conditional hypotheses; they cannot establish
 CPU instruction bottlenecks or universal speedups. Independently computed medians
 are not additive; stage shares use aligned per-fit samples.
+
+The workload is calibrated for KD core-distance pruning and clustering shape,
+not for MST/Borůvka timing or real-data stage balance. In the 100k/ms=5 calibration
+comparison, the synthetic CPU MST stage took about five times as long as the real
+sample. The million-row run below is also not a proxy for real-data stage balance.
+
+**Large clustered run:** for an observational run at one million rows with the same
+generator, run both backends (this is not a stage-analysis gate):
+
+```sh
+uv run --no-sync comparison/compare_hdbscan_stages.py --rows 1000000 --features 16 --seed 42 --backend cpu --skip-python
+uv run --no-sync comparison/compare_hdbscan_stages.py --rows 1000000 --features 16 --seed 42 --backend cuda --skip-python
+```
 
 UMAP reports neighbor search, fuzzy graph, schedule, spectral graph export,
 initialization, and optimization; its `other` row is fit time outside measured
@@ -1105,21 +1120,19 @@ with the original-row mapping available through `finite_index()`. Neighbors
 exclude self, use `-1` padding, and core distances include infinite padding.
 `dbscan_clustering(epsilon)` returns a `Result` and rejects NaN.
 
-KD neighbor implementation: CPU retains C16 leaf-packed SoA and leaf-block queries.
-On eligible CUDA devices, 16–32 features use a flat plane-cooperative scan with
-two planes per cube and no row-count gate. Below 16, above 32, without the required
-plane operations/synchronization, or with insufficient launch/shared-memory
-resources, CUDA uses the per-query kernel (pre-launch selection, not error recovery).
-Leaf order preserves original IDs and output rows; feature sums remain ordered.
-The per-call CUDA pack replaces padded data with tile-rounded padded leaf rows,
-retains padded bounds, and adds per-tile staging counters only with diagnostics.
-Estimator live-buffer accounting and allocation-limit checks follow that same
-plan; the public shape-only resource advisory is not a device-specific allocation
-guarantee. Flat-kernel diagnostics count zero node pops and n scanned positions
-per query including self; staged-position totals count copied candidates once per
-query tile, not evaluated pairs. See [Phase 7 results](../archive/engineering/hdbscan_perf_report.md#phase-7-results-cuda-flat-plane-kernel-f2-accepted)
-for historical measured scope and reported final-source verification. The raw
-performance artifacts may be local and unavailable in a distributed checkout.
+KD neighbor implementation: CPU retains C16 leaf-packed SoA and leaf-block queries;
+CUDA uses per-query traversal at every feature count, selected before launch rather
+than as error recovery. Leaf order preserves original IDs and output rows; feature
+sums remain ordered. Valid builder trees (or equivalent low-level permutation/tree
+preconditions) are required. Estimator live-buffer accounting and allocation-limit
+checks include padded data and padded bounds; the public shape-only resource
+advisory is not a device-specific allocation guarantee. On this host's Gaussian
+300k×16 workload, traversal's CUDA KD core was about 12× slower than the removed F2
+at min-samples 5 and 30. No matched Gaussian CPU timing exists, and the magnitude at
+other dimensions or on other high-intrinsic-dimension data is unknown. Explicit
+`HdbscanSearch::BruteForce` provides exact search at every dimension; its CUDA speed
+relative to F2 is unmeasured. See the [removal evidence](../archive/engineering/hdbscan_perf_report.md#f2-removal-2026-11);
+raw performance artifacts may be local and unavailable in a distributed checkout.
 
 `HdbscanConfig::mst_graph` (`MstGraph::{Auto, Complete, KnnGraph}`, default `Auto`) selects
 the graph and `knn_k` sets the kNN width; both are Rust-only fields except that Python

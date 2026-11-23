@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from hdbscan_stages_common import EXTENDED_ROWS, atomic_json, require_fields, run_command
+from hdbscan_stages_common import (
+    EXTENDED_ROWS,
+    SCHEMA_VERSION,
+    atomic_json,
+    require_fields,
+    run_command,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FEATURES = 16
@@ -260,7 +266,7 @@ def _generate_input(path: Path, rows: int) -> None:
         sys.path.insert(0, str(ROOT))
     from comparison.compare_hdbscan_stages import make_input
 
-    make_input(rows, FEATURES, 1.0, 1.0, 42, path)
+    make_input(rows, FEATURES, 42, path)
     expected_size = rows * FEATURES * 4
     if path.stat().st_size != expected_size:
         raise ValueError(
@@ -299,9 +305,7 @@ def benchmark(
             "min_samples": min_samples,
             "min_cluster_size": 5,
             "search": "auto",
-            "centers": 8,
-            "center_scale": 1.0,
-            "noise": 1.0,
+            "generator": "umap_like_v1",
             "seed": 42,
         },
     }
@@ -311,8 +315,7 @@ def benchmark(
             "path": "comparison/compare_hdbscan_stages.py::make_input",
             "numpy_version": np.__version__,
             "description": (
-                "8 Gaussian centers, shuffled round-robin labels, normal noise; "
-                "contiguous little-endian float32"
+                "Deterministic UMAP-like clustered workload; contiguous little-endian float32"
             ),
         },
         "python_version": platform.python_version(),
@@ -328,7 +331,7 @@ def benchmark(
         },
     }
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "run_id": str(uuid.uuid4()),
         "workload": workload,
         "input_sha256": digest,

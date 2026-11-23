@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Native HDBSCAN hotspot campaign; all timed execution belongs to the Python runner.
 set -euo pipefail
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 usage() {
     printf '%s\n' 'Usage: bash scripts/analyze_hdbscan_stages.sh [--rows 20000|50000|100000] [--output-dir NEW_DIRECTORY]' \
         'Requires cargo, uv, nsys, ncu and working CPU/CUDA runtimes and counter permissions.' \

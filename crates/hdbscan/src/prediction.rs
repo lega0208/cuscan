@@ -1577,9 +1577,6 @@ impl CallReference {
             match plan.layout {
                 KdCandidateLayout::PaddedRows => 0,
                 KdCandidateLayout::LeafSoa { lanes } => lanes as u32,
-                KdCandidateLayout::LeafRows { .. } => {
-                    unreachable!("query layout is never LeafRows")
-                }
             },
         );
         #[cfg(feature = "tracing")]

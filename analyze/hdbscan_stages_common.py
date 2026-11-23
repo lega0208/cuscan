@@ -15,6 +15,7 @@ from typing import Any, TextIO
 # Standalone tools include Phase 7 experiments at 50k/300k and baseline investigations
 # at 200k/300k; the integrated campaign script stays at 20k/50k/100k.
 EXTENDED_ROWS = (20_000, 50_000, 100_000, 200_000, 300_000)
+SCHEMA_VERSION = 2
 
 
 def identity(run_dir: str | os.PathLike[str]) -> dict[str, Any]:
@@ -26,7 +27,7 @@ def identity(run_dir: str | os.PathLike[str]) -> dict[str, Any]:
         raise ValueError(f"cannot read run identity manifest {path}: {error}") from error
     required = ("schema_version", "run_id", "workload", "input_sha256", "provenance")
     require_fields(data, required, f"identity manifest {path}")
-    if data["schema_version"] != 1 or not isinstance(data["run_id"], str):
+    if data["schema_version"] != SCHEMA_VERSION or not isinstance(data["run_id"], str):
         raise ValueError(f"invalid schema_version or run_id in {path}")
     if not isinstance(data["workload"], dict) or not isinstance(data["provenance"], dict):
         raise ValueError(f"invalid workload or provenance in {path}")
@@ -45,6 +46,7 @@ ROUTE_KERNEL_FAMILIES: dict[str, tuple[str, str]] = {
     "BruteForce": ("partial_kernel", "tile_candidates"),
     "KdTree": ("kd_neighbors_kernel", "kd_candidates_kernel"),
 }
+RETIRED_KD_FAMILIES = ("kd_neighbors_tile_kernel", "pack_leaf_rows_kernel")
 
 
 def route_kernel_families(route: Any) -> tuple[str, str]:
@@ -101,13 +103,20 @@ def observed_kernel_families(
     rows = profiled["kernels"]
     if not isinstance(rows, list):
         raise ValueError("cuda_kernels measured kernels must be an array")
-    choices = {"kd_neighbors_kernel", "kd_neighbors_tile_kernel"}
-    observed = [row for row in rows if isinstance(row, dict) and row.get("family") in choices]
+    for row in rows:
+        if isinstance(row, dict) and any(
+            retired in value
+            for value in (row.get("name"), row.get("family"))
+            if isinstance(value, str)
+            for retired in RETIRED_KD_FAMILIES
+        ):
+            raise ValueError("cuda_kernels contains a retired KD kernel family")
+    observed = [
+        row for row in rows if isinstance(row, dict) and row.get("family") == "kd_neighbors_kernel"
+    ]
     families = {row["family"] for row in observed}
     if len(families) != 1:
-        raise ValueError(
-            "cuda_kernels needs exactly one observed KD neighbor family (missing or ambiguous)"
-        )
+        raise ValueError("cuda_kernels needs an observed kd_neighbors_kernel family")
     for row in observed:
         count = row.get("launch_count")
         if (
