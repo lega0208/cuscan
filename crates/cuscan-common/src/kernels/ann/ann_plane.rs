@@ -197,6 +197,7 @@ pub(super) fn forest_pair_slots_plane_kernel<F: Float, I: Int, P: Int, Lanes: Si
     }
 }
 
+#[allow(clippy::manual_checked_ops)]
 #[cube(launch)]
 pub(super) fn pair_slots_plane_kernel<F: Float, I: Int, P: Int, Lanes: Size>(
     data: &Tensor<Vector<F, Lanes>>,

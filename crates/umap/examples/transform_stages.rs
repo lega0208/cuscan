@@ -46,6 +46,7 @@ const SNAPSHOT_FORMAT: &str = "profile_transform_snapshot_v1";
 const TRANSFORM_SEED: u64 = 42;
 
 type Res<T> = Result<T, Box<dyn Error>>;
+type InjectedLayout = (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>);
 
 struct Options {
     snapshot: PathBuf,
@@ -162,13 +163,10 @@ fn read_checked(dir: &Path, manifest: &serde_json::Value, name: &str) -> Res<Opt
 }
 
 fn le4<T>(bytes: &[u8], what: &str, f: fn([u8; 4]) -> T) -> Res<Vec<T>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!("{what} is not a whole number of 4-byte values").into());
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f(c.try_into().unwrap()))
-        .collect())
+    Ok(bytes.as_chunks::<4>().0.iter().copied().map(f).collect())
 }
 
 fn parse_search(name: Option<&str>) -> Res<NeighborSearch> {
@@ -243,8 +241,10 @@ fn load_snapshot(opts: &Options) -> Res<Snapshot> {
     let original_to_training = read_checked(dir, &manifest, "original_to_training.u64le")?
         .map(|bytes| {
             bytes
-                .chunks_exact(8)
-                .map(|c| usize::try_from(u64::from_le_bytes(c.try_into().unwrap())))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| usize::try_from(u64::from_le_bytes(*c)))
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
@@ -325,7 +325,7 @@ fn array<T: Copy>(
 
 /// Shape for a field: `[rows, width]` when it divides evenly, else flat.
 fn shape(len: usize, rows: usize) -> Vec<usize> {
-    if rows > 0 && len % rows == 0 && len > 0 {
+    if rows > 0 && len.is_multiple_of(rows) && len > 0 {
         let width = len / rows;
         if width == 1 {
             vec![rows]
@@ -619,7 +619,7 @@ fn execute(
 
 /// Mean per-row |A ∩ B| / k over neighbor-ID sets; `None` when shapes differ.
 fn recall(ids: &[i32], exact: &[i32], rows: usize) -> Option<f64> {
-    if rows == 0 || ids.len() != exact.len() || ids.is_empty() || ids.len() % rows != 0 {
+    if rows == 0 || ids.len() != exact.len() || ids.is_empty() || !ids.len().is_multiple_of(rows) {
         return None;
     }
     let k = ids.len() / rows;
@@ -672,7 +672,7 @@ fn main() -> Res<()> {
     let injected_layout = opts
         .inject_layout
         .as_ref()
-        .map(|dir| -> Res<(Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>)> {
+        .map(|dir| -> Res<InjectedLayout> {
             Ok((
                 le4(&load_raw(dir, "heads.i32le")?, "heads", i32::from_le_bytes)?,
                 le4(&load_raw(dir, "tails.i32le")?, "tails", i32::from_le_bytes)?,

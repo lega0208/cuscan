@@ -471,8 +471,8 @@ pub(crate) fn base_case(graph: &HostCsr, anchor: &Anchor, depth: usize) -> Resul
     }
     for row in 0..n {
         if anchor.mask[row] {
-            for j in 0..d {
-                mean[j] += f64::from(anchor.values[row * d + j]);
+            for (j, row_mean) in mean.iter_mut().enumerate().take(d) {
+                *row_mean += f64::from(anchor.values[row * d + j]);
             }
         }
     }

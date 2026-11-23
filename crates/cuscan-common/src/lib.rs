@@ -12,10 +12,12 @@ pub mod radix;
 pub use backend_choice::{BackendChoice, validate_backend_choice};
 pub use device::{construct_cpu_device, selected_device};
 pub use error::{AnnError, BackendError};
-pub use kernels::ann::{AnnEstimate, AnnPlan, PlannedMemory, ann_host_estimate, ann_preflight};
+pub use kernels::ann::{
+    AnnEstimate, AnnPlan, PlannedMemory, SlotPolicy, SlotRecipe, ann_host_estimate, ann_preflight,
+};
 #[cfg(feature = "test-support")]
 pub use kernels::ann::{
-    SlotPolicy, SlotRecipe, ann_preflight_with_slot_policy, ann_preflight_with_tile_slots,
+    ann_preflight_with_slot_policy, ann_preflight_with_tile_slots,
     approximate_neighbors_with_tile_slots,
 };
 pub use kernels::legal_cube_dim;

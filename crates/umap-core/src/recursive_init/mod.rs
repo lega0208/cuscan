@@ -550,6 +550,13 @@ pub fn coarse_negative_range(rows: usize) -> usize {
     (half + (rows % 2) * (half % 2)).max(1).min(rows)
 }
 
+/// Draw a pair of independent standard normal variates by Box–Muller.
+pub fn gaussian_pair(rng: &mut StdRng) -> (f64, f64) {
+    let radius = (-2.0 * (1.0 - rng.random::<f64>()).ln()).sqrt();
+    let angle = std::f64::consts::TAU * rng.random::<f64>();
+    (radius * angle.cos(), radius * angle.sin())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,11 +693,4 @@ mod tests {
         assert_eq!((second.parts, second.epochs), (25, 70));
         assert_eq!((coarse_negative_range(5), coarse_negative_range(7)), (2, 4));
     }
-}
-
-/// Draw a pair of independent standard normal variates by Box–Muller.
-pub fn gaussian_pair(rng: &mut StdRng) -> (f64, f64) {
-    let radius = (-2.0 * (1.0 - rng.random::<f64>()).ln()).sqrt();
-    let angle = std::f64::consts::TAU * rng.random::<f64>();
-    (radius * angle.cos(), radius * angle.sin())
 }

@@ -474,9 +474,9 @@ pub fn transition_graph(summed: &SummedCsr) -> Result<HostCsr> {
         .checked_mul(2)
         .ok_or(UmapError::Overflow("recursive transition support"))?;
     let mut support = reserve(capacity)?;
-    for row in 0..n {
+    for (row, row_total) in totals.iter().enumerate().take(n) {
         let range = summed.indptr[row]..summed.indptr[row + 1];
-        if totals[row] <= 0.0 {
+        if *row_total <= 0.0 {
             continue;
         }
         for edge in range {

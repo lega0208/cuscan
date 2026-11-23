@@ -214,14 +214,13 @@ impl SlotPolicy {
 
     fn validate(self, cpu: bool) -> Result<(), AnnError> {
         for (recipe, wide) in [(self.wide, true), (self.scalar, false)] {
-            if let SlotRecipe::Plane { group, unroll, .. } = recipe {
-                if cpu
+            if let SlotRecipe::Plane { group, unroll, .. } = recipe
+                && (cpu
                     || ![1, 2, 4, 8].contains(&group)
                     || (group == 2 && !wide)
-                    || ![1, 2].contains(&unroll)
-                {
-                    return Err(AnnError::InvalidInput("invalid ANN slot policy".into()));
-                }
+                    || ![1, 2].contains(&unroll))
+            {
+                return Err(AnnError::InvalidInput("invalid ANN slot policy".into()));
             }
         }
         Ok(())
@@ -822,6 +821,7 @@ fn ann_independent_cube_count(
     Ok(count)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_with_host_route(
     client: &cubecl::client::Client,
     n: usize,
@@ -924,6 +924,7 @@ fn plan_with_host(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn owner_test_plan(
     client: &cubecl::client::Client,
     n: usize,
@@ -946,7 +947,7 @@ pub(super) fn owner_test_plan(
         || partitions == 0
         || partitions > units.min(OWNER_D_MAX as u32).min(n as u32)
         || ![1, 4, 8].contains(&width)
-        || features % width != 0
+        || !features.is_multiple_of(width)
     {
         return Err(AnnError::InvalidInput("invalid owner test geometry".into()));
     }

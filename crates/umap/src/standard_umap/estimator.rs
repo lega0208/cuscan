@@ -2502,6 +2502,7 @@ pub fn profile_recursive_driver(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recursive_driver(
     graph: &umap_core::recursive_init::graph::HostCsr,
     data: &[f32],
@@ -2600,12 +2601,16 @@ fn recursive_compact_bytes(rows: usize, edges: usize) -> Result<usize> {
 }
 
 #[cfg(test)]
+type RecursiveBudget = (&'static str, u64, u64);
+#[cfg(test)]
+type RecursiveAdmission = (&'static str, usize, usize);
+#[cfg(test)]
 thread_local! {
     /// Overrides (host, device) headroom for one named recursive admission.
-    static RECURSIVE_BUDGET: std::cell::Cell<Option<(&'static str, u64, u64)>> =
+    static RECURSIVE_BUDGET: std::cell::Cell<Option<RecursiveBudget>> =
         const { std::cell::Cell::new(None) };
     /// Records every recursive admission as (stage, host bytes, device bytes).
-    static RECURSIVE_ADMISSIONS: std::cell::RefCell<Option<Vec<(&'static str, usize, usize)>>> =
+    static RECURSIVE_ADMISSIONS: std::cell::RefCell<Option<Vec<RecursiveAdmission>>> =
         const { std::cell::RefCell::new(None) };
 }
 

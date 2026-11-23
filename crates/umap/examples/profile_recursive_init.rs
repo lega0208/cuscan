@@ -30,8 +30,8 @@ fn read_features(path: &str) -> Result<Vec<f32>, Box<dyn Error>> {
     while values.len() < N * FEATURES {
         let count = (N * FEATURES - values.len()).min(bytes.len() / 4);
         reader.read_exact(&mut bytes[..count * 4])?;
-        for chunk in bytes[..count * 4].chunks_exact(4) {
-            let value = f32::from_le_bytes(chunk.try_into()?);
+        for chunk in bytes[..count * 4].as_chunks::<4>().0 {
+            let value = f32::from_le_bytes(*chunk);
             if !value.is_finite() {
                 return Err("synthetic features contain non-finite values".into());
             }
@@ -62,7 +62,7 @@ fn synthetic_graph() -> Result<HostCsr, Box<dyn Error>> {
     weights.try_reserve_exact(N * 16)?;
     indptr.push(0);
     let mut edges = Vec::with_capacity(16);
-    for row in 0..N {
+    for (row, &incoming_row) in incoming.iter().enumerate().take(N) {
         let base = row / BLOCK * BLOCK;
         let local = row % BLOCK;
         // Each tuple contains destination and the forward/reverse membership.
@@ -73,7 +73,7 @@ fn synthetic_graph() -> Result<HostCsr, Box<dyn Error>> {
             edges.push((base + (local + BLOCK - offset) % BLOCK, w, w));
         }
         edges.push((target(row), 0.05, 0.0));
-        edges.push((incoming[row], 0.0, 0.05));
+        edges.push((incoming_row, 0.0, 0.05));
         edges.sort_unstable_by_key(|edge| edge.0);
         let mut i = 0;
         while i < edges.len() {

@@ -498,7 +498,7 @@ fn read_checked(
 }
 
 fn chunks4(bytes: &[u8]) -> impl Iterator<Item = [u8; 4]> + '_ {
-    bytes.chunks_exact(4).map(|c| c.try_into().unwrap())
+    bytes.as_chunks::<4>().0.iter().copied()
 }
 
 /// Load a snapshot; fit-defining options are replaced by the manifest parameters.
@@ -586,8 +586,10 @@ fn load_snapshot(dir: &Path, opts: &mut Options) -> Result<(ModelState, String),
     let original_to_training = read_checked(dir, &manifest, "original_to_training.u64le")?
         .map(|bytes| {
             bytes
-                .chunks_exact(8)
-                .map(|c| usize::try_from(u64::from_le_bytes(c.try_into().unwrap())))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| usize::try_from(u64::from_le_bytes(*c)))
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;

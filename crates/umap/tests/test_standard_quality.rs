@@ -627,13 +627,13 @@ fn assert_approximate_fit_quality(
         n_neighbors - 1
     );
     let mut misses = Vec::new();
-    if !(recall_mean >= RECALL_LIMIT) {
+    if recall_mean < RECALL_LIMIT {
         misses.push(format!(
             "{name}: mean recall@{} {recall_mean:.6} below {RECALL_LIMIT}",
             n_neighbors - 1
         ));
     }
-    if !(trust_loss_mean <= TRUST_GAP_LIMIT) {
+    if trust_loss_mean > TRUST_GAP_LIMIT {
         misses.push(format!(
             "{name}: one-sided mean reference-minus-candidate trustworthiness@{trust_k} {trust_loss_mean:.6} exceeds {TRUST_GAP_LIMIT}"
         ));
@@ -898,12 +898,12 @@ fn run_recall(device: Device) {
         "QUALITY_RECALL {{\"backend\":\"{device_name}\",\"metric\":\"transform_query_ann_recall_at_15\",\"value\":{query_recall:.9},\"threshold\":{RECALL_LIMIT:.9}}}"
     );
     let mut misses = Vec::new();
-    if !(fit_recall >= RECALL_LIMIT) {
+    if fit_recall < RECALL_LIMIT {
         misses.push(format!(
             "fit ANN recall {fit_recall:.6} below {RECALL_LIMIT}"
         ));
     }
-    if !(query_recall >= RECALL_LIMIT) {
+    if query_recall < RECALL_LIMIT {
         misses.push(format!(
             "transform-query ANN recall {query_recall:.6} below {RECALL_LIMIT}"
         ));
@@ -1058,12 +1058,12 @@ fn run_long_run_quality(device: &Device) {
         "LONG_QUALITY {{\"case\":\"{name}\",\"seed\":{seed},\"fit_trustworthiness_at_15\":{fit_trust:.9},\"fit_reference_trustworthiness_at_15\":{fit_reference:.9},\"fit_reference_minus_candidate\":{fit_gap:.9},\"fit_gap_threshold\":{TRUST_GAP_LIMIT:.9},\"transform_trustworthiness_at_15\":{transform_trust:.9},\"transform_reference_trustworthiness_at_15\":{transform_reference:.9},\"transform_reference_minus_candidate\":{transform_gap:.9},\"transform_gap_threshold\":{TRUST_GAP_LIMIT:.9}}}"
     );
     let mut misses = Vec::new();
-    if !(fit_gap <= TRUST_GAP_LIMIT) {
+    if fit_gap > TRUST_GAP_LIMIT {
         misses.push(format!(
             "{name}: long-run fit reference-minus-candidate trustworthiness gap {fit_gap:.6} exceeds {TRUST_GAP_LIMIT}"
         ));
     }
-    if !(transform_gap <= TRUST_GAP_LIMIT) {
+    if transform_gap > TRUST_GAP_LIMIT {
         misses.push(format!(
             "{name}: long-run transform reference-minus-candidate trustworthiness gap {transform_gap:.6} exceeds {TRUST_GAP_LIMIT}"
         ));

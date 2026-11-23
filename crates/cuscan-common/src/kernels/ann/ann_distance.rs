@@ -102,6 +102,7 @@ mod cuda_group_tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn group_r8_matches_scalar_and_host_cuda() {
         let Some(device) = cuda() else { return };
         for features in [
@@ -240,7 +241,7 @@ pub(super) fn squared_l2_r8_group<F: Float, N: Size>(
     )];
     comptime![assert!(unroll == 1 || unroll == 2)];
     let lane = UNIT_POS_PLANE as usize % group;
-    let steps = (features + 7) / 8;
+    let steps = features.div_ceil(8);
     let mut a = Vector::<F, N>::new(F::new(0.0f32));
     let mut b = Vector::<F, N>::new(F::new(0.0f32));
     let mut step = 0usize;
@@ -258,22 +259,20 @@ pub(super) fn squared_l2_r8_group<F: Float, N: Size>(
         );
         let mut d1 = Vector::<F, N>::new(F::new(0.0f32));
         let mut e1 = Vector::<F, N>::new(F::new(0.0f32));
-        if comptime![unroll == 2] {
-            if step + 1 < steps {
-                let (d, e) = group_deltas::<F, N>(
-                    data,
-                    left,
-                    right,
-                    features,
-                    valid,
-                    lane,
-                    step + 1,
-                    group,
-                    binding_width,
-                );
-                d1 = d;
-                e1 = e;
-            }
+        if comptime![unroll == 2] && step + 1 < steps {
+            let (d, e) = group_deltas::<F, N>(
+                data,
+                left,
+                right,
+                features,
+                valid,
+                lane,
+                step + 1,
+                group,
+                binding_width,
+            );
+            d1 = d;
+            e1 = e;
         }
         a = fma(d0, d0, a);
         b = fma(e0, e0, b);
@@ -320,10 +319,8 @@ fn group_deltas<F: Float, N: Size>(
         let stride = features / binding_width;
         a = data[left * stride + index] - data[right * stride + index];
     }
-    if comptime![group == 4] {
-        if valid && feature + 1 < features {
-            b = data[left * features + feature + 1] - data[right * features + feature + 1];
-        }
+    if comptime![group == 4] && valid && feature + 1 < features {
+        b = data[left * features + feature + 1] - data[right * features + feature + 1];
     }
     (a, b)
 }

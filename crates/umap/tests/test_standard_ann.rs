@@ -589,7 +589,7 @@ fn sampled_recall_score(
             .filter(|&other| other != row)
             .map(|other| {
                 let reference = &values[other * features..(other + 1) * features];
-                let distance = query
+                query
                     .iter()
                     .zip(reference)
                     .map(|(&left, &right)| {
@@ -597,8 +597,7 @@ fn sampled_recall_score(
                         delta * delta
                     })
                     .sum::<f64>()
-                    .sqrt();
-                distance
+                    .sqrt()
             })
             .collect::<Vec<_>>();
         exact.select_nth_unstable_by(k - 1, f64::total_cmp);
