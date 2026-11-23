@@ -25,7 +25,7 @@
       "numba_kdtree.py": "414553a5e98b033c0daaf37c5efc421fba13d0f7"
     },
     "knn_graph_sources": {
-      "pynndescent_version": "0.6.0",
+      "pynndescent_version": "0.7.0",
       "modules": {
         "nndescent.py": "a4353f25f43606da6e35fe08678f360172940ba4",
         "kruskal.py": "0a5c7df222aad488d929773181af516c51dafa63",
