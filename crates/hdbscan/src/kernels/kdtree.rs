@@ -2613,7 +2613,6 @@ mod tests {
             let lanes = match plan.layout {
                 KdCandidateLayout::LeafSoa { lanes } => lanes,
                 KdCandidateLayout::PaddedRows => 0,
-                _ => panic!("unexpected query layout"),
             };
             assert_eq!(plan.order, KdQueryOrder::Cyclic);
             assert_eq!(
