@@ -14,7 +14,10 @@ pub use device::{construct_cpu_device, selected_device};
 pub use error::{AnnError, BackendError};
 pub use kernels::ann::{AnnEstimate, AnnPlan, PlannedMemory, ann_host_estimate, ann_preflight};
 #[cfg(feature = "test-support")]
-pub use kernels::ann::{ann_preflight_with_tile_slots, approximate_neighbors_with_tile_slots};
+pub use kernels::ann::{
+    SlotPolicy, SlotRecipe, ann_preflight_with_slot_policy, ann_preflight_with_tile_slots,
+    approximate_neighbors_with_tile_slots,
+};
 pub use kernels::legal_cube_dim;
 pub use memory::{MemoryBudget, host_usable_memory, resolve_memory_budget};
 pub use radix::{

@@ -164,6 +164,101 @@ fn memory_failure_preserves_query_failure_as_unknown_availability() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
+fn cuda_slot_policy_preserves_memory_plan() {
+    use super::super::orchestration::{
+        SlotPolicy, SlotRecipe, ann_host_estimate, ann_preflight_with_slot_policy,
+    };
+
+    let count = crate::cuda_backend::try_device_count().expect("CUDA discovery failed");
+    if count == 0 {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUDA required"
+        );
+        return;
+    }
+    let device = burn::tensor::Device::cuda(0);
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    for (n, features, k) in [(11, 2, 3), (4096, 32, 29), (4096, 50, 29)] {
+        let default =
+            super::super::orchestration::ann_preflight(&device, n, features, k, &budget).unwrap();
+        assert_eq!(
+            default.slot_policy,
+            SlotPolicy {
+                wide: SlotRecipe::Plane {
+                    group: 2,
+                    decode: false,
+                    unroll: 1
+                },
+                scalar: SlotRecipe::PerSlot,
+            }
+        );
+        let forced = ann_preflight_with_slot_policy(
+            &device,
+            n,
+            features,
+            k,
+            default.tile_slots,
+            SlotPolicy::default(),
+        )
+        .unwrap();
+        let exact_default = ann_preflight_with_slot_policy(
+            &device,
+            n,
+            features,
+            k,
+            default.tile_slots,
+            default.slot_policy,
+        )
+        .unwrap();
+        assert_eq!(exact_default.memory, forced.memory);
+        // Exact-tile preflight does not carry admission's available-memory receipt.
+        assert_eq!(
+            default.memory.fixed_peak_bytes,
+            forced.memory.fixed_peak_bytes
+        );
+        assert_eq!(default.memory.staging_bytes, forced.memory.staging_bytes);
+        let table = |plan: &AnnPlan| {
+            ann_buffer_table(
+                n,
+                features,
+                k,
+                plan.host.width,
+                plan.host.workspace.max_candidates_per_class,
+                &plan.host.workspace,
+                plan.tile_slots,
+                plan.join_route,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.buffer,
+                    entry.shape,
+                    entry.dtype,
+                    entry.phases,
+                    entry.route,
+                    entry.staging,
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(table(&default), table(&forced));
+    }
+    // Baseline values from the pre-redesign small-shape host estimate.
+    let estimate = ann_host_estimate(11, 2, 3).unwrap();
+    assert_eq!(
+        estimate.phases.map(|phase| phase.runtime_bytes),
+        [176, 11_600, 13_012, 1_056]
+    );
+}
+
+#[test]
 fn cpu_combined_budget_rejects_before_forest_readback() {
     let (n, features, k) = (64, 1024, 8);
     let device = crate::construct_cpu_device(burn::tensor::Device::cpu).unwrap();
@@ -1475,6 +1570,393 @@ fn sampled_pair_slots_fixture(device: CubeDevice) {
     assert_eq!(read_f32(&distances), [9.0, 1.0, 4.0, 1.0]);
 }
 
+// Compare every record, including invalid records. NaN payloads are deliberately
+// not part of the staging contract, but their masks must remain zero.
+fn assert_staging_identity(
+    expected: &(Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>),
+    actual: &(Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>),
+) {
+    assert_eq!(actual.0, expected.0);
+    assert_eq!(actual.1, expected.1);
+    assert_eq!(actual.3, expected.3);
+    for (slot, (&want, &got)) in expected.2.iter().zip(&actual.2).enumerate() {
+        if want.is_nan() {
+            assert!(got.is_nan(), "slot {slot}");
+            assert_eq!(expected.3[slot], 0, "slot {slot}");
+        } else {
+            assert_eq!(got.to_bits(), want.to_bits(), "slot {slot}");
+        }
+    }
+}
+
+fn plane_staging_identity_fixture(device: CubeDevice) {
+    use super::super::ann_plane::{forest_pair_slots_plane_kernel, pair_slots_plane_kernel};
+
+    let client = device.client();
+    let n = 256usize;
+    let features = 4usize;
+    let mut values = vec![0.0; n * features];
+    for row in 0..n {
+        values[row * features] = row as f32;
+    }
+    values[features] = f32::NAN;
+    values[2 * features] = f32::MAX;
+    values[3 * features] = -f32::MAX;
+    let data = f32_tensor(&device, &[n, features], values);
+    let types = [
+        dtype_to_storage_type(DType::F32),
+        dtype_to_storage_type(DType::I32),
+        dtype_to_storage_type(DType::I64),
+    ];
+    for forest in [false, true] {
+        for capacity in [1usize, 15, 30, 60] {
+            let mut ids = Vec::new();
+            let mut pool_sizes = Vec::new();
+            let mut center_offsets = vec![0i64];
+            for size in [0, 1, 0, 0, 2.min(capacity), capacity, capacity] {
+                for i in 0..capacity * 2 {
+                    ids.push(match i {
+                        1 => n as i32,
+                        2 => 0,
+                        3 => 1,
+                        4 => 2,
+                        5 => 3,
+                        _ => (i % n) as i32,
+                    });
+                }
+                pool_sizes.extend([size as i32, size as i32]);
+                center_offsets.push(
+                    center_offsets.last().unwrap()
+                        + (size * (size.saturating_sub(1)) / 2 + size * size) as i64,
+                );
+            }
+            let lengths = [2usize, 31, 32, 33, 150, 256];
+            let mut row_values = Vec::new();
+            let mut leaf_values = vec![0i32];
+            let mut pair_values = vec![0i64];
+            for length in lengths {
+                row_values.extend((0..length).map(|i| i as i32));
+                leaf_values.push(row_values.len() as i32);
+                pair_values.push(pair_values.last().unwrap() + (length * (length - 1) / 2) as i64);
+            }
+            for shift in [0i64, (1i64 << 32) + 17] {
+                let mut shifted_ids = vec![n as i32; capacity * 2];
+                shifted_ids.extend_from_slice(&ids);
+                let mut shifted_sizes = vec![0, 0];
+                shifted_sizes.extend_from_slice(&pool_sizes);
+                let shifted_offsets: Vec<i64> = std::iter::once(0)
+                    .chain(center_offsets.iter().map(|v| v + shift))
+                    .collect();
+                let shifted_leaves: Vec<i32> = std::iter::once(0)
+                    .chain(leaf_values.iter().copied())
+                    .collect();
+                let shifted_prefix: Vec<i64> = std::iter::once(0)
+                    .chain(pair_values.iter().map(|v| v + shift))
+                    .collect();
+                let sampled = i32_tensor(&device, &[8, capacity * 2], shifted_ids);
+                let sizes = i32_tensor(&device, &[16], shifted_sizes);
+                let offsets = i64_tensor(&device, &[9], shifted_offsets);
+                let rows = i32_tensor(&device, &[row_values.len()], row_values.clone());
+                let leaves = i32_tensor(&device, &[shifted_leaves.len()], shifted_leaves);
+                let prefix = i64_tensor(&device, &[shifted_prefix.len()], shifted_prefix);
+                let total = if forest {
+                    *pair_values.last().unwrap()
+                } else {
+                    *center_offsets.last().unwrap()
+                } as u64;
+                let mut windows = vec![
+                    (0u64, 1usize),
+                    (0, 3),
+                    (0, 5),
+                    (0, 7),
+                    (0, 9),
+                    (0, 31),
+                    (3, 33),
+                    (total - 1, 1),
+                ];
+                if forest {
+                    windows.push((total, 1));
+                }
+                for &boundary in if forest {
+                    &pair_values
+                } else {
+                    &center_offsets
+                } {
+                    if boundary > 1 {
+                        windows.push((boundary as u64 - 1, 1));
+                    }
+                }
+                for (local_start, slots) in windows {
+                    let start = local_start + shift as u64;
+                    if !forest && local_start + slots as u64 > total {
+                        continue;
+                    }
+                    for full in [false, true] {
+                        let worst_ids = if full {
+                            i32_tensor(&device, &[n], vec![0; n])
+                        } else {
+                            open_worst_ids(&device, n)
+                        };
+                        let worst_distances = if full {
+                            f32_tensor(&device, &[n], vec![1.0; n])
+                        } else {
+                            open_worst_distances(&device, n)
+                        };
+                        let run = |recipe: Option<(usize, usize, bool, usize)>| {
+                            let left = i32_tensor(&device, &[slots], vec![-1; slots]);
+                            let right = i32_tensor(&device, &[slots], vec![-1; slots]);
+                            let distances = f32_tensor(&device, &[slots], vec![-1.0; slots]);
+                            let valid = i32_tensor(&device, &[slots], vec![-1; slots]);
+                            let (count, dim) = launch_units(&client, slots);
+                            let width = recipe.map_or(1, |r| r.1);
+                            if forest {
+                                if let Some((group, binding, decode, unroll)) = recipe {
+                                    forest_pair_slots_plane_kernel::launch(
+                                        &client,
+                                        count,
+                                        dim,
+                                        width as VectorSize,
+                                        ann_data_arg(&data, n, features, width),
+                                        rows.clone().into_tensor_arg(),
+                                        leaves.clone().into_tensor_arg(),
+                                        prefix.clone().into_tensor_arg(),
+                                        worst_ids.clone().into_tensor_arg(),
+                                        worst_distances.clone().into_tensor_arg(),
+                                        left.clone().into_tensor_arg(),
+                                        right.clone().into_tensor_arg(),
+                                        distances.clone().into_tensor_arg(),
+                                        valid.clone().into_tensor_arg(),
+                                        n as u32,
+                                        features as u32,
+                                        start,
+                                        slots as u32,
+                                        width,
+                                        group,
+                                        binding,
+                                        decode,
+                                        unroll,
+                                        types,
+                                    );
+                                } else {
+                                    forest_pair_slots_kernel::launch(
+                                        &client,
+                                        count,
+                                        dim,
+                                        1 as VectorSize,
+                                        data.clone().into_tensor_arg(),
+                                        rows.clone().into_tensor_arg(),
+                                        leaves.clone().into_tensor_arg(),
+                                        prefix.clone().into_tensor_arg(),
+                                        worst_ids.clone().into_tensor_arg(),
+                                        worst_distances.clone().into_tensor_arg(),
+                                        left.clone().into_tensor_arg(),
+                                        right.clone().into_tensor_arg(),
+                                        distances.clone().into_tensor_arg(),
+                                        valid.clone().into_tensor_arg(),
+                                        n as u32,
+                                        features as u32,
+                                        start,
+                                        slots as u32,
+                                        1usize,
+                                        types,
+                                    );
+                                }
+                            } else if let Some((group, binding, decode, unroll)) = recipe {
+                                pair_slots_plane_kernel::launch(
+                                    &client,
+                                    count,
+                                    dim,
+                                    width as VectorSize,
+                                    ann_data_arg(&data, n, features, width),
+                                    sampled.clone().into_tensor_arg(),
+                                    sizes.clone().into_tensor_arg(),
+                                    offsets.clone().into_tensor_arg(),
+                                    worst_ids.clone().into_tensor_arg(),
+                                    worst_distances.clone().into_tensor_arg(),
+                                    left.clone().into_tensor_arg(),
+                                    right.clone().into_tensor_arg(),
+                                    distances.clone().into_tensor_arg(),
+                                    valid.clone().into_tensor_arg(),
+                                    n as u32,
+                                    features as u32,
+                                    start,
+                                    slots as u32,
+                                    capacity as u32,
+                                    width,
+                                    group,
+                                    binding,
+                                    decode,
+                                    unroll,
+                                    types,
+                                );
+                            } else {
+                                pair_slots_kernel::launch(
+                                    &client,
+                                    count,
+                                    dim,
+                                    1 as VectorSize,
+                                    data.clone().into_tensor_arg(),
+                                    sampled.clone().into_tensor_arg(),
+                                    sizes.clone().into_tensor_arg(),
+                                    offsets.clone().into_tensor_arg(),
+                                    worst_ids.clone().into_tensor_arg(),
+                                    worst_distances.clone().into_tensor_arg(),
+                                    left.clone().into_tensor_arg(),
+                                    right.clone().into_tensor_arg(),
+                                    distances.clone().into_tensor_arg(),
+                                    valid.clone().into_tensor_arg(),
+                                    n as u32,
+                                    features as u32,
+                                    start,
+                                    slots as u32,
+                                    capacity as u32,
+                                    1usize,
+                                    types,
+                                );
+                            }
+                            (
+                                read_i32(&left),
+                                read_i32(&right),
+                                read_f32(&distances),
+                                read_i32(&valid),
+                            )
+                        };
+                        let expected = run(None);
+                        for (group, binding) in [(1, 1), (1, 4), (2, 4), (4, 1), (8, 1)] {
+                            for decode in [false, true] {
+                                for unroll in [1, 2] {
+                                    assert_staging_identity(
+                                        &expected,
+                                        &run(Some((group, binding, decode, unroll))),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn plane_graph_invariance_fixture(device: CubeDevice) {
+    use super::super::orchestration::{SlotPolicy, SlotRecipe, ann_preflight_with_slot_policy};
+
+    let dispatch = burn::tensor::Device::new(burn::backend::DispatchDevice::Cube(device.clone()));
+    let budget = crate::memory::MemoryBudget {
+        total_bytes: u64::MAX,
+        free_bytes: u64::MAX,
+        limit_bytes: None,
+    };
+    let n = 4096usize;
+    let k = 29usize;
+    for features in [32usize, 50, 256] {
+        let default =
+            super::super::orchestration::ann_preflight(&dispatch, n, features, k, &budget).unwrap();
+        for structure in 0..3 {
+            // Match the frozen B0 SplitMix64 blobs, Ties binary patterns, and
+            // Hub signed-unit-vector generators, extended to this shape.
+            let mut state = 42u64;
+            let mut unit = || {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
+            };
+            let centers: Vec<f32> = (0..4 * features).map(|_| unit() * 20.0 - 10.0).collect();
+            let values: Vec<f32> = (0..n * features)
+                .map(|index| {
+                    let row = index / features;
+                    let col = index % features;
+                    match structure {
+                        0 => centers[(row % 4) * features + col] + (unit() - 0.5) * 0.5,
+                        1 => {
+                            if col < usize::BITS as usize {
+                                (((row / 4) >> col) & 1) as f32
+                            } else {
+                                0.0
+                            }
+                        }
+                        _ => {
+                            if row != 0 && ((row - 1) / 2) % features == col {
+                                if (row - 1) % 2 == 0 { 1.0 } else { -1.0 }
+                            } else {
+                                0.0
+                            }
+                        }
+                    }
+                })
+                .collect();
+            for squared in [true, false] {
+                let mut expected = None;
+                let mut recipes = vec![SlotRecipe::PerSlot];
+                for group in [1, 2, 4, 8] {
+                    if features == 50 && group == 2 {
+                        continue;
+                    }
+                    for decode in [false, true] {
+                        for unroll in [1, 2] {
+                            recipes.push(SlotRecipe::Plane {
+                                group,
+                                decode,
+                                unroll,
+                            });
+                        }
+                    }
+                }
+                for recipe in recipes {
+                    let policy = if features == 50 {
+                        SlotPolicy {
+                            wide: SlotRecipe::PerSlot,
+                            scalar: recipe,
+                        }
+                    } else {
+                        SlotPolicy {
+                            wide: recipe,
+                            scalar: SlotRecipe::PerSlot,
+                        }
+                    };
+                    for tile in [1 << 20, default.tile_slots] {
+                        let plan =
+                            ann_preflight_with_slot_policy(&dispatch, n, features, k, tile, policy)
+                                .unwrap();
+                        super::TEST_MAX_PAIR_TILES.with(|count| count.set(0));
+                        let (ids, distances) = approximate_neighbors(
+                            f32_tensor(&device, &[n, features], values.clone()),
+                            k,
+                            42,
+                            2,
+                            squared,
+                            plan,
+                        )
+                        .unwrap();
+                        if tile == 1 << 20 {
+                            assert!(super::TEST_MAX_PAIR_TILES.with(|count| count.get()) > 1);
+                        }
+                        let output = (
+                            read_i32(&ids),
+                            read_f32(&distances)
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                        );
+                        if let Some(reference) = &expected {
+                            assert_eq!(
+                                &output, reference,
+                                "features={features} structure={structure} squared={squared} recipe={recipe:?} tile={tile}"
+                            );
+                        } else {
+                            expected = Some(output);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn forest_pair_slots_tiled_fixture(device: CubeDevice) {
     let client = device.client();
     let data = f32_tensor(&device, &[4, 1], vec![0.0, 1.0, 2.0, 3.0]);
@@ -2699,4 +3181,21 @@ fn sampled_kernels_cuda_match_injected_contract_fixtures() {
         return;
     }
     run_kernel_fixtures(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
+    plane_staging_identity_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn plane_graph_execution_parameter_invariance_cuda() {
+    let count = crate::cuda_backend::try_device_count()
+        .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+    if count == 0 {
+        assert!(
+            std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+            "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+        );
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    plane_graph_invariance_fixture(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }));
 }

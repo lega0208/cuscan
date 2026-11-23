@@ -7,12 +7,13 @@
 //! With `--features nvtx`, each command runs inside a process-wide NVTX range named
 //! `ann:warmup:<ordinal>` or `ann:build:<ordinal>` (one ordinal sequence across both kinds),
 //! bracketed by device synchronization so every launch of a command falls inside its range.
-//! The optional `slot_policy` field accepts only the per-slot policy
-//! `wide:per_slot,scalar:per_slot`; other values are rejected.
+//! The optional `slot_policy` field uses `wide:<recipe>,scalar:<recipe>`.
+//! Recipes are `per_slot` or `plane/<group>/<loop|plane>/<unroll>`.
 
 use burn::tensor::{Tensor, TensorData};
 use cuscan_common::{
-    ann_preflight, memory::resolve_memory_budget, neighbors::approximate_neighbors,
+    SlotPolicy, SlotRecipe, ann_preflight, ann_preflight_with_slot_policy,
+    memory::resolve_memory_budget, neighbors::approximate_neighbors,
 };
 use serde_json::{Value, json};
 use std::{
@@ -22,8 +23,31 @@ use std::{
     time::Instant,
 };
 
-/// The only slot policy that exists: both binding classes use the per-slot kernels.
-const PER_SLOT_POLICY: &str = "wide:per_slot,scalar:per_slot";
+fn parse_slot_policy(value: &str) -> Result<SlotPolicy, Box<dyn Error>> {
+    fn recipe(value: &str) -> Result<SlotRecipe, Box<dyn Error>> {
+        if value == "per_slot" {
+            return Ok(SlotRecipe::PerSlot);
+        }
+        let parts: Vec<_> = value.split('/').collect();
+        match parts.as_slice() {
+            ["plane", group, decode @ ("loop" | "plane"), unroll] => Ok(SlotRecipe::Plane {
+                group: group.parse()?,
+                decode: *decode == "plane",
+                unroll: unroll.parse()?,
+            }),
+            _ => Err(format!("invalid slot recipe {value:?}").into()),
+        }
+    }
+    let (wide, scalar) = value.split_once(',').ok_or("missing scalar slot recipe")?;
+    Ok(SlotPolicy {
+        wide: recipe(wide.strip_prefix("wide:").ok_or("missing wide: prefix")?)?,
+        scalar: recipe(
+            scalar
+                .strip_prefix("scalar:")
+                .ok_or("missing scalar: prefix")?,
+        )?,
+    })
+}
 
 fn read_features(path: &Path, rows: usize, features: usize) -> Result<Vec<f32>, Box<dyn Error>> {
     let bytes = std::fs::read(path)?;
@@ -99,11 +123,10 @@ fn perform(
     };
     let slot_policy = match command.get("slot_policy") {
         None => None,
-        Some(Value::String(value)) if value == PER_SLOT_POLICY => Some(value.clone()),
-        Some(_) => {
-            return Err(format!("command slot_policy must be {PER_SLOT_POLICY:?}").into());
-        }
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err("command slot_policy must be a string".into()),
     };
+    let policy = slot_policy.map(parse_slot_policy).transpose()?;
     if k == 0 || k as usize >= rows {
         return Err(format!("k must be in 1..{rows}").into());
     }
@@ -120,7 +143,17 @@ fn perform(
         device,
     );
     let budget = resolve_memory_budget(device, None)?;
-    let plan = ann_preflight(device, rows, features, k as usize, &budget)?;
+    let mut plan = ann_preflight(device, rows, features, k as usize, &budget)?;
+    if let Some(policy) = policy {
+        plan = ann_preflight_with_slot_policy(
+            device,
+            rows,
+            features,
+            k as usize,
+            plan.tile_slots,
+            policy,
+        )?;
+    }
     let ann_started = Instant::now();
     let (indices, distances) = approximate_neighbors(input, &plan, seed, cap, squared)?;
     device.sync()?;

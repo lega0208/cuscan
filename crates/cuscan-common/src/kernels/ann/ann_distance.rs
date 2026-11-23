@@ -4,7 +4,396 @@
 #[path = "ann_distance_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+mod cuda_group_tests {
+    use super::*;
+    use burn::{
+        backend::cubecl::dtype_to_storage_type,
+        tensor::{DType, Shape},
+    };
+    use burn_cubecl::{CubeDevice, tensor::CubeTensor};
+
+    #[cube(launch)]
+    fn group_probe<F: Float, N: Size>(
+        data: &Tensor<Vector<F, N>>,
+        output: &mut Tensor<F>,
+        oracle: &mut Tensor<F>,
+        features: u32,
+        #[comptime] group: usize,
+        #[comptime] width: usize,
+        #[comptime] unroll: usize,
+        #[define(F)] _dtype: ElemType,
+    ) {
+        let lane = UNIT_POS_PLANE as usize;
+        let pair = lane / group;
+        let left = pair % 4 * 2;
+        let right = left + 1;
+        let valid = pair % 3 != 1;
+        output[lane] = squared_l2_r8_group::<F, N>(
+            data,
+            left,
+            right,
+            features as usize,
+            valid,
+            group,
+            width,
+            unroll,
+        );
+        if valid {
+            oracle[lane] = squared_l2_r8::<F, N>(data, left, right, features as usize, width);
+        } else {
+            oracle[lane] = F::new(0.0f32);
+        }
+    }
+
+    #[cube(launch)]
+    fn triangle_probe(output: &mut Tensor<u32>, members: u32, count: u32) {
+        let local = ABSOLUTE_POS_X;
+        if local < count {
+            let (row, column) = triangle_decode(local, members);
+            output[local as usize * 2] = row;
+            output[local as usize * 2 + 1] = column;
+        }
+    }
+
+    fn tensor<T: burn::tensor::Element>(
+        device: &CubeDevice,
+        shape: &[usize],
+        values: Vec<T>,
+        dtype: DType,
+    ) -> CubeTensor {
+        let shape = Shape::from(shape.to_vec());
+        let data = burn::tensor::TensorData::new(values, shape.clone());
+        let (bytes, _, _) = data.into_parts();
+        let client = device.client();
+        CubeTensor::new_contiguous(
+            client.clone(),
+            device.clone(),
+            shape,
+            client.create(bytes),
+            dtype,
+        )
+    }
+
+    fn read_words(tensor: &CubeTensor) -> Vec<u32> {
+        tensor
+            .client
+            .read_one_unchecked(tensor.handle.clone())
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .collect()
+    }
+
+    fn cuda() -> Option<CubeDevice> {
+        let count = crate::cuda_backend::try_device_count()
+            .unwrap_or_else(|error| panic!("CUDA discovery failed: {error}"));
+        if count == 0 {
+            assert!(
+                std::env::var_os("CUSCAN_REQUIRE_CUDA").is_none(),
+                "CUSCAN_REQUIRE_CUDA is set, but no CUDA device is available"
+            );
+            eprintln!("SKIPPED: no CUDA device");
+            None
+        } else {
+            Some(CubeDevice::Cuda(cubecl::device::CudaDevice { index: 0 }))
+        }
+    }
+
+    #[test]
+    fn group_r8_matches_scalar_and_host_cuda() {
+        let Some(device) = cuda() else { return };
+        for features in [
+            1usize, 2, 3, 4, 7, 8, 9, 12, 15, 16, 31, 32, 33, 50, 255, 256, 260,
+        ] {
+            let mut rows = vec![vec![0.0f32; features]; 8];
+            for f in 0..features {
+                rows[0][f] = (f as f32 * 0.125) - 2.0;
+                rows[1][f] = (f as f32 * -0.0625) + 1.0;
+                rows[2][f] = if f % 2 == 0 { -0.0 } else { f32::from_bits(1) };
+                rows[3][f] = rows[2][f];
+                rows[4][f] = f32::MAX;
+                rows[5][f] = -f32::MAX;
+                rows[6][f] = if f == features - 1 { f32::NAN } else { 0.0 };
+            }
+            let input = tensor(
+                &device,
+                &[8, features],
+                rows.iter().flatten().copied().collect(),
+                DType::F32,
+            );
+            for (group, width) in [(2usize, 4usize), (4, 1), (8, 1)] {
+                if features % width != 0 {
+                    continue;
+                }
+                for unroll in [1usize, 2] {
+                    let output = tensor(&device, &[32], vec![0.0f32; 32], DType::F32);
+                    let oracle = tensor(&device, &[32], vec![0.0f32; 32], DType::F32);
+                    let data_arg = if width == 1 {
+                        input.clone().into_tensor_arg()
+                    } else {
+                        // SAFETY: contiguous F32 input is aligned and its length is divisible by four.
+                        unsafe {
+                            TensorArg::from_raw_parts(
+                                input.handle.clone(),
+                                [1].into(),
+                                [8 * features / width].into(),
+                            )
+                        }
+                    };
+                    group_probe::launch(
+                        &device.client(),
+                        CubeCount::Static(1, 1, 1),
+                        CubeDim::new_1d(32),
+                        width as VectorSize,
+                        data_arg,
+                        output.clone().into_tensor_arg(),
+                        oracle.clone().into_tensor_arg(),
+                        features as u32,
+                        group,
+                        width,
+                        unroll,
+                        dtype_to_storage_type(DType::F32),
+                    );
+                    let actual = read_words(&output);
+                    let reference = read_words(&oracle);
+                    for lane in 0..32 {
+                        let pair = lane / group;
+                        let row = pair % 4 * 2;
+                        let host = if pair % 3 != 1 {
+                            host_squared_l2_r8(&rows[row], &rows[row + 1])
+                        } else {
+                            0.0
+                        };
+                        let result = f32::from_bits(actual[lane]);
+                        let scalar = f32::from_bits(reference[lane]);
+                        if host.is_nan() {
+                            assert!(result.is_nan() && scalar.is_nan());
+                        } else {
+                            assert_eq!(
+                                actual[lane],
+                                host.to_bits(),
+                                "features={features} group={group} unroll={unroll} lane={lane}"
+                            );
+                            assert_eq!(
+                                reference[lane],
+                                host.to_bits(),
+                                "scalar features={features} group={group} lane={lane}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn triangle_decode_all_locals_cuda() {
+        let Some(device) = cuda() else { return };
+        for members in [2u32, 3, 30, 31, 60, 61, 150, 255, 256] {
+            let count = members * (members - 1) / 2;
+            let output = tensor(
+                &device,
+                &[count as usize * 2],
+                vec![0u32; count as usize * 2],
+                DType::U32,
+            );
+            triangle_probe::launch(
+                &device.client(),
+                CubeCount::Static(count.div_ceil(32), 1, 1),
+                CubeDim::new_1d(32),
+                output.clone().into_tensor_arg(),
+                members,
+                count,
+            );
+            let actual = read_words(&output);
+            for local in 0..count {
+                let expected = host_triangle_decode(local, members);
+                assert_eq!(
+                    (actual[local as usize * 2], actual[local as usize * 2 + 1]),
+                    expected,
+                    "members={members} local={local}"
+                );
+            }
+        }
+    }
+}
+
 use cubecl::prelude::*;
+
+/// Every plane lane must call this under uniform control flow with the same
+/// feature count and with safe, in-row ids, including for invalid slots.
+#[cube]
+pub(super) fn squared_l2_r8_group<F: Float, N: Size>(
+    data: &Tensor<Vector<F, N>>,
+    left: usize,
+    right: usize,
+    features: usize,
+    valid: bool,
+    #[comptime] group: usize,
+    #[comptime] binding_width: usize,
+    #[comptime] unroll: usize,
+) -> F {
+    comptime![assert!(
+        (group == 2 && binding_width == 4) || ((group == 4 || group == 8) && binding_width == 1)
+    )];
+    comptime![assert!(unroll == 1 || unroll == 2)];
+    let lane = UNIT_POS_PLANE as usize % group;
+    let steps = (features + 7) / 8;
+    let mut a = Vector::<F, N>::new(F::new(0.0f32));
+    let mut b = Vector::<F, N>::new(F::new(0.0f32));
+    let mut step = 0usize;
+    while step < steps {
+        let (d0, e0) = group_deltas::<F, N>(
+            data,
+            left,
+            right,
+            features,
+            valid,
+            lane,
+            step,
+            group,
+            binding_width,
+        );
+        let mut d1 = Vector::<F, N>::new(F::new(0.0f32));
+        let mut e1 = Vector::<F, N>::new(F::new(0.0f32));
+        if comptime![unroll == 2] {
+            if step + 1 < steps {
+                let (d, e) = group_deltas::<F, N>(
+                    data,
+                    left,
+                    right,
+                    features,
+                    valid,
+                    lane,
+                    step + 1,
+                    group,
+                    binding_width,
+                );
+                d1 = d;
+                e1 = e;
+            }
+        }
+        a = fma(d0, d0, a);
+        b = fma(e0, e0, b);
+        if comptime![unroll == 2] {
+            a = fma(d1, d1, a);
+            b = fma(e1, e1, b);
+        }
+        step += unroll;
+    }
+    let mut sum = if comptime![group == 2] {
+        (a.extract(0usize) + a.extract(1usize)) + (a.extract(2usize) + a.extract(3usize))
+    } else if comptime![group == 4] {
+        a.extract(0usize) + b.extract(0usize)
+    } else {
+        a.extract(0usize)
+    };
+    sum += plane_shuffle_xor(sum, 1u32);
+    if comptime![group >= 4] {
+        sum += plane_shuffle_xor(sum, 2u32);
+    }
+    if comptime![group == 8] {
+        sum += plane_shuffle_xor(sum, 4u32);
+    }
+    sum
+}
+
+#[cube]
+fn group_deltas<F: Float, N: Size>(
+    data: &Tensor<Vector<F, N>>,
+    left: usize,
+    right: usize,
+    features: usize,
+    valid: bool,
+    lane: usize,
+    step: usize,
+    #[comptime] group: usize,
+    #[comptime] binding_width: usize,
+) -> (Vector<F, N>, Vector<F, N>) {
+    let mut a = Vector::<F, N>::new(F::new(0.0f32));
+    let mut b = Vector::<F, N>::new(F::new(0.0f32));
+    let feature = step * 8 + lane * comptime![8 / group];
+    if valid && feature < features {
+        let index = feature / binding_width;
+        let stride = features / binding_width;
+        a = data[left * stride + index] - data[right * stride + index];
+    }
+    if comptime![group == 4] {
+        if valid && feature + 1 < features {
+            b = data[left * features + feature + 1] - data[right * features + feature + 1];
+        }
+    }
+    (a, b)
+}
+
+#[cube]
+pub(super) fn triangle_decode(local: u32, members: u32) -> (u32, u32) {
+    let width = 2 * members - 1;
+    let estimate =
+        (f32::cast_from(width) - f32::sqrt(f32::cast_from(width * width - 8 * local))) * 0.5;
+    let mut row = u32::cast_from(estimate).min(members - 2);
+    while (row + 1) * (2 * members - row - 2) / 2 <= local {
+        row += 1;
+    }
+    while row * (2 * members - row - 1) / 2 > local {
+        row -= 1;
+    }
+    let start = row * (2 * members - row - 1) / 2;
+    (row, row + 1 + local - start)
+}
+
+#[cfg(test)]
+pub(super) fn host_triangle_decode(local: u32, members: u32) -> (u32, u32) {
+    let width = 2 * members as u64 - 1;
+    let discriminant = width * width - 8 * local as u64;
+    let estimate = (width as f32 - (discriminant as f32).sqrt()) * 0.5;
+    let mut row = (estimate as u32).min(members - 2);
+    let start = |i: u32| i as u64 * (2 * members as u64 - i as u64 - 1) / 2;
+    while start(row + 1) <= local as u64 {
+        row += 1;
+    }
+    while start(row) > local as u64 {
+        row -= 1;
+    }
+    (row, row + 1 + local - start(row) as u32)
+}
+
+#[cfg(test)]
+#[test]
+fn triangle_decode_host_exhaustive_and_boundaries() {
+    let mut max_corrections = 0u32;
+    let mut check = |members: u32, row: u32, local: u32| {
+        let start = row as u64 * (2 * members as u64 - row as u64 - 1) / 2;
+        assert_eq!(
+            host_triangle_decode(local, members),
+            (row, row + 1 + local - start as u32)
+        );
+        let width = 2 * members as u64 - 1;
+        let estimate =
+            ((width as f32 - ((width * width - 8 * local as u64) as f32).sqrt()) * 0.5) as u32;
+        max_corrections = max_corrections.max(estimate.min(members - 2).abs_diff(row));
+    };
+    for members in 2..=256u32 {
+        let mut local = 0;
+        for row in 0..members - 1 {
+            for _ in row + 1..members {
+                check(members, row, local);
+                local += 1;
+            }
+        }
+    }
+    for members in [257u32, 1024, 32768, 65536] {
+        for row in 0..members - 1 {
+            let start = row as u64 * (2 * members as u64 - row as u64 - 1) / 2;
+            let end = start + (members - row - 2) as u64;
+            check(members, row, start as u32);
+            check(members, row, end as u32);
+        }
+    }
+    eprintln!("maximum triangle decode corrections: {max_corrections}");
+}
 
 /// Accumulate features in eight independent chains and reduce them in the
 /// fixed R8 tree. Width one uses scalar chains; widths four/eight load vector

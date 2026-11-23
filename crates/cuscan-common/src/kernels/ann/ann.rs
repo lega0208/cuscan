@@ -161,6 +161,92 @@ impl LaunchShape {
     }
 }
 
+/// Pair-slot kernel and its cooperative execution parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRecipe {
+    PerSlot,
+    Plane {
+        group: usize,
+        decode: bool,
+        unroll: usize,
+    },
+}
+
+impl std::fmt::Display for SlotRecipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PerSlot => f.write_str("per_slot"),
+            Self::Plane {
+                group,
+                decode,
+                unroll,
+            } => write!(
+                f,
+                "plane:g{group}:decode{}:u{unroll}",
+                if *decode { "plane" } else { "loop" }
+            ),
+        }
+    }
+}
+
+/// Recipes selected for wide and scalar input bindings respectively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotPolicy {
+    pub wide: SlotRecipe,
+    pub scalar: SlotRecipe,
+}
+
+impl SlotPolicy {
+    fn for_cpu(cpu: bool) -> Self {
+        if cpu {
+            Self::default()
+        } else {
+            Self {
+                wide: SlotRecipe::Plane {
+                    group: 2,
+                    decode: false,
+                    unroll: 1,
+                },
+                scalar: SlotRecipe::PerSlot,
+            }
+        }
+    }
+
+    fn validate(self, cpu: bool) -> Result<(), AnnError> {
+        for (recipe, wide) in [(self.wide, true), (self.scalar, false)] {
+            if let SlotRecipe::Plane { group, unroll, .. } = recipe {
+                if cpu
+                    || ![1, 2, 4, 8].contains(&group)
+                    || (group == 2 && !wide)
+                    || ![1, 2].contains(&unroll)
+                {
+                    return Err(AnnError::InvalidInput("invalid ANN slot policy".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn select(self, width: usize) -> (SlotRecipe, usize) {
+        let recipe = if width == 1 { self.scalar } else { self.wide };
+        let binding = match recipe {
+            SlotRecipe::Plane { group: 2, .. } => 4,
+            SlotRecipe::Plane { group: 4 | 8, .. } => 1,
+            _ => width,
+        };
+        (recipe, binding)
+    }
+}
+
+impl Default for SlotPolicy {
+    fn default() -> Self {
+        Self {
+            wide: SlotRecipe::PerSlot,
+            scalar: SlotRecipe::PerSlot,
+        }
+    }
+}
+
 /// Checked shape, launch geometry and immutable memory admission for one ANN call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnPlan {
@@ -168,6 +254,7 @@ pub struct AnnPlan {
     merge: LaunchShape,
     pub(super) vector_widths: &'static [usize],
     pub(crate) join_route: AnnJoinRoute,
+    pub(super) slot_policy: SlotPolicy,
     pub n: usize,
     pub features: usize,
     pub k: usize,
@@ -743,6 +830,7 @@ fn plan_with_host_route(
     host: HostPlan,
     tile_slots: usize,
     override_route: Option<AnnJoinRoute>,
+    override_policy: Option<SlotPolicy>,
 ) -> Result<AnnPlan, AnnError> {
     let memory = &client.properties().memory;
     let max_page = usize::try_from(memory.max_page_size)
@@ -752,6 +840,8 @@ fn plan_with_host_route(
     let n_u32 = u32::try_from(n).expect("ANN row count validated by host_plan");
     let merge = ann_launch_shape(client, DType::F32.size(), n_u32)?;
     let join_route = override_route.unwrap_or_else(|| AnnJoinRoute::for_cpu(merge.cpu_merge));
+    let slot_policy = override_policy.unwrap_or_else(|| SlotPolicy::for_cpu(merge.cpu_merge));
+    slot_policy.validate(merge.cpu_merge)?;
     if !merge.cpu_merge && join_route == AnnJoinRoute::Owner {
         return Err(AnnError::InvalidInput("ANN owner join requires CPU".into()));
     }
@@ -805,6 +895,7 @@ fn plan_with_host_route(
         merge,
         vector_widths,
         join_route,
+        slot_policy,
         n,
         features,
         k,
@@ -829,7 +920,7 @@ fn plan_with_host(
     host: HostPlan,
     tile_slots: usize,
 ) -> Result<AnnPlan, AnnError> {
-    plan_with_host_route(client, n, features, k, host, tile_slots, None)
+    plan_with_host_route(client, n, features, k, host, tile_slots, None, None)
 }
 
 #[cfg(test)]
@@ -867,6 +958,7 @@ pub(super) fn owner_test_plan(
         host,
         tile_slots,
         Some(AnnJoinRoute::Owner),
+        None,
     )?;
     let chunks = n
         .div_ceil(ch)
@@ -1114,6 +1206,23 @@ pub fn ann_preflight_with_tile_slots(
     let host = host_plan(n, features, k)?;
     plan_tiles(tile_caps(&client, n, &host)?, TileRequest::Exact(slots))?;
     plan_with_host(&client, n, features, k, host, slots)
+}
+
+/// Exact tile preflight with an explicit experimental slot policy.
+#[cfg(feature = "test-support")]
+pub fn ann_preflight_with_slot_policy(
+    device: &burn::tensor::Device,
+    n: usize,
+    features: usize,
+    k: usize,
+    slots: usize,
+    policy: SlotPolicy,
+) -> Result<AnnPlan, AnnError> {
+    let DispatchDevice::Cube(device) = device.as_dispatch();
+    let client = device.client();
+    let host = host_plan(n, features, k)?;
+    plan_tiles(tile_caps(&client, n, &host)?, TileRequest::Exact(slots))?;
+    plan_with_host_route(&client, n, features, k, host, slots, None, Some(policy))
 }
 
 /// Public launch preflight. Returns typed errors for invalid shapes and
@@ -1484,6 +1593,7 @@ pub fn approximate_neighbors_planned(
         host,
         plan.tile_slots,
         Some(plan.join_route),
+        Some(plan.slot_policy),
     )?;
     checked.memory = plan.memory;
     if checked != *plan {
@@ -1497,6 +1607,91 @@ pub fn approximate_neighbors_planned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_policy_validation_and_binding_mapping() {
+        let per_slot = SlotRecipe::PerSlot;
+        let plane = |group, unroll| SlotRecipe::Plane {
+            group,
+            decode: true,
+            unroll,
+        };
+        let default = SlotPolicy::default();
+        assert_eq!(default.select(1), (per_slot, 1));
+        assert_eq!(default.select(4), (per_slot, 4));
+        assert_eq!(default.select(8), (per_slot, 8));
+        assert!(default.validate(true).is_ok());
+        assert_eq!(SlotPolicy::for_cpu(true), default);
+        let cuda = SlotPolicy::for_cpu(false);
+        assert_eq!(cuda.select(1), (per_slot, 1));
+        assert_eq!(
+            cuda.select(4),
+            (
+                SlotRecipe::Plane {
+                    group: 2,
+                    decode: false,
+                    unroll: 1
+                },
+                4
+            )
+        );
+        assert_eq!(
+            cuda.select(8),
+            (
+                SlotRecipe::Plane {
+                    group: 2,
+                    decode: false,
+                    unroll: 1
+                },
+                4
+            )
+        );
+        assert!(cuda.validate(false).is_ok());
+        for group in [1, 4, 8] {
+            let policy = SlotPolicy {
+                wide: plane(group, 1),
+                scalar: plane(group, 2),
+            };
+            assert!(policy.validate(false).is_ok());
+            assert!(matches!(
+                policy.validate(true),
+                Err(AnnError::InvalidInput(_))
+            ));
+            assert_eq!(policy.select(1).1, 1);
+            assert_eq!(policy.select(4).1, if group == 1 { 4 } else { 1 });
+            assert_eq!(policy.select(8).1, if group == 1 { 8 } else { 1 });
+        }
+        let wide_two = SlotPolicy {
+            wide: plane(2, 1),
+            scalar: per_slot,
+        };
+        assert!(wide_two.validate(false).is_ok());
+        assert_eq!(wide_two.select(4).1, 4);
+        assert_eq!(wide_two.select(8).1, 4);
+        for invalid in [
+            SlotPolicy {
+                wide: per_slot,
+                scalar: plane(2, 1),
+            },
+            SlotPolicy {
+                wide: plane(3, 1),
+                scalar: per_slot,
+            },
+            SlotPolicy {
+                wide: plane(1, 0),
+                scalar: per_slot,
+            },
+            SlotPolicy {
+                wide: plane(1, 3),
+                scalar: per_slot,
+            },
+        ] {
+            assert!(matches!(
+                invalid.validate(false),
+                Err(AnnError::InvalidInput(_))
+            ));
+        }
+    }
 
     #[test]
     fn owner_route_table_and_estimate_cover_both_routes() {

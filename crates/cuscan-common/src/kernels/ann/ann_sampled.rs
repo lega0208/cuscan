@@ -19,10 +19,11 @@ use super::ann_distance::squared_l2_r8;
 use super::ann_forest::{
     ForestLeaves, MAX_CANDIDATES, NnDescentParams, WorkspaceError, WorkspacePlan, build_forest,
 };
+use super::ann_plane::{forest_pair_slots_plane_kernel, pair_slots_plane_kernel};
 use super::orchestration::{
     AnnJoinRoute, AnnPlan, Buffer, BufferEntry, BufferRoute, OWNER_CH, OWNER_CH_LEAF, OWNER_D_MAX,
-    REVERSE_NEW_BIT, ann_buffer_table, ann_independent_launch, ann_output, ann_should_stop,
-    reverse_count, reverse_scatter, reverse_zero, workspace_error,
+    REVERSE_NEW_BIT, SlotRecipe, ann_buffer_table, ann_independent_launch, ann_output,
+    ann_should_stop, reverse_count, reverse_scatter, reverse_zero, workspace_error,
 };
 use crate::error::AnnError;
 use burn::{
@@ -502,6 +503,11 @@ fn heap_copy_kernel<I: Int>(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MAX_PAIR_TILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Production sampled NN-descent orchestration. Source IDs and flags stay frozen
 /// for each iteration; merge tiles update a working ID heap and one distance heap.
 /// Heap-distance launches are forest/refinement merge, random fill, the row-worst
@@ -621,6 +627,7 @@ pub(super) fn approximate_neighbors(
     .map_err(|error| workspace_error("RP forest initialization", error))?;
     let vector_width = resolve_vector_width(&data, n, features, plan.vector_widths);
     let vector_size = vector_width as VectorSize;
+    let (slot_recipe, binding_width) = plan.slot_policy.select(vector_width);
     let row_worst_ids = allocator.empty(Buffer::RowWorstIds, Shape::new([n]), DType::I32);
     let row_worst_distances =
         allocator.empty(Buffer::RowWorstDistances, Shape::new([n]), DType::F32);
@@ -765,12 +772,13 @@ pub(super) fn approximate_neighbors(
         let slots = (forest_pairs - forest_offset).min(pair_slots);
         let slots_u32 = u32::try_from(slots).expect("ANN forest tile exceeds CubeCL range");
         let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
-        forest_pair_slots_kernel::launch(
+        macro_rules! launch_forest_pairs {
+            ($kernel:ident $(, $extra:expr)*) => { $kernel::launch(
             &client,
             pair_count.clone(),
             pair_dim,
-            vector_size,
-            ann_data_arg(&data, n, features, vector_width),
+            binding_width as VectorSize,
+            ann_data_arg(&data, n, features, binding_width),
             forest_rows.clone().into_tensor_arg(),
             forest_leaf_rows.clone().into_tensor_arg(),
             forest_pair_prefix.clone().into_tensor_arg(),
@@ -784,13 +792,29 @@ pub(super) fn approximate_neighbors(
             features_u32,
             u64::try_from(forest_offset).expect("ANN forest offset exceeds u64"),
             slots_u32,
-            vector_width,
+            binding_width,
+            $($extra,)*
             [
                 dtype_to_storage_type(DType::F32),
                 dtype_to_storage_type(DType::I32),
                 dtype_to_storage_type(DType::I64),
             ],
-        );
+        ) };
+        }
+        match slot_recipe {
+            SlotRecipe::PerSlot => launch_forest_pairs!(forest_pair_slots_kernel),
+            SlotRecipe::Plane {
+                group,
+                decode,
+                unroll,
+            } => launch_forest_pairs!(
+                forest_pair_slots_plane_kernel,
+                group,
+                binding_width,
+                decode,
+                unroll
+            ),
+        }
         #[cfg(feature = "test-support")]
         if let Some(counts) = &survival_counts {
             let (produced, predicted) = profile_tile_survival(
@@ -908,12 +932,12 @@ pub(super) fn approximate_neighbors(
     if profile {
         let _ = client.read_one_unchecked(candidates.handle.clone());
         // Slot-route fields: binding-class policy and the recipe/binding resolved at launch.
-        // Only the per-slot recipe exists, so its binding width is the resolved width.
         let slot_fields = if owner_enabled {
             String::new()
         } else {
             format!(
-                " slot_policy=wide:per_slot,scalar:per_slot vector_width={vector_width} slot_recipe=per_slot binding_width={vector_width}"
+                " slot_policy=wide:{},scalar:{} vector_width={vector_width} slot_recipe={slot_recipe} binding_width={binding_width}",
+                plan.slot_policy.wide, plan.slot_policy.scalar,
             )
         };
         eprintln!(
@@ -1099,12 +1123,13 @@ pub(super) fn approximate_neighbors(
             let slots = (total_slots - slot_offset).min(pair_slots);
             let slots_u32 = u32::try_from(slots).expect("ANN pair tile exceeds CubeCL range");
             let (pair_count, pair_dim) = ann_independent_launch(&client, slots_u32)?;
-            pair_slots_kernel::launch(
+            macro_rules! launch_pairs {
+                ($kernel:ident $(, $extra:expr)*) => { $kernel::launch(
                 &client,
                 pair_count.clone(),
                 pair_dim,
-                vector_size,
-                ann_data_arg(&data, n, features, vector_width),
+                binding_width as VectorSize,
+                ann_data_arg(&data, n, features, binding_width),
                 sampled_ids.clone().into_tensor_arg(),
                 pool_sizes.clone().into_tensor_arg(),
                 center_offsets.clone().into_tensor_arg(),
@@ -1119,13 +1144,29 @@ pub(super) fn approximate_neighbors(
                 u64::try_from(slot_offset).expect("ANN pair offset exceeds u64"),
                 slots_u32,
                 cap_u32,
-                vector_width,
+                binding_width,
+                $($extra,)*
                 [
                     dtype_to_storage_type(DType::F32),
                     dtype_to_storage_type(DType::I32),
                     dtype_to_storage_type(DType::I64),
                 ],
-            );
+            ) };
+            }
+            match slot_recipe {
+                SlotRecipe::PerSlot => launch_pairs!(pair_slots_kernel),
+                SlotRecipe::Plane {
+                    group,
+                    decode,
+                    unroll,
+                } => launch_pairs!(
+                    pair_slots_plane_kernel,
+                    group,
+                    binding_width,
+                    decode,
+                    unroll
+                ),
+            }
             #[cfg(feature = "test-support")]
             if let Some(counts) = &survival_counts {
                 let (produced, predicted) = profile_tile_survival(
@@ -1207,6 +1248,9 @@ pub(super) fn approximate_neighbors(
             );
             slot_offset += slots;
         }
+        #[cfg(test)]
+        TEST_MAX_PAIR_TILES
+            .with(|count| count.set(count.get().max(total_slots.div_ceil(pair_slots) as u64)));
         if profile && !owner_enabled {
             let _ = client.read_one_unchecked(if total_slots > 0 {
                 working_ids.handle.clone()
@@ -2116,7 +2160,7 @@ fn endpoint_passes<F: Float, I: Int>(
 /// negative/NaN-distance pairs produce no records (mask 0), as the merge rejects
 /// them; +inf and signed zero go through the ordinary comparisons.
 #[cube]
-fn endpoint_mask<F: Float, I: Int>(
+pub(super) fn endpoint_mask<F: Float, I: Int>(
     left: usize,
     right: usize,
     distance: F,

@@ -662,9 +662,16 @@ projected = model.transform(X_new)
   ANN squared distances use eight FMA accumulation chains indexed by feature
   modulo eight, followed by a fixed pairwise reduction. The CPU owner generator
   selects eight- or four-wide loads when the feature count and binding alignment
-  permit, otherwise scalar loads. The CUDA slot route likewise uses supported
-  four- or eight-wide loads when permitted, otherwise scalar loads. The arithmetic
-  order is unchanged across these routes. The R8 CPU/CUDA distance identity was
+  permit, otherwise scalar loads. The CUDA slot route resolves width after input
+  normalization. Width 4 or 8 selects the plane forest and refinement pair kernels
+  with a four-wide binding: two adjacent lanes compute each pair, and an explicit
+  XOR shuffle combines their partial sums in the fixed R8 tree. Width 1 keeps
+  the per-slot kernels, which also serve as staging oracles. The plane-bounded
+  search and closed-form triangle decode were evaluated but are not selected:
+  the production recipe keeps the per-slot search and loop decode.
+  `ANN_PROFILE` reports `slot_policy`, `vector_width`, `slot_recipe` and
+  `binding_width`. Resolved width 8 was checked in host policy tests only.
+  The arithmetic order is unchanged across these routes. The R8 CPU/CUDA distance identity was
   previously verified on FMA-capable x86-64 and the tested NVIDIA CUDA device;
   it is not guaranteed on hosts without FMA.
   This order does not apply to exact search or HDBSCAN KD-tree distances.

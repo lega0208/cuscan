@@ -64,15 +64,17 @@ CAP = 60
 RANGE_NAMES = ("ann:warmup:0", "ann:build:1", "ann:build:2")
 # Ordered: the first matching prefix wins, so `forest_pair_slots` precedes `pair_slots`.
 KERNEL_GROUPS = (
+    ("forest_pair_slots", "forest_pair_slots_plane_kernel"),
     ("forest_pair_slots", "forest_pair_slots_kernel"),
+    ("pair_slots", "pair_slots_plane_kernel"),
     ("pair_slots", "pair_slots_kernel"),
     ("endpoint", "endpoint_"),
     ("sampled_pool", "sampled_pool_kernel"),
 )
 PAIR_GROUPS = ("forest_pair_slots", "pair_slots")
 NCU_KERNELS = {
-    "forest_pair_slots": "^forest_pair_slots_kernel_.*$",
-    "pair_slots": "^pair_slots_kernel_.*$",
+    "forest_pair_slots": "^forest_pair_slots(_plane)?_kernel_.*$",
+    "pair_slots": "^pair_slots(_plane)?_kernel_.*$",
 }
 NCU_SECTIONS = (
     "SpeedOfLight",

@@ -2,13 +2,18 @@
 
 mod ann_distance;
 mod ann_forest;
+mod ann_plane;
 mod ann_sampled;
 #[path = "ann.rs"]
 mod orchestration;
 
 pub(crate) use orchestration::approximate_neighbors_planned;
 pub use orchestration::{
-    AnnEstimate, AnnPhase, AnnPhaseBytes, AnnPlan, PlannedMemory, ann_host_estimate, ann_preflight,
+    AnnEstimate, AnnPhase, AnnPhaseBytes, AnnPlan, PlannedMemory, SlotPolicy, SlotRecipe,
+    ann_host_estimate, ann_preflight,
 };
 #[cfg(feature = "test-support")]
-pub use orchestration::{ann_preflight_with_tile_slots, approximate_neighbors_with_tile_slots};
+pub use orchestration::{
+    ann_preflight_with_slot_policy, ann_preflight_with_tile_slots,
+    approximate_neighbors_with_tile_slots,
+};
