@@ -684,7 +684,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "num-traits",
  "oneshot",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_distr 0.6.0",
  "serde",
  "spin 0.12.3",
@@ -727,7 +727,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "log",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "regex",
  "serde",
  "serde_json",
@@ -808,7 +808,7 @@ dependencies = [
  "csv",
  "derive-new",
  "dirs 7.0.0",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rmp-serde",
  "sanitize-filename",
  "serde",
@@ -932,7 +932,7 @@ dependencies = [
  "ndarray 0.17.2",
  "num-traits",
  "paste",
- "rand 0.10.3",
+ "rand 0.10.4",
 ]
 
 [[package]]
@@ -989,7 +989,7 @@ dependencies = [
  "futures-util",
  "gloo-timers",
  "log",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -1056,7 +1056,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indicatif",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_distr 0.6.0",
  "reqwest",
  "serde",
@@ -1459,6 +1459,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "constcat"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1699,9 +1708,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-common"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68f8320cfe8f6f24bf6144e2eee003adf56600e55227e20fc587d177a1e261f1"
+checksum = "7ec818209d97ad8f62e4ac9bb22c15f8ed8301698d46d61a92721d28f2a3f5c9"
 dependencies = [
  "bytemuck",
  "cfg_aliases",
@@ -1796,7 +1805,7 @@ dependencies = [
  "log",
  "pliron",
  "spin 0.12.3",
- "sysinfo",
+ "sysinfo 0.39.6",
  "winapi",
 ]
 
@@ -1824,9 +1833,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-environment"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f565ed728f9de5ccea6c83ffd26469490e4c40c2e16f59ea7696368ee88838"
+checksum = "d47cca02047e7b3ceae0b53dc544887f48408cc6f670b0a911b42db83caabea3"
 dependencies = [
  "async-channel",
  "backtrace",
@@ -1848,7 +1857,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -1898,9 +1907,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-ir"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56fc93fa6d8999c835a20c3f3dc94c3dc003cb474822f032dfd5e5637cf3e3d5"
+checksum = "9714b8124a7736c9c694e23944048e77d6c1b33f3de8d13379a3a02d497eb0f5"
 dependencies = [
  "bumpalo",
  "cubecl-common",
@@ -1968,9 +1977,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-macros-internal"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84046de60d8bb21eba4b8d6aea8d79c67f60b9b7945ff21da667ab187f49b70f"
+checksum = "450576459be780afa4158ed3b2481935342834df79cd2293928b223044056f37"
 dependencies = [
  "darling 0.24.1",
  "inflections",
@@ -2006,9 +2015,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-monitoring"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdc12c0f02d82a23292ac7250f990e5876bdb7d5fe569096ca534a6e9b6df5"
+checksum = "41a159090b55e83641a823b6ea1dc1f205db0931e59210cc19e329a7d256b481"
 dependencies = [
  "cfg_aliases",
  "cubecl-ir",
@@ -2043,9 +2052,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-runtime"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0a7aab25ed7220e3c0b173a959403136b3b4f1479a1d39c83d00d3f085ca42c"
+checksum = "cc18c95e3b851f50f807c40056e02b70d46773ca478b97ae4e93516d97cf9933"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2075,9 +2084,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-server"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f900c09396e0f971f3ce3a3ec27d65b649e531c561eb2512eab37e6f4c26ff4e"
+checksum = "c8494d0b834cd9319ea0b0a6c756f7b163ad94a096d964cb91b9d1e0757b3295"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2180,9 +2189,9 @@ dependencies = [
 
 [[package]]
 name = "cubecl-zspace"
-version = "0.11.1"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac45e796e54c54e25ce310c478d1bbd0ce57bc374c286b6b3327a4c52300293d"
+checksum = "30b3a4ad34a20287783a2c9859322e86980bcf166bac5bce0e0febe7c267f470"
 dependencies = [
  "derive-new",
  "serde",
@@ -2314,7 +2323,7 @@ dependencies = [
  "cubek-std",
  "half",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde",
 ]
 
@@ -2376,7 +2385,7 @@ dependencies = [
  "cubecl-cpu",
  "cudarc",
  "rayon",
- "sysinfo",
+ "sysinfo 0.40.4",
  "tempfile",
 ]
 
@@ -3516,7 +3525,7 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
- "zip 9.1.3",
+ "zip 9.8.2",
 ]
 
 [[package]]
@@ -3527,7 +3536,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
- "zip 9.1.3",
+ "zip 9.8.2",
 ]
 
 [[package]]
@@ -4190,9 +4199,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4329,9 +4338,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "loom"
@@ -5676,7 +5685,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_pcg 0.10.2",
  "ring",
  "rustc-hash 2.1.3",
@@ -5753,9 +5762,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -5823,7 +5832,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
 dependencies = [
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
 ]
 
 [[package]]
@@ -6428,9 +6437,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
@@ -6806,6 +6815,20 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "objc2-open-directory",
+ "windows",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.40.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e80749408e2d8bec0ffa303012cf4e1b3b355f4a09087b4fdf7473680f6a2de"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
  "windows",
 ]
 
@@ -7485,7 +7508,7 @@ version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 dependencies = [
- "rand 0.10.3",
+ "rand 0.10.4",
 ]
 
 [[package]]
@@ -7530,7 +7553,7 @@ dependencies = [
  "cuscan-common",
  "log",
  "nvtx",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rayon",
  "serde",
  "serde_json",
@@ -7539,7 +7562,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "umap-core",
- "zip 9.1.3",
+ "zip 9.8.2",
 ]
 
 [[package]]
@@ -7547,7 +7570,7 @@ name = "umap-core"
 version = "0.1.3"
 dependencies = [
  "faer",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rayon",
  "serde",
  "serde_json",
@@ -8550,6 +8573,20 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"
@@ -8595,7 +8632,7 @@ dependencies = [
  "aes",
  "byteorder",
  "bzip2",
- "constant_time_eq",
+ "constant_time_eq 0.1.5",
  "crc32fast",
  "crossbeam-utils",
  "flate2",
@@ -8608,18 +8645,21 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.3"
+version = "9.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
+checksum = "2d8dbe089cf6b0448b78f5fc50139ab5aaa40d08ac07cdc1baf2c13add35fcce"
 dependencies = [
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
  "indexmap",
+ "libc",
  "memchr",
  "nix",
  "typed-path",
  "windows-sys 0.61.2",
+ "zeroize",
  "zopfli",
 ]
 
