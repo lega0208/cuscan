@@ -188,6 +188,11 @@ imports upstream UMAP. CPU and CUDA baselines use strict backends, run serially,
 and record cold JIT separately from warm samples. Do not run other campaigns
 concurrently with these measurements.
 
+Campaign execution uses POSIX file locks and process groups; run the campaign on
+Linux (including WSL2). The reference, scoring and report-validation tests stay
+in `python/tests`, including for Windows wheels. The process-group cleanup test
+runs in the Linux tooling suite (`uv run --no-sync pytest analyze/tests`).
+
 The harness always passes `optimizer` and `init` explicitly, so library-default
 changes do not alter its configurations. `cuscan_worker.py --library-defaults`
 (mutually exclusive with `--optimizer` and `--init`) omits both keywords and

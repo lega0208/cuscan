@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
 import hashlib
 import importlib.util
 import json
@@ -292,6 +291,8 @@ def campaign_term_handler(_signum, _frame):
 
 
 def child(command, destination, timeout, env=None, intent=None):
+    if os.name != "posix":
+        raise RuntimeError("UMAP 0.6 campaign workers require POSIX process groups")
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     if intent is not None:
@@ -3019,6 +3020,10 @@ def main():
     if args.command in ("compare-hashes", "compare-variants"):
         args.function(args)
         return
+    if os.name != "posix":
+        parser.error("UMAP 0.6 campaign commands require POSIX file locking")
+    import fcntl
+
     args.artifacts.mkdir(parents=True, exist_ok=True)
     with (args.artifacts / ".campaign.lock").open("a+") as lock:
         try:

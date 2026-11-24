@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
 import json
 import os
 import signal
@@ -29,6 +28,9 @@ def main():
     report = commands.add_parser("report")
     report.add_argument("--ledger", type=Path, required=True)
     args = parser.parse_args()
+    if os.name != "posix":
+        parser.error("UMAP 0.6 campaign commands require POSIX file locking and process groups")
+    import fcntl
 
     args.ledger.parent.mkdir(parents=True, exist_ok=True)
     with args.ledger.open("a+", encoding="utf-8") as ledger:
