@@ -208,7 +208,7 @@ def provenance():
         "rustc": command_output(["rustc", "-Vv"]),
         "freeze": command_output(["uv", "pip", "freeze"]),
         "gpu": sample()["gpu"],
-        "source_hashes": {str(p.relative_to(ROOT)): sha256(p) for p in sources},
+        "source_hashes": {p.relative_to(ROOT).as_posix(): sha256(p) for p in sources},
     }
 
 
@@ -521,7 +521,7 @@ def runs(root, data):
     result = {}
     current_extension = require_extension(root)["sha256"]
     source_hashes = {
-        str(path.relative_to(ROOT)): sha256(path)
+        path.relative_to(ROOT).as_posix(): sha256(path)
         for path in [
             ROOT / "comparison" / "umap_reference.py",
             *sorted((ROOT / "comparison" / "umap06").glob("*.py")),

@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from comparison import umap_reference as reference
 
 
-def test_campaign_modules_import_without_fcntl():
+def test_campaign_modules_import_without_posix_dependencies():
     import subprocess
 
     subprocess.run(
@@ -25,13 +25,14 @@ import sys
 
 original_import = builtins.__import__
 def blocked_import(name, *args, **kwargs):
-    if name == 'fcntl' or name.startswith('fcntl.'):
-        raise ImportError('fcntl is unavailable')
+    if name.split('.')[0] in {'fcntl', 'resource'}:
+        raise ModuleNotFoundError(f'{name} is unavailable', name=name)
     return original_import(name, *args, **kwargs)
 
 builtins.__import__ = blocked_import
 sys.path.insert(0, sys.argv[1])
 import comparison.umap06.campaign
+import comparison.umap06.cuscan_worker
 import comparison.umap06.run
 """,
             str(Path(__file__).resolve().parents[2]),
@@ -1253,7 +1254,11 @@ def run_fake_worker(tmp_path, monkeypatch, algorithm_args):
 
 
 def test_worker_library_defaults_omits_algorithm_keywords(tmp_path, monkeypatch):
+    from comparison.umap06 import cuscan_worker
+
+    monkeypatch.setattr(cuscan_worker, "resource", None)
     constructed, record = run_fake_worker(tmp_path, monkeypatch, ["--library-defaults"])
+    assert record["peak_rss_kib"] is None
     assert len(constructed) == 2  # main fit and in-process repeat fit
     for kwargs in constructed:
         assert "optimizer" not in kwargs and "init" not in kwargs

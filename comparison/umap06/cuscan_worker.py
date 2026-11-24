@@ -6,12 +6,16 @@ import argparse
 import hashlib
 import json
 import os
-import resource
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 from .datasets import load_fixture
 from .spec import FIXTURES
@@ -167,7 +171,9 @@ def main() -> None:
             "transform_seconds": transforms,
             "hashes": hashes,
             "settings": {name: getattr(model, name) for name in settings},
-            "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "peak_rss_kib": (
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource is not None else None
+            ),
         }
         if not args.skip_repeat_fit and position == len(args.seeds) - 1:
             repeat_model = UMAP(
