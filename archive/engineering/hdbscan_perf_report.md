@@ -604,7 +604,55 @@ The full `all_cuda` campaign retains pre-existing unrelated ignored hardware-cam
 
 `codegen_evidence.json` links hashed optimized LLVM IR from reporting-only 257-row d16 diagnostic probes, not timing binaries. Selected IR has **16 `load <16 x float>`**, **16 `fsub <16 x float>`**, **17 `llvm.fmuladd.v16f32`** matches; baseline has zero of these and **33 scalar `llvm.fmuladd.f32`** matches versus selected **17**. These textual counts include declarations, not dynamic instruction counts or assembly/ISA proof. Observed vector FMA supports candidate-axis vectorization but independently proves neither correctness nor the entire speedup. Independent review receipts are maintained separately in the ultragoal ledger.
 
+## F2 removal (2026-11)
+
+The CUDA KD route was changed to per-query traversal at every feature count; the
+flat F2 scan was removed. The investigation compared pinned F2 and traversal arms
+on one RTX 3080 / Ryzen 9800X3D host. Core times include packing, and are median
+seconds for three measured fits after warmup; the small repeat counts limit inference.
+
+| Workload | F2 core | Traversal core | Other observation |
+| --- | ---: | ---: | --- |
+| Real UMAP 200k×16, min-samples 30 | 0.86 s | 0.06 s | |
+| Real UMAP 1,584,605×16, min-samples 30 | 12.9 s | 0.95 s | Fit 17.5 s vs 5.5–6.0 s |
+| Gaussian 300k×16, min-samples 5 | 0.40 s | 4.75 s | Traversal about 12× slower |
+| Gaussian 300k×16, min-samples 30 | 0.56 s | 6.69 s | Traversal about 12× slower |
+
+The investigation observed mean leaf scanning of 0.235% on real data versus
+74.1% on the earlier Gaussian workload; these are workload-specific observations,
+not universal KD behavior. Full real-data labels had SHA-256
+`92f427969ab934df0dbf0634806311657af7b47bdd2ff3055bc04c64bbf50035`
+for F2, traversal and CPU in the investigation. No matched Gaussian CPU timing
+exists; CUDA brute-force speed relative to F2 is unmeasured. Real-data timing at
+17–32 features and the regression magnitude on other high-intrinsic-dimension
+data are unmeasured.
+
+Phase 0 real-data targets and Phase 1 `umap_like_v1` calibration used 16 features.
+For 20k/ms=5, 100k/ms=5 and 100k/ms=30 respectively, real mean scanned fractions
+were 0.013454, 0.002149 and 0.004219; calibrated means were 0.009168, 0.004075
+and 0.004436. At 300k/ms=5, calibrated CUDA core medians were 0.41056 s F2 and
+0.05850 s traversal (7.02×). All Phase 1 calibration checks C1–C6 passed; these
+are pre-removal arm measurements, not final-source verification.
+
+Final source passed Rust format, Clippy, HDBSCAN core and facade tests, and the
+common-crate tests. The required-CUDA release suite passed with direct Cargo
+after the soldr-wrapped command failed in rustdoc. The 166 focused Python tests,
+Ruff and ty passed. Both the 20k and 100k live stage analyses produced identical
+CPU/CUDA labels and Nsight counter evidence for `kd_neighbors_kernel`.
+
+Both final real-data label exports matched the frozen SHA-256 above. On the
+1,584,605-row input the final median CUDA core and fit times were 0.920 s and
+5.803 s. On the separate 1M×16 clustered workload the CUDA core median was
+0.863 s versus CPU's 0.579 s (CUDA 1.49× slower), despite a shorter CUDA fit
+(8.002 s versus 27.751 s). These are one-host observations, not speed guarantees.
+
+Criterion source was unchanged: eligible CUDA KD benchmarks at 16–32 features,
+including 30-D cases, compare different kernels before and after removal. Their
+timings should not be interpreted as like-for-like kernel measurements.
+
 ## Phase 7 results: CUDA flat plane kernel F2 accepted
+
+Superseded by [F2 removal](#f2-removal-2026-11).
 
 **Decision:** accept **F2**, fixed **two planes per cube**, dimension gate **16**, **no row-count gate**. CPU C16 is unchanged. CUDA retains the per-query kernel below 16 features, above 32, on non-plane devices and with insufficient launch/shared-memory resources. This is pre-launch routing, not execution-error recovery. F scans all candidates, staging leaf-ordered padded rows for plane broadcasts, retaining original IDs/output rows, the output-backed heap and ordered scalar feature arithmetic. Experimental arms/measurement overrides are removed in finalization; below-gate forcing is test-only.
 

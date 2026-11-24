@@ -36,7 +36,7 @@ jobs:
       - uses: ./.github/actions/ci-env
       - uses: ./.github/actions/setup-python-uv
         with:
-          python-version: '3.14'
+          python-version: '3.13'
       - uses: ./.github/actions/setup-rust
         with:
           class: test-windows

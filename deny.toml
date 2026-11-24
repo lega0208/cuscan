@@ -7,6 +7,7 @@ ignore = [
     # This advisory concerns maintenance, not a vulnerability. Revisit when the
     # upstream numerical stack migrates away from paste; other advisories fail.
     { id = "RUSTSEC-2024-0436", reason = "Maintainer-approved exception for transitive compile-time paste; revisit on upstream migration" },
+    { id = "RUSTSEC-2026-0543", reason = "Maintainer-approved exception for transitive compile-time chrono; revisit on upstream migration" },
 ]
 
 [licenses]

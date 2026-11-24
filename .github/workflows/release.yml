@@ -33,14 +33,14 @@ jobs:
       platform: linux
       use-cache: false
       build-sdist: true
-      pythons: '["3.12","3.14"]'
+      pythons: '["3.12","3.13"]'
   wheels-windows:
     needs: verify
     uses: ./.github/workflows/_wheels.yml
     with:
       platform: windows
       use-cache: false
-      pythons: '["3.12","3.14"]'
+      pythons: '["3.12","3.13"]'
   sdist-source-build:
     needs: wheels-linux
     runs-on: ubuntu-24.04
