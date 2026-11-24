@@ -1,0 +1,2 @@
+# The Phase 7 verifier hashes the original bytes, including line endings.
+comparison/umap06/reference/upstream-worker-*.py.txt -text

@@ -40,22 +40,19 @@ MEASUREMENT_SOURCES = (
 SCORE_SOURCES = ("comparison/umap06/quality.py", "comparison/umap06/datasets.py")
 FROZEN_UPSTREAM_WORKER_REVISION = "8e6823f83ded23b806ef38133145703e35466c7d"
 FROZEN_UPSTREAM_WORKER_SHA256 = "ba3b17ebb447fdc56ccf440d0581509ce2e6b20185a02ba56ee593083a886140"
+FROZEN_UPSTREAM_WORKER_FIXTURE = (
+    ROOT
+    / "comparison/umap06/reference"
+    / f"upstream-worker-{FROZEN_UPSTREAM_WORKER_REVISION}.py.txt"
+)
 
 
 def phase7_frozen_worker_hash():
     """Verify the exact historical worker bytes used by the frozen reference."""
     try:
-        data = subprocess.check_output(
-            [
-                "git",
-                "show",
-                f"{FROZEN_UPSTREAM_WORKER_REVISION}:comparison/umap06/upstream_worker.py",
-            ],
-            cwd=ROOT,
-            stderr=subprocess.PIPE,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("cannot recover frozen upstream worker from git") from exc
+        data = FROZEN_UPSTREAM_WORKER_FIXTURE.read_bytes()
+    except OSError as exc:
+        raise ValueError("cannot read frozen upstream worker fixture") from exc
     digest = hashlib.sha256(data).hexdigest()
     if digest != FROZEN_UPSTREAM_WORKER_SHA256:
         raise ValueError("historical upstream worker sha256 mismatch")

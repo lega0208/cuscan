@@ -1,0 +1,176 @@
+"""Isolated upstream fits; never imports cuscan."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+from comparison.umap_reference import reference_kwargs, require_reference
+
+from .datasets import load_fixture
+from .spec import CONFIGS, FIXTURES, warmup_plan
+
+
+def embedding_hash(values: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(values, dtype="<f4").tobytes()).hexdigest()
+
+
+def validate_embedding(values: np.ndarray, rows: int, components: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.shape != (rows, components) or not np.isfinite(values).all():
+        raise ValueError(f"Invalid embedding: {values.shape}, expected {(rows, components)} finite")
+    return values
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fixture", required=True, choices=FIXTURES)
+    parser.add_argument("--config", required=True, choices=CONFIGS)
+    parser.add_argument("--seeds", required=True, type=int, nargs="+")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--data", type=Path, default=Path("data/umap06"))
+    parser.add_argument("--components", type=int, default=2)
+    parser.add_argument("--precomputed-knn", action="store_true")
+    args = parser.parse_args()
+    require_reference()
+    import umap
+    import umap.umap_ as upstream
+
+    observed_epochs: list[int] = []
+    optimize_layout = upstream.optimize_layout_euclidean
+
+    def observe_layout(*positional, **keywords):
+        epochs = positional[4] if len(positional) > 4 else keywords["n_epochs"]
+        observed_epochs.append(int(np.max(epochs)))
+        return optimize_layout(*positional, **keywords)
+
+    upstream.optimize_layout_euclidean = cast(Any, observe_layout)
+
+    args.out.mkdir(parents=True, exist_ok=False)
+    train, batches, _ = load_fixture(args.data, args.fixture)
+    config = CONFIGS[args.config]
+    warmup = warmup_plan(FIXTURES[args.fixture])
+
+    def model(seed: int, precomputed: tuple | None = None):
+        options = reference_kwargs(
+            optimizer=config.optimizer,
+            init=config.init,
+            n_neighbors=15,
+            n_components=args.components,
+            min_dist=0.1,
+            spread=1.0,
+            learning_rate=1.0,
+            negative_sample_rate=5,
+            repulsion_strength=1.0,
+            metric="euclidean",
+            random_state=seed,
+            transform_seed=seed,
+            low_memory=True,
+            verbose=False,
+            n_jobs=-1,
+        )
+        if precomputed is not None:
+            options["precomputed_knn"] = precomputed
+        return umap.UMAP(**options)
+
+    warm_start = time.perf_counter()
+    with warnings.catch_warnings(record=True) as warm_warnings:
+        warnings.simplefilter("always")
+        for rows in warmup["fit_rows"]:
+            reducer = model(args.seeds[0]).fit(train[:rows])
+            for count in warmup["transform_rows"]:
+                # Repeat verified input rows only for compilation; these are not measured queries.
+                queries = np.resize(train[: min(len(train), count)], (count, train.shape[1]))
+                reducer.transform(queries)
+    warm_seconds = time.perf_counter() - warm_start
+    precomputed = None
+    if args.precomputed_knn:
+        with np.load(args.data / args.fixture / "eval.npz", allow_pickle=False) as cache:
+            precomputed = (cache["precomputed_ids"], cache["precomputed_distances"], None)
+    for seed in args.seeds:
+        destination = args.out / str(seed)
+        destination.mkdir(exist_ok=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            reducer = model(seed, precomputed)
+            observed_epochs.clear()
+            start = time.perf_counter()
+            fit = validate_embedding(reducer.fit_transform(train), len(train), args.components)
+            fit_seconds = time.perf_counter() - start
+            if not observed_epochs:
+                raise RuntimeError("Upstream fit did not call the observed layout entry point")
+            fit_epochs = observed_epochs[-1]
+            fit_layout_epochs = list(observed_epochs)
+            np.save(destination / "fit.npy", fit, allow_pickle=False)
+            hashes = {"fit": embedding_hash(fit)}
+            transform_seconds = {}
+            transform_epochs = {}
+            if not args.precomputed_knn:
+                for count, queries in batches.items():
+                    observed_epochs.clear()
+                    start = time.perf_counter()
+                    embedding = validate_embedding(
+                        reducer.transform(queries), count, args.components
+                    )
+                    transform_seconds[str(count)] = time.perf_counter() - start
+                    if not observed_epochs:
+                        raise RuntimeError("Upstream transform did not call observed layout")
+                    transform_epochs[str(count)] = observed_epochs[-1]
+                    np.save(destination / f"transform_{count}.npy", embedding, allow_pickle=False)
+                    hashes[f"transform_{count}"] = embedding_hash(embedding)
+        warning_records = [str(item.message) for item in [*warm_warnings, *caught]]
+        for message in warning_records:
+            lowered = message.lower()
+            if (
+                "fallback" in lowered
+                or "falling back" in lowered
+                or "spectral initialisation failed" in lowered
+            ):
+                raise RuntimeError(f"Reference initialization fallback: {message}")
+        knn = getattr(reducer, "_knn_indices", None)
+        if knn is not None:
+            np.save(destination / "knn_indices.npy", knn, allow_pickle=False)
+        params = reducer.get_params()
+        params.pop("precomputed_knn", None)
+        record = {
+            "role": "upstream",
+            "fixture": args.fixture,
+            "config": args.config,
+            "seed": seed,
+            "components": args.components,
+            "precomputed_knn": args.precomputed_knn,
+            "params": params,
+            "resolved_optimizer": reducer._optimizer,
+            "resolved_init": reducer._init,
+            "epochs": fit_epochs,
+            "fit_layout_epochs": fit_layout_epochs,
+            "transform_epochs": transform_epochs,
+            "fit_seconds": fit_seconds,
+            "transform_seconds": transform_seconds,
+            "warmup": warmup,
+            "warmup_seconds": warm_seconds,
+            "warnings": warning_records,
+            "hashes": hashes,
+            "threads": {
+                key: os.environ.get(key)
+                for key in (
+                    "NUMBA_NUM_THREADS",
+                    "OMP_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                )
+            },
+            "cpu_count": os.cpu_count(),
+        }
+        (destination / "run.json").write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
+
+
+if __name__ == "__main__":
+    main()

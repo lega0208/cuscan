@@ -2066,11 +2066,15 @@ def build_phase7(tmp_path, monkeypatch, approximate=False):
     return run, args, path, doc, ref
 
 
-def test_phase7_historical_worker_bytes_are_verified(monkeypatch):
+def test_phase7_historical_worker_bytes_are_verified(tmp_path, monkeypatch):
     from comparison.umap06 import run
 
     assert run.phase7_frozen_worker_hash() == run.FROZEN_UPSTREAM_WORKER_SHA256
-    monkeypatch.setattr(run.subprocess, "check_output", lambda *args, **kwargs: b"tampered")
+    fixture = tmp_path / "upstream-worker.py.txt"
+    fixture.write_bytes(run.FROZEN_UPSTREAM_WORKER_FIXTURE.read_bytes())
+    monkeypatch.setattr(run, "FROZEN_UPSTREAM_WORKER_FIXTURE", fixture)
+    assert run.phase7_frozen_worker_hash() == run.FROZEN_UPSTREAM_WORKER_SHA256
+    fixture.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="historical upstream worker sha256 mismatch"):
         run.phase7_frozen_worker_hash()
 

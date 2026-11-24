@@ -243,7 +243,11 @@ def _fit_or_skip_cuda(backend: str, fit: Any) -> Any:
         if (
             backend == "cuda"
             and os.environ.get("CUSCAN_REQUIRE_CUDA") != "1"
-            and ("no CUDA" in str(error) or "CUDA is unavailable" in str(error))
+            and (
+                "no CUDA" in str(error)
+                or "CUDA is unavailable" in str(error)
+                or str(error) == "CUDA device index 0 is unavailable; 0 device(s) detected"
+            )
         ):
             pytest.skip(str(error))
         raise
@@ -794,16 +798,9 @@ def test_recursive_auto_matches_multilevel_adam_fit(backend: str) -> None:
         random_state=11,
         recursive_init_kwds={"base_init_threshold": 8, "n_embedding_epochs": 2},
     )
-    try:
-        recursive = estimator(init="recursive", **options).fit_transform(x)
-    except RuntimeError as error:
-        if (
-            backend == "cuda"
-            and os.environ.get("CUSCAN_REQUIRE_CUDA") != "1"
-            and ("no CUDA" in str(error) or "CUDA is unavailable" in str(error))
-        ):
-            pytest.skip(str(error))
-        raise
+    recursive = _fit_or_skip_cuda(
+        backend, lambda: estimator(init="recursive", **options).fit_transform(x)
+    )
     auto = estimator(init="auto", **options).fit_transform(x)
     assert recursive.shape == (64, 2)
     assert np.isfinite(recursive).all()
@@ -828,16 +825,7 @@ def test_modern_initialization_controls_center_scale_and_repeat(
         "learning_rate": 0.0,
         "n_epochs": 12,
     }
-    try:
-        model = estimator(**params).fit(x)
-    except RuntimeError as error:
-        if (
-            backend == "cuda"
-            and os.environ.get("CUSCAN_REQUIRE_CUDA") != "1"
-            and ("no CUDA" in str(error) or "CUDA is unavailable" in str(error))
-        ):
-            pytest.skip(str(error))
-        raise
+    model = _fit_or_skip_cuda(backend, lambda: estimator(**params).fit(x))
     assert model.embedding_.shape == (40, 2)
     assert np.isfinite(model.embedding_).all()
     np.testing.assert_allclose(model.embedding_.mean(axis=0), 0.0, atol=1e-5)

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-uv run maturin develop --release
+uv run maturin develop --release --extras serialization
 uv lock --check
 uv sync --locked --no-install-project --extra serialization
 uv run --no-sync ruff check
