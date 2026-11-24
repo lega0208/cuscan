@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.3](https://github.com/lega0208/cuscan/compare/v0.1.2...v0.1.3) (2026-11-24)
+
+
+### Features
+
+* add validation script ([6bde2d0](https://github.com/lega0208/cuscan/commit/6bde2d01979ba48b769d7da12be6ca8c47c9a349))
+* CUDA ANN pairwise kernel rewrite ([2e7b8a6](https://github.com/lega0208/cuscan/commit/2e7b8a6db305a644d40952dda097c61a54d79260))
+* Improve ANN performance ([2d7feae](https://github.com/lega0208/cuscan/commit/2d7feae0abc3d378b4ae3d2391596d5d046ef737))
+* port RINND to cubecl kernels for CPU ANN (close enough for now) ([dead1de](https://github.com/lega0208/cuscan/commit/dead1de713c10dbf6a507a7b51917d9721491ff6))
+* port UMAP 0.6.0 changes ([b349ff7](https://github.com/lega0208/cuscan/commit/b349ff72113beec7cc9fd1e5dfb995477d51d2e9))
+
+
+### Bug Fixes
+
+* **ci:** Change python version from 3.14 to 3.13 because of `rinnd` dependency; update cargo deny ([ee67c76](https://github.com/lega0208/cuscan/commit/ee67c76de267fafd04c1c32fc068881f2d1ce44a))
+* **ci:** windows tests failing because of `fcntl` package ([ea1fb6e](https://github.com/lega0208/cuscan/commit/ea1fb6efe3af3e60707067be8fecbdaedd49db53))
+* **ci:** windows tests failing because of `resource` package ([be19074](https://github.com/lega0208/cuscan/commit/be1907490f3c07a85e5aaf70e910999dd5071b4f))
+* clippy lint ([15d1bff](https://github.com/lega0208/cuscan/commit/15d1bff32346ee7bbff708b85d7355ae94559c66))
+* missing cuda device throwing error and other CI issues ([200bcb8](https://github.com/lega0208/cuscan/commit/200bcb8632bac22c2ba7308ebf9983df26e2d6ab))
+* **perf:** remove HDBSCAN kernel that turned out to only be good for gaussian noise ([438ef99](https://github.com/lega0208/cuscan/commit/438ef99f2e91209628be1e7e6510daa1b9c2ca03))
+* update pynndescent fixture provenance versions ([4386c92](https://github.com/lega0208/cuscan/commit/4386c926a38c8004ca7ef958eed6be5db4a5fc85))
+
+
+### Performance
+
+* improve HDBSCAN kdtree build performance ([521ec09](https://github.com/lega0208/cuscan/commit/521ec096e4cd85c278b6ecc2f361c18af2d0b154))
+
 ## [0.1.2](https://github.com/lega0208/cuscan/compare/v0.1.1...v0.1.2) (2026-11-13)
 
 
